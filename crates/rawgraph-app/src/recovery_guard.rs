@@ -151,11 +151,70 @@ pub fn process_alive(pid: u32, exe: &str) -> Option<bool> {
             l.contains(&wanted_pid) && (exe.is_empty() || (!name.is_empty() && exe.starts_with(name)))
         }))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        let _ = exe;
-        Some(Path::new(&format!("/proc/{pid}")).exists())
+        linux_process_alive(pid, exe)
     }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        unix_ps_alive(pid, exe)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (pid, exe);
+        None
+    }
+}
+
+/// Linux: the pid must exist, must not be a zombie, and its program name must be ours. A pid that exists
+/// but belongs to another program (pid reuse after a crash) is "not running", like on Windows.
+#[cfg(target_os = "linux")]
+fn linux_process_alive(pid: u32, exe: &str) -> Option<bool> {
+    let dir = PathBuf::from(format!("/proc/{pid}"));
+    if !dir.exists() {
+        return Some(false);
+    }
+    // /proc/<pid>/stat: "pid (comm) S ..."; the state follows the last ')' (comm may contain anything).
+    if let Ok(stat) = std::fs::read_to_string(dir.join("stat")) {
+        let state = stat.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next());
+        if matches!(state, Some('Z' | 'X')) {
+            return Some(false);
+        }
+    }
+    if exe.is_empty() {
+        return Some(true);
+    }
+    // Full name from the exe link (a deleted/replaced binary shows " (deleted)").
+    if let Ok(target) = std::fs::read_link(dir.join("exe")) {
+        let full = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let full = full.strip_suffix(" (deleted)").unwrap_or(&full);
+        return Some(full == exe);
+    }
+    // The link is unreadable for processes of other users: /proc/<pid>/comm holds the name cut to 15 bytes.
+    if let Ok(comm) = std::fs::read_to_string(dir.join("comm")) {
+        let comm = comm.trim_end_matches(&['\n', '\r'][..]);
+        return Some(!comm.is_empty() && exe.starts_with(comm));
+    }
+    // Exists but cannot be identified: let the heartbeat decide.
+    None
+}
+
+/// Other Unix systems (macOS, BSD) have no /proc: ask `ps` for the program of the pid. If `ps` cannot be
+/// run the answer is `None`, so the heartbeat decides (a live session is not discarded).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn unix_ps_alive(pid: u32, exe: &str) -> Option<bool> {
+    let out = std::process::Command::new("ps").args(["-p", &pid.to_string(), "-o", "comm="]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let comm = text.trim();
+    if comm.is_empty() {
+        // `ps` exits non-zero and prints nothing for an unknown pid.
+        return if out.status.success() { None } else { Some(false) };
+    }
+    if exe.is_empty() {
+        return Some(true);
+    }
+    let name = Path::new(comm).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    Some(!name.is_empty() && (exe.starts_with(&name) || name.starts_with(exe)))
 }
 
 /// Whether the session behind a lock is still running. The process check wins

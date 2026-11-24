@@ -391,9 +391,11 @@ const SNIPPET_CURVE: &str = r#"    if (P[$0].x != 0.0) {
                 }
             }
         } else {
-            let v = c[ch - 1u];
+            // No element is assigned through a runtime index (FXC / DX12 rejects that): pick with select().
+            let v = select(select(c.x, c.y, ch == 2u), c.z, ch == 3u);
             if (v >= 0.0 && fin(v)) {
-                c[ch - 1u] = curve_to_v(curve_lookup(divc(v, v + 0.18), $Tu, one), tmax);
+                let nv = curve_to_v(curve_lookup(divc(v, v + 0.18), $Tu, one), tmax);
+                c = vec3<f32>(select(c.x, nv, ch == 1u), select(c.y, nv, ch == 2u), select(c.z, nv, ch == 3u));
             }
         }
     }

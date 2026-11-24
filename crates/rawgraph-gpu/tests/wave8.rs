@@ -366,7 +366,14 @@ fn chains_with_the_new_ops_cache_pipelines_and_tables() {
         with_neutral.push(PointOp::Vibrance(0.0));
         with_neutral.push(PointOp::WhitesBlacks { whites: 0.0, blacks: 0.0 });
         let on = apply_point_ops(&ctx, &src, &with_neutral).unwrap().download(&ctx).unwrap();
-        assert_eq!(&on, out, "neutral ops at the end of the chain must not change the result");
+        // Bit-exact on drivers that compile both shaders alike (Vulkan, DX12/DXC); the FXC compiler may
+        // schedule float operations of the longer shader differently (about one ulp), so the exact
+        // identity of the neutral parameters is checked by `neutral_wave8_parameters_are_the_bit_exact_identity`.
+        if &on != out {
+            let worst = rel_errors(&on, out).into_iter().fold(0.0f32, f32::max);
+            println!("neutral ops at the end of the chain ({label}): not bit-identical, max relative difference {worst:.3e}");
+            assert!(worst <= 1e-5, "neutral ops at the end of the chain must not change the result: {worst}");
+        }
     }
 
     // Slider drag through render_into: after the first call nothing new at all (tables included).

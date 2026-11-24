@@ -6,7 +6,7 @@ use crate::crop_logic::Aspect;
 use crate::history::History;
 use crate::render::Frame;
 use eframe::egui::{Event, PointerButton};
-use rawgraph_core::ImageBuf;
+use rawgraph_core::{ImageBuf, NodeKind};
 use std::sync::Arc;
 
 const FRAME_W: u32 = 300;
