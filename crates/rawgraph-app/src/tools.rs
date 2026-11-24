@@ -389,7 +389,8 @@ mod tests {
         let p = transform_params(n, img);
         assert_eq!((p.angle_deg, p.quarter_turns, p.flip_h), (0.0, 0, false));
     }
-
-    #[path = "../../tools_tests.rs"]
-    mod interaction_tests;
 }
+
+#[cfg(test)]
+#[path = "tools_tests.rs"]
+mod interaction_tests;
