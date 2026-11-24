@@ -114,11 +114,23 @@ pub fn save(dir: &Path, name: &str, sub: &Subgraph) -> Result<PathBuf, String> {
     }
     ensure_dir(dir)?;
     let path = recipe_path(dir, &stem);
-    if path.exists() {
+    if path.exists() || name_taken(dir, &stem, None) {
         return Err(format!("A recipe named \"{stem}\" already exists"));
     }
     write_new(&path, &sub.to_json())?;
     Ok(path)
+}
+
+/// True when a recipe file in `dir` has the same stem as `stem` ignoring case (other than `except`, the
+/// exact stem of the file being renamed). Names are compared case-insensitively on every OS, so a folder
+/// copied between Linux and Windows/macOS never holds two recipes that collide there.
+fn name_taken(dir: &Path, stem: &str, except: Option<&str>) -> bool {
+    let wanted = stem.to_lowercase();
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    rd.flatten().any(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        name.strip_suffix(RECIPE_EXT).is_some_and(|other| Some(other) != except && other.to_lowercase() == wanted)
+    })
 }
 
 fn write_new(path: &Path, text: &str) -> Result<(), String> {
@@ -141,10 +153,27 @@ pub fn rename(dir: &Path, from_stem: &str, to_name: &str) -> Result<PathBuf, Str
     if !src.is_file() {
         return Err(format!("Recipe \"{from}\" does not exist"));
     }
-    if dst.exists() {
+    let case_only = from != to && from.to_lowercase() == to.to_lowercase();
+    // A case-only rename ("A" to "a") must work; any other existing name, in any case, is a clash.
+    if from == to || name_taken(dir, &to, Some(from)) || (!case_only && dst.exists()) {
         return Err(format!("A recipe named \"{to}\" already exists"));
     }
-    std::fs::rename(&src, &dst).map_err(|e| format!("Cannot rename: {e}"))?;
+    if case_only {
+        // The only file that matches is the source itself: a plain rename cannot replace anything else.
+        std::fs::rename(&src, &dst).map_err(|e| format!("Cannot rename: {e}"))?;
+    } else {
+        // `hard_link` fails when the target exists on every OS, unlike `rename`, which replaces it on
+        // Unix. Remaining race: a file created under `to` between the check above and the link is still
+        // never overwritten (the link fails); only the source could vanish in between, which errors out.
+        match std::fs::hard_link(&src, &dst) {
+            Ok(()) => std::fs::remove_file(&src).map_err(|e| format!("Cannot rename: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(format!("A recipe named \"{to}\" already exists"));
+            }
+            // No hard links on this file system: fall back to rename (check-then-rename, small race).
+            Err(_) => std::fs::rename(&src, &dst).map_err(|e| format!("Cannot rename: {e}"))?,
+        }
+    }
     Ok(dst)
 }
 

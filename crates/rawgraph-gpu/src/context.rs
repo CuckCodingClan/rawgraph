@@ -31,7 +31,8 @@ impl GpuContext {
     /// Headless context on the high-performance adapter. Returns an error (never panics)
     /// when no adapter or device is available.
     pub fn new() -> Result<Self, GpuError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        // `with_env` leaves the defaults alone unless WGPU_BACKEND, WGPU_DX12_COMPILER etc. are set.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle().with_env());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
