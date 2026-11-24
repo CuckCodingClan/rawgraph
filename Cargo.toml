@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+rawgraph-core = { path = "crates/rawgraph-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1"
+
+# Image processing is unusable without optimisation, so dependencies are always
+# optimised and our own code gets light optimisation even in dev builds.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# "*" does not cover workspace members. These crates do the pixel work, so they
+# are fully optimised in dev builds too (debug info is kept); the app and the
+# remaining crates stay at opt-level 1 for fast rebuilds.
+[profile.dev.package.rawgraph-core]
+opt-level = 3
+
+[profile.dev.package.rawgraph-engine]
+opt-level = 3
+
+[profile.dev.package.rawgraph-scopes]
+opt-level = 3
+
+[profile.dev.package.rawgraph-io]
+opt-level = 3
+
+[profile.dev.package.rawgraph-fx]
+opt-level = 3
+
+[profile.release]
+lto = "thin"

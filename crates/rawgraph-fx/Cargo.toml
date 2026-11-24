@@ -1,0 +1,13 @@
+[package]
+name = "rawgraph-fx"
+description = "RawGraph effects: CPU reference tone/colour/detail/geometry effects and mask generators"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rawgraph-core.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+rawgraph-io = { path = "../rawgraph-io" }

@@ -1,0 +1,9 @@
+[package]
+name = "rawgraph-scopes"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rawgraph-core.workspace = true
+rayon.workspace = true

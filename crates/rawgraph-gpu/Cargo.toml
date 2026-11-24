@@ -1,0 +1,18 @@
+[package]
+name = "rawgraph-gpu"
+description = "RawGraph GPU pixel path prototype: point-op chains and display transform in WGSL, validated against the CPU reference"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rawgraph-core.workspace = true
+# `curve_eval` bakes the point curve table exactly like the CPU does.
+rawgraph-fx = { path = "../rawgraph-fx" }
+# DisplayImage is the return type of display_samples.
+rawgraph-scopes = { path = "../rawgraph-scopes" }
+# Same wgpu as eframe 0.37 / egui-wgpu (see Cargo.lock). Only the backends that matter on desktop.
+wgpu = { version = "=30.0.2", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12", "vulkan"] }
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "1"
+

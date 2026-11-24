@@ -1,0 +1,19 @@
+[package]
+name = "rawgraph-batch"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rawgraph-core.workspace = true
+rawgraph-engine = { path = "../rawgraph-engine" }
+rawgraph-scopes = { path = "../rawgraph-scopes" }
+rawgraph-io = { path = "../rawgraph-io" }
+rayon.workspace = true
+
+[dev-dependencies]
+# Reads exported EXR files back in tests (same crate and version rawgraph-io already uses).
+exr = "1.74.3"
+# Read exported files back in tests (same crates and versions rawgraph-io already uses).
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "tiff"] }
+kamadak-exif = "0.6.2"

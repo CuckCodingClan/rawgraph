@@ -1,0 +1,9 @@
+[package]
+name = "rawgraph-engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rawgraph-core.workspace = true
+rawgraph-fx = { path = "../rawgraph-fx" }
