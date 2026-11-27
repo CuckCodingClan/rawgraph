@@ -178,6 +178,14 @@ impl Env<'_> {
         graph.input_edges(node, port).find(|e| self.contains_output(graph, e.from, e.from_port, image)).map(|e| (e.from, e.from_port))
     }
 
+    /// Resolve auxiliary controls without adding their images to the main collection.
+    fn control_edge(&self, graph: &Graph, node: NodeId, port: usize, image: ImageId) -> Option<(NodeId, usize, ImageId)> {
+        let (up, output) = graph.input_edge(node, port)?;
+        if self.contains_output(graph, up, output, image) { return Some((up, output, image)); }
+        let members = self.cat(|c| graph.members(up, output, c));
+        if members.len() == 1 { Some((up, output, members[0])) } else { None }
+    }
+
     /// Membership for viewing `node` (output port 0). Viewing a Metadata Split passes its
     /// whole input collection through.
     fn viewing_member(&self, graph: &Graph, node: NodeId, image: ImageId) -> bool {
@@ -605,11 +613,17 @@ impl Evaluator {
                 if chosen.is_some_and(|c| c != port) {
                     continue;
                 }
-                match env.input_edge(graph, id, port, image) {
-                    Some((up, up_port)) => {
+                let edge = if node.is_control_input(port) { env.control_edge(graph, id, port, image) } else { env.input_edge(graph, id, port, image).map(|(up, p)| (up, p, image)) };
+                match edge {
+                    Some((up, up_port, up_image)) => {
                         used.push(up);
-                        let (_, value) = self.eval_node(graph, up, image, up_size, &env.control(spec.ty == PortType::Mask), cancel, visiting, memo)?;
-                        let value = output_value(graph, up, up_port, value);
+                        let mut other_memo = FingerprintMemo::new();
+                        let up_env = env.control(node.is_control_input(port) || spec.ty == PortType::Mask);
+                        let (_, value) = self.eval_node(graph, up, up_image, up_size, &up_env, cancel, visiting, if up_image == image { memo } else { &mut other_memo })?;
+                        let mut value = output_value(graph, up, up_port, value);
+                        if node.is_control_input(port) && spec.ty == PortType::Mask {
+                            if let Value::Images(img) = value { value = Value::Mask(control_mask(&img, up_size)); }
+                        }
                         let ty = match value {
                             Value::Images(_) => PortType::Images,
                             Value::Mask(_) => PortType::Mask,
@@ -626,12 +640,14 @@ impl Evaluator {
         }
 
         for (i, exposed) in node.exposed_inputs().iter().enumerate() {
-            let Some(exposed) = exposed else { continue };
+            if exposed.is_none() { continue; }
             let port = specs.len() + i;
-            if let Some((up, up_port)) = env.input_edge(graph, id, port, image) {
+            if let Some((up, up_port, up_image)) = env.control_edge(graph, id, port, image) {
                 used.push(up);
                 let target = inputs.iter().flatten().find_map(|v| match v { Value::Images(img) => Some((img.width(), img.height())), _ => None });
-                let (_, v) = self.eval_node(graph, up, image, if exposed.ty == PortType::Mask { target } else { None }, &env.control(true), cancel, visiting, memo)?;
+                let mut other_memo = FingerprintMemo::new();
+                let is_up_mask = graph.node(up).and_then(|n| n.output_type(up_port)) == Some(PortType::Mask);
+                let (_, v) = self.eval_node(graph, up, up_image, if is_up_mask { target } else { None }, &env.control(true), cancel, visiting, if up_image == image { memo } else { &mut other_memo })?;
                 inputs[port] = Some(output_value(graph, up, up_port, v));
             }
         }
@@ -1213,16 +1229,19 @@ fn node_fingerprint_inner(
             if chosen.is_some_and(|c| c != port) {
                 continue;
             }
-            match env.input_edge(graph, id, port, image) {
-                Some((up, up_port)) => {
+            let edge = if node.is_control_input(port) { env.control_edge(graph, id, port, image) } else { env.input_edge(graph, id, port, image).map(|(up, p)| (up, p, image)) };
+            match edge {
+                Some((up, up_port, up_image)) => {
                     up_port.hash(&mut hasher);
                     output_channel(graph.node(up).unwrap(), up_port).hash(&mut hasher);
                     if graph.node(up).is_some_and(|u| u.kind == NodeKind::MetadataSplit) {
                         // The port decision of the split this input hangs on.
                         env.cat(|c| graph.split_port_in(up, image, c)).hash(&mut hasher);
                     }
-                    let fp = node_fingerprint(graph, up, image, &env.control(spec.ty == PortType::Mask), memo, visiting)?;
-                    if graph.node(up).and_then(|u| u.kind.output()) != Some(spec.ty) {
+                    let mut other_memo = FingerprintMemo::new();
+                    let up_env = env.control(node.is_control_input(port) || spec.ty == PortType::Mask);
+                    let fp = node_fingerprint(graph, up, up_image, &up_env, if up_image == image { memo } else { &mut other_memo }, visiting)?;
+                    if !node.is_control_input(port) && graph.node(up).and_then(|u| u.kind.output()) != Some(spec.ty) {
                         return Err(EvalError::WrongType { node: id, port });
                     }
                     fp.hash(&mut hasher);
@@ -1237,10 +1256,11 @@ fn node_fingerprint_inner(
         let port = specs.len() + i;
         port.hash(&mut hasher);
         exposed.parameter.hash(&mut hasher);
-        if let Some((up, up_port)) = env.input_edge(graph, id, port, image) {
+        if let Some((up, up_port, up_image)) = env.control_edge(graph, id, port, image) {
             up_port.hash(&mut hasher);
             output_channel(graph.node(up).unwrap(), up_port).hash(&mut hasher);
-            node_fingerprint(graph, up, image, &env.control(true), memo, visiting)?.hash(&mut hasher);
+            let mut other_memo = FingerprintMemo::new();
+            node_fingerprint(graph, up, up_image, &env.control(true), if up_image == image { memo } else { &mut other_memo }, visiting)?.hash(&mut hasher);
         } else { u64::MAX.hash(&mut hasher); }
     }
     Ok(hasher.finish())
@@ -1393,7 +1413,9 @@ fn develop_base_is_neutral(settings: &DevelopSettings) -> bool {
 fn tail_step(graph: &Graph, node: &rawgraph_core::Node, image: ImageId, provider: &dyn ImageProvider) -> TailStep {
     let id = node.id;
     let param = |name: &str| node.param(name, image);
-    let masked = graph.input_edge(id, 1).is_some() || node.exposed_inputs().iter().enumerate().any(|(i, p)| p.is_some() && graph.input_edge(id, node.kind.inputs().len() + i).is_some());
+    let images = provider.images();
+    let env = Env { provider, images: &images, view_tone: ToneMap::AcesFit, control: false }; // membership only
+    let masked = (0..node.kind.inputs().len() + node.exposed_inputs().len()).any(|port| node.is_control_input(port) && env.control_edge(graph, id, port, image).is_some());
     match node.kind {
         NodeKind::Output | NodeKind::Export | NodeKind::MetadataFilter | NodeKind::MetadataSplit | NodeKind::Merge => {
             TailStep::Through(Vec::new())
@@ -1582,6 +1604,15 @@ fn output_value(graph: &Graph, node: NodeId, port: usize, value: Value) -> Value
         let v = match channel { 0 => 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2], n => p[n as usize - 1] };
         p.copy_from_slice(&[v, v, v, 1.0]);
     }}), other => other }
+}
+
+fn control_mask(img: &ImageBuf, size: Option<(u32, u32)>) -> Arc<MaskBuf> {
+    let mut mask = MaskBuf { width: img.width(), height: img.height(), data: img.data().as_chunks::<4>().0.iter().map(|p| {
+        let v = 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2];
+        if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 }
+    }).collect() };
+    if let Some((w, h)) = size { if (mask.width, mask.height) != (w, h) { mask = fx::resize_mask(&mask, w, h); } }
+    Arc::new(mask)
 }
 
 fn input_image(inputs: &[Option<Value>], port: usize, node: NodeId) -> Result<Arc<ImageBuf>, EvalError> {
@@ -2256,6 +2287,76 @@ mod tests {
                 for (a,b) in changed.data().iter().zip(scalar.data()) { assert!((a-b).abs() < 1e-5, "{name} local={local}: {a} {b}"); }
             }
         }
+    }
+
+    #[test]
+    fn standalone_generator_controls_develop_exposure() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
+        let dev = g.add_node(NodeKind::Develop, [0.0; 2]);
+        g.connect(src, dev, 0).unwrap();
+        let p = TestProvider::default();
+        *p.catalog.lock().unwrap() = vec![A];
+        *p.dims.lock().unwrap() = Some((5, 1));
+        let mut ev = Evaluator::new();
+        let plain = run(&g, dev, A, &p, &mut ev);
+        let port = g.expose_parameter(dev, "exposure", PortType::Images).unwrap();
+        g.connect(generator, dev, port).unwrap();
+        let mapped = run(&g, dev, A, &p, &mut ev);
+        assert_ne!(*plain, *mapped);
+        assert_ne!(mapped.pixel(0, 0), mapped.pixel(4, 0));
+        assert!(matches!(tail_step(&g, g.node(dev).unwrap(), A, &p), TailStep::Base));
+        let misses = ev.misses();
+        set(&mut g, generator, "gradient_reverse", A, 1.0);
+        let changed = run(&g, dev, A, &p, &mut ev);
+        assert_ne!(*mapped, *changed);
+        assert!(ev.misses() > misses);
+    }
+
+    #[test]
+    fn standalone_generator_radius_mask_image_and_luma() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
+        let blur = g.add_node(NodeKind::Blur, [0.0; 2]);
+        g.connect(src, blur, 0).unwrap();
+        set(&mut g, blur, "radius", A, 30.0);
+        let p = TestProvider::default();
+        *p.catalog.lock().unwrap() = vec![A];
+        let mut ev = Evaluator::new();
+        let plain = run(&g, blur, A, &p, &mut ev);
+        let luma = g.expose_output(generator, 0, "Luma").unwrap();
+        for port in [0, luma] {
+            g.connect_ports(generator, port, blur, 1).unwrap();
+            let mapped = run(&g, blur, A, &p, &mut ev);
+            assert_ne!(*plain, *mapped);
+            assert!(Graph::from_json(&g.to_json()).is_ok());
+        }
+    }
+
+    #[test]
+    fn disjoint_multi_image_control_is_unconnected() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let maps = g.add_node(NodeKind::Source, [0.0; 2]);
+        let dev = g.add_node(NodeKind::Develop, [0.0; 2]);
+        set_data(&mut g, maps, A, Some(NodeData::Folder("/maps".into())));
+        g.connect(src, dev, 0).unwrap();
+        let p = TestProvider::default();
+        let c = ImageId(3);
+        *p.catalog.lock().unwrap() = vec![A, B, c];
+        p.paths.lock().unwrap().insert(A.0, "/photos/a.jpg".into());
+        p.paths.lock().unwrap().insert(B.0, "/maps/b.jpg".into());
+        p.paths.lock().unwrap().insert(c.0, "/maps/c.jpg".into());
+        let mut ev = Evaluator::new();
+        let plain = run(&g, dev, A, &p, &mut ev);
+        let port = g.expose_parameter(dev, "exposure", PortType::Images).unwrap();
+        g.connect(maps, dev, port).unwrap();
+        assert_eq!(*plain, *run(&g, dev, A, &p, &mut ev));
+        let env = Env { provider: &p, images: &[A, B, c], view_tone: ToneMap::AcesFit, control: false };
+        assert!(env.control_edge(&g, dev, port, A).is_none());
+        assert_eq!(env.cat(|catalog| g.members(dev, 0, catalog)), vec![A, B, c]);
     }
 
     #[test]

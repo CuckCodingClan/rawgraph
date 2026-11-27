@@ -10,7 +10,7 @@ Edit the relevant node section in Git. To distinguish a request from an implemen
 
 - **All / Individual:** One shared setting set, or per-image overrides that inherit shared values when unset. These are distinct from a node’s own mode selector.
 - **Ports:** `Images` carry an image collection; `Mask` carries a single-channel modulation map. Required/optional below reflects the core declaration; callouts describe exceptions such as standalone Generator.
-- **Add Input:** Use the blue top-left title-bar square. Only the parameters listed for a node currently have per-pixel evaluation. The graph’s exposed image inputs use luminance for intensity. Fixed mask ports are listed separately.
+- **Add Input:** Use the blue top-left title-bar square. Only the parameters listed for a node currently have per-pixel evaluation. Exposed inputs and fixed parameter mask ports accept images or masks; images use clamped linear luminance. Exposed inputs replace the slider across its range, while fixed masks scale from minimum to the slider value. A matching image is used, otherwise a single-image output applies to every photo; a disjoint multi-image output is ignored. Control images do not join the main collection.
 - **Add Output:** Use the red top-right title-bar square; image-producing nodes can expose Luma, R, G, B and A from the first built-in image output. These are additional labelled edge ports, not replacements for the original image output. Right-click an added port to remove it; additions and removals are undoable.
 
 ## Collection

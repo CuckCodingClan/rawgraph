@@ -1101,6 +1101,11 @@ impl Node {
         !(self.kind == NodeKind::Blur && port == 2)
             && self.kind.inputs().get(port).is_some_and(|p| p.ty == PortType::Images)
     }
+    /// Whether this auxiliary input controls a numeric parameter per pixel.
+    pub fn is_control_input(&self, port: usize) -> bool {
+        self.kind.inputs().get(port).is_some_and(|p| p.modulates.is_some())
+            || port.checked_sub(self.kind.inputs().len()).and_then(|i| self.exposed_inputs.get(i)).is_some_and(Option::is_some)
+    }
     /// Effective value of a parameter for one image.
     pub fn param(&self, name: &str, image: ImageId) -> f32 {
         if self.mode == Mode::Individual {
@@ -1535,7 +1540,7 @@ impl Graph {
         }
         let found = src.output_type(from_port).ok_or(GraphError::NoSuchPort { node: from, port: from_port })?;
         let expected = dst.input_type(to_port).ok_or(GraphError::NoSuchPort { node: to, port: to_port })?;
-        if expected != found {
+        if expected != found && !dst.is_control_input(to_port) {
             return Err(GraphError::TypeMismatch { expected, found });
         }
         if self.depends_on(from, to) {
@@ -2157,7 +2162,7 @@ impl Graph {
             let Some(expected) = dst.input_type(e.to_port) else {
                 return bad(format!("{what}: node {} ({}) has no input {}", e.to.0, dst.kind.label(), e.to_port));
             };
-            if expected != found {
+            if expected != found && !dst.is_control_input(e.to_port) {
                 return bad(format!("{what}: input expects {:?} but the source carries {found:?}", expected));
             }
             let multi = dst.is_collection_input(e.to_port) && !matches!(dst.kind, NodeKind::Merge | NodeKind::Layer);
@@ -2388,10 +2393,7 @@ mod tests {
             g.connect(mask, sat, 0),
             Err(GraphError::TypeMismatch { expected: PortType::Images, found: PortType::Mask })
         );
-        assert_eq!(
-            g.connect(sat, blur, 1),
-            Err(GraphError::TypeMismatch { expected: PortType::Mask, found: PortType::Images })
-        );
+        assert_eq!(g.connect(sat, blur, 1), Ok(()));
         assert_eq!(g.connect(mask, blur, 1), Ok(()));
         assert_eq!(g.connect(out, sat, 0), Err(GraphError::NoOutput(out)));
         assert_eq!(g.connect(sat, out, 3), Err(GraphError::NoSuchPort { node: out, port: 3 }));
@@ -3064,12 +3066,12 @@ mod tests {
         g.connect(hue, sharpen, 1).unwrap();
         g.connect(grad, adjust, 0).unwrap();
 
-        // Images into mask ports and masks into image ports are rejected.
+        // Non-control mask and image ports remain strictly typed.
         let mismatch_mask = Err(GraphError::TypeMismatch { expected: PortType::Mask, found: PortType::Images });
         let mismatch_images = Err(GraphError::TypeMismatch { expected: PortType::Images, found: PortType::Mask });
         assert_eq!(g.connect(src, adjust, 0), mismatch_mask);
         assert_eq!(g.connect(src, combine, 1), mismatch_mask);
-        assert_eq!(g.connect(src, exp, 1), mismatch_mask);
+        assert_eq!(g.connect(src, exp, 1), Ok(()));
         assert_eq!(g.connect(radial, lum, 0), mismatch_images);
         assert_eq!(g.connect(combine, sharpen, 0), mismatch_images);
         assert_eq!(g.connect(src, radial, 0), Err(GraphError::NoSuchPort { node: radial, port: 0 }));
@@ -3529,10 +3531,7 @@ mod tests {
             assert_eq!(g.edges().len(), port + 2);
         }
         // Types across ports: split outputs are images, the brush mask is a mask.
-        assert_eq!(
-            g.connect_ports(split, 3, sharpen, 1),
-            Err(GraphError::TypeMismatch { expected: PortType::Mask, found: PortType::Images })
-        );
+        assert_eq!(g.connect_ports(split, 3, sharpen, 1), Ok(()));
         assert_eq!(
             g.connect_ports(brush, 0, sharpen, 0),
             Err(GraphError::TypeMismatch { expected: PortType::Images, found: PortType::Mask })
@@ -4534,7 +4533,7 @@ mod exposed_port_tests {
         g.connect(src, exp, 0).unwrap();
         let p = g.expose_parameter(exp, "ev", PortType::Images).unwrap();
         g.connect(other, exp, p).unwrap();
-        assert!(matches!(g.connect(mask, exp, p), Err(GraphError::TypeMismatch { .. })));
+        assert_eq!(g.connect(mask, exp, p), Ok(()));
         let alias = g.expose_output(src, 0, "copy").unwrap();
         let ids = [ImageId(1), ImageId(2)];
         let catalog = Catalog { images: &ids, capture: &|_| None };
