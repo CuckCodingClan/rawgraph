@@ -196,7 +196,7 @@ fn input_menu(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions
         if node.exposed_inputs().iter().flatten().any(|p| p.parameter == parameter) { continue; }
         let label = Graph::parameter_input_label(node.kind, parameter).unwrap();
         let hint = if parameter == "direction" { "Use linear RGB as an encoded Motion Blur direction" }
-            else { "Map luminance linearly to the parameter's full range (replaces its slider value)" };
+            else { "Scale this slider per pixel by luminance: black = no effect, white = the slider value" };
         let response = ui.button(label).on_hover_text(hint);
         #[cfg(test)] record_port_control(&response, id, "input_item");
         if response.clicked() { actions.push(Action::ExposeInput(id, parameter)); ui.close(); }

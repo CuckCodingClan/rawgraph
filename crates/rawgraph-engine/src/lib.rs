@@ -639,7 +639,7 @@ impl Evaluator {
         let local = node.choice("tone_version", image) == 1;
         let tone = tone_ops(&values);
         let mapped: HashMap<_, _> = Graph::supported_parameter_inputs(node.kind).iter()
-            .filter_map(|&key| parameter_values(node, inputs, key, &src).map(|values| (key, values)))
+            .filter_map(|&key| parameter_values(node, image, inputs, key, &src).map(|values| (key, values)))
             .collect();
         if !mapped.is_empty() {
             let fp_pre = pre_tone_fingerprint(graph, node, image, env, memo)?;
@@ -1543,10 +1543,23 @@ fn control_plane(map: &ImageBuf, target: &ImageBuf) -> MaskBuf {
     plane
 }
 
-fn parameter_values(node: &rawgraph_core::Node, inputs: &[Option<Value>], key: &str, target: &ImageBuf) -> Option<Vec<f32>> {
+/// Value of a parameter at which it has no effect (black on an intensity input).
+fn neutral_value(kind: NodeKind, spec: &rawgraph_core::ParamSpec) -> f32 {
+    match (kind, spec.name) {
+        (NodeKind::Blur, "radius") => 0.0,
+        _ => spec.default,
+    }
+}
+
+/// Per-pixel values of an intensity input: the map scales the slider's effect.
+/// Black (0) gives the neutral value, white (1) gives the slider value; in between
+/// it interpolates linearly, so the slider still sets the strength.
+fn parameter_values(node: &rawgraph_core::Node, image: ImageId, inputs: &[Option<Value>], key: &str, target: &ImageBuf) -> Option<Vec<f32>> {
     let spec = node.kind.param_spec(key)?;
     let plane = control_plane(control_image(node, inputs, key)?, target);
-    Some(plane.data.into_iter().map(|t| spec.min + t * (spec.max - spec.min)).collect())
+    let neutral = neutral_value(node.kind, spec);
+    let slider = node.param(key, image);
+    Some(plane.data.into_iter().map(|t| neutral + t * (slider - neutral)).collect())
 }
 
 fn grayscale_rgba(plane: MaskBuf) -> Value {
@@ -1692,7 +1705,7 @@ fn compute(
         }
         NodeKind::CaptureEv | NodeKind::Exposure => {
             let src = input_image(inputs, 0, id)?;
-            if let Some(values) = parameter_values(node, inputs, "ev", &src) {
+            if let Some(values) = parameter_values(node, image, inputs, "ev", &src) {
                 return Ok(modified(&src, |img| ops::exposure_mapped(img, &values)));
             }
             let ev = if node.kind == NodeKind::CaptureEv { param("delta") } else { param("ev") };
@@ -1711,7 +1724,7 @@ fn compute(
         }
         NodeKind::Saturation => {
             let src = input_image(inputs, 0, id)?;
-            if let Some(values) = parameter_values(node, inputs, "amount", &src) {
+            if let Some(values) = parameter_values(node, image, inputs, "amount", &src) {
                 return Ok(modified(&src, |img| ops::saturation_mapped(img, &values)));
             }
             let amount = param("amount");
@@ -1748,7 +1761,7 @@ fn compute(
         },
         NodeKind::Contrast => {
             let src = input_image(inputs, 0, id)?;
-            if let Some(values) = parameter_values(node, inputs, "amount", &src) {
+            if let Some(values) = parameter_values(node, image, inputs, "amount", &src) {
                 return Ok(modified(&src, |img| ops::contrast_mapped(img, &values, param("pivot"))));
             }
             let amount = param("amount");
@@ -1795,8 +1808,8 @@ fn compute(
         NodeKind::Sharpen => {
             let src = input_image(inputs, 0, id)?;
             let map = control_image(node, inputs, "amount").map(|map| control_plane(map, &src));
-            // Amount starts at zero, so the normalized plane scales the upper endpoint.
-            let amount = if map.is_some() { node.kind.param_spec("amount").unwrap().max } else { param("amount") };
+            // Amount starts at zero, so the plane scales the slider amount (black = none, white = slider).
+            let amount = param("amount");
             if amount == 0.0 { return Ok(Value::Images(src)); }
             let radius_px = param("radius") / 1000.0 * long_edge(&src);
             Ok(Value::Images(Arc::new(fx::sharpen(&src, amount, radius_px, param("threshold"), map.as_ref()))))
@@ -1857,7 +1870,8 @@ fn compute(
         NodeKind::Blur => {
             let src = input_image(inputs, 0, id)?;
             let radius_map = control_image(node, inputs, "radius").map(|map| control_plane(map, &src));
-            let sigma = (if radius_map.is_some() { node.kind.param_spec("radius").unwrap().max } else { param("radius") }) / 1000.0 * long_edge(&src);
+            // An intensity map scales the radius set on the slider (black = no blur, white = slider radius).
+            let sigma = param("radius") / 1000.0 * long_edge(&src);
             let high = node.choice("pass", image) == 1;
             let kernel = node.choice("kernel", image);
             if sigma.round() <= 0.0 && !high {
@@ -2049,6 +2063,7 @@ mod tests {
         let out = g.add_node(NodeKind::Output, [0.0; 2]);
         g.connect(src, exp, 0).unwrap();
         g.connect(exp, out, 0).unwrap();
+        set(&mut g, exp, "ev", A, 4.0);
         let input = g.expose_parameter(exp, "ev", PortType::Images).unwrap();
         let red = g.expose_output(src, 0, "R").unwrap();
         let green = g.expose_output(src, 0, "G").unwrap();
@@ -2068,7 +2083,8 @@ mod tests {
             assert_eq!(img.pixel(0, 0)[3], 1.0);
         }
         let first = run(&g, out, A, &p, &mut ev);
-        assert!((first.pixel(0,0)[0] - 0.25 * 2f32.powf(-3.0)).abs() < 1e-6);
+        // Red 0.25 scales the +4 EV slider to +1 EV.
+        assert!((first.pixel(0,0)[0] - 0.25 * 2f32.powf(1.0)).abs() < 1e-6);
         let fp = fingerprint_of(&g, out, A, &p);
         let plan = ev.plan_tail(&g, out, A, &p).unwrap();
         assert_eq!(plan.base, exp);
@@ -2077,7 +2093,7 @@ mod tests {
         g.connect_ports(src, green, exp, input).unwrap();
         assert_ne!(fp, fingerprint_of(&g, out, A, &p));
         let second = run(&g, out, A, &p, &mut ev);
-        assert!((second.pixel(0,0)[0] - 0.25).abs() < 1e-6);
+        assert!((second.pixel(0,0)[0] - 0.25 * 2f32.powf(2.0)).abs() < 1e-6);
         assert_ne!(*first, *second);
         let restored = Graph::from_json(&g.to_json()).unwrap();
         assert_eq!(*second, *run(&restored, out, A, &p, &mut ev));
@@ -2093,6 +2109,10 @@ mod tests {
                 let out = g.add_node(NodeKind::Output, [0.0; 2]);
                 g.connect(src, dev, 0).unwrap(); g.connect(dev, out, 0).unwrap();
                 set(&mut g, dev, "tone_version", A, local);
+                let spec = NodeKind::Develop.param_spec(name).unwrap();
+                // The map scales the slider's effect: green 0.75 means 75 % of the slider value.
+                let slider = spec.default + 0.8 * (spec.max - spec.default);
+                set(&mut g, dev, name, A, slider);
                 let port = g.expose_parameter(dev, name, PortType::Images).unwrap();
                 let red = g.expose_output(src, 0, "R").unwrap();
                 let green = g.expose_output(src, 0, "G").unwrap();
@@ -2107,7 +2127,7 @@ mod tests {
                 g.connect_ports(src, green, dev, port).unwrap(); let changed = run(&g, out, A, &p, &mut ev);
                 if name == "exposure" || name == "contrast" { assert_ne!(*mapped, *changed, "{name} local={local}"); }
                 g.remove_exposed_input(dev, port);
-                let spec = NodeKind::Develop.param_spec(name).unwrap(); set(&mut g, dev, name, A, spec.min + 0.75*(spec.max-spec.min));
+                set(&mut g, dev, name, A, spec.default + 0.75 * (slider - spec.default));
                 let scalar = run(&g, out, A, &p, &mut ev);
                 for (a,b) in changed.data().iter().zip(scalar.data()) { assert!((a-b).abs() < 1e-5, "{name} local={local}: {a} {b}"); }
             }
@@ -2125,6 +2145,7 @@ mod tests {
         *p.catalog.lock().unwrap() = vec![A];
         *p.dims.lock().unwrap() = Some((5, 1));
         let mut ev = Evaluator::new();
+        set(&mut g, dev, "exposure", A, 2.0);
         let plain = run(&g, dev, A, &p, &mut ev);
         let port = g.expose_parameter(dev, "exposure", PortType::Images).unwrap();
         g.connect(generator, dev, port).unwrap();
@@ -2198,6 +2219,9 @@ mod tests {
                 g.connect(src, dev, 0).unwrap();
                 g.connect(dev, out, 0).unwrap();
                 set(&mut g, dev, "tone_version", A, local);
+                let spec = NodeKind::Develop.param_spec(name).unwrap();
+                let slider = spec.default + 0.8 * (spec.max - spec.default);
+                set(&mut g, dev, name, A, slider);
                 let port = g.expose_parameter(dev, name, PortType::Images).unwrap();
                 g.connect(generator, dev, port).unwrap();
                 let p = TestProvider::default();
@@ -2211,9 +2235,9 @@ mod tests {
                 let base = ev.eval_base(&g, &plan, A, &p, &CancelToken::new()).unwrap();
                 assert_eq!(apply_tail_cpu(&base, &plan.ops), *mapped);
                 g.remove_exposed_input(dev, port);
-                let spec = NodeKind::Develop.param_spec(name).unwrap();
                 for x in 0..5 {
-                    let value = spec.min + (x as f32 / 4.0) * (spec.max - spec.min);
+                    // Black = no effect (default), white = the slider value.
+                    let value = spec.default + (x as f32 / 4.0) * (slider - spec.default);
                     set(&mut g, dev, name, A, value);
                     let scalar = run(&g, out, A, &p, &mut ev);
                     for (a, b) in mapped.pixel(x, 0).iter().zip(scalar.pixel(x, 0)) {
@@ -2713,13 +2737,15 @@ mod tests {
         g.connect(src, filter, 0).unwrap();
         set(&mut g, map, "width", A, 64.0);
         set(&mut g, map, "height", A, 64.0);
+        set(&mut g, filter, "radius", A, 80.0);
         let port = g.expose_parameter(filter, "radius", PortType::Images).unwrap();
         g.connect(map, filter, port).unwrap();
         let (p, mut ev, c) = (TestProvider::default(), Evaluator::new(), CancelToken::new());
         let out = ev.eval_image(&g, filter, A, &p, &c).unwrap();
         let m = control_plane(&render_generator(g.node(map).unwrap(), A, 64, 64).unwrap(), &p.image(A).unwrap());
-        let max = NodeKind::Blur.param_spec("radius").unwrap().max / 1000.0 * 64.0;
-        assert_eq!(*out, ops::filter_low_modulated(&p.image(A).unwrap(), max, &m, false));
+        // White blurs with the slider radius, not the slider maximum.
+        let slider = 80.0 / 1000.0 * 64.0;
+        assert_eq!(*out, ops::filter_low_modulated(&p.image(A).unwrap(), slider, &m, false));
         let misses = ev.misses();
         set(&mut g, map, "gradient_angle", A, 90.0);
         let changed = ev.eval_image(&g, filter, A, &p, &c).unwrap();
@@ -2778,8 +2804,9 @@ mod tests {
                 let low = ev.eval_image(&g, filter, A, &p, &c).unwrap();
                 let expected = if masked {
                     let m = control_plane(&render_generator(g.node(mask).unwrap(), A, 1024, 1024).unwrap(), &base);
-                    if kernel < 2 { ops::filter_low_modulated(&base, 64.0, &m, kernel == 1) }
-                    else { ops::filter_sampled(&base, 64.0, kernel, 0.0, Some(&m)) }
+                    // The map scales the slider radius (30 = 1.92 px here), not the slider maximum.
+                    if kernel < 2 { ops::filter_low_modulated(&base, 1.92, &m, kernel == 1) }
+                    else { ops::filter_sampled(&base, 1.92, kernel, 0.0, Some(&m)) }
                 } else if kernel < 2 { ops::filter_low(&base, 1.92, kernel == 1) }
                 else { ops::filter_sampled(&base, 1.92, kernel, 0.0, None) };
                 assert_eq!(*low, expected);
@@ -3503,12 +3530,14 @@ mod tests {
         assert_eq!(drawing.pixel(0, 0), [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(drawing.pixel(13, 13), [1.0, 1.0, 1.0, 1.0]);
         assert_eq!(provider.calls(), 0);
+        set(&mut g, exp, "ev", A, 6.0);
         let port = g.expose_parameter(exp, "ev", PortType::Images).unwrap();
         g.connect(src, exp, 0).unwrap();
         g.connect(draw, exp, port).unwrap();
         let base = provider.image(A).unwrap();
         let adjusted = run(&g, exp, A, &provider, &mut eval);
-        assert_eq!(adjusted.pixel(0, 0)[0], base.pixel(0, 0)[0] / 64.0);
+        // Unpainted (black) leaves the image alone; strokes (white) get the full +6 EV slider.
+        assert_eq!(adjusted.pixel(0, 0)[0], base.pixel(0, 0)[0]);
         assert_eq!(adjusted.pixel(13, 13)[0], base.pixel(13, 13)[0] * 64.0);
         set_data(&mut g, draw, image, Some(NodeData::Strokes(vec![])));
         let changed = run(&g, exp, A, &provider, &mut eval);
@@ -3530,11 +3559,12 @@ mod tests {
             p.texture.store(true, Ordering::Relaxed);
             let mut ev = Evaluator::new();
             let spec = kind.param_spec("amount").unwrap();
-            set(&mut g, effect, "amount", A, spec.min);
+            set(&mut g, effect, "amount", A, spec.default);
             let black = run(&g, effect, A, &p, &mut ev);
             set(&mut g, effect, "amount", A, spec.max);
             let white = run(&g, effect, A, &p, &mut ev);
             assert!(black != white, "{kind:?}");
+            // The slider stays at max: the map scales from no effect (black) to the slider (white).
             let port = g.expose_parameter(effect, "amount", PortType::Images).unwrap();
             g.connect(map, effect, port).unwrap();
             let spatial = run(&g, effect, A, &p, &mut ev);
@@ -3544,6 +3574,18 @@ mod tests {
             }
             assert_ne!(spatial, black);
             assert_ne!(spatial, white);
+            // Lowering the slider lowers the white end: the map is intensity, not an absolute value.
+            let half = spec.default + 0.5 * (spec.max - spec.default);
+            set(&mut g, effect, "amount", A, half);
+            let half_spatial = run(&g, effect, A, &p, &mut ev);
+            g.remove_exposed_input(effect, port);
+            let half_scalar = run(&g, effect, A, &p, &mut ev);
+            for y in 0..64 {
+                for x in (width - width / 5)..width { assert_eq!(half_spatial.pixel(x, y), half_scalar.pixel(x, y), "{kind:?}"); }
+            }
+            let port = g.expose_parameter(effect, "amount", PortType::Images).unwrap();
+            g.connect(map, effect, port).unwrap();
+            set(&mut g, effect, "amount", A, spec.max);
             assert_eq!(ev.plan_tail(&g, effect, A, &p).unwrap().base, effect);
             let misses = ev.misses();
             set(&mut g, map, "gradient_reverse", A, 1.0);

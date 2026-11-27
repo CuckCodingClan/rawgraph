@@ -932,10 +932,8 @@ pub fn demo_graph() -> Graph {
     }
     let port = g.expose_parameter(blur, "radius", rawgraph_core::PortType::Images).expect("Filter supports Radius");
     g.connect(mask, blur, port).expect("demo control is valid");
-    // Keep the demo preview modest despite Radius mapping to its full range.
-    let map = g.node_mut(mask).unwrap();
-    for key in ["end_r", "end_g", "end_b"] { map.set_param(key, ImageId(0), 0.03); }
-    map.set_param("height", ImageId(0), 2.0);
+    // The map scales the Filter radius slider: a short gradient from no blur to the slider radius.
+    g.node_mut(mask).unwrap().set_param("height", ImageId(0), 2.0);
     g
 }
 
