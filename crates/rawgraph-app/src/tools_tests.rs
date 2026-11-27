@@ -130,6 +130,19 @@ impl View {
     }
 }
 
+#[test]
+fn painting_without_a_photo_edits_the_standalone_draw_image() {
+    let mut v = View::new(NodeKind::Draw);
+    v.s.selected = None;
+    v.s.project.graph.disconnect(v.node, 0);
+    let image = v.s.image_for_target(v.node, None).unwrap();
+    assert_eq!(image, ImageId(u64::MAX - v.node.0));
+    v.drag_path(&[[0.3, 0.4], [0.6, 0.4]]);
+    let strokes = strokes_of(v.s.project.graph.node(v.node).unwrap(), image);
+    assert_eq!(strokes.len(), 1);
+    assert!(strokes[0].points.len() >= 2);
+}
+
 /// A horizontal pointer path of `n` equal steps across the middle of the picture.
 fn line(n: usize) -> Vec<[f32; 2]> {
     (0..=n).map(|i| [0.2 + 0.6 * i as f32 / n as f32, 0.5]).collect()
@@ -466,7 +479,8 @@ fn a_stroke_behind_a_quarter_turn_and_a_fine_rotation_lands_where_the_oracle_say
 #[test]
 fn a_lens_behind_the_mask_shows_the_consumer_picture_with_a_label_while_painting() {
     let mut v = View::new(NodeKind::Draw);
-    let (exp, _) = brush_behind(&mut v, &[NodeKind::Transform, NodeKind::LensManual]);
+    let (exp, nodes) = brush_behind(&mut v, &[NodeKind::Transform, NodeKind::LensManual]);
+    v.s.viewed_node = nodes.last().copied();
     assert!(matches!(v.s.brush_plan(v.node), crate::frames::BrushPlan::ShowConsumer { consumer } if consumer == exp));
     assert_eq!(v.s.render_target(), Some((exp, None)), "the picture as it leaves the node that uses the mask");
     v.frame(vec![]);

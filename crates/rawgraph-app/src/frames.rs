@@ -1,6 +1,6 @@
 //! Picture frames along the graph: the size of the image entering a node (through all upstream
 //! Crop / Rotate nodes) and where a drawing is painted when a Crop / Rotate sits between the
-//! node that uses the mask and the picture on screen. No UI code, so everything is testable.
+//! node that uses the drawing and the picture on screen. No UI code, so everything is testable.
 //!
 //! A drawing belongs to the frame of the image it is applied to (its consumer). Three cases:
 //! * `Direct`: no geometry-changing node lies between the consumer and the viewed node, the

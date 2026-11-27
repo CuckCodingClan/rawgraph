@@ -1,6 +1,6 @@
 # RawGraph node structure
 
-Current inventory of the NAS source checkout, not a list of what shipped in `2611.001`. Node labels, stable keys, port types, choice order and defaults come from the core graph definitions. Tables describe stored settings; the inspector may group settings or hide ones that do not apply.
+Current inventory for graph format 3, not a list of what shipped in `2611.001`. Node labels, stable keys, port types, choice order and defaults come from the core graph definitions. Tables describe stored settings; the inspector may group settings or hide ones that do not apply.
 
 ## Propose changes here
 
@@ -9,8 +9,8 @@ Edit the relevant node section in Git. To distinguish a request from an implemen
 ## Shared graph controls
 
 - **All / Individual:** One shared setting set, or per-image overrides that inherit shared values when unset. These are distinct from a node’s own mode selector.
-- **Ports:** `Images` carry an image collection; `Mask` carries a single-channel modulation map. Required/optional below reflects the core declaration; callouts describe exceptions such as standalone Generator.
-- **Add Input:** Use the inset blue **+** tab at the left of the title bar. Each exposed input sits on the left edge beside its parameter name and value, which remain visible even at the default value. Only the parameters listed for a node currently have per-pixel evaluation. Exposed inputs and fixed parameter mask ports accept images or masks; images use clamped linear luminance. Exposed inputs replace the slider across its range, while fixed masks scale from minimum to the slider value. A matching image is used, otherwise a single-image output applies to every photo; a disjoint multi-image output is ignored. Control images do not join the main collection.
+- **Ports:** All fixed ports carry `Images` collections. Merge and Layer have multiple collection inputs; Split by Metadata has multiple collection outputs.
+- **Add Input:** Use the inset blue **+** tab at the left of the title bar. Each exposed input sits on the left edge beside its parameter name and value, which remain visible even at the default value. A scalar control reads clamped linear ACEScg luminance and replaces the slider across its full range per pixel (black = minimum, white = maximum). Filter Direction instead reads encoded XY in R/G. The matching image is used, otherwise a single-image output applies to every photo; a disjoint multi-image output is ignored. Controls do not join the main collection and a disconnected control leaves its slider in charge.
 - **Add Output:** Use the inset red **+** tab at the far right of the title bar, outside the A/I badge; image-producing nodes can expose Luma, R, G, B and A from the first built-in image output. These are additional labelled edge ports, not replacements for the original image output. Right-click an added port to remove it; additions and removals are undoable.
 
 ## Collection
@@ -113,8 +113,9 @@ Up to six editable named ranges (name, min, max); range names label their output
 
 ### Saturation (`Saturation`)
 
-- **Inputs:** Images: Images (required); Amount mask: Mask (optional), modulates `amount`
+- **Inputs:** Images: Images (required)
 - **Outputs:** Images: Images
+- **Add Input:** Saturation (`amount`)
 
 | Setting | Key | Default | Range or choices |
 | --- | --- | --- | --- |
@@ -181,11 +182,11 @@ Up to six editable named ranges (name, min, max); range names label their output
 
 ### Filter (`Blur`)
 
-The inspector displays radius as a percentage of the long edge; the graph stores it in per mille. The RGB direction input is for Motion Blur.
+The inspector displays Radius as a percentage of the long edge; stored values are per mille. Direction (RGB) overrides Motion angle only for Motion Blur. It decodes R/G as XY in [−1, 1], normalizes XY and ignores blue and alpha. Neutral or invalid XY leaves a pixel unblurred.
 
-- **Inputs:** Images: Images (required); Radius mask: Mask (optional), modulates `radius`; Direction normal (RGB): Images (optional)
+- **Inputs:** Images: Images (required)
 - **Outputs:** Images: Images
-- **Add Input:** `radius`
+- **Add Input:** Radius (`radius`), Direction (RGB) (`direction`)
 
 | Setting | Key | Default | Range or choices |
 | --- | --- | --- | --- |
@@ -208,8 +209,9 @@ The inspector displays radius as a percentage of the long edge; the graph stores
 
 ### Sharpen (`Sharpen`)
 
-- **Inputs:** Images: Images (required); Amount mask: Mask (optional), modulates `amount`
+- **Inputs:** Images: Images (required)
 - **Outputs:** Images: Images
+- **Add Input:** Amount (`amount`)
 
 | Setting | Key | Default | Range or choices |
 | --- | --- | --- | --- |
@@ -242,7 +244,7 @@ The inspector displays radius as a percentage of the long edge; the graph stores
 
 - **Inputs:** Images: Images (required)
 - **Outputs:** Images: Images
-- **Add Input:** `exposure`, `contrast`, `highlights`, `shadows`, `whites`, `blacks`
+- **Add Input:** Exposure (`exposure`), Contrast (`contrast`), Lights (`highlights`), Shadows (`shadows`), White (`whites`), Black (`blacks`)
 
 | Setting | Key | Default | Range or choices |
 | --- | --- | --- | --- |
@@ -285,24 +287,48 @@ The inspector displays radius as a percentage of the long edge; the graph stores
 | Sort by | `metric` | Brightness | Brightness / Saturation / Hue |
 | Reverse | `reverse` | Off | Off / On |
 
-### Normals (`Normals`)
+## Generators
 
-- **Inputs:** Relative depth: Mask (optional); Height image: Images (optional)
+### Draw (`Draw`)
+
+Paint or erase in the viewer. Size, Hardness and Flow are brush-tool settings; the node stores normalized strokes. Draw starts in Individual mode and renders white coverage on opaque black. An optional input supplies dimensions and membership, not background pixels. With no input the canvas is a standalone image at Width × Height.
+
+- **Inputs:** Images: Images (optional)
+- **Outputs:** Images: Images
+- **Structured settings:** `Strokes`
+
+| Setting | Key | Default | Range or choices |
+| --- | --- | --- | --- |
+| Width | `width` | 1024 | 1 to 8192 px |
+| Height | `height` | 1024 | 1 to 8192 px |
+
+### Normal Map (`NormalMap`)
+
+Interprets linear image luminance as height and encodes the resulting normals as RGB. Choose Data output on an upstream Generator to use its literal height values.
+
+- **Inputs:** Images: Images (required)
 - **Outputs:** Images: Images
 
 | Setting | Key | Default | Range or choices |
 | --- | --- | --- | --- |
-| Input | `mode` | Relative depth mask | Relative depth mask / Image luminance height |
 | Strength | `strength` | 1 | 0 to 100 |
 | Smoothing | `smoothing` | 0 | 0 to 8 px |
 | Flip Y | `flip_y` | Off | Off / On |
 
-### Generator (`Generator`)
+### Depth Map (`DepthMap`)
 
-Image input is optional in practice: it supplies dimensions and collection membership when connected; otherwise Generator produces a standalone image. Gradient has separate draggable colour and opacity ramps, each with 2–256 stops. Select a stop to edit its position, value or midpoint to the next stop, or to delete it. The structured setting is `GradientRamp`; old scalar ramp values are fallback data. Noise remains a separate mode. Display values are inverse-view transformed with the current session tone map (excluding preview exposure); Data preserves numeric values. Control-input evaluation uses data values. Export evaluation uses the session view tone. Saturated ACES-fit colours outside the invertible gamut are projected and can change hue.
+Outputs opaque grayscale relative depth (black near, white far). Requires the optional worker and model described in [Depth Map setup](docs/depth-estimate.md).
 
 - **Inputs:** Images: Images (required)
 - **Outputs:** Images: Images
+
+### Generator (`Generator`)
+
+Image input is optional: it supplies dimensions and collection membership when connected; otherwise Generator produces a standalone image. Gradient has separate draggable colour and opacity ramps, each with 2–256 stops. Select a stop to edit its position, value or midpoint to the next stop, or to delete it. The structured setting is `GradientRamp`; old scalar ramp values are fallback data. Noise remains a separate mode. Display values are inverse-view transformed with the current session tone map (excluding preview exposure); Data preserves numeric values. Control-input evaluation uses data values. Export evaluation uses the session view tone. Saturated ACES-fit colours outside the invertible gamut are projected and can change hue.
+
+- **Inputs:** Images: Images (optional)
+- **Outputs:** Images: Images
+- **Structured settings:** `GradientRamp`
 
 | Setting | Key | Default | Range or choices |
 | --- | --- | --- | --- |
@@ -311,18 +337,32 @@ Image input is optional in practice: it supplies dimensions and collection membe
 | Type | `type` | Gradient | Gradient / Noise / Pattern |
 | Vertical gradient (legacy) | `vertical` | Off | Off / On |
 | Gradient style | `gradient_style` | Linear | Linear / Radial / Angle / Reflected / Diamond |
-| Gradient angle | `gradient_angle` | 0 | −180° to 180° |
-| Gradient scale | `gradient_scale` | 100 | 1% to 400% |
+| Gradient angle | `gradient_angle` | 0 | -180 to 180 deg |
+| Gradient scale | `gradient_scale` | 100 | 1 to 400 % |
 | Reverse gradient | `gradient_reverse` | Off | Off / On |
-| Ramp interpolation | `ramp_interpolation` | Linear | Linear / Smooth |
-| Ramp smoothness | `ramp_smoothness` | 100 | 0% to 100% (Smooth only) |
-| Ramp dither | `ramp_dither` | Off | Off / On |
 | Start red | `start_r` | 0 | -4 to 4 |
 | Start green | `start_g` | 0 | -4 to 4 |
 | Start blue | `start_b` | 0 | -4 to 4 |
 | End red | `end_r` | 1 | -4 to 4 |
 | End green | `end_g` | 1 | -4 to 4 |
 | End blue | `end_b` | 1 | -4 to 4 |
+| Use middle colour stop | `ramp_middle_color` | Off | Off / On |
+| Middle colour position | `ramp_color_position` | 50 | 0 to 100 % |
+| Middle red | `ramp_color_r` | 0.5 | -4 to 4 |
+| Middle green | `ramp_color_g` | 0.5 | -4 to 4 |
+| Middle blue | `ramp_color_b` | 0.5 | -4 to 4 |
+| Colour midpoint 1 | `ramp_color_midpoint_1` | 50 | 1 to 99 % |
+| Colour midpoint 2 | `ramp_color_midpoint_2` | 50 | 1 to 99 % |
+| Start opacity | `ramp_alpha_start` | 100 | 0 to 100 % |
+| Use middle opacity stop | `ramp_middle_alpha` | Off | Off / On |
+| Middle opacity position | `ramp_alpha_position` | 50 | 0 to 100 % |
+| Middle opacity | `ramp_alpha_middle` | 100 | 0 to 100 % |
+| End opacity | `ramp_alpha_end` | 100 | 0 to 100 % |
+| Opacity midpoint 1 | `ramp_alpha_midpoint_1` | 50 | 1 to 99 % |
+| Opacity midpoint 2 | `ramp_alpha_midpoint_2` | 50 | 1 to 99 % |
+| Ramp interpolation | `ramp_interpolation` | Linear | Linear / Smooth |
+| Ramp smoothness | `ramp_smoothness` | 100 | 0 to 100 % |
+| Ramp dither | `ramp_dither` | Off | Off / On |
 | Noise seed | `seed` | 0 | 0 to 65535 |
 | Pattern cell size | `cell_size` | 32 | 1 to 1024 px |
 | Invert pattern | `invert` | Off | Off / On |
@@ -406,105 +446,13 @@ Structured fields: output folder, filename template, artist, copyright, and desc
 | Author | `meta_author` | On | Off / On |
 | Software | `meta_software` | On | Off / On |
 
-## Mask
-
-### Gradient Mask (`GradientMask`)
-
-- **Inputs:** None
-- **Outputs:** Mask: Mask
-
-| Setting | Key | Default | Range or choices |
-| --- | --- | --- | --- |
-| Angle | `angle` | 90 | 0 to 360 deg |
-| Center | `center` | 0.5 | 0 to 1 |
-| Width | `width` | 0.5 | 0 to 1 |
-
-### Radial Mask (`RadialMask`)
-
-- **Inputs:** None
-- **Outputs:** Mask: Mask
-
-| Setting | Key | Default | Range or choices |
-| --- | --- | --- | --- |
-| Center X | `center_x` | 0.5 | 0 to 1 |
-| Center Y | `center_y` | 0.5 | 0 to 1 |
-| Radius X | `radius_x` | 0.3 | 0 to 1.5 |
-| Radius Y | `radius_y` | 0.3 | 0 to 1.5 |
-| Feather | `feather` | 0.5 | 0 to 1 |
-| Angle | `angle` | 0 | 0 to 360 deg |
-| Invert | `invert` | Off | Off / On |
-
-### Luminance Mask (`LuminanceMask`)
-
-- **Inputs:** Images: Images (required)
-- **Outputs:** Mask: Mask
-
-| Setting | Key | Default | Range or choices |
-| --- | --- | --- | --- |
-| Low | `low` | 0 | 0 to 1 |
-| High | `high` | 1 | 0 to 1 |
-| Feather | `feather` | 0.1 | 0 to 1 |
-| Invert | `invert` | Off | Off / On |
-
-### Hue Mask (`HueMask`)
-
-- **Inputs:** Images: Images (required)
-- **Outputs:** Mask: Mask
-
-| Setting | Key | Default | Range or choices |
-| --- | --- | --- | --- |
-| Hue | `hue` | 0 | 0 to 360 deg |
-| Width | `width` | 30 | 1 to 180 deg |
-| Feather | `feather` | 0.5 | 0 to 1 |
-| Minimum saturation | `min_saturation` | 0.1 | 0 to 1 |
-
-### Mask Adjust (`MaskAdjust`)
-
-- **Inputs:** Mask: Mask (required)
-- **Outputs:** Mask: Mask
-
-| Setting | Key | Default | Range or choices |
-| --- | --- | --- | --- |
-| Low | `low` | 0 | 0 to 1 |
-| High | `high` | 1 | 0 to 1 |
-| Gamma | `gamma` | 1 | 0.1 to 10 (log scale) |
-| Invert | `invert` | Off | Off / On |
-
-### Mask Combine (`MaskCombine`)
-
-- **Inputs:** A: Mask (required); B: Mask (required)
-- **Outputs:** Mask: Mask
-
-| Setting | Key | Default | Range or choices |
-| --- | --- | --- | --- |
-| Mode | `mode` | Multiply | Multiply / Add / Subtract / Maximum / Minimum |
-
-### Brush Mask (`BrushMask`)
-
-Interactive paint/erase strokes; structured stroke data stores the painted mask. Starts in Individual mode.
-
-- **Inputs:** None
-- **Outputs:** Mask: Mask
-- **Structured settings:** `Strokes`
-
-| Setting | Key | Default | Range or choices |
-| --- | --- | --- | --- |
-| Invert | `invert` | Off | Off / On |
-
-### Depth Estimate (`DepthEstimate`)
-
-Requires the optional worker and model described in [Depth Estimate setup](docs/depth-estimate.md).
-
-- **Inputs:** Images: Images (required)
-- **Outputs:** Mask: Mask
-
 ## Tone
 
 ### Exposure (`Exposure`)
 
-- **Inputs:** Images: Images (required); Exposure mask: Mask (optional), modulates `ev`
+- **Inputs:** Images: Images (required)
 - **Outputs:** Images: Images
-- **Add Input:** `ev`
+- **Add Input:** Exposure (`ev`)
 
 | Setting | Key | Default | Range or choices |
 | --- | --- | --- | --- |
@@ -512,8 +460,9 @@ Requires the optional worker and model described in [Depth Estimate setup](docs/
 
 ### Contrast (`Contrast`)
 
-- **Inputs:** Images: Images (required); Amount mask: Mask (optional), modulates `amount`
+- **Inputs:** Images: Images (required)
 - **Outputs:** Images: Images
+- **Add Input:** Amount (`amount`)
 
 | Setting | Key | Default | Range or choices |
 | --- | --- | --- | --- |

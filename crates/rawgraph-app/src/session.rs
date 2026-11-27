@@ -149,7 +149,7 @@ pub fn folder_key(p: &str) -> String {
 }
 
 /// What the viewer does with the pointer: shows the picture, paints a brush
-/// mask, or edits the crop of a Crop / Rotate node.
+/// image, or edits the crop of a Crop / Rotate node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolMode {
     None,
@@ -176,7 +176,7 @@ pub struct Session {
     /// The three built-in test images instead of the project's images.
     pub demo: bool,
     pub filter: FilterUi,
-    /// Brush settings of the brush-mask tool.
+    /// Brush settings of the Draw tool.
     pub brush: BrushSettings,
     pub crop: CropUi,
     /// Luminance histogram behind the curve editor, made by the render worker.
@@ -754,7 +754,7 @@ impl Session {
     pub fn tool_mode(&self) -> ToolMode {
         let Some(node) = self.selected_node.and_then(|id| self.project.graph.node(id)) else { return ToolMode::None };
         match node.kind {
-            NodeKind::Draw if self.viewed_node.is_none() || matches!(self.brush_plan(node.id), crate::frames::BrushPlan::Mapped { .. }) => ToolMode::Brush(node.id),
+            NodeKind::Draw => ToolMode::Brush(node.id),
             NodeKind::Transform if self.viewed_node.is_none() && self.project.graph.input_edge(node.id, 0).is_some() => ToolMode::Crop(node.id),
             _ => ToolMode::None,
         }
@@ -781,7 +781,7 @@ impl Session {
             }
         }
         // Painting a drawing whose picture cannot be shown right behind later geometry:
-        // show the picture as it leaves the node that uses the mask.
+        // show the picture as it leaves the node that uses the drawing.
         if let ToolMode::Brush(id) = self.tool_mode() {
             if let crate::frames::BrushPlan::ShowConsumer { consumer } = crate::frames::brush_plan(&self.project.graph, id, target.node) {
                 return Some((consumer, None));
