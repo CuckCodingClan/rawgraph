@@ -190,13 +190,15 @@ individual-image overrides. Projects using non-default values or multiple
 Develop nodes can therefore render differently; use visible Develop exposure
 adjustments to recreate any desired compensation.
 
+The blue top-left and red top-right title-bar squares add supported input maps and output channel aliases. Added ports appear as labelled edge rows; right-click one to remove it. These edits support undo.
+
 ### Source nodes
 
 A new Source, including the starter Source, supplies no images until you choose a folder. Clearing the folder makes it empty again. **File → Open folder** assigns the path to a Source before scanning; it does not create an input shared by all nodes. Older saved Sources with no folder setting retain their catalog-wide behavior so saved graphs keep their inputs.
 
-Right-click a Develop node and choose **Add Input** to expose Exposure, Contrast, Highlights, Shadows, Whites, or Blacks as an image-intensity or mask input. A connected map replaces that slider per pixel: 0–1 maps linearly across the slider's full range, with values outside 0–1 clamped. Image inputs use linear ACEScg luminance; use an exposed image channel if you need a particular channel. Both Legacy and Local v1 tone processing support these inputs. An unconnected input leaves the slider in control.
+Click the blue top-left square on a Develop node and choose a parameter to expose Exposure, Contrast, Highlights, Shadows, Whites, or Blacks as an image-intensity or mask input. A connected map replaces that slider per pixel: 0–1 maps linearly across the slider's full range, with values outside 0–1 clamped. Image inputs use linear ACEScg luminance; use an exposed image channel if you need a particular channel. Both Legacy and Local v1 tone processing support these inputs. An unconnected input leaves the slider in control.
 
-Right-click a Filter node and choose **Add Input → Radius** to drive radius per pixel from image luminance. Values 0–1 replace the radius slider across its full range; the built-in Radius mask, if connected, additionally scales that radius. Gaussian and Box use the existing multi-level radius approximation; other kernels use the existing bounded spatial sampler. Unsupported controls are not listed.
+Click the blue top-left square on a Filter node and choose **Radius** to drive radius per pixel from image luminance. Values 0–1 replace the radius slider across its full range; the built-in Radius mask, if connected, additionally scales that radius. Gaussian and Box use the existing multi-level radius approximation; other kernels use the existing bounded spatial sampler. Unsupported controls are not listed.
 
 The **Filter** node offers low pass and high pass with Gaussian (the original three-box approximation), Box (average), Lens Disk, Motion, Radial Zoom, Radial Spin, Diamond, Median, and Bilateral. High pass shows the signed detail around a neutral midpoint; it is not a sharpening operation. Older Blur nodes load as Gaussian low pass. **Preview Exposure** lives in the viewer toolbar and affects only the preview and display scopes, not exports.
 

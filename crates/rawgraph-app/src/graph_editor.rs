@@ -176,39 +176,39 @@ fn node_port_rows(node: &rawgraph_core::Node) -> usize {
         .max(node.kind.outputs().len() + node.exposed_outputs().len()).max(1)
 }
 
-fn exposed_toolbar_rect(node: Rect) -> Rect {
-    Rect::from_min_size(Pos2::new(node.left() + 10.0, node.bottom() + 10.0), Vec2::new(220.0, 24.0))
-}
-
 #[cfg(test)]
 fn record_port_control(response: &egui::Response, name: &'static str) {
     response.ctx.data_mut(|data| data.insert_temp(egui::Id::unique(("port_control", name)), response.rect));
 }
 
-fn exposed_port_menus(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions: &mut Vec<Action>) {
-    let kind = node.kind;
-    let input = ui.menu_button("Add Input", |ui| {
-        let parameters = rawgraph_core::Graph::supported_parameter_inputs(kind);
-        if parameters.is_empty() { ui.label("No supported parameter maps"); }
-        for &parameter in parameters {
-            let available = !node.exposed_inputs().iter().flatten().any(|p| p.parameter == parameter);
-            let label = kind.param_spec(parameter).unwrap().label;
-            let response = ui.add_enabled(available, egui::Button::new(label)).on_hover_text("Map luminance linearly to the parameter's full range (replaces its slider value)");
-            #[cfg(test)] record_port_control(&response, "input_item");
-            if response.clicked() { actions.push(Action::ExposeInput(id, parameter)); ui.close(); }
-        }
-    });
-    #[cfg(test)] record_port_control(&input.response, "input");
-    let output = ui.menu_button("Add Output", |ui| {
-        let source = kind.outputs().iter().position(|p| p.ty == PortType::Images);
+fn input_menu(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions: &mut Vec<Action>) {
+    for &parameter in Graph::supported_parameter_inputs(node.kind) {
+        if node.exposed_inputs().iter().flatten().any(|p| p.parameter == parameter) { continue; }
+        let label = node.kind.param_spec(parameter).unwrap().label;
+        let response = ui.button(label).on_hover_text("Map luminance linearly to the parameter's full range (replaces its slider value)");
+        #[cfg(test)] record_port_control(&response, "input_item");
+        if response.clicked() { actions.push(Action::ExposeInput(id, parameter)); ui.close(); }
+    }
+}
+
+fn output_menu(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions: &mut Vec<Action>) {
+    if let Some(source) = node.kind.outputs().iter().position(|p| p.ty == PortType::Images) {
         for label in ["Luma", "R", "G", "B", "A"] {
-            let response = ui.add_enabled(source.is_some(), egui::Button::new(label));
+            if node.exposed_outputs().iter().flatten().any(|p| p.label == label) { continue; }
+            let response = ui.button(label);
             #[cfg(test)] if label == "Luma" { record_port_control(&response, "output_item"); }
-            if response.clicked() { actions.push(Action::ExposeOutput(id, source.unwrap(), label)); ui.close(); }
+            if response.clicked() { actions.push(Action::ExposeOutput(id, source, label)); ui.close(); }
         }
-    });
-    #[cfg(test)] record_port_control(&output.response, "output");
-    #[cfg(not(test))] let _ = (input, output);
+    }
+}
+
+fn exposed_port_menus(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions: &mut Vec<Action>) {
+    if !Graph::supported_parameter_inputs(node.kind).is_empty() {
+        ui.menu_button("Add Input", |ui| input_menu(ui, node, id, actions));
+    }
+    if node.kind.outputs().iter().any(|p| p.ty == PortType::Images) {
+        ui.menu_button("Add Output", |ui| output_menu(ui, node, id, actions));
+    }
 }
 
 fn actual_node_size(node: &rawgraph_core::Node) -> Vec2 {
@@ -615,7 +615,7 @@ impl GraphEditor {
                 for i in 0..kind.inputs().len() + node.exposed_inputs().len() {
                     let Some(ty) = node.input_type(i) else { continue };
                     let builtin = kind.inputs().get(i);
-                    let label = builtin.map(|s| s.label).unwrap_or_else(|| node.exposed_inputs()[i - kind.inputs().len()].as_ref().unwrap().parameter.as_str());
+                    let label = builtin.map(|s| s.label).unwrap_or_else(|| kind.param_spec(&node.exposed_inputs()[i - kind.inputs().len()].as_ref().unwrap().parameter).unwrap().label);
                     let c = xf.to_screen(input_port(pos, i));
                     let connected = session.project.graph.input_of(id, i).is_some();
                     inputs.push((id, i, c, ty));
@@ -630,6 +630,7 @@ impl GraphEditor {
                         ty,
                         if builtin.is_some_and(|s| s.required) { ", required" } else { ", optional" }
                     ));
+                    if builtin.is_none() { pr.context_menu(|ui| { if ui.button("Remove port").clicked() { actions.push(Action::RemoveInput(id, i)); ui.close(); } }); }
                     if pr.drag_started() {
                         if let Some((src, src_port)) = session.project.graph.input_edge(id, i) {
                             self.conn = Some(ConnDrag::FromOutput(src, src_port, Some((id, i))));
@@ -652,11 +653,29 @@ impl GraphEditor {
                         None => format!("Output ({ty:?}): drag to an input to connect"),
                     };
                     let pr = pr.on_hover_text(tip);
+                    if port >= kind.outputs().len() { pr.context_menu(|ui| { if ui.button("Remove port").clicked() { actions.push(Action::RemoveOutput(id, port)); ui.close(); } }); }
                     if pr.drag_started() {
                         self.conn = Some(ConnDrag::FromOutput(id, port, None));
                     }
                     let connected = session.project.graph.edges().iter().any(|e| e.from == id && e.from_port == port);
                     draw_port(&painter, c, ty, connected, pr.hovered() || pr.dragged(), self.zoom);
+                }
+            }
+
+            // Corner controls are registered after the node so they own their clicks.
+            if !space {
+                for (input, enabled) in [(true, !Graph::supported_parameter_inputs(kind).is_empty()), (false, kind.outputs().iter().any(|p| p.ty == PortType::Images))] {
+                    if !enabled { continue; }
+                    let side = 12.0 * self.zoom;
+                    let x = if input { node_rect.left() } else { node_rect.right() - side };
+                    let square = Rect::from_min_size(Pos2::new(x, node_rect.top()), Vec2::splat(side));
+                    let response = ui.interact(square, ui.scope_id().with(("corner", id.0, input)), Sense::click())
+                        .on_hover_text(if input { "Add input port" } else { "Add output port" });
+                    painter.rect_filled(square, 0, if input { Color32::from_rgb(48, 140, 230) } else { Color32::from_rgb(220, 65, 70) });
+                    #[cfg(test)] record_port_control(&response, if input { "input" } else { "output" });
+                    egui::Popup::menu(&response).show(|ui| {
+                        if input { input_menu(ui, &node, id, &mut actions); } else { output_menu(ui, &node, id, &mut actions); }
+                    });
                 }
             }
 
@@ -686,14 +705,6 @@ impl GraphEditor {
                     let d = resp.drag_delta() / self.zoom;
                     actions.push(Action::Move(id, d));
                 }
-            }
-            // A separate toolbar below the primary node leaves its drag surface and
-            // every port's full hit rectangle untouched.
-            if session.selected_node == Some(id) && !space {
-                let toolbar = exposed_toolbar_rect(node_rect);
-                ui.scope_builder(egui::UiBuilder::new().max_rect(toolbar), |ui| {
-                    ui.horizontal(|ui| exposed_port_menus(ui, &node, id, &mut actions));
-                });
             }
             resp.context_menu(|ui| {
                 exposed_port_menus(ui, &node, id, &mut actions);
@@ -927,8 +938,8 @@ impl GraphEditor {
             return;
         }
         painter.text(
-            node_rect.min + Vec2::new(8.0, TITLE_H / 2.0) * z,
-            Align2::LEFT_CENTER,
+            node_rect.min + Vec2::new(NODE_W / 2.0, TITLE_H / 2.0) * z,
+            Align2::CENTER_CENTER,
             node.kind.label(),
             FontId::proportional(13.0 * z),
             Color32::from_gray(240),
@@ -945,7 +956,7 @@ impl GraphEditor {
         for (i, input) in node.exposed_inputs().iter().enumerate() {
             if let Some(input) = input {
                 let p = node_rect.min + input_port([0.0, 0.0], node.kind.inputs().len() + i).to_vec2() * z;
-                painter.text(p + Vec2::new(11.0 * z, 0.0), Align2::LEFT_CENTER, &input.parameter, label_font.clone(), label_color);
+                painter.text(p + Vec2::new(11.0 * z, 0.0), Align2::LEFT_CENTER, node.kind.param_spec(&input.parameter).unwrap().label, label_font.clone(), label_color);
             }
         }
         for (i, output) in node.exposed_outputs().iter().enumerate() {
