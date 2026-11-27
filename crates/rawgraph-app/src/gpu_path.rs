@@ -77,7 +77,7 @@ pub const REASON_COMPARE: &str = "the compare view shows the selected image from
 
 /// Short form of a CPU reason for the status bar ("mask overlay", "crop tool", ...).
 pub fn short_reason(reason: &str) -> String {
-    let table: [(&str, &str); 11] = [
+    let table = [
         ("crop tool", "crop tool"),
         ("mask overlay", "mask overlay"),
         ("compare view", "compare view"),

@@ -2249,7 +2249,7 @@ mod tests {
             assert_eq!((display.rgb[0]*1023.0).round() as u32, 0);
             assert_eq!((display.rgb[3069]*1023.0).round() as u32, 1023);
             let env = Env { provider: &p, images: &[], view_tone: tone, control: true };
-            let (_, value) = ev.eval_node(&g, generator, id, None, &env, &cancel, &mut vec![], &mut FingerprintMemo::new()).unwrap();
+            let (_, value) = ev.eval_node(&g, generator, id, &env, &cancel, &mut vec![], &mut FingerprintMemo::new()).unwrap();
             let Value::Images(control) = value;
             for x in 0..1024 { assert!((control.pixel(x, 0)[0] - x as f32/1023.0).abs() < 1e-6); }
         }
@@ -3074,12 +3074,6 @@ mod tests {
         g.node(n).unwrap().param(name, A)
     }
 
-    fn assert_close(a: &ImageBuf, b: &ImageBuf, tol: f32) {
-        assert_eq!((a.width(), a.height()), (b.width(), b.height()));
-        let worst = a.data().iter().zip(b.data()).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
-        assert!(worst <= tol, "images differ by {worst}");
-    }
-
     #[test]
     fn new_nodes_are_identities_at_defaults() {
         let p = TestProvider::default();
@@ -3282,10 +3276,6 @@ mod tests {
         p.caps.lock().unwrap().remove(&A.0);
         let again = run(&g, src, A, &p, &mut ev);
         assert!(Arc::ptr_eq(&again, &run(&g, n, A, &p, &mut ev)));
-    }
-
-    fn crop_params(g: &Graph, n: NodeId) -> fx::TransformParams {
-        transform_params(g.node(n).unwrap(), A)
     }
 
     /// Source -> Transform (crop to the middle half horizontally and 3/4 vertically).

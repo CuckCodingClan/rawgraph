@@ -135,7 +135,6 @@ pub struct InputSpec {
     pub label: &'static str,
     pub ty: PortType,
     pub required: bool,
-
 }
 
 /// One output port of a node.
@@ -4144,7 +4143,8 @@ mod exposed_port_tests {
         g.add_node(NodeKind::Generator, [0.0; 2]);
         for kind in ["GradientMask", "RadialMask", "LuminanceMask", "HueMask", "MaskAdjust", "MaskCombine", "BrushMask", "DepthEstimate", "Normals"] {
             let text = g.to_json().replace("\"Generator\"", &format!("\"{kind}\""));
-            assert_rejected(Graph::from_json(&text), &format!("unknown variant `{kind}`"));
+            let err = Graph::from_json(&text).unwrap_err();
+            assert!(err.to_string().contains(&format!("unknown variant `{kind}`")), "{err}");
         }
     }
 
