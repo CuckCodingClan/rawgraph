@@ -573,6 +573,7 @@ impl App {
         };
         let mut status = Status::default();
         if let Some(path) = &cli.project {
+            crate::splash::stage(crate::splash::Stage::OpeningProject);
             match session.load_project(path) {
                 Ok(note) => {
                     if let Some(n) = note {
@@ -586,6 +587,7 @@ impl App {
             }
         }
 
+        crate::splash::stage(crate::splash::Stage::PreparingEditor);
         let history = History::new(&session.project.graph);
         let renderer_mode = cli.renderer.unwrap_or(settings.renderer);
         let renderer = Renderer::with_gpu(
@@ -2858,6 +2860,7 @@ enum Aux {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        crate::splash::finish();
         let ctx = ui.ctx().clone();
         self.frames += 1;
         if self.frames == 20 && self.shot.is_some() {

@@ -109,6 +109,10 @@ For quick testing on Windows, double-click `RawGraph Dev.cmd` in the repository 
 
 CI (`.github/workflows/ci.yml`): Linux clippy + tests on every push to `main` and every pull request, Windows tests on pull requests, macOS only when started manually.
 
+### Windows startup and console
+
+The Windows GUI starts without creating a console and shows a small startup splash while the GPU and editor initialize. Automated capture, benchmark and export runs skip the splash. With command-line arguments, RawGraph attempts to attach to the parent console for help, errors and other output; GUI-subsystem programs may return the shell prompt before their output appears. A launch without a parent console does not create one. The splash uses the primary display and is currently Windows-only.
+
 ### Graph workspace
 
 Click a node to preview its result. Pin the viewer to keep that stage visible while editing another node. With no selected or pinned node, there is no preview. New graphs no longer include an Output node; old graphs can still be opened. Use an Export node to save files or Quick Export to write from the stage you are viewing.

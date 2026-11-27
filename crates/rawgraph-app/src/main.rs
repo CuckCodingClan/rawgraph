@@ -1,4 +1,5 @@
 //! RawGraph desktop application (wave 1: interactive loop on built-in test images).
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
 mod autosave;
@@ -46,6 +47,7 @@ mod selection;
 mod session;
 mod shot;
 mod status;
+mod splash;
 mod testimages;
 mod textfit;
 mod thumbs;
@@ -69,6 +71,11 @@ fn display_version() -> String {
 }
 
 fn main() {
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).is_some() {
+        // Do not create a console for Explorer launches. Attach before first output.
+        unsafe { windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS); }
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--version")) {
         println!("RawGraph {}", display_version());
         return;
@@ -85,6 +92,7 @@ fn main() {
         return;
     }
 
+    let _splash = splash::start(&cli);
     let (w, h) = cli.size.unwrap_or((1600.0, 1000.0));
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("RawGraph")
