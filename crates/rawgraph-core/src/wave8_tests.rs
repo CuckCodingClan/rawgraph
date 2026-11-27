@@ -447,9 +447,9 @@ fn members_order_for_every_node_type() {
     g.connect(m, layer, 0).unwrap();
     assert_eq!(lib.members(&g, layer, 0), vec![1, 2, 3, 4, 5, 6]);
 
-    // Masks and unknown things.
-    let mask = g.add_node(NodeKind::GradientMask, [0.0, 0.0]);
-    assert_eq!(lib.members(&g, mask, 0), vec![1, 2, 3, 4, 5, 6]);
+    // Standalone generated images and unknown nodes.
+    let mask = g.add_node(NodeKind::Generator, [0.0, 0.0]);
+    assert_eq!(lib.members(&g, mask, 0), vec![u64::MAX - mask.0]);
     assert!(lib.members(&g, NodeId(9999), 0).is_empty());
     assert!(lib.members(&g, exp, 3).is_empty(), "single-output nodes only have port 0");
 }
@@ -562,9 +562,9 @@ fn layer_node_shape() {
     assert!(k.data_kinds().is_empty());
     // A layer's inputs take image collections only.
     let mut g = Graph::new();
-    let mask = g.add_node(NodeKind::GradientMask, [0.0, 0.0]);
+    let mask = g.add_node(NodeKind::Generator, [0.0, 0.0]);
     let layer = g.add_node(k, [0.0, 0.0]);
-    assert!(matches!(g.connect(mask, layer, 0), Err(GraphError::TypeMismatch { .. })));
+    assert!(g.connect(mask, layer, 0).is_ok());
     assert!(matches!(g.connect(mask, layer, 8), Err(GraphError::NoSuchPort { .. })));
 }
 
@@ -1552,13 +1552,13 @@ fn encode_values() {
 // ---------------------------------------------------------------------------
 // Graph format
 
-const FIXTURE_V1: &str = include_str!("../tests/fixtures/graph_v1.json");
+const FIXTURE_V3: &str = include_str!("../tests/fixtures/graph_v3.json");
 
 #[test]
-fn version_1_files_still_load_and_evaluate_the_same() {
-    assert_eq!(GRAPH_FORMAT_VERSION, 2);
-    assert!(FIXTURE_V1.contains("\"format_version\": 1"));
-    let g = Graph::from_json(FIXTURE_V1).expect("version 1 loads");
+fn version_3_fixture_round_trips_and_routes_images() {
+    assert_eq!(GRAPH_FORMAT_VERSION, 3);
+    assert!(FIXTURE_V3.contains("\"format_version\": 3"));
+    let g = Graph::from_json(FIXTURE_V3).expect("version 3 loads");
     assert_eq!(g.nodes().count(), 11);
     assert_eq!(g.edges().len(), 11);
     let find = |kind: NodeKind| g.nodes().find(|n| n.kind == kind).unwrap();
@@ -1576,7 +1576,7 @@ fn version_1_files_still_load_and_evaluate_the_same() {
     let curve = find(NodeKind::PointCurve);
     assert_eq!(curve.data(a), Some(&NodeData::Curve(vec![[0.0, 0.0], [0.4, 0.5], [1.0, 1.0]])));
     assert_eq!(curve_set(curve, a), vec![CurveEntry { channel: 1, points: vec![[0.0, 0.0], [0.4, 0.5], [1.0, 1.0]] }]);
-    let brush = find(NodeKind::BrushMask);
+    let brush = find(NodeKind::Draw);
     assert!(matches!(brush.data(a), Some(NodeData::Strokes(s)) if s.len() == 1 && s[0].points.len() == 2));
     assert!(brush.data(b).is_none());
     let split = find(NodeKind::MetadataSplit);
@@ -1600,14 +1600,14 @@ fn version_1_files_still_load_and_evaluate_the_same() {
     let src_id = src.id;
     assert!((1..=8).all(|i| g.contains(src_id, id(i), &caps)));
 
-    // Saving writes version 2, which loads back to the same graph.
+    // Saving writes version 3, which loads back to the same graph.
     let json = g.to_json();
-    assert!(json.contains("\"format_version\": 2"));
+    assert!(json.contains("\"format_version\": 3"));
     assert_eq!(Graph::from_json(&json), Ok(g.clone()));
-    // Version 2 files and no newer ones.
+    // Version 3 files and no newer ones.
     assert!(Graph::from_json(&json).is_ok());
-    let newer = json.replace("\"format_version\": 2", "\"format_version\": 3");
-    assert_eq!(Graph::from_json(&newer), Err(GraphError::UnsupportedVersion(3)));
+    let newer = json.replace("\"format_version\": 3", "\"format_version\": 4");
+    assert_eq!(Graph::from_json(&newer), Err(GraphError::UnsupportedVersion(4)));
 }
 
 #[test]
@@ -1731,7 +1731,7 @@ fn new_kinds_are_in_every_list_and_round_trip() {
     for kind in [NodeKind::Layer, NodeKind::Export] {
         assert!(NodeKind::ALL.contains(&kind));
     }
-    assert_eq!(NodeKind::ALL.len(), 37);
+    assert_eq!(NodeKind::ALL.len(), 31);
     let mut seen = std::collections::HashSet::new();
     for kind in NodeKind::ALL {
         assert!(seen.insert(kind), "{kind:?} listed twice");

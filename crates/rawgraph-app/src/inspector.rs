@@ -95,7 +95,6 @@ pub fn profile_text(profile: &rawgraph_io::InputProfile) -> (String, bool) {
 }
 
 fn node_section(ui: &mut egui::Ui, session: &mut Session) {
-    let image = session.current_image();
     let image_name = session.current_entry().map(crate::testimages::display_name).unwrap_or_default();
     let Some(id) = session.selected_node.filter(|id| session.project.graph.node(*id).is_some()) else {
         ui.heading("Inspector");
@@ -103,6 +102,7 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
         return;
     };
     let kind = session.project.graph.node(id).map_or(NodeKind::Source, |n| n.kind);
+    let image = if kind == NodeKind::Draw { session.draw_image(id, session.current_image()) } else { session.current_image() };
     ui.heading(kind.label());
     if session.node_sel.len() > 1 {
         ui.label(RichText::new(format!("{} nodes selected", session.node_sel.len())).color(Color32::from_rgb(255, 210, 90)));
@@ -223,7 +223,7 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
     match kind {
         NodeKind::Generator if session.project.graph.node(id).is_some_and(|n| n.choice("type", image) == 0) => crate::gradient_editor::show(ui, session, id),
         NodeKind::PointCurve => crate::curve_editor::show(ui, session, id),
-        NodeKind::BrushMask => crate::tool_panels::brush_section(ui, session, id),
+        NodeKind::Draw => crate::tool_panels::brush_section(ui, session, id),
         NodeKind::MetadataSplit => crate::tool_panels::split_section(ui, session, id),
         _ => {}
     }
@@ -239,24 +239,7 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
     if kind == NodeKind::Blur {
         ui.add_space(8.0);
         ui.label(RichText::new("High pass: 0.5 + input − low pass (unclipped RGB); alpha is unchanged.").weak());
-        let connected = session.project.graph.input_of(id, 1).is_some();
-        ui.label(
-            RichText::new(if connected {
-                "The Radius mask input modulates the radius: mask 0 gives no blur, 1 the full radius, linear in between."
-            } else {
-                "Connect a mask to the Radius mask input to vary the radius across the image (0 = no blur, 1 = full radius)."
-            })
-            .weak(),
-        );
-    } else if let Some(text) = groups::mask_text(&session.project.graph, id) {
-        ui.add_space(8.0);
-        let connected = groups::overlay_source(&session.project.graph, id).is_some();
-        ui.group(|ui| {
-            ui.label(if connected { RichText::new(text).color(crate::graph_editor::COLOR_MASK) } else { RichText::new(text).weak() });
-            if connected {
-                ui.label(RichText::new("View > Show mask overlay (M) tints the viewer red where the mask is above 0.").weak());
-            }
-        });
+        ui.label(RichText::new("Add Input can expose Radius as a full-range intensity map or Direction (RGB) for Motion Blur.").weak());
     }
 }
 

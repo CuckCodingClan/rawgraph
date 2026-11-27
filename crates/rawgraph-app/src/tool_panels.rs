@@ -1,5 +1,5 @@
 //! Inspector panels of the nodes that have a tool: Split by Metadata (range
-//! table), Brush Mask (brush controls) and Crop / Rotate (aspect, reset).
+//! table), Draw (brush controls) and Crop / Rotate (aspect, reset).
 
 use eframe::egui::{self, Color32, RichText};
 use rawgraph_core::{ImageId, Mode, NamedRange, NodeData, NodeId};
@@ -142,10 +142,10 @@ fn graph_rows_name(session: &Session, id: NodeId, image: ImageId, port: usize) -
     ranges_of(session, id, image).get(port).map(|r| format!("{} ({}..{})", r.name, number_text(r.min), number_text(r.max)))
 }
 
-// ---------------------------------------------------------------- brush mask
+// ---------------------------------------------------------------- drawing
 
 pub fn brush_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
-    let image = session.current_image();
+    let image = session.draw_image(id, session.current_image());
     let (mode, count) = session.project.graph.node(id).map_or((Mode::All, 0), |n| (n.mode, strokes_of(n, image).len()));
     ui.add_space(8.0);
     ui.group(|ui| {
@@ -168,7 +168,7 @@ pub fn brush_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
         ui.add(egui::Slider::new(&mut b.hardness, 0.0..=1.0).clamping(egui::SliderClamping::Always).max_decimals(2)).labelled_by(l.id);
         let l = ui.label("Flow");
         ui.add(egui::Slider::new(&mut b.flow, 0.0..=1.0).clamping(egui::SliderClamping::Always).max_decimals(2)).labelled_by(l.id);
-        ui.checkbox(&mut b.erase, "Erase").on_hover_text("Strokes take away from the mask. Holding Alt while painting does the same.");
+        ui.checkbox(&mut b.erase, "Erase").on_hover_text("Strokes erase the drawing. Holding Alt while painting does the same.");
         ui.add_space(4.0);
         ui.label(RichText::new(count_text(count)).strong());
         let mut undo = false;

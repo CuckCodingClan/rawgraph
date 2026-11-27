@@ -72,16 +72,14 @@ pub enum RenderPath {
 /// Why the CPU makes a frame by design. The status bar derives its short text from these.
 pub const REASON_CROP_TOOL: &str = "the crop tool shows the picture entering the node, which needs CPU pixels";
 pub const REASON_MASK_OVERLAY: &str = "the mask overlay is composited on the CPU";
-pub const REASON_MASK_VIEW: &str = "a mask is shown; masks are evaluated on the CPU";
 pub const REASON_CPU_ONLY: &str = "the renderer is set to CPU only";
 pub const REASON_COMPARE: &str = "the compare view shows the selected image from CPU pixels";
 
 /// Short form of a CPU reason for the status bar ("mask overlay", "crop tool", ...).
 pub fn short_reason(reason: &str) -> String {
-    let table: [(&str, &str); 12] = [
+    let table: [(&str, &str); 11] = [
         ("crop tool", "crop tool"),
         ("mask overlay", "mask overlay"),
-        ("masks are evaluated", "mask view"),
         ("compare view", "compare view"),
         ("set to CPU only", "CPU only"),
         ("no wgpu render state", "no GPU"),
@@ -448,7 +446,6 @@ mod tests {
     fn short_reasons_of_every_cpu_frame() {
         assert_eq!(short_reason(REASON_MASK_OVERLAY), "mask overlay");
         assert_eq!(short_reason(REASON_CROP_TOOL), "crop tool");
-        assert_eq!(short_reason(REASON_MASK_VIEW), "mask view");
         assert_eq!(short_reason(REASON_COMPARE), "compare view");
         assert_eq!(short_reason(REASON_CPU_ONLY), "CPU only");
         assert_eq!(short_reason("eframe has no wgpu render state, so there is no GPU to use"), "no GPU");
@@ -470,7 +467,6 @@ mod tests {
         assert_eq!(RenderPath::fallback("GPU out of memory (x)").status_label(RendererMode::Auto), "CPU \u{2014} GPU out of memory");
         assert_eq!(RenderPath::cpu(REASON_CROP_TOOL).status_label(RendererMode::Auto), "CPU \u{2014} crop tool");
         assert_eq!(RenderPath::cpu(REASON_COMPARE).status_label(RendererMode::Auto), "CPU \u{2014} compare view");
-        assert_eq!(RenderPath::cpu(REASON_MASK_VIEW).status_label(RendererMode::Auto), "CPU \u{2014} mask view");
     }
 
     #[test]

@@ -362,12 +362,9 @@ pub fn parse_kind(name: &str) -> Option<rawgraph_core::NodeKind> {
         "huesat" | "hsl" => return Some(NodeKind::HueSaturation),
         "bw" | "blackandwhite" => return Some(NodeKind::BlackWhite),
         "lens" => return Some(NodeKind::LensManual),
-        "radial" => return Some(NodeKind::RadialMask),
-        "luminance" | "lum" => return Some(NodeKind::LuminanceMask),
-        "gradient" => return Some(NodeKind::GradientMask),
         "tone" | "tonecurve" => return Some(NodeKind::ToneCurve),
         "curve" | "pointcurve" => return Some(NodeKind::PointCurve),
-        "brush" => return Some(NodeKind::BrushMask),
+        "draw" => return Some(NodeKind::Draw),
         "split" | "metadatasplit" => return Some(NodeKind::MetadataSplit),
         "wheels" | "colorwheels" | "lgg" | "liftgammagain" => return Some(NodeKind::ColorWheels),
         "clarity" | "texture" | "claritytexture" => return Some(NodeKind::Clarity),
@@ -778,7 +775,9 @@ mod tests {
         assert_eq!(parse_kind("develop"), Some(NodeKind::Develop));
         assert_eq!(parse_kind("Hue / Saturation"), Some(NodeKind::HueSaturation));
         assert_eq!(parse_kind("transform"), Some(NodeKind::Transform));
-        assert_eq!(parse_kind("RadialMask"), Some(NodeKind::RadialMask));
+        assert_eq!(parse_kind("RadialMask"), None);
+        assert_eq!(parse_kind("Depth Map"), Some(NodeKind::DepthMap));
+        assert_eq!(parse_kind("NormalMap"), Some(NodeKind::NormalMap));
         assert_eq!(parse_kind("sharpen"), Some(NodeKind::Sharpen));
         assert_eq!(parse_kind("vignette"), Some(NodeKind::Vignette));
         assert_eq!(parse_kind("blackwhite"), Some(NodeKind::BlackWhite));
@@ -855,7 +854,7 @@ mod tests {
         use rawgraph_core::NodeKind;
         assert_eq!(parse_kind("curve"), Some(NodeKind::PointCurve));
         assert_eq!(parse_kind("tonecurve"), Some(NodeKind::ToneCurve));
-        assert_eq!(parse_kind("brush"), Some(NodeKind::BrushMask));
+        assert_eq!(parse_kind("draw"), Some(NodeKind::Draw));
         assert_eq!(parse_kind("split"), Some(NodeKind::MetadataSplit));
         assert_eq!(parse_kind("Split by Metadata"), Some(NodeKind::MetadataSplit));
         assert_eq!(parse_kind("wheels"), Some(NodeKind::ColorWheels));

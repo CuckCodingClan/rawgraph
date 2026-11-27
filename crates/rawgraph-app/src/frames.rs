@@ -1,8 +1,8 @@
 //! Picture frames along the graph: the size of the image entering a node (through all upstream
-//! Crop / Rotate nodes) and where a brush mask is painted when a Crop / Rotate sits between the
+//! Crop / Rotate nodes) and where a drawing is painted when a Crop / Rotate sits between the
 //! node that uses the mask and the picture on screen. No UI code, so everything is testable.
 //!
-//! A brush mask belongs to the frame of the image it is applied to (its consumer). Three cases:
+//! A drawing belongs to the frame of the image it is applied to (its consumer). Three cases:
 //! * `Direct`: no geometry-changing node lies between the consumer and the viewed node, the
 //!   viewed picture is painted on as it is.
 //! * `Mapped`: only Crop / Rotate nodes lie between; pointer positions are mapped back through
@@ -68,7 +68,7 @@ pub fn size_into(graph: &Graph, node: NodeId, image: ImageId, source: (u32, u32)
     transforms_upstream(graph, node).into_iter().fold(source, |s, t| size_after(graph, t, image, s))
 }
 
-/// Where a brush mask is painted (see the module text).
+/// Where a drawing is painted (see the module text).
 #[derive(Clone, Debug, PartialEq)]
 pub enum BrushPlan {
     Direct { consumer: Option<NodeId> },
@@ -94,6 +94,7 @@ pub fn brush_plan(graph: &Graph, brush: NodeId, viewed: Option<NodeId>) -> Brush
     consumers.dedup();
     let Some(&consumer) = consumers.first() else { return BrushPlan::Direct { consumer: None } };
     let Some(viewed) = viewed else { return BrushPlan::Direct { consumer: Some(consumer) } };
+    if viewed == brush { return BrushPlan::Direct { consumer: None }; }
     // The consumer's own picture is painted on as it is (also the picture a ShowConsumer plan shows).
     if viewed == consumer {
         return BrushPlan::Direct { consumer: Some(consumer) };
@@ -181,7 +182,7 @@ impl Mapper {
     }
 }
 
-/// What the render worker needs to draw the overlay of a brush mask on the viewed picture.
+/// What the render worker needs to draw the overlay of a drawing on the viewed picture.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OverlayFrame {
     pub consumer: NodeId,
@@ -193,7 +194,8 @@ pub struct OverlayFrame {
 /// A brush overlay that cannot be shown correctly on the rendered picture is dropped.
 pub fn overlay_for_render(graph: &Graph, overlay: Option<NodeId>, rendered: NodeId) -> (Option<NodeId>, Option<OverlayFrame>) {
     let Some(mask) = overlay else { return (None, None) };
-    if graph.node(mask).is_none_or(|n| n.kind != NodeKind::BrushMask) {
+    if mask == rendered { return (None, None); }
+    if graph.node(mask).is_none_or(|n| n.kind != NodeKind::Draw) {
         return (Some(mask), None);
     }
     match brush_plan(graph, mask, Some(rendered)) {
@@ -220,12 +222,13 @@ fn image_to_mask(img: &ImageBuf) -> MaskBuf {
 /// the frame of the viewed picture. `source` is the pixel size of the decoded source picture.
 pub fn brush_overlay_mask(graph: &Graph, brush: NodeId, frame: &OverlayFrame, image: ImageId, source: (u32, u32)) -> Option<MaskBuf> {
     let node = graph.node(brush)?;
-    let strokes = match node.data(image) {
+    let draw_image = if graph.input_edge(brush, 0).is_none() { ImageId(u64::MAX - brush.0) } else { image };
+    let strokes = match node.data(draw_image) {
         Some(NodeData::Strokes(s)) => s.as_slice(),
         _ => &[],
     };
     let (cw, ch) = size_into(graph, frame.consumer, image, source);
-    let mut mask = rawgraph_fx::stroke_mask(cw, ch, strokes, node.toggle("invert", image));
+    let mut mask = rawgraph_fx::stroke_mask(cw, ch, strokes, false);
     for id in &frame.chain {
         let n = graph.node(*id)?;
         let params = transform_params(n, image);
@@ -266,8 +269,10 @@ mod tests {
         }
         let exposure = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
         g.connect(prev, exposure, 0).unwrap();
-        let brush = g.add_node(NodeKind::BrushMask, [0.0, 0.0]);
-        g.connect(brush, exposure, 1).unwrap();
+        let brush = g.add_node(NodeKind::Draw, [0.0, 0.0]);
+        g.connect(prev, brush, 0).unwrap();
+        let port = g.expose_parameter(exposure, "ev", rawgraph_core::PortType::Images).unwrap();
+        g.connect(brush, exposure, port).unwrap();
         prev = exposure;
         let mut post = Vec::new();
         for k in after {
@@ -291,7 +296,7 @@ mod tests {
         assert_eq!(brush_plan(&b.g, b.brush, Some(b.output)), BrushPlan::Direct { consumer: Some(b.exposure) });
         // A brush without consumers paints on whatever is shown.
         let mut g = Graph::new();
-        let lone = g.add_node(NodeKind::BrushMask, [0.0, 0.0]);
+        let lone = g.add_node(NodeKind::Draw, [0.0, 0.0]);
         assert_eq!(brush_plan(&g, lone, None), BrushPlan::Direct { consumer: None });
     }
 
@@ -322,7 +327,8 @@ mod tests {
         b.g.connect(src, tf, 0).unwrap();
         let second = b.g.add_node(NodeKind::Exposure, [0.0, 0.0]);
         b.g.connect(tf, second, 0).unwrap();
-        b.g.connect(b.brush, second, 1).unwrap();
+        let port = b.g.expose_parameter(second, "ev", rawgraph_core::PortType::Images).unwrap();
+        b.g.connect(b.brush, second, port).unwrap();
         assert!(matches!(brush_plan(&b.g, b.brush, Some(b.output)), BrushPlan::ShowConsumer { .. }));
         // The mask overlay is only drawn when it can be shown right.
         let (shown, frame) = overlay_for_render(&b.g, Some(b.brush), b.output);

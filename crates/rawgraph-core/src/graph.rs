@@ -24,7 +24,7 @@ use crate::lens::LENS_MODES;
 /// Bumped whenever the serialized graph layout changes incompatibly.
 /// Version 2 added the Layer and Export kinds, Source folders, curve sets and
 /// the Develop tone parameters; version 1 files still load.
-pub const GRAPH_FORMAT_VERSION: u32 = 2;
+pub const GRAPH_FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -41,8 +41,6 @@ pub struct ImageId(pub u64);
 pub enum PortType {
     /// A collection of images (a single image is a collection of one).
     Images,
-    /// A single-channel map in 0..1 that modulates a numeric parameter.
-    Mask,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -61,7 +59,7 @@ pub enum NodeKind {
     Exposure,
     WhiteBalance,
     Saturation,
-    GradientMask,
+
     Blur,
     Output,
     Contrast,
@@ -81,16 +79,12 @@ pub enum NodeKind {
     LensManual,
     /// Crop, straighten, rotate and flip.
     Transform,
-    RadialMask,
-    LuminanceMask,
-    HueMask,
-    MaskAdjust,
-    MaskCombine,
+
     /// Curve through (input, output) points on the perceptual axis `t = Y / (Y + 0.18)`.
     PointCurve,
     /// Painted mask built from brush strokes. Created in Individual mode:
     /// a painted mask belongs to one image.
-    BrushMask,
+    Draw,
     /// Splits the collection into up to six named metadata ranges plus an
     /// "Unmatched" output.
     MetadataSplit,
@@ -106,9 +100,9 @@ pub enum NodeKind {
     /// Sort complete pixels over the whole image.
     PixelSort,
     /// Convert relative depth or luminance height to tangent-space normals.
-    Normals,
+    NormalMap,
     /// Relative depth estimated by an explicitly configured local worker.
-    DepthEstimate,
+    DepthMap,
     /// Generate pixels at the incoming image dimensions.
     Generator,
 }
@@ -141,10 +135,7 @@ pub struct InputSpec {
     pub label: &'static str,
     pub ty: PortType,
     pub required: bool,
-    /// For mask inputs: the parameter this mask modulates. A mask value of 0
-    /// maps to the parameter's minimum and 1 to the node's parameter value
-    /// (linear in between); remapping nodes can reshape the mask beforehand.
-    pub modulates: Option<&'static str>,
+
 }
 
 /// One output port of a node.
@@ -229,26 +220,15 @@ const fn toggle(name: &'static str, label: &'static str, default: bool) -> Param
     }
 }
 
-const IMAGE_IN: InputSpec = InputSpec { label: "Images", ty: PortType::Images, required: true, modulates: None };
+const IMAGE_IN: InputSpec = InputSpec { label: "Images", ty: PortType::Images, required: true };
 
 const IMAGE_INPUTS: &[InputSpec] = &[IMAGE_IN];
 
-const fn mask_in(label: &'static str, required: bool, modulates: Option<&'static str>) -> InputSpec {
-    InputSpec { label, ty: PortType::Mask, required, modulates }
-}
-
-const EXPOSURE_INPUTS: &[InputSpec] = &[IMAGE_IN, mask_in("Exposure mask", false, Some("ev"))];
-const AMOUNT_MASK_INPUTS: &[InputSpec] = &[IMAGE_IN, mask_in("Amount mask", false, Some("amount"))];
-const MASK_ADJUST_INPUTS: &[InputSpec] = &[mask_in("Mask", true, None)];
-const MASK_COMBINE_INPUTS: &[InputSpec] = &[mask_in("A", true, None), mask_in("B", true, None)];
-
-const NORMALS_INPUTS: &[InputSpec] = &[mask_in("Relative depth", false, None), InputSpec { label: "Height image", ty: PortType::Images, required: false, modulates: None }];
-const NORMALS_PARAMS: &[ParamSpec] = &[choice("mode", "Input", &["Relative depth mask", "Image luminance height"], 0), p("strength", "Strength", "", 0.0, 100.0, 1.0), p("smoothing", "Smoothing", "px", 0.0, 8.0, 0.0), toggle("flip_y", "Flip Y", false)];
-
-const BLUR_INPUTS: &[InputSpec] = &[
-    IMAGE_IN,
-    InputSpec { label: "Radius mask", ty: PortType::Mask, required: false, modulates: Some("radius") },
-    InputSpec { label: "Direction normal (RGB)", ty: PortType::Images, required: false, modulates: None },
+const OPTIONAL_IMAGE_INPUTS: &[InputSpec] = &[InputSpec { required: false, ..IMAGE_IN }];
+const NORMALS_PARAMS: &[ParamSpec] = &[
+    p("strength", "Strength", "", 0.0, 100.0, 1.0),
+    p("smoothing", "Smoothing", "px", 0.0, 8.0, 0.0),
+    toggle("flip_y", "Flip Y", false),
 ];
 
 // Change to the capture-derived exposure value; +1 EV renders one stop brighter.
@@ -296,11 +276,6 @@ const WHITE_BALANCE_PARAMS: &[ParamSpec] = &[
     p("tint", "Tint shift", "", -100.0, 100.0, 0.0),
 ];
 const SATURATION_PARAMS: &[ParamSpec] = &[p("amount", "Saturation", "x", 0.0, 2.0, 1.0)];
-const GRADIENT_MASK_PARAMS: &[ParamSpec] = &[
-    p("angle", "Angle", "deg", 0.0, 360.0, 90.0),
-    p("center", "Center", "", 0.0, 1.0, 0.5),
-    p("width", "Width", "", 0.0, 1.0, 0.5),
-];
 // Radius as per-mille of the long edge, so preview and export agree.
 const BLUR_PARAMS: &[ParamSpec] = &[
     plog("radius", "Radius", "\u{2030} of long edge", 0.0, 1000.0, 5.0),
@@ -351,7 +326,6 @@ const METADATA_FILTER_PARAMS: &[ParamSpec] = &[
     choice("missing", "Missing metadata", MISSING_OPTIONS, 0),
 ];
 const IMAGE_OUTPUTS: &[OutputSpec] = &[OutputSpec { label: "Images", ty: PortType::Images }];
-const MASK_OUTPUTS: &[OutputSpec] = &[OutputSpec { label: "Mask", ty: PortType::Mask }];
 const NO_OUTPUTS: &[OutputSpec] = &[];
 const fn range_out(label: &'static str) -> OutputSpec {
     OutputSpec { label, ty: PortType::Images }
@@ -366,10 +340,10 @@ const SPLIT_OUTPUTS: &[OutputSpec] = &[
     range_out("Unmatched"),
 ];
 const MERGE_INPUTS: &[InputSpec] = &[
-    InputSpec { label: "A", ty: PortType::Images, required: false, modulates: None },
-    InputSpec { label: "B", ty: PortType::Images, required: false, modulates: None },
-    InputSpec { label: "C", ty: PortType::Images, required: false, modulates: None },
-    InputSpec { label: "D", ty: PortType::Images, required: false, modulates: None },
+    InputSpec { label: "A", ty: PortType::Images, required: false },
+    InputSpec { label: "B", ty: PortType::Images, required: false },
+    InputSpec { label: "C", ty: PortType::Images, required: false },
+    InputSpec { label: "D", ty: PortType::Images, required: false },
 ];
 
 const WB_OPTIONS: &[&str] = &["As shot", "Custom"];
@@ -452,35 +426,6 @@ const TRANSFORM_PARAMS: &[ParamSpec] = &[
     toggle("flip_h", "Flip horizontal", false),
     toggle("flip_v", "Flip vertical", false),
 ];
-const RADIAL_MASK_PARAMS: &[ParamSpec] = &[
-    p("center_x", "Center X", "", 0.0, 1.0, 0.5),
-    p("center_y", "Center Y", "", 0.0, 1.0, 0.5),
-    p("radius_x", "Radius X", "", 0.0, 1.5, 0.3),
-    p("radius_y", "Radius Y", "", 0.0, 1.5, 0.3),
-    p("feather", "Feather", "", 0.0, 1.0, 0.5),
-    p("angle", "Angle", "deg", 0.0, 360.0, 0.0),
-    toggle("invert", "Invert", false),
-];
-const LUMINANCE_MASK_PARAMS: &[ParamSpec] = &[
-    p("low", "Low", "", 0.0, 1.0, 0.0),
-    p("high", "High", "", 0.0, 1.0, 1.0),
-    p("feather", "Feather", "", 0.0, 1.0, 0.1),
-    toggle("invert", "Invert", false),
-];
-const HUE_MASK_PARAMS: &[ParamSpec] = &[
-    p("hue", "Hue", "deg", 0.0, 360.0, 0.0),
-    p("width", "Width", "deg", 1.0, 180.0, 30.0),
-    p("feather", "Feather", "", 0.0, 1.0, 0.5),
-    p("min_saturation", "Minimum saturation", "", 0.0, 1.0, 0.1),
-];
-const MASK_ADJUST_PARAMS: &[ParamSpec] = &[
-    p("low", "Low", "", 0.0, 1.0, 0.0),
-    p("high", "High", "", 0.0, 1.0, 1.0),
-    plog("gamma", "Gamma", "", 0.1, 10.0, 1.0),
-    toggle("invert", "Invert", false),
-];
-const MASK_COMBINE_MODES: &[&str] = &["Multiply", "Add", "Subtract", "Maximum", "Minimum"];
-const MASK_COMBINE_PARAMS: &[ParamSpec] = &[choice("mode", "Mode", MASK_COMBINE_MODES, 0)];
 
 /// Channels a Curves node can edit, indexed by [`CurveEntry::channel`].
 pub const CURVE_CHANNELS: [&str; 7] =
@@ -518,7 +463,7 @@ macro_rules! layer_params {
 const LAYER_PARAMS: &[ParamSpec] = layer_params!(1, 2, 3, 4, 5, 6, 7, 8);
 
 const fn layer_in(label: &'static str) -> InputSpec {
-    InputSpec { label, ty: PortType::Images, required: false, modulates: None }
+    InputSpec { label, ty: PortType::Images, required: false }
 }
 const LAYER_INPUTS: &[InputSpec] = &[
     layer_in("Layer 1"),
@@ -552,7 +497,10 @@ const EXPORT_PARAMS: &[ParamSpec] = &[
     toggle("meta_author", "Author", true),
     toggle("meta_software", "Software", true),
 ];
-const BRUSH_MASK_PARAMS: &[ParamSpec] = &[toggle("invert", "Invert", false)];
+const DRAW_PARAMS: &[ParamSpec] = &[
+    p("width", "Width", "px", 1.0, 8192.0, 1024.0),
+    p("height", "Height", "px", 1.0, 8192.0, 1024.0),
+];
 const SPLIT_MISSING_OPTIONS: &[&str] = &["Unmatched", "Exclude"];
 const METADATA_SPLIT_PARAMS: &[ParamSpec] = &[
     choice("measure", "Measure", MEASURE_OPTIONS, 0),
@@ -652,13 +600,13 @@ pub fn curve_set(node: &Node, image: ImageId) -> Vec<CurveEntry> {
 }
 
 impl NodeKind {
-    pub const ALL: [NodeKind; 37] = [
+    pub const ALL: [NodeKind; 31] = [
         NodeKind::Source,
         NodeKind::CaptureEv,
         NodeKind::Exposure,
         NodeKind::WhiteBalance,
         NodeKind::Saturation,
-        NodeKind::GradientMask,
+
         NodeKind::Blur,
         NodeKind::Output,
         NodeKind::Contrast,
@@ -674,21 +622,17 @@ impl NodeKind {
         NodeKind::BlackWhite,
         NodeKind::LensManual,
         NodeKind::Transform,
-        NodeKind::RadialMask,
-        NodeKind::LuminanceMask,
-        NodeKind::HueMask,
-        NodeKind::MaskAdjust,
-        NodeKind::MaskCombine,
+
         NodeKind::PointCurve,
-        NodeKind::BrushMask,
+        NodeKind::Draw,
         NodeKind::MetadataSplit,
         NodeKind::ColorWheels,
         NodeKind::Clarity,
         NodeKind::Layer,
         NodeKind::Export,
         NodeKind::PixelSort,
-        NodeKind::Normals,
-        NodeKind::DepthEstimate,
+        NodeKind::NormalMap,
+        NodeKind::DepthMap,
         NodeKind::Generator,
     ];
 
@@ -706,15 +650,9 @@ impl NodeKind {
             NodeKind::ColorWheels => "Colour",
             NodeKind::NoiseReduction | NodeKind::Sharpen | NodeKind::Blur | NodeKind::Clarity => "Detail",
             NodeKind::Transform | NodeKind::LensManual => "Geometry",
-            NodeKind::Vignette | NodeKind::PixelSort | NodeKind::Normals | NodeKind::Generator => "Effects",
+            NodeKind::Vignette | NodeKind::PixelSort => "Effects",
             NodeKind::MetadataFilter | NodeKind::Merge | NodeKind::MetadataSplit | NodeKind::Layer => "Collection",
-            NodeKind::GradientMask
-            | NodeKind::RadialMask
-            | NodeKind::LuminanceMask
-            | NodeKind::HueMask
-            | NodeKind::MaskAdjust
-            | NodeKind::MaskCombine
-            | NodeKind::BrushMask | NodeKind::DepthEstimate => "Mask",
+            NodeKind::Draw | NodeKind::DepthMap | NodeKind::NormalMap | NodeKind::Generator => "Generators",
         }
     }
 
@@ -725,7 +663,7 @@ impl NodeKind {
             NodeKind::Exposure => "Exposure",
             NodeKind::WhiteBalance => "White Balance (relative)",
             NodeKind::Saturation => "Saturation",
-            NodeKind::GradientMask => "Gradient Mask",
+
             NodeKind::Blur => "Filter",
             NodeKind::Output => "Output",
             NodeKind::Contrast => "Contrast",
@@ -741,21 +679,17 @@ impl NodeKind {
             NodeKind::BlackWhite => "Black & White",
             NodeKind::LensManual => "Lens Correction",
             NodeKind::Transform => "Crop / Rotate",
-            NodeKind::RadialMask => "Radial Mask",
-            NodeKind::LuminanceMask => "Luminance Mask",
-            NodeKind::HueMask => "Hue Mask",
-            NodeKind::MaskAdjust => "Mask Adjust",
-            NodeKind::MaskCombine => "Mask Combine",
+
             NodeKind::PointCurve => "Curves",
-            NodeKind::BrushMask => "Brush Mask",
+            NodeKind::Draw => "Draw",
             NodeKind::MetadataSplit => "Split by Metadata",
             NodeKind::ColorWheels => "Lift / Gamma / Gain",
             NodeKind::Clarity => "Clarity / Texture",
             NodeKind::Layer => "Layer",
             NodeKind::Export => "Export",
             NodeKind::PixelSort => "Pixel Sort",
-            NodeKind::Normals => "Normals",
-            NodeKind::DepthEstimate => "Depth Estimate",
+            NodeKind::NormalMap => "Normal Map",
+            NodeKind::DepthMap => "Depth Map",
             NodeKind::Generator => "Generator",
         }
     }
@@ -771,7 +705,7 @@ impl NodeKind {
             NodeKind::Exposure => EXPOSURE_PARAMS,
             NodeKind::WhiteBalance => WHITE_BALANCE_PARAMS,
             NodeKind::Saturation => SATURATION_PARAMS,
-            NodeKind::GradientMask => GRADIENT_MASK_PARAMS,
+
             NodeKind::Blur => BLUR_PARAMS,
             NodeKind::Contrast => CONTRAST_PARAMS,
             NodeKind::HighlightsShadows => HIGHLIGHTS_SHADOWS_PARAMS,
@@ -785,34 +719,25 @@ impl NodeKind {
             NodeKind::BlackWhite => BLACK_WHITE_PARAMS,
             NodeKind::LensManual => LENS_MANUAL_PARAMS,
             NodeKind::Transform => TRANSFORM_PARAMS,
-            NodeKind::RadialMask => RADIAL_MASK_PARAMS,
-            NodeKind::LuminanceMask => LUMINANCE_MASK_PARAMS,
-            NodeKind::HueMask => HUE_MASK_PARAMS,
-            NodeKind::MaskAdjust => MASK_ADJUST_PARAMS,
-            NodeKind::MaskCombine => MASK_COMBINE_PARAMS,
+
             NodeKind::PointCurve => POINT_CURVE_PARAMS,
-            NodeKind::BrushMask => BRUSH_MASK_PARAMS,
+            NodeKind::Draw => DRAW_PARAMS,
             NodeKind::MetadataSplit => METADATA_SPLIT_PARAMS,
             NodeKind::ColorWheels => COLOR_WHEELS_PARAMS,
             NodeKind::Clarity => CLARITY_PARAMS,
             NodeKind::PixelSort => PIXEL_SORT_PARAMS,
-            NodeKind::Normals => NORMALS_PARAMS,
-            NodeKind::DepthEstimate => &[],
+            NodeKind::NormalMap => NORMALS_PARAMS,
+            NodeKind::DepthMap => &[],
             NodeKind::Generator => GENERATOR_PARAMS,
         }
     }
 
     pub fn inputs(self) -> &'static [InputSpec] {
         match self {
-            NodeKind::Source | NodeKind::GradientMask | NodeKind::RadialMask | NodeKind::BrushMask => &[],
-            NodeKind::Blur => BLUR_INPUTS,
-            NodeKind::Normals => NORMALS_INPUTS,
+            NodeKind::Source => &[],
+            NodeKind::Generator | NodeKind::Draw => OPTIONAL_IMAGE_INPUTS,
             NodeKind::Merge => MERGE_INPUTS,
             NodeKind::Layer => LAYER_INPUTS,
-            NodeKind::Exposure => EXPOSURE_INPUTS,
-            NodeKind::Contrast | NodeKind::Saturation | NodeKind::Sharpen => AMOUNT_MASK_INPUTS,
-            NodeKind::MaskAdjust => MASK_ADJUST_INPUTS,
-            NodeKind::MaskCombine => MASK_COMBINE_INPUTS,
             _ => IMAGE_INPUTS,
         }
     }
@@ -821,13 +746,6 @@ impl NodeKind {
     pub fn outputs(self) -> &'static [OutputSpec] {
         match self {
             NodeKind::Output | NodeKind::Export => NO_OUTPUTS,
-            NodeKind::GradientMask
-            | NodeKind::RadialMask
-            | NodeKind::LuminanceMask
-            | NodeKind::HueMask
-            | NodeKind::MaskAdjust
-            | NodeKind::MaskCombine
-            | NodeKind::BrushMask | NodeKind::DepthEstimate => MASK_OUTPUTS,
             NodeKind::MetadataSplit => SPLIT_OUTPUTS,
             _ => IMAGE_OUTPUTS,
         }
@@ -850,7 +768,7 @@ impl NodeKind {
         match self {
             NodeKind::PointCurve => &[DataKind::Curve, DataKind::CurveSet],
             NodeKind::Generator => &[DataKind::GradientRamp],
-            NodeKind::BrushMask => &[DataKind::Strokes],
+            NodeKind::Draw => &[DataKind::Strokes],
             NodeKind::MetadataSplit => &[DataKind::Ranges],
             NodeKind::Source => &[DataKind::Folder],
             NodeKind::Export => &[DataKind::Export],
@@ -863,7 +781,7 @@ impl NodeKind {
     }
 }
 
-/// One brush stroke of a Brush Mask. Points are normalised image coordinates
+/// One brush stroke of a Draw. Points are normalised image coordinates
 /// (0..1 in x and y, may slightly exceed), `radius` is a fraction of the long
 /// edge (0.0005..0.5), `hardness` and `flow` are 0..1.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1041,7 +959,7 @@ fn is_zero(v: &usize) -> bool {
     *v == 0
 }
 
-/// An exposed numeric parameter input. Image inputs are intensity maps, not
+/// An exposed image control input. These are not
 /// collection inputs. Indices are stable slots, never reused after removal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExposedInput {
@@ -1098,13 +1016,11 @@ impl Node {
         self.kind.outputs().get(alias.source_port).map(|_| alias.source_port)
     }
     pub fn is_collection_input(&self, port: usize) -> bool {
-        !(self.kind == NodeKind::Blur && port == 2)
-            && self.kind.inputs().get(port).is_some_and(|p| p.ty == PortType::Images)
+        port < self.kind.inputs().len()
     }
-    /// Whether this auxiliary input controls a numeric parameter per pixel.
+    /// Whether this auxiliary input controls a parameter or direction per pixel.
     pub fn is_control_input(&self, port: usize) -> bool {
-        self.kind.inputs().get(port).is_some_and(|p| p.modulates.is_some())
-            || port.checked_sub(self.kind.inputs().len()).and_then(|i| self.exposed_inputs.get(i)).is_some_and(Option::is_some)
+        port.checked_sub(self.kind.inputs().len()).and_then(|i| self.exposed_inputs.get(i)).is_some_and(Option::is_some)
     }
     /// Effective value of a parameter for one image.
     pub fn param(&self, name: &str, image: ImageId) -> f32 {
@@ -1413,8 +1329,8 @@ impl Graph {
     pub fn add_node(&mut self, kind: NodeKind, pos: [f32; 2]) -> NodeId {
         let id = NodeId(self.next_id);
         self.next_id += 1;
-        // Painted masks belong to one image, so Brush Mask starts per image.
-        let mode = if kind == NodeKind::BrushMask { Mode::Individual } else { Mode::All };
+        // Draw starts per image so painting can differ across a collection.
+        let mode = if kind == NodeKind::Draw { Mode::Individual } else { Mode::All };
         self.nodes.insert(
             id,
             Node {
@@ -1435,15 +1351,28 @@ impl Graph {
 
     /// Parameters with implemented per-pixel evaluation.
     pub fn supported_parameter_inputs(kind: NodeKind) -> &'static [&'static str] {
-        match kind { NodeKind::Develop => &["exposure", "contrast", "highlights", "shadows", "whites", "blacks"], NodeKind::Exposure => &["ev"], NodeKind::Blur => &["radius"], _ => &[] }
+        match kind {
+            NodeKind::Develop => &["exposure", "contrast", "highlights", "shadows", "whites", "blacks"],
+            NodeKind::Exposure => &["ev"],
+            NodeKind::Contrast | NodeKind::Saturation | NodeKind::Sharpen => &["amount"],
+            NodeKind::Blur => &["radius", "direction"],
+            _ => &[],
+        }
     }
 
-    /// Expose a numeric parameter as an auxiliary mask or image-intensity input.
+    /// Label of an implemented image control, including non-scalar inputs.
+    pub fn parameter_input_label(kind: NodeKind, parameter: &str) -> Option<&'static str> {
+        if !Self::supported_parameter_inputs(kind).contains(&parameter) { return None; }
+        if kind == NodeKind::Blur && parameter == "direction" { return Some("Direction (RGB)"); }
+        kind.param_spec(parameter).map(|p| p.label)
+    }
+
+    /// Expose a parameter as an auxiliary image control input.
     pub fn expose_parameter(&mut self, id: NodeId, parameter: &str, ty: PortType) -> Result<usize, GraphError> {
         let node = self.nodes.get_mut(&id).ok_or(GraphError::UnknownNode(id))?;
-        if !(Self::supported_parameter_inputs(node.kind).contains(&parameter) && matches!(ty, PortType::Images | PortType::Mask))
+        if !Self::supported_parameter_inputs(node.kind).contains(&parameter)
             || node.exposed_inputs.iter().flatten().any(|p| p.parameter == parameter) {
-            return Err(GraphError::Parse(format!("invalid or already exposed numeric parameter {parameter}")));
+            return Err(GraphError::Parse(format!("invalid or already exposed parameter {parameter}")));
         }
         let port = node.kind.inputs().len() + node.exposed_inputs.len();
         node.exposed_inputs.push(Some(ExposedInput { parameter: parameter.to_owned(), ty }));
@@ -1602,13 +1531,9 @@ impl Graph {
                 add(format!("{label}: no input is connected"));
             }
             for (port, spec) in node.kind.inputs().iter().enumerate() {
-                if spec.required && self.input_of(node.id, port).is_none() && !(node.kind == NodeKind::Generator && port == 0) {
+                if spec.required && self.input_of(node.id, port).is_none() {
                     add(format!("{label}: input \"{}\" is not connected", spec.label));
                 }
-            }
-            if node.kind == NodeKind::Normals {
-                let port = node.all_choice("mode");
-                if self.input_of(node.id, port).is_none() { add(format!("Normals: selected input is not connected (port {port})")); }
             }
             match node.kind {
                 NodeKind::Layer if node.all_choice("mode") == 1 => {
@@ -1860,18 +1785,11 @@ impl Graph {
 
     fn contains_ctx(&self, ctx: &Ctx, node: NodeId, image: ImageId) -> bool {
         let Some(n) = self.node(node) else { return false };
-        if n.kind == NodeKind::DepthEstimate {
-            return self.input_contains_ctx(ctx, node, 0, image);
-        }
-        if n.kind.output() == Some(PortType::Mask) {
-            return true;
-        }
         if !ctx.enter() {
             return false;
         }
         let result = match n.kind {
-            NodeKind::Generator if self.input_edges(node, 0).next().is_none() => image == ImageId(u64::MAX - node.0) && !ctx.catalog.images.contains(&image),
-            NodeKind::Normals => self.input_contains_ctx(ctx, node, n.choice("mode", image), image),
+            NodeKind::Generator | NodeKind::Draw if self.input_edges(node, 0).next().is_none() => image == ImageId(u64::MAX - node.0) && !ctx.catalog.images.contains(&image),
             NodeKind::Source => match source_folder(n) {
                 None => true,
                 Some((folder, recursive)) => !folder.is_empty() && ctx
@@ -1935,24 +1853,10 @@ impl Graph {
             let Some(port) = n.resolve_output(port) else { return none() };
             port
         };
-        if n.kind == NodeKind::DepthEstimate {
-            return if port == 0 { self.input_members(ctx, node, 0) } else { none() };
-        }
-        if n.kind.output() == Some(PortType::Mask) {
-            return if port == 0 { Rc::new(ctx.catalog.images.to_vec()) } else { none() };
-        }
         match n.kind {
-            NodeKind::Generator if port == 0 && self.input_edges(node, 0).next().is_none() => {
+            NodeKind::Generator | NodeKind::Draw if port == 0 && self.input_edges(node, 0).next().is_none() => {
                 let image = ImageId(u64::MAX - node.0);
                 if ctx.catalog.images.contains(&image) { none() } else { Rc::new(vec![image]) }
-            }
-            NodeKind::Normals if port == 0 => {
-                let mut seen = std::collections::HashSet::new();
-                let candidates = (0..n.kind.inputs().len())
-                    .flat_map(|port| self.input_members(ctx, node, port).as_ref().clone())
-                    .filter(|&image| seen.insert(image) && self.input_contains_ctx(ctx, node, n.choice("mode", image), image))
-                    .collect();
-                Rc::new(candidates)
             }
             NodeKind::MetadataSplit => {
                 if port >= n.kind.outputs().len() {
@@ -2080,7 +1984,7 @@ impl Graph {
             return Err(GraphError::UnsupportedVersion(graph.format_version));
         }
         graph.check_consistency()?;
-        // Older files are plain subsets of the current layout.
+        // Save successfully validated graphs using the current format.
         graph.format_version = GRAPH_FORMAT_VERSION;
         Ok(graph)
     }
@@ -2099,7 +2003,7 @@ impl Graph {
             }
             let mut exposed = BTreeSet::new();
             for input in node.exposed_inputs.iter().flatten() {
-                if !(Self::supported_parameter_inputs(node.kind).contains(&input.parameter.as_str()) && matches!(input.ty, PortType::Images | PortType::Mask)) || !exposed.insert(&input.parameter) {
+                if !Self::supported_parameter_inputs(node.kind).contains(&input.parameter.as_str()) || !exposed.insert(&input.parameter) {
                     return bad(format!("node {}: invalid or duplicate exposed parameter", node.id.0));
                 }
             }
@@ -2198,7 +2102,7 @@ impl Graph {
 }
 
 /// Bumped whenever the serialized sub-graph layout changes incompatibly.
-pub const SUBGRAPH_FORMAT_VERSION: u32 = 1;
+pub const SUBGRAPH_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SubNode {
@@ -2376,12 +2280,12 @@ mod tests {
     const B: ImageId = ImageId(2);
 
     #[test]
-    fn connect_checks_types_ports_and_cycles() {
+    fn connect_checks_ports_and_cycles() {
         let mut g = Graph::new();
         let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
         let exp = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
         let sat = g.add_node(NodeKind::Saturation, [0.0, 0.0]);
-        let mask = g.add_node(NodeKind::GradientMask, [0.0, 0.0]);
+        let mask = g.add_node(NodeKind::Generator, [0.0, 0.0]);
         let blur = g.add_node(NodeKind::Blur, [0.0, 0.0]);
         let out = g.add_node(NodeKind::Output, [0.0, 0.0]);
 
@@ -2389,12 +2293,9 @@ mod tests {
         assert_eq!(g.connect(exp, sat, 0), Ok(()));
         assert_eq!(g.connect(sat, exp, 0), Err(GraphError::WouldCycle));
         assert_eq!(g.connect(exp, exp, 0), Err(GraphError::WouldCycle));
-        assert_eq!(
-            g.connect(mask, sat, 0),
-            Err(GraphError::TypeMismatch { expected: PortType::Images, found: PortType::Mask })
-        );
-        assert_eq!(g.connect(sat, blur, 1), Ok(()));
-        assert_eq!(g.connect(mask, blur, 1), Ok(()));
+        assert_eq!(g.connect(mask, blur, 1), Err(GraphError::NoSuchPort { node: blur, port: 1 }));
+        let radius = g.expose_parameter(blur, "radius", PortType::Images).unwrap();
+        assert_eq!(g.connect(mask, blur, radius), Ok(()));
         assert_eq!(g.connect(out, sat, 0), Err(GraphError::NoOutput(out)));
         assert_eq!(g.connect(sat, out, 3), Err(GraphError::NoSuchPort { node: out, port: 3 }));
     }
@@ -2511,7 +2412,7 @@ mod tests {
 
     #[test]
     fn newer_format_versions_are_refused() {
-        let text = Graph::new().to_json().replace("\"format_version\": 2", "\"format_version\": 999");
+        let text = Graph::new().to_json().replace("\"format_version\": 3", "\"format_version\": 999");
         assert_eq!(Graph::from_json(&text), Err(GraphError::UnsupportedVersion(999)));
         assert!(matches!(Graph::from_json("not json"), Err(GraphError::Parse(_))));
     }
@@ -2523,13 +2424,14 @@ mod tests {
         let exp = g.add_node(NodeKind::Exposure, [2.0, 0.0]);
         let wb = g.add_node(NodeKind::WhiteBalance, [3.0, 0.0]);
         let sat = g.add_node(NodeKind::Saturation, [4.0, 0.0]);
-        let mask = g.add_node(NodeKind::GradientMask, [4.0, 1.0]);
+        let mask = g.add_node(NodeKind::Generator, [4.0, 1.0]);
         let blur = g.add_node(NodeKind::Blur, [5.0, 0.0]);
         let out = g.add_node(NodeKind::Output, [6.0, 0.0]);
         for (a, b) in [(src, cap), (cap, exp), (exp, wb), (wb, sat), (sat, blur), (blur, out)] {
             g.connect(a, b, 0).unwrap();
         }
-        g.connect(mask, blur, 1).unwrap();
+        let radius = g.expose_parameter(blur, "radius", PortType::Images).unwrap();
+        g.connect(mask, blur, radius).unwrap();
         g.node_mut(exp).unwrap().set_param("ev", A, 1.5);
         let n = g.node_mut(sat).unwrap();
         n.mode = Mode::Individual;
@@ -2540,7 +2442,7 @@ mod tests {
     }
 
     // Node ids in sample_graph: 1 Source, 2 CaptureEv, 3 Exposure, 4 WhiteBalance,
-    // 5 Saturation, 6 GradientMask, 7 Blur, 8 Output.
+    // 5 Saturation, 6 Generator, 7 Blur, 8 Output.
     fn load_edited(edit: impl FnOnce(&mut serde_json::Value)) -> Result<Graph, GraphError> {
         let mut v: serde_json::Value = serde_json::from_str(&sample_graph().to_json()).unwrap();
         edit(&mut v);
@@ -2597,23 +2499,6 @@ mod tests {
         assert_rejected(load_edited(|v| v["edges"][0]["to_port"] = serde_json::json!(5)), "has no input 5");
         // The Output node (8) has no output to connect from.
         assert_rejected(load_edited(|v| push_edge(v, 8, 3, 0)), "has no output");
-    }
-
-    #[test]
-    fn load_rejects_type_mismatched_edges() {
-        // Gradient mask (6) into the image input of Saturation (5).
-        let r = load_edited(|v| {
-            let edges = v["edges"].as_array_mut().unwrap();
-            edges.retain(|e| e["to"] != 5);
-            push_edge(v, 6, 5, 0);
-        });
-        assert_rejected(r, "expects Images but the source carries Mask");
-    }
-
-    #[test]
-    fn load_rejects_two_edges_into_one_port() {
-        assert!(load_edited(|v| push_edge(v, 1, 3, 0)).is_ok());
-        assert_rejected(load_edited(|v| push_edge(v, 2, 3, 0)), "connected more than once");
     }
 
     #[test]
@@ -2699,7 +2584,6 @@ mod tests {
             NodeKind::Exposure,
             NodeKind::WhiteBalance,
             NodeKind::Saturation,
-            NodeKind::GradientMask,
         ] {
             for spec in kind.params() {
                 assert_eq!((spec.kind, spec.logarithmic), (ParamKind::Continuous, false), "{}", spec.name);
@@ -2787,7 +2671,7 @@ mod tests {
 
     // ---- wave 4 kinds ---------------------------------------------------
 
-    const NEW_KINDS: [NodeKind; 13] = [
+    const NEW_KINDS: [NodeKind; 8] = [
         NodeKind::Develop,
         NodeKind::ToneCurve,
         NodeKind::HueSaturation,
@@ -2796,11 +2680,6 @@ mod tests {
         NodeKind::BlackWhite,
         NodeKind::LensManual,
         NodeKind::Transform,
-        NodeKind::RadialMask,
-        NodeKind::LuminanceMask,
-        NodeKind::HueMask,
-        NodeKind::MaskAdjust,
-        NodeKind::MaskCombine,
     ];
 
     /// (name, min, max, default) of every parameter of `kind`.
@@ -2893,97 +2772,6 @@ mod tests {
     }
 
     #[test]
-    fn mask_kind_parameter_tables() {
-        assert_eq!(
-            table(NodeKind::RadialMask),
-            vec![
-                ("center_x", 0.0, 1.0, 0.5),
-                ("center_y", 0.0, 1.0, 0.5),
-                ("radius_x", 0.0, 1.5, 0.3),
-                ("radius_y", 0.0, 1.5, 0.3),
-                ("feather", 0.0, 1.0, 0.5),
-                ("angle", 0.0, 360.0, 0.0),
-                ("invert", 0.0, 1.0, 0.0)
-            ]
-        );
-        assert_eq!(
-            table(NodeKind::LuminanceMask),
-            vec![("low", 0.0, 1.0, 0.0), ("high", 0.0, 1.0, 1.0), ("feather", 0.0, 1.0, 0.1), ("invert", 0.0, 1.0, 0.0)]
-        );
-        assert_eq!(
-            table(NodeKind::HueMask),
-            vec![
-                ("hue", 0.0, 360.0, 0.0),
-                ("width", 1.0, 180.0, 30.0),
-                ("feather", 0.0, 1.0, 0.5),
-                ("min_saturation", 0.0, 1.0, 0.1)
-            ]
-        );
-        assert_eq!(
-            table(NodeKind::MaskAdjust),
-            vec![("low", 0.0, 1.0, 0.0), ("high", 0.0, 1.0, 1.0), ("gamma", 0.1, 10.0, 1.0), ("invert", 0.0, 1.0, 0.0)]
-        );
-        assert!(NodeKind::MaskAdjust.param_spec("gamma").unwrap().logarithmic);
-        let mode = NodeKind::MaskCombine.param_spec("mode").unwrap();
-        assert_eq!(mode.kind, ParamKind::Choice(&["Multiply", "Add", "Subtract", "Maximum", "Minimum"]));
-        assert_eq!((mode.min, mode.max, mode.default), (0.0, 4.0, 0.0));
-    }
-
-    #[test]
-    fn new_kinds_have_the_specified_ports() {
-        let images = |k: NodeKind| k.inputs().iter().map(|i| (i.label, i.ty, i.required, i.modulates)).collect::<Vec<_>>();
-        let img = ("Images", PortType::Images, true, None);
-        for kind in [
-            NodeKind::Develop,
-            NodeKind::ToneCurve,
-            NodeKind::HueSaturation,
-            NodeKind::Vignette,
-            NodeKind::BlackWhite,
-            NodeKind::LensManual,
-            NodeKind::Transform,
-            NodeKind::LuminanceMask,
-            NodeKind::HueMask,
-        ] {
-            assert_eq!(images(kind), vec![img], "{kind:?}");
-        }
-        assert_eq!(
-            images(NodeKind::Sharpen),
-            vec![img, ("Amount mask", PortType::Mask, false, Some("amount"))]
-        );
-        assert_eq!(images(NodeKind::RadialMask), vec![]);
-        assert_eq!(images(NodeKind::MaskAdjust), vec![("Mask", PortType::Mask, true, None)]);
-        assert_eq!(
-            images(NodeKind::MaskCombine),
-            vec![("A", PortType::Mask, true, None), ("B", PortType::Mask, true, None)]
-        );
-        // Changed existing kinds.
-        assert_eq!(images(NodeKind::Exposure), vec![img, ("Exposure mask", PortType::Mask, false, Some("ev"))]);
-        assert_eq!(images(NodeKind::Contrast), vec![img, ("Amount mask", PortType::Mask, false, Some("amount"))]);
-        assert_eq!(images(NodeKind::Saturation), vec![img, ("Amount mask", PortType::Mask, false, Some("amount"))]);
-        // Outputs.
-        for kind in NEW_KINDS {
-            let mask = matches!(
-                kind,
-                NodeKind::RadialMask
-                    | NodeKind::LuminanceMask
-                    | NodeKind::HueMask
-                    | NodeKind::MaskAdjust
-                    | NodeKind::MaskCombine
-            );
-            assert_eq!(kind.output(), Some(if mask { PortType::Mask } else { PortType::Images }), "{kind:?}");
-            assert!(NodeKind::ALL.contains(&kind));
-        }
-        // Every modulated parameter exists.
-        for kind in NodeKind::ALL {
-            for i in kind.inputs() {
-                if let Some(name) = i.modulates {
-                    assert!(kind.param_spec(name).is_some(), "{kind:?} modulates unknown {name}");
-                }
-            }
-        }
-    }
-
-    #[test]
     fn labels_defaults_and_categories_of_every_kind() {
         let labels = [
             (NodeKind::Develop, "Develop", "Develop"),
@@ -2994,11 +2782,6 @@ mod tests {
             (NodeKind::BlackWhite, "Black & White", "Colour"),
             (NodeKind::LensManual, "Lens Correction", "Geometry"),
             (NodeKind::Transform, "Crop / Rotate", "Geometry"),
-            (NodeKind::RadialMask, "Radial Mask", "Mask"),
-            (NodeKind::LuminanceMask, "Luminance Mask", "Mask"),
-            (NodeKind::HueMask, "Hue Mask", "Mask"),
-            (NodeKind::MaskAdjust, "Mask Adjust", "Mask"),
-            (NodeKind::MaskCombine, "Mask Combine", "Mask"),
             (NodeKind::Source, "Source", "Input/Output"),
             (NodeKind::Output, "Output", "Input/Output"),
             (NodeKind::CaptureEv, "Capture EV", "Develop"),
@@ -3010,16 +2793,15 @@ mod tests {
             (NodeKind::NoiseReduction, "Noise Reduction", "Detail"),
             (NodeKind::Blur, "Filter", "Detail"),
             (NodeKind::PixelSort, "Pixel Sort", "Effects"),
-            (NodeKind::Normals, "Normals", "Effects"),
-            (NodeKind::Generator, "Generator", "Effects"),
-            (NodeKind::DepthEstimate, "Depth Estimate", "Mask"),
+            (NodeKind::NormalMap, "Normal Map", "Generators"),
+            (NodeKind::Generator, "Generator", "Generators"),
+            (NodeKind::DepthMap, "Depth Map", "Generators"),
             (NodeKind::MetadataFilter, "Metadata Filter", "Collection"),
             (NodeKind::Merge, "Merge", "Collection"),
-            (NodeKind::GradientMask, "Gradient Mask", "Mask"),
             (NodeKind::PointCurve, "Curves", "Tone"),
             (NodeKind::Layer, "Layer", "Collection"),
             (NodeKind::Export, "Export", "Input/Output"),
-            (NodeKind::BrushMask, "Brush Mask", "Mask"),
+            (NodeKind::Draw, "Draw", "Generators"),
             (NodeKind::MetadataSplit, "Split by Metadata", "Collection"),
             (NodeKind::ColorWheels, "Lift / Gamma / Gain", "Colour"),
             (NodeKind::Clarity, "Clarity / Texture", "Detail"),
@@ -3043,65 +2825,6 @@ mod tests {
     }
 
     #[test]
-    fn masks_connect_to_the_new_mask_ports_and_images_do_not() {
-        let mut g = Graph::new();
-        let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
-        let radial = g.add_node(NodeKind::RadialMask, [0.0, 0.0]);
-        let lum = g.add_node(NodeKind::LuminanceMask, [0.0, 0.0]);
-        let hue = g.add_node(NodeKind::HueMask, [0.0, 0.0]);
-        let adjust = g.add_node(NodeKind::MaskAdjust, [0.0, 0.0]);
-        let combine = g.add_node(NodeKind::MaskCombine, [0.0, 0.0]);
-        let exp = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
-        let sharpen = g.add_node(NodeKind::Sharpen, [0.0, 0.0]);
-        let grad = g.add_node(NodeKind::GradientMask, [0.0, 0.0]);
-
-        g.connect(src, lum, 0).unwrap();
-        g.connect(src, hue, 0).unwrap();
-        g.connect(src, exp, 0).unwrap();
-        g.connect(src, sharpen, 0).unwrap();
-        g.connect(radial, adjust, 0).unwrap();
-        g.connect(adjust, combine, 0).unwrap();
-        g.connect(lum, combine, 1).unwrap();
-        g.connect(combine, exp, 1).unwrap();
-        g.connect(hue, sharpen, 1).unwrap();
-        g.connect(grad, adjust, 0).unwrap();
-
-        // Non-control mask and image ports remain strictly typed.
-        let mismatch_mask = Err(GraphError::TypeMismatch { expected: PortType::Mask, found: PortType::Images });
-        let mismatch_images = Err(GraphError::TypeMismatch { expected: PortType::Images, found: PortType::Mask });
-        assert_eq!(g.connect(src, adjust, 0), mismatch_mask);
-        assert_eq!(g.connect(src, combine, 1), mismatch_mask);
-        assert_eq!(g.connect(src, exp, 1), Ok(()));
-        assert_eq!(g.connect(radial, lum, 0), mismatch_images);
-        assert_eq!(g.connect(combine, sharpen, 0), mismatch_images);
-        assert_eq!(g.connect(src, radial, 0), Err(GraphError::NoSuchPort { node: radial, port: 0 }));
-        assert_eq!(g.connect(radial, combine, 2), Err(GraphError::NoSuchPort { node: combine, port: 2 }));
-        // A mask chain cannot loop.
-        assert_eq!(g.connect(combine, adjust, 0), Err(GraphError::WouldCycle));
-
-        assert!(g.validate().is_empty(), "{:?}", g.validate());
-        assert_eq!(Graph::from_json(&g.to_json()), Ok(g));
-    }
-
-    #[test]
-    fn validate_reports_missing_required_mask_inputs() {
-        let mut g = Graph::new();
-        let adjust = g.add_node(NodeKind::MaskAdjust, [0.0, 0.0]);
-        let combine = g.add_node(NodeKind::MaskCombine, [0.0, 0.0]);
-        let exp = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
-        let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
-        g.connect(src, exp, 0).unwrap();
-        let issues = g.validate();
-        assert_eq!(issues.len(), 3, "{issues:?}"); // adjust: Mask; combine: A and B
-        assert!(issues.iter().all(|i| i.node == adjust || i.node == combine));
-        let radial = g.add_node(NodeKind::RadialMask, [0.0, 0.0]);
-        g.connect(radial, adjust, 0).unwrap();
-        g.connect(radial, combine, 0).unwrap();
-        g.connect(adjust, combine, 1).unwrap();
-        assert!(g.validate().is_empty());
-    }
-
-    #[test]
     fn develop_nodes_saved_without_brightness_get_the_default() {
         let old = r#"{
             "format_version": 1,
@@ -3113,38 +2836,6 @@ mod tests {
         let n = g.node(NodeId(1)).unwrap();
         assert_eq!(n.param("brightness", A), 1.6);
         assert_eq!(n.param("baseline_default", A), 1.0);
-    }
-
-    #[test]
-    fn a_pre_wave_4_graph_still_loads_and_validates() {
-        // Exposure, Contrast and Saturation as saved before they gained a mask port.
-        let old = r#"{
-            "format_version": 1,
-            "nodes": {
-                "1": {"id": 1, "kind": "Source", "mode": "All", "all": {}, "individual": {}, "pos": [0.0, 0.0]},
-                "2": {"id": 2, "kind": "Exposure", "mode": "All", "all": {"ev": 0.5}, "individual": {}, "pos": [1.0, 0.0]},
-                "3": {"id": 3, "kind": "Contrast", "mode": "All", "all": {"amount": 0.2}, "individual": {}, "pos": [2.0, 0.0]},
-                "4": {"id": 4, "kind": "Saturation", "mode": "Individual", "all": {}, "individual": {"7": {"amount": 1.3}}, "pos": [3.0, 0.0]},
-                "5": {"id": 5, "kind": "GradientMask", "mode": "All", "all": {}, "individual": {}, "pos": [3.0, 1.0]},
-                "6": {"id": 6, "kind": "Blur", "mode": "All", "all": {}, "individual": {}, "pos": [4.0, 0.0]},
-                "7": {"id": 7, "kind": "Output", "mode": "All", "all": {}, "individual": {}, "pos": [5.0, 0.0]}
-            },
-            "edges": [
-                {"from": 1, "to": 2, "to_port": 0}, {"from": 2, "to": 3, "to_port": 0},
-                {"from": 3, "to": 4, "to_port": 0}, {"from": 4, "to": 6, "to_port": 0},
-                {"from": 5, "to": 6, "to_port": 1}, {"from": 6, "to": 7, "to_port": 0}
-            ],
-            "next_id": 8
-        }"#;
-        let g = Graph::from_json(old).unwrap();
-        assert!(g.validate().is_empty());
-        assert_eq!(g.input_of(NodeId(2), 1), None, "the new mask ports start unconnected");
-        let capture = |_: ImageId| None;
-        assert!(g.contains(NodeId(7), A, &capture));
-        // The new ports can be used on the loaded graph.
-        let mut g = g;
-        g.connect(NodeId(5), NodeId(2), 1).unwrap();
-        assert!(g.validate().is_empty());
     }
 
     #[test]
@@ -3179,64 +2870,6 @@ mod tests {
         assert_rejected(load(NodeKind::Transform, "rotate", json!(4)), "outside 0..3");
         assert_rejected(load(NodeKind::Transform, "rotate", json!(1.5)), "not a whole option");
         assert_rejected(load(NodeKind::Transform, "flip_h", json!(2)), "outside 0..1");
-        assert_rejected(load(NodeKind::RadialMask, "radius_x", json!(1.6)), "outside 0..1.5");
-        assert_rejected(load(NodeKind::RadialMask, "angle", json!(361.0)), "outside 0..360");
-        assert_rejected(load(NodeKind::LuminanceMask, "high", json!(1.1)), "outside 0..1");
-        assert_rejected(load(NodeKind::HueMask, "width", json!(0.5)), "outside 1..180");
-        assert_rejected(load(NodeKind::MaskAdjust, "gamma", json!(11.0)), "outside 0.1..10");
-        assert_rejected(load(NodeKind::MaskCombine, "mode", json!(5)), "outside 0..4");
-        assert_rejected(load(NodeKind::MaskCombine, "bogus", json!(1)), "unknown parameter");
-    }
-
-    #[test]
-    fn membership_for_new_mask_and_geometry_kinds() {
-        let capture = standard_caps();
-        let mut g = Graph::new();
-        let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
-        let filter = filter_node(&mut g, src, 100.0, 400.0); // images 2, 3, 4
-        let lum = g.add_node(NodeKind::LuminanceMask, [0.0, 0.0]);
-        let hue = g.add_node(NodeKind::HueMask, [0.0, 0.0]);
-        let radial = g.add_node(NodeKind::RadialMask, [0.0, 0.0]);
-        let adjust = g.add_node(NodeKind::MaskAdjust, [0.0, 0.0]);
-        let combine = g.add_node(NodeKind::MaskCombine, [0.0, 0.0]);
-        let develop = g.add_node(NodeKind::Develop, [0.0, 0.0]);
-        let transform = g.add_node(NodeKind::Transform, [0.0, 0.0]);
-        let sharpen = g.add_node(NodeKind::Sharpen, [0.0, 0.0]);
-        let out = g.add_node(NodeKind::Output, [0.0, 0.0]);
-        let all: Vec<u64> = (1..=7).collect();
-
-        // Mask producers contain everything even with an unconnected or filtered Images input.
-        for m in [lum, hue, radial, adjust, combine] {
-            assert_eq!(members(&g, m, &capture), all, "{m:?}");
-        }
-        g.connect(filter, lum, 0).unwrap();
-        assert_eq!(members(&g, lum, &capture), all);
-
-        assert_eq!(members(&g, develop, &capture), Vec::<u64>::new(), "unconnected required input");
-        g.connect(filter, develop, 0).unwrap();
-        g.connect(develop, transform, 0).unwrap();
-        g.connect(transform, sharpen, 0).unwrap();
-        g.connect(lum, sharpen, 1).unwrap(); // a mask never changes the collection
-        g.connect(sharpen, out, 0).unwrap();
-        for n in [develop, transform, sharpen, out] {
-            assert_eq!(members(&g, n, &capture), vec![2, 3, 4], "{n:?}");
-        }
-    }
-
-    #[test]
-    fn capture_ev_delta_ignores_mask_inputs() {
-        let mut g = Graph::new();
-        let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
-        let cap = g.add_node(NodeKind::CaptureEv, [0.0, 0.0]);
-        g.node_mut(cap).unwrap().set_param("delta", A, 1.0);
-        g.connect(src, cap, 0).unwrap();
-        let lum = g.add_node(NodeKind::LuminanceMask, [0.0, 0.0]);
-        g.connect(cap, lum, 0).unwrap();
-        let exp = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
-        g.connect(lum, exp, 1).unwrap(); // only the mask port is wired
-        assert_eq!(g.capture_ev_delta(exp, A), 0.0);
-        g.connect(cap, exp, 0).unwrap();
-        assert_eq!(g.capture_ev_delta(exp, A), 1.0);
     }
 
     // ---- collection membership ----------------------------------------
@@ -3281,9 +2914,9 @@ mod tests {
         let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
         let exp = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
         let out = g.add_node(NodeKind::Output, [0.0, 0.0]);
-        let mask = g.add_node(NodeKind::GradientMask, [0.0, 0.0]);
+        let mask = g.add_node(NodeKind::Generator, [0.0, 0.0]);
         assert_eq!(members(&g, src, &capture), (1..=7).collect::<Vec<_>>());
-        assert!(g.contains(mask, A, &capture), "mask producers count as containing everything");
+        assert!(!g.contains(mask, A, &capture), "standalone generators have their own identity");
         assert!(!g.contains(exp, A, &capture), "unconnected required input");
         assert!(!g.contains(NodeId(999), A, &capture), "unknown node");
         g.connect(src, exp, 0).unwrap();
@@ -3444,11 +3077,11 @@ mod tests {
         (1..=7).filter(|i| g.contains_output(node, port, ImageId(*i), capture)).collect()
     }
 
-    /// Nodes: 1 PointCurve, 2 BrushMask, 3 MetadataSplit, 4 Exposure.
+    /// Nodes: 1 PointCurve, 2 Draw, 3 MetadataSplit, 4 Exposure.
     fn data_graph() -> Graph {
         let mut g = Graph::new();
         let curve = g.add_node(NodeKind::PointCurve, [0.0, 0.0]);
-        let brush = g.add_node(NodeKind::BrushMask, [1.0, 0.0]);
+        let brush = g.add_node(NodeKind::Draw, [1.0, 0.0]);
         let split = g.add_node(NodeKind::MetadataSplit, [2.0, 0.0]);
         g.add_node(NodeKind::Exposure, [3.0, 0.0]);
         assert!(g.node_mut(curve).unwrap().set_data(A, Some(NodeData::Curve(vec![[0.0, 0.0], [0.5, 0.7], [1.0, 1.0]]))));
@@ -3517,7 +3150,7 @@ mod tests {
         let split = g.add_node(NodeKind::MetadataSplit, [0.0, 0.0]);
         let exp = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
         let sharpen = g.add_node(NodeKind::Sharpen, [0.0, 0.0]);
-        let brush = g.add_node(NodeKind::BrushMask, [0.0, 0.0]);
+        let brush = g.add_node(NodeKind::Draw, [0.0, 0.0]);
         let out = g.add_node(NodeKind::Output, [0.0, 0.0]);
         g.connect(src, split, 0).unwrap();
 
@@ -3530,13 +3163,10 @@ mod tests {
             assert_eq!(g.input_edges(exp, 0).last().map(|e| (e.from, e.from_port)), Some((split, port)));
             assert_eq!(g.edges().len(), port + 2);
         }
-        // Types across ports: split outputs are images, the brush mask is a mask.
-        assert_eq!(g.connect_ports(split, 3, sharpen, 1), Ok(()));
-        assert_eq!(
-            g.connect_ports(brush, 0, sharpen, 0),
-            Err(GraphError::TypeMismatch { expected: PortType::Images, found: PortType::Mask })
-        );
-        assert_eq!(g.connect_ports(brush, 0, sharpen, 1), Ok(()));
+        let amount = g.expose_parameter(sharpen, "amount", PortType::Images).unwrap();
+        assert_eq!(g.connect_ports(split, 3, sharpen, amount), Ok(()));
+        assert_eq!(g.connect_ports(brush, 0, sharpen, amount), Ok(()));
+        assert_eq!(g.connect_ports(brush, 0, sharpen, 0), Ok(()));
         // Feeding a split from its own output loops.
         assert_eq!(g.connect_ports(split, 2, split, 0), Err(GraphError::WouldCycle));
         g.connect_ports(split, 6, sharpen, 0).unwrap();
@@ -3545,15 +3175,16 @@ mod tests {
     }
 
     #[test]
-    fn from_json_checks_output_ports_and_their_types() {
+    fn from_json_checks_output_ports() {
         let mut g = Graph::new();
         let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
         let split = g.add_node(NodeKind::MetadataSplit, [0.0, 0.0]);
         let exp = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
-        let brush = g.add_node(NodeKind::BrushMask, [0.0, 0.0]);
+        let brush = g.add_node(NodeKind::Draw, [0.0, 0.0]);
         g.connect(src, split, 0).unwrap();
         g.connect_ports(split, 5, exp, 0).unwrap();
-        g.connect(brush, exp, 1).unwrap();
+        let ev = g.expose_parameter(exp, "ev", PortType::Images).unwrap();
+        g.connect(brush, exp, ev).unwrap();
         let load = |edit: &dyn Fn(&mut serde_json::Value)| {
             let mut v: serde_json::Value = serde_json::from_str(&g.to_json()).unwrap();
             edit(&mut v);
@@ -3564,14 +3195,6 @@ mod tests {
         assert_rejected(load(&|v| v["edges"][1]["from_port"] = json!(7)), "no output port 7");
         assert_rejected(load(&|v| v["edges"][0]["from_port"] = json!(1)), "no output port 1");
         assert_rejected(load(&|v| v["edges"][2]["from_port"] = json!(1)), "no output port 1");
-        // Re-point the image edge at the brush mask's output: images expected, mask carried.
-        assert_rejected(
-            load(&|v| {
-                v["edges"][1]["from"] = json!(4);
-                v["edges"][1]["from_port"] = json!(0);
-            }),
-            "expects Images but the source carries Mask",
-        );
         assert_rejected(load(&|v| v["edges"][1]["from_port"] = json!(-1)), "");
     }
 
@@ -3591,9 +3214,8 @@ mod tests {
                 _ => assert_eq!(outs.len(), 1, "{kind:?}"),
             }
         }
-        assert_eq!(NodeKind::BrushMask.output(), Some(PortType::Mask));
+        assert_eq!(NodeKind::Draw.output(), Some(PortType::Images));
         assert_eq!(NodeKind::PointCurve.output(), Some(PortType::Images));
-        assert_eq!(NodeKind::GradientMask.outputs()[0].ty, PortType::Mask);
     }
 
     #[test]
@@ -3602,7 +3224,7 @@ mod tests {
             let expected = match kind {
                 NodeKind::Generator => Some(DataKind::GradientRamp),
                 NodeKind::PointCurve => Some(DataKind::Curve),
-                NodeKind::BrushMask => Some(DataKind::Strokes),
+                NodeKind::Draw => Some(DataKind::Strokes),
                 NodeKind::MetadataSplit => Some(DataKind::Ranges),
                 NodeKind::Source => Some(DataKind::Folder),
                 NodeKind::Export => Some(DataKind::Export),
@@ -3630,11 +3252,10 @@ mod tests {
         let curve_node = g.add_node(c, [0.0, 0.0]);
         assert!(g.node_mut(curve_node).unwrap().set_data(A, Some(default_curve())));
 
-        let b = NodeKind::BrushMask;
-        assert_eq!((b.label(), b.category()), ("Brush Mask", "Mask"));
-        assert!(b.inputs().is_empty());
-        assert_eq!(b.param_spec("invert").unwrap().kind, ParamKind::Toggle);
-        assert_eq!(b.params().len(), 1);
+        let b = NodeKind::Draw;
+        assert_eq!((b.label(), b.category()), ("Draw", "Generators"));
+        assert_eq!(b.inputs(), OPTIONAL_IMAGE_INPUTS);
+        assert_eq!(b.params(), DRAW_PARAMS);
 
         let s = NodeKind::MetadataSplit;
         assert_eq!((s.label(), s.category()), ("Split by Metadata", "Collection"));
@@ -3643,7 +3264,7 @@ mod tests {
         assert_eq!(s.param_spec("missing").unwrap().kind, ParamKind::Choice(&["Unmatched", "Exclude"]));
         assert_eq!(s.params().len(), 2);
         assert!(NodeKind::ALL.contains(&c) && NodeKind::ALL.contains(&b) && NodeKind::ALL.contains(&s));
-        assert_eq!(NodeKind::ALL.len(), 37);
+        assert_eq!(NodeKind::ALL.len(), 31);
     }
 
     #[test]
@@ -3682,7 +3303,7 @@ mod tests {
     #[test]
     fn set_data_enforces_the_stroke_limits_and_clamps() {
         let mut g = Graph::new();
-        let id = g.add_node(NodeKind::BrushMask, [0.0, 0.0]);
+        let id = g.add_node(NodeKind::Draw, [0.0, 0.0]);
         let n = g.node_mut(id).unwrap();
         let strokes = |s: Vec<BrushStroke>| Some(NodeData::Strokes(s));
         assert!(n.set_data(A, strokes(vec![])));
@@ -3853,14 +3474,14 @@ mod tests {
     }
 
     #[test]
-    fn brush_mask_starts_in_individual_mode() {
+    fn draw_starts_in_individual_mode() {
         let mut g = Graph::new();
         for kind in NodeKind::ALL {
             let id = g.add_node(kind, [0.0, 0.0]);
-            let expected = if kind == NodeKind::BrushMask { Mode::Individual } else { Mode::All };
+            let expected = if kind == NodeKind::Draw { Mode::Individual } else { Mode::All };
             assert_eq!(g.node(id).unwrap().mode, expected, "{kind:?}");
         }
-        let brush = g.add_node(NodeKind::BrushMask, [0.0, 0.0]);
+        let brush = g.add_node(NodeKind::Draw, [0.0, 0.0]);
         let n = g.node_mut(brush).unwrap();
         assert!(n.set_data(A, Some(NodeData::Strokes(vec![stroke(2)]))));
         assert!(n.data(A).is_some(), "painted for A");
@@ -3896,8 +3517,8 @@ mod tests {
         assert_eq!(g.output_label(split, 7, A), "");
         assert_eq!(g.output_label(NodeId(99), 0, A), "");
         assert_eq!(g.output_label(src, 0, A), "Images");
-        let brush = g.add_node(NodeKind::BrushMask, [0.0, 0.0]);
-        assert_eq!(g.output_label(brush, 0, A), "Mask");
+        let brush = g.add_node(NodeKind::Draw, [0.0, 0.0]);
+        assert_eq!(g.output_label(brush, 0, A), "Images");
         // Individual ranges are per image.
         let n = g.node_mut(split).unwrap();
         n.mode = Mode::Individual;
@@ -4079,19 +3700,20 @@ mod tests {
 
     // ---- sub-graphs ---------------------------------------------------------
 
-    /// 1 Source, 2 Exposure, 3 Saturation, 4 BrushMask, 5 Output, 6 MetadataSplit, 7 Contrast.
+    /// 1 Source, 2 Exposure, 3 Saturation, 4 Draw, 5 Output, 6 MetadataSplit, 7 Contrast.
     fn recipe_graph() -> Graph {
         let mut g = Graph::new();
         let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
         let exp = g.add_node(NodeKind::Exposure, [10.0, 0.0]);
         let sat = g.add_node(NodeKind::Saturation, [20.0, 0.0]);
-        let brush = g.add_node(NodeKind::BrushMask, [20.0, 10.0]);
+        let brush = g.add_node(NodeKind::Draw, [20.0, 10.0]);
         let out = g.add_node(NodeKind::Output, [30.0, 0.0]);
         let split = g.add_node(NodeKind::MetadataSplit, [10.0, 20.0]);
         let con = g.add_node(NodeKind::Contrast, [20.0, 20.0]);
         g.connect(src, exp, 0).unwrap();
         g.connect(exp, sat, 0).unwrap();
-        g.connect(brush, sat, 1).unwrap();
+        let amount = g.expose_parameter(sat, "amount", PortType::Images).unwrap();
+        g.connect(brush, sat, amount).unwrap();
         g.connect(sat, out, 0).unwrap();
         g.connect(exp, split, 0).unwrap();
         g.connect_ports(split, 3, con, 0).unwrap();
@@ -4101,7 +3723,7 @@ mod tests {
         n.set_param("amount", A, 1.2);
         n.mode = Mode::Individual;
         n.set_param("amount", A, 1.8);
-        // Brush mask: All data plus strokes for A.
+        // Draw: All data plus strokes for A.
         let n = g.node_mut(brush).unwrap();
         n.mode = Mode::All;
         assert!(n.set_data(A, Some(NodeData::Strokes(vec![stroke(1)]))));
@@ -4120,7 +3742,7 @@ mod tests {
         assert!(!sub.is_empty());
         assert_eq!(
             sub.kinds(),
-            vec![NodeKind::Exposure, NodeKind::Saturation, NodeKind::BrushMask, NodeKind::MetadataSplit, NodeKind::Contrast]
+            vec![NodeKind::Exposure, NodeKind::Saturation, NodeKind::Draw, NodeKind::MetadataSplit, NodeKind::Contrast]
         );
 
         let mut target = Graph::new();
@@ -4231,7 +3853,7 @@ mod tests {
     #[test]
     fn invalid_subgraph_json_is_rejected() {
         let g = recipe_graph();
-        // Order: 0 Exposure, 1 Saturation, 2 BrushMask, 3 MetadataSplit, 4 Contrast.
+        // Order: 0 Exposure, 1 Saturation, 2 Draw, 3 MetadataSplit, 4 Contrast.
         let sub = g.extract_subgraph(&[NodeId(2), NodeId(3), NodeId(4), NodeId(6), NodeId(7)]);
         let base: serde_json::Value = serde_json::from_str(&sub.to_json()).unwrap();
         let load = |edit: &dyn Fn(&mut serde_json::Value)| {
@@ -4254,15 +3876,7 @@ mod tests {
         parse_err(load(&|v| v["edges"][0]["to"] = json!(40)), "has 5 nodes");
         parse_err(load(&|v| v["edges"][0]["to_port"] = json!(9)), "has no input 9");
         parse_err(load(&|v| v["edges"][0]["from_port"] = json!(3)), "no output port 3");
-        // Exposure -> Split re-pointed at Saturation port 0, which Exposure already feeds.
-        parse_err(load(&|v| v["edges"][2]["to"] = json!(1)), "connected more than once");
-        // Brush mask (2) into the image input of Saturation (1): type mismatch.
-        parse_err(
-            load(&|v| {
-                v["edges"] = json!([{"from": 2, "to": 1, "to_port": 0}]);
-            }),
-            "expects Images but the source carries Mask",
-        );
+        parse_err(load(&|v| { let edge = v["edges"][1].clone(); v["edges"].as_array_mut().unwrap().push(edge); }), "connected more than once");
         // exposure -> saturation plus saturation -> exposure.
         parse_err(
             load(&|v| {
@@ -4285,7 +3899,8 @@ mod tests {
         g.connect_ports(id(NodeKind::MetadataSplit), 6, id(NodeKind::Merge), 1).unwrap();
         g.connect(id(NodeKind::PointCurve), id(NodeKind::Merge), 0).unwrap();
         g.connect(id(NodeKind::Merge), id(NodeKind::Exposure), 0).unwrap();
-        g.connect(id(NodeKind::BrushMask), id(NodeKind::Exposure), 1).unwrap();
+        let ev = g.expose_parameter(id(NodeKind::Exposure), "ev", PortType::Images).unwrap();
+        g.connect(id(NodeKind::Draw), id(NodeKind::Exposure), ev).unwrap();
         g.connect(id(NodeKind::Exposure), id(NodeKind::Output), 0).unwrap();
         for kind in NodeKind::ALL {
             let node = g.node_mut(id(kind)).unwrap();
@@ -4298,7 +3913,7 @@ mod tests {
         assert!(n.set_data(A, Some(NodeData::Curve(vec![[0.0, 0.2], [0.4, 0.5], [1.0, 0.9]]))));
         n.mode = Mode::Individual;
         assert!(n.set_data(B, Some(default_curve())));
-        let n = g.node_mut(id(NodeKind::BrushMask)).unwrap();
+        let n = g.node_mut(id(NodeKind::Draw)).unwrap();
         assert!(n.set_data(A, Some(NodeData::Strokes(vec![stroke(4)]))));
         n.mode = Mode::All;
         assert!(n.set_data(A, Some(NodeData::Strokes(vec![stroke(2)]))));
@@ -4330,8 +3945,8 @@ mod tests {
         }
         assert_eq!(table(NodeKind::Clarity), vec![("clarity", -1.0, 1.0, 0.0), ("texture", -1.0, 1.0, 0.0)]);
         for kind in [cw, NodeKind::Clarity] {
-            let ins: Vec<_> = kind.inputs().iter().map(|i| (i.ty, i.required, i.modulates)).collect();
-            assert_eq!(ins, vec![(PortType::Images, true, None)]);
+            let ins: Vec<_> = kind.inputs().iter().map(|i| (i.ty, i.required)).collect();
+            assert_eq!(ins, vec![(PortType::Images, true)]);
             assert_eq!(kind.outputs(), IMAGE_OUTPUTS);
             assert_eq!(kind.data_kind(), None);
             assert!(NodeKind::ALL.contains(&kind));
@@ -4524,12 +4139,32 @@ mod tests {
 mod exposed_port_tests {
     use super::*;
     #[test]
+    fn removed_node_kinds_are_rejected_by_name() {
+        let mut g = Graph::new();
+        g.add_node(NodeKind::Generator, [0.0; 2]);
+        for kind in ["GradientMask", "RadialMask", "LuminanceMask", "HueMask", "MaskAdjust", "MaskCombine", "BrushMask", "DepthEstimate", "Normals"] {
+            let text = g.to_json().replace("\"Generator\"", &format!("\"{kind}\""));
+            assert_rejected(Graph::from_json(&text), &format!("unknown variant `{kind}`"));
+        }
+    }
+
+    #[test]
+    fn fixed_ports_only_carry_images() {
+        for kind in NodeKind::ALL {
+            let count = match kind { NodeKind::Source => 0, NodeKind::Merge => 4, NodeKind::Layer => MAX_LAYERS, _ => 1 };
+            assert_eq!(kind.inputs().len(), count, "{kind:?}");
+            assert!(kind.inputs().iter().all(|p| p.ty == PortType::Images));
+            assert!(kind.outputs().iter().all(|p| p.ty == PortType::Images));
+        }
+    }
+
+    #[test]
     fn exposed_ports_are_stable_validated_and_auxiliary() {
         let mut g = Graph::new();
         let src = g.add_node(NodeKind::Source, [0.0; 2]);
         let other = g.add_node(NodeKind::Source, [0.0; 2]);
         let exp = g.add_node(NodeKind::Exposure, [0.0; 2]);
-        let mask = g.add_node(NodeKind::GradientMask, [0.0; 2]);
+        let mask = g.add_node(NodeKind::Generator, [0.0; 2]);
         g.connect(src, exp, 0).unwrap();
         let p = g.expose_parameter(exp, "ev", PortType::Images).unwrap();
         g.connect(other, exp, p).unwrap();
@@ -4546,7 +4181,7 @@ mod exposed_port_tests {
         assert_eq!(Graph::from_json(&g.to_json()), Ok(g.clone()));
         assert!(g.remove_exposed_input(exp, p));
         assert!(g.input_of(exp, p).is_none());
-        let p2 = g.expose_parameter(exp, "ev", PortType::Mask).unwrap();
+        let p2 = g.expose_parameter(exp, "ev", PortType::Images).unwrap();
         assert!(p2 > p);
         assert!(matches!(g.connect(other, exp, p), Err(GraphError::NoSuchPort { .. })));
         assert!(g.remove_exposed_output(src, alias));

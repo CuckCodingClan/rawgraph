@@ -1,4 +1,4 @@
-//! Interactive viewer tools: painting a brush mask and editing the crop of a
+//! Interactive viewer tools: painting a drawing and editing the crop of a
 //! Crop / Rotate node. The pure rules live in `brush_logic` and `crop_logic`;
 //! this file connects them to the pointer, the graph and the painter.
 
@@ -128,7 +128,8 @@ impl Tools {
 
     fn brush(&mut self, ui: &egui::Ui, geom: &Geometry, session: &mut Session, node: NodeId) -> Option<String> {
         let ctx = ui.ctx();
-        let image = session.current_image();
+        let viewed_image = session.render_target().and_then(|(node, port)| session.image_for_target(node, port)).unwrap_or_else(|| session.current_image());
+        let image = session.draw_image(node, viewed_image);
         if self.paint.as_ref().is_some_and(|p| p.node != node || p.image != image) {
             self.paint = None;
         }
@@ -136,7 +137,7 @@ impl Tools {
         // Strokes belong to the frame of the node that uses the mask. Behind Crop / Rotate nodes the
         // pointer is mapped back through them (see `frames`).
         let mapper = match session.brush_plan(node) {
-            crate::frames::BrushPlan::Mapped { consumer, chain } => session.proxy_size(image).map(|src| crate::frames::Mapper::new(&session.project.graph, consumer, &chain, image, src)),
+            crate::frames::BrushPlan::Mapped { consumer, chain } => session.proxy_size(viewed_image).map(|src| crate::frames::Mapper::new(&session.project.graph, consumer, &chain, image, src)),
             _ => None,
         };
         let to_frame = |p: Pos2| -> Option<[f32; 2]> {
@@ -189,7 +190,7 @@ impl Tools {
         if pressed && inside && !space && !middle && self.paint.is_none() {
             let base = session.project.graph.node(node).map(|n| strokes_of(n, image)).unwrap_or_default();
             if !brush_logic::can_add_stroke(base.len()) {
-                message = Some(format!("A brush mask holds at most {} strokes", rawgraph_core::graph::MAX_STROKES));
+                message = Some(format!("A drawing holds at most {} strokes", rawgraph_core::graph::MAX_STROKES));
             } else if let Some(first) = pos.and_then(to_frame) {
                 self.paint = Some(PaintDrag { node, image, base, builder: StrokeBuilder::new(&session.brush, alt, first, aspect) });
             }
@@ -205,7 +206,7 @@ impl Tools {
             // The first point of a stroke is shown at once, not only after the first move.
             let live = brush_logic::with_stroke(&drag.base, &drag.builder.stroke);
             if (changed || drag.builder.stroke.points.len() == 1) && !set_strokes(session, node, image, live) {
-                message = Some("This brush mask cannot hold more points".to_owned());
+                message = Some("This drawing cannot hold more points".to_owned());
             }
             if !down {
                 self.paint = None;

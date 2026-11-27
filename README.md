@@ -9,13 +9,13 @@ Local-first RAW photo analysis, organization, and non-destructive editing throug
 - **Rust performance core:** RAW processing, image operations, graph evaluation, metadata/catalog ingestion, caching, batch execution, and export. Keep pixel data and hot paths in Rust; any UI boundary must be efficient and versioned.
 - **Professional scopes:** histogram, waveform, RGB parade, and vectorscope, targeting DaVinci Resolve-level capability and usability. Colorized. Define color-space semantics and validate accuracy with known test patterns.
 - **Display layouts:** provide Resolve-like selectable single- and dual-monitor workspaces, with optional clean feed and/or scopes on a third or fourth display; restore sensibly when displays are disconnected or rearranged.
-- **Node workflows:** typed data flow for images, collections, metadata, masks, and scopes; editable graphs, batch execution, reusable recipes, and clear validation/errors.
+- **Node workflows:** typed data flow for images, collections, metadata, and scopes; editable graphs, batch execution, reusable recipes, and clear validation/errors.
 - **RAW compatibility:** prioritize broad camera/file compatibility in the initial product; matching Adobe Camera Raw or Capture One rendering quality is a later optimization, not an MVP gate.
 - **Parametric, non-destructive editing:** preserve editable operation parameters and source data throughout the graph; make edits reproducible, adjustable, and reversible.
 - **Batch and per-image control:** nodes are created in **All** mode (same parameters for every incoming image) or **Individual** mode. Individual-mode nodes store parameter values keyed to each adjusted image identity, so settings persist independently of the current selection. Nodes compose in graph order, allowing shared edits and per-image tweaks together.
 - **RAW and JPEG editing:** JPEGs use the same adjustment controls and graph workflow as RAWs, while respecting their lower latitude and already-rendered image data. White balance supports absolute settings and relative offsets on both formats; RAW absolute WB uses capture metadata as reference, while JPEG behavior accounts for baked-in WB and limited recovery.
 - **Exposure values:** calculate and expose a capture-derived exposure value per image from ISO, shutter time, and aperture metadata. Let users edit values per image and apply collection-wide offsets (adding the same offset to each image's value), using parametric nodes that compose in graph order. Define units/reference and missing/inaccurate metadata behavior. Keep this distinct from pixel-based exposure compensation; JPEGs share controls but cannot recover clipped/discarded data.
-- **Masks as effect controls:** effects accept single-channel masks/maps to modulate numeric parameters where spatial variation is meaningful (for example, blur radius). Map values linearly to a parameter range by default; curves/remapping nodes can reshape the mapping. Discrete or categorical controls need explicit semantics rather than blindly interpolating values. This is distinct from merely blending the effect output.
+- **Image controls:** effects can expose image inputs to modulate numeric parameters where spatial variation is meaningful (for example, blur radius). Map values linearly to a parameter range by default; curves/remapping nodes can reshape the mapping. Discrete or categorical controls need explicit semantics rather than blindly interpolating values. This is distinct from merely blending the effect output.
 - **HDR and precision:** use ACES as the internal working-space foundation, with a 32-bit floating-point image-processing flow and correct HDR handling throughout preview, scopes, and export. Specify the ACES variant, transfer/display transforms, and output targets during architecture work.
 
 ## Roadmap
@@ -58,14 +58,14 @@ RawGraph should feel snappy on the first view of a RAW, not just after it is cac
 - [ ] Support RAW and JPEG with the same adjustment controls; absolute WB uses RAW capture metadata when available, while relative WB offsets compose afterward. Preserve JPEG baked-in-WB limitations.
 - [ ] Define exposure-value calculation from ISO, shutter time, and aperture; specify units/reference, per-image edits, collection-wide offsets, graph composition, and missing/inaccurate metadata behavior. Distinguish this capture-derived value from pixel-based exposure compensation.
 - [ ] Add All- and Individual-mode adjustment nodes; persist Individual parameters per image identity and verify sequential composition without flattening edits.
-- [ ] Add mask/map inputs to effects, with linear modulation of supported numeric parameters and composable curve/range remapping; test with spatially varying blur radius as a reference case.
+- [ ] Extend per-pixel image controls to more effects and add composable curve/range remapping.
 - [ ] Establish camera/lens profile and color-managed preview/export strategy using ACES and a 32-bit floating-point pipeline; validate HDR scopes, display transforms, and HDR export.
 - [ ] Implement histogram, waveform, RGB parade, and vectorscope in the Rust rendering path; define sampling, modes, scales, color-space interpretation, and update behavior.
 - [ ] Verify scope values against generated reference patterns and high-bit-depth inputs; compare capabilities and workflow with DaVinci Resolve.
 - [ ] Compare RAW output against selected reference converters; document camera-specific limitations rather than claiming unverified parity.
 
 ### 5. Professional release
-- [ ] Add masks/local adjustments, batch presets, graph groups/macros, and reusable templates.
+- [ ] Expand local adjustments, batch presets, graph groups/macros, and reusable templates.
 - [ ] Profile Rust hot paths and enforce performance/regression budgets for import, preview, scopes, graph evaluation, batches, memory, and export.
 - [ ] Add project recovery, crash handling, accessibility, keyboard workflows, packaging, privacy/licensing review, and documentation.
 - [ ] Test representative photo batches and Resolve-like single-/dual-monitor layouts, optional third-/fourth-screen clean feed/scopes, and display reconnect behavior on supported systems before release.
@@ -87,7 +87,7 @@ crates/
   rawgraph-project/            # Project file (SQLite), stable image ids with relinking, culling data,
                                #   filter/sort, parallel folder scan
   rawgraph-fx/                 # Effects on the CPU reference path: tone curve, hue/saturation, sharpen,
-                               #   vignette, crop/rotate, lens correction, masks, brush strokes, curves,
+                               #   vignette, crop/rotate, lens correction, brush rasterization, curves,
                                #   colour wheels, clarity, layer placement and blending
   rawgraph-batch/              # Export pipeline: progress, cancel, partial failure, retry, 16-bit, ICC, metadata
   rawgraph-gpu/                # GPU pixel path (wgpu): display transform and pointwise operations, verified
@@ -176,7 +176,7 @@ Drop a folder onto the graph to create a Source there and scan that folder. View
 
 ### Multiple image inputs
 
-Connect multiple Sources or edit branches to the same ordinary image input. The node processes their combined collection; if an image arrives more than once, the first connected branch carrying it supplies its pixels. Use Merge for explicit filename collision rules. Mask ports and the individual Merge and Layer ports still accept one wire each.
+Connect multiple Sources or edit branches to the same ordinary image input. The node processes their combined collection; if an image arrives more than once, the first connected branch carrying it supplies its pixels. Use Merge for explicit filename collision rules. Exposed control inputs and the individual Merge and Layer ports accept one wire each.
 
 ### RAW input exposure
 
@@ -196,11 +196,15 @@ The inset blue **+** tab at the left of the title bar adds supported input maps.
 
 A new Source, including the starter Source, supplies no images until you choose a folder. Clearing the folder makes it empty again. **File → Open folder** assigns the path to a Source before scanning; it does not create an input shared by all nodes. Older saved Sources with no folder setting retain their catalog-wide behavior so saved graphs keep their inputs.
 
-Click the blue title-bar **+** tab on a Develop node and choose a parameter to expose Exposure, Contrast, Highlights, Shadows, Whites, or Blacks as an image-intensity or mask input. A connected map replaces that slider per pixel: 0–1 maps linearly across the slider's full range, with values outside 0–1 clamped. Image inputs use linear ACEScg luminance; use an exposed image channel if you need a particular channel. Both Legacy and Local v1 tone processing support these inputs. An unconnected input leaves the slider in control.
+### Per-pixel image controls
 
-Fixed parameter mask ports also accept images or exposed channels. Images are read as clamped linear luminance and resized to the photo; fixed masks scale between the parameter minimum and the slider value (white gives the full slider value). A control uses the matching photo when present, otherwise a single-image output such as a standalone Generator applies to every photo. A disjoint multi-image output is ignored. Control images do not enter the main gallery.
+Click the blue title-bar **+** tab to add a control input. Develop exposes Exposure, Contrast, Lights, Shadows, White and Black; Exposure is available on the standalone Exposure node; Contrast, Saturation and Sharpen each expose their amount; Filter exposes Radius and Direction (RGB). A connected map replaces that slider per pixel: 0–1 maps linearly across the slider's full range, with values outside 0–1 clamped. Image inputs use linear ACEScg luminance; use an exposed image channel if you need a particular channel. Both Legacy and Local v1 tone processing support these inputs. An unconnected input leaves the slider in control.
 
-Click the blue title-bar **+** tab on a Filter node and choose **Radius** to drive radius per pixel from image luminance. Values 0–1 replace the radius slider across its full range; the built-in Radius mask, if connected, additionally scales that radius. Gaussian and Box use the existing multi-level radius approximation; other kernels use the existing bounded spatial sampler. Unsupported controls are not listed.
+Intensity maps are resized to the photo. A control uses the matching photo when present; otherwise a single-image output such as a standalone Generator or Draw applies to every photo. A disjoint multi-image output is ignored. Control images do not enter the main gallery. **View → Show mask overlay** (M) tints the first connected intensity control red without affecting the render, scopes or export.
+
+Graph format 3 removes the Mask category and all fixed mask ports. Use Generator for gradients or radial maps, Draw for painted images, and the image/channel outputs of ordinary nodes for other control maps. Old graphs using removed kinds or ports must be rebuilt; there is no migration.
+
+Click the blue title-bar **+** tab on a Filter node and choose **Radius** to drive radius per pixel from image luminance. Values 0–1 replace the radius slider across its full range. Gaussian and Box use the existing multi-level radius approximation; other kernels use the existing bounded spatial sampler. Unsupported controls are not listed.
 
 The **Filter** node offers low pass and high pass with Gaussian (the original three-box approximation), Box (average), Lens Disk, Motion, Radial Zoom, Radial Spin, Diamond, Median, and Bilateral. High pass shows the signed detail around a neutral midpoint; it is not a sharpening operation. Older Blur nodes load as Gaussian low pass. **Preview Exposure** lives in the viewer toolbar and affects only the preview and display scopes, not exports.
 
@@ -208,9 +212,13 @@ The **Filter** node offers low pass and high pass with Gaussian (the original th
 
 Choose **Adobe XMP** in an Export node to write ratings and colour labels for the proprietary RAW images that reach it. It writes sidecars to the chosen output folder without rendering or modifying the originals, and skips existing sidecars. Put each sidecar beside its matching RAW before reading metadata in Lightroom Classic or Bridge. Develop adjustments are not exported by this mode.
 
-### Depth and normals
+### Depth Map and Normal Map
 
-**Depth Estimate** outputs a relative-depth mask (black near, white far). It requires the opt-in CPU model and worker described in [Depth Estimate setup](docs/depth-estimate.md). Use Mask Adjust to remap or invert it. **Normals** converts a depth mask or an explicitly selected luminance height map to RGB normals, with strength, smoothing, and Flip Y. Export via **PNG 16-bit data map** at Original size to preserve the encoded channels without photo color transforms.
+**Depth Map** outputs a grayscale relative-depth image (black near, white far; opaque alpha). It requires the opt-in CPU model and worker described in [Depth Map setup](docs/depth-estimate.md). **Normal Map** interprets the linear luminance of its single image input as height and encodes normals as RGB, with strength, smoothing, and Flip Y. If you want near depth to represent higher terrain, invert luminance before the Normal Map. For predictable numeric heights from Generator, choose Data output. Export via **PNG 16-bit data map** at Original size to preserve the encoded channels without photo color transforms.
+
+### Draw
+
+Draw paints white strokes on an opaque black RGBA canvas. Select it to paint in the viewer; set Size, Hardness and Flow in the inspector and hold Alt to erase. With an image input, Draw inherits the collection and dimensions without copying the source pixels. Unconnected, it uses its own Width and Height and produces one image without needing a photo. Draw starts in Individual mode. To paint a photo-specific control, give Draw the same input as the effect, then wire its output to the added control; a compatible pinned preview lets you paint over downstream Crop / Rotate.
 
 ### Generator
 
@@ -238,12 +246,12 @@ Tests that need sample photos print `skipped: no sample folder (set RAWGRAPH_SAM
 when the folder does not exist or holds no supported file.
 
 State of the prototype (2026-11-15, after wave 8): interactive editing of real RAW/DNG/JPEG files
-with 33 node kinds, including every node of `node_structure.md`: Source (folder, sub-folders),
+with the node kinds listed in `node_structure.md`: Source (folder, sub-folders),
 Metadata Filter, Merge (same-name rule), Layer (Match pairing, blend modes, opacity, fit, filter),
 Develop (exposure, contrast, lights, shadows, white, black, white balance, tint, dynamic,
 saturation), Curves (luminance, RGB, Sat vs Sat, Hue vs Hue, Hue vs Sat), Lens Correction (manual
 and auto from DNG correction data) and Export (format incl. AVIF, size, output colour space,
-metadata selection, folder, collision rule). Also: masks incl. painted brush masks, viewer with
+metadata selection, folder, collision rule). Also: exposed image controls and paintable Draw images, viewer with
 crop and brush tools, node graph with multi-selection, copy/paste and recipes, filmstrip with
 culling, XMP rating import and relinking, colourised scopes, project files in format 2 with
 revisions, history, graph restore, conflict check and crash recovery, and a packaging script.
@@ -278,7 +286,7 @@ proxy resolution, halos, fine detail, color and performance need evaluation.
 
 ### Filter motion direction
 
-The Filter node’s optional Direction normal (RGB) image input overrides Motion angle.
+Expose **Direction (RGB)** on Filter using Add Input. When connected, it overrides Motion angle.
 It reads scene-linear R and G directly as X and Y, decoded by `2 * channel - 1`,
 then normalizes XY; B and map alpha are ignored. Neutral (0.5, 0.5), near-zero
 or non-finite XY leaves the pixel unblurred. Without a map for an image, Motion

@@ -16,13 +16,13 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use rawgraph_core::{Graph, ImageBuf, ImageId, NodeId, PortType, NodeKind, ExportFileFormat, export_spec};
+use rawgraph_core::{Graph, ImageBuf, ImageId, NodeId, NodeKind, ExportFileFormat, export_spec};
 use rawgraph_engine::{CancelToken, EvalError, Evaluator, ImageProvider, Value};
 use rawgraph_scope_views::{PrepareSettings, PreparedScopes};
 use rawgraph_scopes::DisplayImage;
 
 use crate::frames::OverlayFrame;
-use crate::gpu_path::{BaseKey, Preloader, RenderPath, RendererMode, REASON_CROP_TOOL, REASON_MASK_OVERLAY, REASON_MASK_VIEW};
+use crate::gpu_path::{BaseKey, Preloader, RenderPath, RendererMode, REASON_CROP_TOOL, REASON_MASK_OVERLAY};
 use crate::gpu_real::{GpuSetup, RealBackend};
 use crate::gpu_session::{gpu_tone, Backend, Begin, DisplayArgs, GpuPicture, GpuSession, Preloaded, Shown};
 use crate::session::ViewSettings;
@@ -42,7 +42,7 @@ pub struct GpuHints {
     pub neighbours: Vec<ImageId>,
     /// Curve node whose input gets a luminance histogram (sent after the frame).
     pub histogram: Option<NodeId>,
-    /// How to frame the overlay of a brush mask (its consumer and the crops in between).
+    /// How to frame the overlay of a drawing (its consumer and the crops in between).
     pub overlay_frame: Option<OverlayFrame>,
 }
 
@@ -608,9 +608,6 @@ fn forced_cpu_reason(req: &Request) -> Option<String> {
     if req.overlay.is_some() {
         return Some(REASON_MASK_OVERLAY.to_owned());
     }
-    if req.graph.node(req.node).is_some_and(|n| n.kind.output() == Some(PortType::Mask)) {
-        return Some(REASON_MASK_VIEW.to_owned());
-    }
     None
 }
 
@@ -857,7 +854,7 @@ fn histogram_reply(evaluator: &mut Evaluator, req: &Request, node: NodeId, provi
     }
     let (up, port) = req.graph.input_edge(node, 0)?;
     let value = evaluator.eval_output(&req.graph, up, port, req.image, provider, &req.cancel).ok()?;
-    let Value::Images(img) = value else { return None };
+    let Value::Images(img) = value;
     if req.cancel.is_cancelled() {
         return None;
     }
@@ -878,10 +875,7 @@ fn run_cpu(evaluator: &mut Evaluator, req: &Request, provider: &dyn ImageProvide
     if req.cancel.is_cancelled() {
         return None;
     }
-    let buf: Arc<ImageBuf> = match value {
-        Value::Images(img) => img,
-        Value::Mask(mask) => Arc::new(mask_to_image(&mask)),
-    };
+    let Value::Images(buf) = value;
     let t = Instant::now();
     let (display, rgba8) = if let Some(node) = req.graph.node(req.node).filter(|n| n.kind == NodeKind::Export) {
         let spec = export_spec(node, req.image);
@@ -896,16 +890,23 @@ fn run_cpu(evaluator: &mut Evaluator, req: &Request, provider: &dyn ImageProvide
     let node_timings = evaluator.timings();
     // The overlay is best effort: a mask that cannot be computed just shows nothing.
     let overlay = req.overlay.and_then(|n| match &req.hints.overlay_frame {
-        // A brush mask lives in the frame of the node that uses it; carry it through the crops
+        // A drawing lives in the frame of the node that uses it; carry it through the crops
         // between that node and the picture shown.
         Some(frame) => {
             let source = provider.image(req.image).ok().map(|i| (i.width(), i.height()))?;
             crate::frames::brush_overlay_mask(&req.graph, n, frame, req.image, source).map(|m| mask_overlay(&m))
         }
-        None => match evaluator.eval(&req.graph, n, req.image, provider, &req.cancel) {
-            Ok(Value::Mask(m)) => Some(mask_overlay(&m)),
-            _ => None,
-        },
+        None => {
+            let port = req.graph.node(req.node)?.exposed_inputs().iter().enumerate().find_map(|(i, input)| {
+                let input = input.as_ref()?;
+                let port = req.graph.node(req.node)?.kind.inputs().len() + i;
+                (input.parameter != "direction" && req.graph.input_of(req.node, port) == Some(n)).then_some(port)
+            })?;
+            let map = evaluator.eval_control_image(&req.graph, req.node, port, req.image, provider, &req.cancel).ok().flatten()?;
+            let [r, g, b] = rawgraph_core::color::AP1_LUMA;
+            let data = map.data().as_chunks::<4>().0.iter().map(|p| r*p[0] + g*p[1] + b*p[2]).collect();
+            Some(mask_overlay(&rawgraph_core::MaskBuf { width: map.width(), height: map.height(), data }))
+        }
     });
     if req.cancel.is_cancelled() {
         return None;
@@ -958,15 +959,6 @@ fn codec_preview(buf: &ImageBuf, spec: &rawgraph_core::ExportSpec, transform: ra
         v.map(|x| srgb_oetf(x as f32))
     }).collect();
     Ok(Some(DisplayImage { width: d.width, height: d.height, rgb }))
-}
-
-/// Shows a mask as a grey image.
-fn mask_to_image(mask: &rawgraph_core::MaskBuf) -> ImageBuf {
-    let mut data = Vec::with_capacity(mask.data.len() * 4);
-    for v in &mask.data {
-        data.extend_from_slice(&[*v, *v, *v, 1.0]);
-    }
-    ImageBuf::from_rgba(mask.width, mask.height, data).unwrap_or_else(|| ImageBuf::new(1, 1))
 }
 
 /// Message for an image that a node's collection does not contain.
@@ -1346,13 +1338,10 @@ mod tests {
         let f = frame_of(run(&mut session, RendererMode::Auto, &r, &mut ev, prov.as_ref()));
         assert!(matches!(&f.path, RenderPath::Cpu { reason, .. } if reason.contains("CPU only")));
         assert_eq!(session.as_ref().unwrap().stats.uploads, 0, "the GPU was not touched");
-        // The crop tool's input view and a mask node.
+        // The crop tool's input view.
         let mut r = request(&g, out, 3, 0.0, false);
         r.port = Some(0);
         assert!(forced_cpu_reason(&r).is_some_and(|m| m.contains("crop")));
-        let mut g2 = g.clone();
-        let mask = g2.add_node(NodeKind::RadialMask, [0.0, 0.0]);
-        assert!(forced_cpu_reason(&request(&g2, mask, 4, 0.0, false)).is_some_and(|m| m.contains("mask")));
         assert!(forced_cpu_reason(&request(&g, out, 5, 0.0, false)).is_none());
     }
 

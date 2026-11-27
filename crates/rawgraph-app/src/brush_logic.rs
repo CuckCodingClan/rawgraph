@@ -300,7 +300,7 @@ mod tests {
     fn what_the_logic_produces_is_accepted_by_the_core() {
         use rawgraph_core::{Graph, ImageId, NodeData, NodeKind};
         let mut g = Graph::new();
-        let id = g.add_node(NodeKind::BrushMask, [0.0, 0.0]);
+        let id = g.add_node(NodeKind::Draw, [0.0, 0.0]);
         let s = BrushSettings::default();
         let mut b = StrokeBuilder::new(&s, false, [0.2, 0.2], 1.5);
         b.add([0.4, 0.3]);

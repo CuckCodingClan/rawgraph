@@ -286,7 +286,12 @@ struct RequestKey {
 impl RequestKey {
     #[cfg(test)]
     fn new(session: &Session, node: NodeId, scopes: Option<PrepareSettings>, overlay: Option<NodeId>) -> Self {
-        Self::for_image(session, session.current_image(), node, None, scopes, overlay)
+        Self::for_target(session, node, None, scopes, overlay)
+    }
+
+    #[cfg(test)]
+    fn for_target(session: &Session, node: NodeId, port: Option<usize>, scopes: Option<PrepareSettings>, overlay: Option<NodeId>) -> Self {
+        Self::for_image(session, session.current_image(), node, port, scopes, overlay)
     }
 
     /// The request for a given image (the compare view renders the reference image this way).
@@ -1569,8 +1574,10 @@ impl App {
 
     fn single_viewer_request(&self) -> Option<(ImageId, NodeId, Option<usize>)> {
         let target = if self.compare.active() { self.session.viewer_target(None, self.session.viewed_node) } else { self.primary_target() };
-        let image = target.image?;
         let (node, port) = self.session.render_viewer_target(target)?;
+        // A pinned image stays; otherwise a node whose collection does not contain the selected
+        // photo (e.g. a standalone Generator) shows its own image.
+        let image = if target.image_pinned { target.image? } else { self.session.image_for_target(node, port).or(target.image)? };
         Some((image, node, port))
     }
 
@@ -1594,7 +1601,7 @@ impl App {
         }
         let scopes = (!self.compare.active() && self.scopes_pos != ScopesPos::Hidden).then(|| self.scope_panel.prepare_settings());
         let overlay = crate::groups::overlay_request(self.show_mask_overlay, &self.session.project.graph, self.session.selected_node);
-        // A brush mask is drawn in the frame of the node that uses it; one that cannot be shown right
+        // A drawing is drawn in the frame of the node that uses it; one that cannot be shown right
         // on this picture is not drawn at all.
         let (overlay, overlay_frame) = if port.is_some() { (overlay, None) } else { crate::frames::overlay_for_render(&self.session.project.graph, overlay, node) };
         let histogram = self
@@ -2045,8 +2052,9 @@ impl App {
                 let sat = g.nodes().find(|n| n.kind == NodeKind::Saturation).map(|n| n.id);
                 let out = g.nodes().find(|n| n.kind == NodeKind::Output).map(|n| n.id);
                 if let (Some(exp), Some(sat), Some(out)) = (exp, sat, out) {
-                    let brush = g.add_node(NodeKind::BrushMask, [0.0, 300.0]);
-                    let _ = g.connect(brush, exp, 1);
+                    let brush = g.add_node(NodeKind::Draw, [0.0, 300.0]);
+                    if let Some(input) = g.input_of(exp, 0) { let _ = g.connect(input, brush, 0); }
+                    if let Ok(port) = g.expose_parameter(exp, "ev", rawgraph_core::PortType::Images) { let _ = g.connect(brush, exp, port); }
                     if let Some(n) = g.node_mut(exp) {
                         n.set_param("ev", image, 1.5);
                     }
@@ -2134,7 +2142,7 @@ impl App {
                     s.sort_by(f32::total_cmp);
                     format!("n={} min {:.1} median {:.1} max {:.1} ms", s.len(), s[0], s[s.len() / 2], s[s.len() - 1])
                 };
-                eprintln!("BENCH preview {} px, brush mask with 30 existing strokes + {} points in progress", self.session.provider.preview_size(), TOOL_BENCH_STEPS);
+                eprintln!("BENCH preview {} px, drawing with 30 existing strokes + {} points in progress", self.session.provider.preview_size(), TOOL_BENCH_STEPS);
                 eprintln!("BENCH paint: pointer move -> updated frame: {}", stats(&tb.paint));
                 eprintln!("BENCH curve: drag step -> updated frame:    {}", stats(&tb.curve));
                 let (lat, eval): (Vec<f32>, Vec<f32>) = tb.transform.iter().copied().unzip();
@@ -2713,11 +2721,6 @@ impl App {
             return;
         }
         if self.primary_target().image.is_none() { return; }
-        self.viewer.shows_mask = self
-            .session
-            .render_target()
-            .and_then(|(id, _)| self.session.project.graph.node(id))
-            .is_some_and(|n| n.kind.output() == Some(rawgraph_core::PortType::Mask));
         // Keep the previous frame visible while a proxy decodes.
         self.viewer.busy = None;
         if self.renderer.pending() && self.session.selected.is_some_and(|id| !self.session.provider.is_cached(id)) {
@@ -3247,10 +3250,11 @@ pub fn apply_cli_state(session: &mut Session, cli: &Cli) {
         }
     }
     for (node, points, look) in &cli.paint {
-        let Some(id) = session.node_by_index(*node).filter(|id| session.project.graph.node(*id).is_some_and(|n| n.kind == NodeKind::BrushMask)) else {
-            eprintln!("--paint: node {node} is not a Brush Mask");
+        let Some(id) = session.node_by_index(*node).filter(|id| session.project.graph.node(*id).is_some_and(|n| n.kind == NodeKind::Draw)) else {
+            eprintln!("--paint: node {node} is not a Draw");
             continue;
         };
+        let image = session.draw_image(id, image);
         let mut settings = session.brush.clone();
         if let Some([size, hardness, flow]) = look {
             settings.size_pct = *size;
@@ -3613,7 +3617,7 @@ mod tests {
     fn the_mask_overlay_and_new_metadata_trigger_exactly_one_new_request() {
         let s = demo_session();
         let out = s.output_node().unwrap();
-        let mask = s.project.graph.nodes().find(|n| n.kind == NodeKind::GradientMask).unwrap().id;
+        let mask = s.project.graph.nodes().find(|n| n.kind == NodeKind::Generator).unwrap().id;
         let base = RequestKey::new(&s, out, None, None);
         assert!(base != RequestKey::new(&s, out, None, Some(mask)), "switching the overlay on asks once");
         assert!(RequestKey::new(&s, out, None, Some(mask)) == RequestKey::new(&s, out, None, Some(mask)));

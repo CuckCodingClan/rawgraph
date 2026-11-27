@@ -41,26 +41,33 @@ pub fn saturation(img: &mut ImageBuf, amount: f32) {
     });
 }
 
-/// Linear gradient mask. `angle_deg` 0 runs left to right, 90 top to bottom.
-/// `center` is where the mask reaches 0.5 along that direction and `width`
-/// the length of the transition, both as a fraction of the image.
-pub fn linear_gradient_mask(width: u32, height: u32, angle_deg: f32, center: f32, transition: f32) -> MaskBuf {
-    let (sin, cos) = angle_deg.to_radians().sin_cos();
-    let mut mask = MaskBuf::new(width, height, 0.0);
-    let (w, h) = (width as f32, height as f32);
-    mask.data.par_chunks_mut(width.max(1) as usize).enumerate().for_each(|(y, row)| {
-        let v = (y as f32 + 0.5) / h - 0.5;
-        for (x, out) in row.iter_mut().enumerate() {
-            let u = (x as f32 + 0.5) / w - 0.5;
-            let along = u * cos + v * sin + 0.5;
-            *out = if transition <= f32::EPSILON {
-                if along >= center { 1.0 } else { 0.0 }
-            } else {
-                ((along - center) / transition + 0.5).clamp(0.0, 1.0)
-            };
+/// Apply a different exposure value at each pixel.
+pub fn exposure_mapped(img: &mut ImageBuf, ev: &[f32]) {
+    img.data_mut().par_chunks_exact_mut(4).zip(ev).for_each(|(px, ev)| {
+        let gain = ev.exp2();
+        for c in &mut px[..3] { *c *= gain; }
+    });
+}
+
+/// Apply a different saturation amount at each pixel.
+pub fn saturation_mapped(img: &mut ImageBuf, amounts: &[f32]) {
+    img.data_mut().par_chunks_exact_mut(4).zip(amounts).for_each(|(px, &amount)| {
+        if amount == 1.0 { return; }
+        let y = AP1_LUMA[0] * px[0] + AP1_LUMA[1] * px[1] + AP1_LUMA[2] * px[2];
+        for c in &mut px[..3] { *c = y + (*c - y) * amount; }
+    });
+}
+
+/// Apply a different contrast amount at each pixel around the same pivot.
+pub fn contrast_mapped(img: &mut ImageBuf, amounts: &[f32], pivot: f32) {
+    img.data_mut().par_chunks_exact_mut(4).zip(amounts).for_each(|(px, &amount)| {
+        if amount == 0.0 { return; }
+        let y = AP1_LUMA[0] * px[0] + AP1_LUMA[1] * px[1] + AP1_LUMA[2] * px[2];
+        if y > 0.0 {
+            let gain = pivot * (y / pivot).powf(amount.exp2()) / y;
+            for c in &mut px[..3] { *c *= gain; }
         }
     });
-    mask
 }
 
 /// Width (in pixels) of the column strips used by the vertical pass. A strip of
@@ -925,17 +932,6 @@ mod tests {
     }
 
     #[test]
-    fn gradient_mask_runs_in_the_requested_direction() {
-        let m = linear_gradient_mask(100, 10, 0.0, 0.5, 1.0);
-        assert!(m.get(0, 5) < 0.02 && m.get(99, 5) > 0.98);
-        assert!((m.get(50, 0) - m.get(50, 9)).abs() < 1e-6);
-        let m = linear_gradient_mask(10, 100, 90.0, 0.5, 1.0);
-        assert!(m.get(5, 0) < 0.02 && m.get(5, 99) > 0.98);
-        let step = linear_gradient_mask(100, 1, 0.0, 0.5, 0.0);
-        assert_eq!((step.get(10, 0), step.get(90, 0)), (0.0, 1.0));
-    }
-
-    #[test]
     fn blur_preserves_flat_areas_and_total_energy() {
         let img = flat(32, 16, [0.25, 2.0, 0.0]);
         let out = blur(&img, 3.0);
@@ -1364,7 +1360,7 @@ mod tests {
         for (i, v) in img.data_mut().iter_mut().enumerate() {
             *v = ((i * 2654435761) % 1000) as f32 / 500.0;
         }
-        let mask = linear_gradient_mask(w, h, 0.0, 0.5, 1.0);
+        let mask = MaskBuf { width: w, height: h, data: (0..w*h).map(|i| (i % w) as f32 / (w - 1) as f32).collect() };
         time_runs("blur sigma 8", || drop(blur(&img, 8.0)));
         time_runs("blur sigma 60", || drop(blur(&img, 60.0)));
         time_runs("blur_modulated max 60", || drop(blur_modulated(&img, 60.0, &mask)));

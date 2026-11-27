@@ -729,10 +729,10 @@ fn standalone_generator_normals_exports_without_source() {
     let id = ImageId(u64::MAX - generator.0);
     assert!(g.node_mut(generator).unwrap().set_param("width", id, 7.0));
     assert!(g.node_mut(generator).unwrap().set_param("height", id, 5.0));
-    let normals = g.add_node(NodeKind::Normals, [0.0; 2]);
-    assert!(g.node_mut(normals).unwrap().set_param("mode", id, 1.0));
+    let normals = g.add_node(NodeKind::NormalMap, [0.0; 2]);
+    assert!(g.node_mut(generator).unwrap().set_param("output", id, 1.0));
     let e = export_node_to(&mut g, &t.path("out"), 1.0);
-    g.connect(generator, normals, 1).unwrap();
+    g.connect(generator, normals, 0).unwrap();
     g.connect(normals, e, 0).unwrap();
     let g = Graph::from_json(&g.to_json()).unwrap();
     let report = export_node(&g, e, &[], &[id], DisplayTransform::default(), &CancelToken::new(), &mut |_| {}).unwrap();

@@ -1,6 +1,6 @@
-# Depth Estimate prototype (CPU, opt-in)
+# Depth Map prototype (CPU, opt-in)
 
-Depth Estimate takes an Images input and produces a normalized relative-depth Mask (black near, white far), not metric distance. It runs a separate local process; the application never downloads a model. Configure `RAWGRAPH_DEPTH_WORKER` as an executable path (not a shell command) and `RAWGRAPH_DEPTH_MODEL` as the ONNX file path before starting RawGraph. Unconfigured or failed workers produce an explicit evaluation error. The worker reads/writes `RGD1`, little-endian width/height and float32 RGBA input / float32 mask output. Only execute a trusted worker.
+Depth Map takes an Images input and produces an opaque grayscale Images output (linear RGB, black near and white far), not metric distance. It runs a separate local process; the application never downloads a model. Configure `RAWGRAPH_DEPTH_WORKER` as an executable path (not a shell command) and `RAWGRAPH_DEPTH_MODEL` as the ONNX file path before starting RawGraph. Unconfigured or failed workers produce an explicit evaluation error. The worker reads/writes `RGD1`, little-endian width/height and float32 RGBA input / one float32 depth sample per output pixel. Only execute a trusted worker.
 
 ## Model provenance and setup
 

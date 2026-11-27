@@ -71,8 +71,6 @@ pub struct Viewer {
     pub last_scale: f32,
     /// Red mask overlay painted above the image (view only).
     overlay: Option<TextureHandle>,
-    /// The viewed node produces a mask: a small "MASK" label is drawn in the corner.
-    pub shows_mask: bool,
     /// A tool owns the primary button: the picture pans only with Space+drag or the middle button.
     pub tool_active: bool,
     /// Pinch / Ctrl+scroll belong to the tool (brush size) instead of zooming.
@@ -100,7 +98,6 @@ impl Default for Viewer {
             excluded: None,
             last_scale: 1.0,
             overlay: None,
-            shows_mask: false,
             tool_active: false,
             pinch_to_tool: false,
             orient: None,
@@ -301,9 +298,7 @@ impl Viewer {
                 }
             }
         }
-        if self.shows_mask {
-            paint_mask_label(&painter, rect);
-        } else if self.overlay.is_some() {
+        if self.overlay.is_some() {
             paint_tag(&painter, rect, "MASK OVERLAY", Color32::from_rgb(255, 120, 110));
         }
 
@@ -338,10 +333,6 @@ fn paint_banner(painter: &egui::Painter, rect: Rect, text: &str) {
     painter.rect_filled(tag, 4.0, Color32::from_rgba_unmultiplied(12, 14, 18, 225));
     painter.rect_stroke(tag, 4.0, egui::Stroke::new(1.0, color), egui::StrokeKind::Inside);
     painter.galley(tag.min + Vec2::new(8.0, 5.0), galley, color);
-}
-
-fn paint_mask_label(painter: &egui::Painter, rect: Rect) {
-    paint_tag(painter, rect, "MASK", Color32::from_rgb(240, 165, 62));
 }
 
 /// Small tag in the top-left corner of the viewer.

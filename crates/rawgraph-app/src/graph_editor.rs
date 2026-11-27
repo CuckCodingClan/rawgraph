@@ -35,14 +35,12 @@ const TAB_INPUT: Color32 = Color32::from_rgb(58, 120, 190);
 const TAB_OUTPUT: Color32 = Color32::from_rgb(180, 70, 74);
 
 pub const COLOR_IMAGES: Color32 = Color32::from_rgb(92, 165, 240);
-pub const COLOR_MASK: Color32 = Color32::from_rgb(240, 165, 62);
 const COLOR_SELECTED: Color32 = Color32::from_rgb(255, 210, 90);
 const COLOR_WARN: Color32 = Color32::from_rgb(255, 176, 40);
 
 pub fn port_color(ty: PortType) -> Color32 {
     match ty {
         PortType::Images => COLOR_IMAGES,
-        PortType::Mask => COLOR_MASK,
     }
 }
 
@@ -67,13 +65,13 @@ pub fn category_color(category: &str) -> Color32 {
         "Geometry" => Color32::from_rgb(56, 108, 92),
         "Effects" => Color32::from_rgb(100, 84, 56),
         "Collection" => Color32::from_rgb(40, 110, 104),
-        "Mask" => Color32::from_rgb(128, 90, 34),
+        "Generators" => Color32::from_rgb(128, 90, 34),
         _ => Color32::from_rgb(70, 76, 90),
     }
 }
 
 /// Categories in the order of the add-node menu and the Tab search.
-pub const CATEGORY_ORDER: [&str; 9] = ["Input/Output", "Develop", "Tone", "Colour", "Detail", "Geometry", "Effects", "Collection", "Mask"];
+pub const CATEGORY_ORDER: [&str; 9] = ["Input/Output", "Develop", "Tone", "Colour", "Detail", "Geometry", "Effects", "Collection", "Generators"];
 
 /// Groups of the add-node menu and the Tab search: every node kind once, by
 /// `NodeKind::category()`, categories in `CATEGORY_ORDER`, kinds in their
@@ -114,11 +112,6 @@ fn summary_row_count(kind: NodeKind) -> usize {
     }
 }
 
-/// Whether the box shows an image count (mask producers do not carry images).
-fn has_count(kind: NodeKind) -> bool {
-    kind.output() != Some(PortType::Mask)
-}
-
 fn compact(v: f32) -> String {
     if (v - v.round()).abs() < 1e-3 {
         format!("{v:.0}")
@@ -149,7 +142,11 @@ pub fn summary_rows(node: &rawgraph_core::Node, image: ImageId) -> Vec<(String, 
     // Exposed parameters always occupy the first summary rows, in stable port
     // order, regardless of the current image or which slider values changed.
     let mut rows: Vec<_> = node.exposed_inputs().iter().flatten()
-        .map(|input| parameter_row(node, image, node.kind.param_spec(&input.parameter).unwrap()))
+        .map(|input| match node.kind.param_spec(&input.parameter) {
+            Some(spec) => parameter_row(node, image, spec),
+            // Vector inputs such as Filter direction have no slider: show the port's own label.
+            None => crate::groups::Row { key: None, label: Graph::parameter_input_label(node.kind, &input.parameter).unwrap_or(&input.parameter).to_owned(), value: "image".to_owned(), changed: true },
+        })
         .collect();
     let max = MAX_BOX_ROWS.saturating_sub(rows.len());
     let other = all_rows(node, image).into_iter()
@@ -176,7 +173,7 @@ pub fn node_size(kind: NodeKind) -> Vec2 {
     let rows = port_rows(kind) as f32;
     let params = summary_row_count(kind) as f32;
     let param_block = if params > 0.0 { params * PARAM_H + 4.0 } else { 0.0 };
-    let count = if has_count(kind) { COUNT_H } else { 0.0 };
+    let count = COUNT_H;
     Vec2::new(NODE_W, TITLE_H + 6.0 + rows * ROW_H + param_block + count + PAD)
 }
 
@@ -197,8 +194,10 @@ fn record_port_control(response: &egui::Response, id: NodeId, name: &'static str
 fn input_menu(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions: &mut Vec<Action>) {
     for &parameter in Graph::supported_parameter_inputs(node.kind) {
         if node.exposed_inputs().iter().flatten().any(|p| p.parameter == parameter) { continue; }
-        let label = node.kind.param_spec(parameter).unwrap().label;
-        let response = ui.button(label).on_hover_text("Map luminance linearly to the parameter's full range (replaces its slider value)");
+        let label = Graph::parameter_input_label(node.kind, parameter).unwrap();
+        let hint = if parameter == "direction" { "Use linear RGB as an encoded Motion Blur direction" }
+            else { "Map luminance linearly to the parameter's full range (replaces its slider value)" };
+        let response = ui.button(label).on_hover_text(hint);
         #[cfg(test)] record_port_control(&response, id, "input_item");
         if response.clicked() { actions.push(Action::ExposeInput(id, parameter)); ui.close(); }
     }
@@ -717,7 +716,7 @@ impl GraphEditor {
                 for i in 0..kind.inputs().len() + node.exposed_inputs().len() {
                     let Some(ty) = node.input_type(i) else { continue };
                     let builtin = kind.inputs().get(i);
-                    let label = builtin.map(|s| s.label).unwrap_or_else(|| kind.param_spec(&node.exposed_inputs()[i - kind.inputs().len()].as_ref().unwrap().parameter).unwrap().label);
+                    let label = builtin.map(|s| s.label).unwrap_or_else(|| Graph::parameter_input_label(kind, &node.exposed_inputs()[i - kind.inputs().len()].as_ref().unwrap().parameter).unwrap_or("Input"));
                     let c = xf.to_screen(input_port(&node, i));
                     let connected = session.project.graph.input_of(id, i).is_some();
                     inputs.push((id, i, c, ty));
@@ -1058,11 +1057,7 @@ impl GraphEditor {
         for (port, spec) in node.kind.outputs().iter().enumerate() {
             let p = node_rect.min + output_port([0.0, 0.0], port).to_vec2() * z;
             if !is_split {
-                let label = match spec.ty {
-                    PortType::Images => "Images",
-                    PortType::Mask => "Mask",
-                };
-                painter.text(p - Vec2::new(11.0 * z, 0.0), Align2::RIGHT_CENTER, label, label_font.clone(), label_color);
+                painter.text(p - Vec2::new(11.0 * z, 0.0), Align2::RIGHT_CENTER, spec.label, label_font.clone(), label_color);
                 continue;
             }
             // Split by Metadata: range name and how many images leave through the port.
@@ -1085,7 +1080,7 @@ impl GraphEditor {
             painter.text(node_rect.min + Vec2::new(10.0, y) * z, Align2::LEFT_CENTER, label, FontId::proportional(11.0 * z), Color32::from_gray(130));
             painter.text(node_rect.min + Vec2::new(NODE_W - 10.0, y) * z, Align2::RIGHT_CENTER, value, FontId::monospace(11.0 * z), color);
         }
-        if has_count(node.kind) {
+        {
             let text = match session.collection.counts.get(&id) {
                 Some(n) => format!("{} img", crate::collection::with_thousands(*n)),
                 None => "... img".to_owned(),
@@ -1348,20 +1343,8 @@ fn draw_port(painter: &egui::Painter, c: Pos2, ty: PortType, connected: bool, ho
     let color = port_color(ty);
     let fill = if connected || hot { color } else { Color32::from_rgb(30, 32, 38) };
     let stroke = Stroke::new((1.6 * zoom).max(1.0), if hot { Color32::WHITE } else { color });
-    match ty {
-        PortType::Images => {
-            painter.circle_filled(c, r, fill);
-            painter.circle_stroke(c, r, stroke);
-        }
-        PortType::Mask => {
-            // Hollow diamond while nothing is connected, filled once it is.
-            let d = r * 1.35;
-            let pts = vec![Pos2::new(c.x, c.y - d), Pos2::new(c.x + d, c.y), Pos2::new(c.x, c.y + d), Pos2::new(c.x - d, c.y)];
-            let hollow = Stroke::new((2.0 * zoom).max(1.4), if hot { Color32::WHITE } else { color });
-            let fill = if connected || hot { color } else { Color32::from_rgb(44, 47, 54) };
-            painter.add(egui::Shape::convex_polygon(pts, fill, hollow));
-        }
-    }
+    painter.circle_filled(c, r, fill);
+    painter.circle_stroke(c, r, stroke);
 }
 
 
@@ -1769,18 +1752,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_connections_are_refused_with_a_message() {
-        let (mut g, _, exp, _) = loose_graph();
-        let mask = g.add_node(NodeKind::GradientMask, [0.0, 150.0]);
-        let mut h = Harness::new(g);
-        let (from, to) = (h.out_port(mask), h.in_port(exp, 0));
-        h.drag(from, to);
-        assert_eq!(h.s.project.graph.input_of(exp, 0), None);
-        let (text, is_error) = h.st.current().expect("a status message");
-        assert!(is_error && text.contains("Cannot connect") && text.contains("Mask"), "{text}");
-    }
-
-    #[test]
     fn dragging_a_node_moves_it_and_selects_it() {
         let (g, _, exp, _) = loose_graph();
         let mut h = Harness::new(g);
@@ -1859,7 +1830,7 @@ mod tests {
         assert_eq!(names, expected, "the order given for the menu");
         assert_eq!(names[0], "Input/Output");
         assert_eq!(names[1], "Develop");
-        assert_eq!(*names.last().unwrap(), "Mask");
+        assert_eq!(*names.last().unwrap(), "Generators");
         for (cat, kinds) in &groups {
             assert!(kinds.iter().all(|k| k.category() == *cat));
         }
@@ -1867,8 +1838,11 @@ mod tests {
         assert_eq!(develop.1, vec![NodeKind::CaptureEv, NodeKind::Develop]);
         let tone: Vec<NodeKind> = groups.iter().find(|(g, _)| *g == "Tone").unwrap().1.clone();
         assert!(tone.contains(&NodeKind::Exposure) && tone.contains(&NodeKind::ToneCurve));
-        let mask = &groups.iter().find(|(g, _)| *g == "Mask").unwrap().1;
-        assert!(mask.contains(&NodeKind::RadialMask) && mask.contains(&NodeKind::GradientMask) && mask.contains(&NodeKind::MaskCombine));
+        let generators = &groups.iter().find(|(g, _)| *g == "Generators").unwrap().1;
+        assert_eq!(generators.len(), 4);
+        for kind in [NodeKind::Generator, NodeKind::Draw, NodeKind::DepthMap, NodeKind::NormalMap] {
+            assert!(generators.contains(&kind));
+        }
     }
 
     #[test]
@@ -1919,11 +1893,10 @@ mod tests {
     }
 
     #[test]
-    fn nearest_port_respects_types() {
+    fn nearest_port_respects_distance() {
         let a = NodeId(1);
-        let inputs = vec![(a, 0, Pos2::new(10.0, 10.0), PortType::Images), (a, 1, Pos2::new(10.0, 40.0), PortType::Mask)];
+        let inputs = vec![(a, 0, Pos2::new(10.0, 10.0), PortType::Images), (a, 1, Pos2::new(10.0, 40.0), PortType::Images)];
         assert_eq!(nearest_input(&inputs, Pos2::new(12.0, 12.0), 1.0, None).map(|x| x.1), Some(0));
-        assert!(nearest_input(&inputs, Pos2::new(12.0, 12.0), 1.0, Some(PortType::Mask)).is_none());
         assert!(nearest_input(&inputs, Pos2::new(300.0, 300.0), 1.0, None).is_none());
     }
 
@@ -2010,18 +1983,6 @@ mod tests {
         assert_eq!(g.output_label(split, 2, img), "Range 3", "an undefined range keeps its default label");
         assert_eq!(g.output_label(split, 6, img), "Unmatched");
         assert_eq!(g.output_label(split, 7, img), "", "no such port");
-    }
-
-    #[test]
-    fn connections_to_the_wrong_port_type_are_refused_for_every_split_output() {
-        let (mut g, _, split, a, _, _) = split_graph_loose();
-        let mask_user = g.add_node(NodeKind::MaskAdjust, [0.0, 0.0]);
-        let mut h = Harness::new(std::mem::take(&mut g));
-        let (from, to) = (h.out_port_n(split, 5), h.in_port(mask_user, 0));
-        h.drag(from, to);
-        assert_eq!(h.s.project.graph.input_edge(mask_user, 0), None);
-        assert!(h.st.current().is_some_and(|(t, e)| e && t.contains("Cannot connect")));
-        let _ = a;
     }
 
     // ---- wave 5b: multi-selection, copy / paste, recipes ----

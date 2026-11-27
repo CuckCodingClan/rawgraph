@@ -1,8 +1,7 @@
 //! Pure rules for long parameter lists: which parameters form a group in the
-//! inspector, which ones fit into a node box, and the text that describes the
-//! mask input of a node. No UI code, so everything here is unit-testable.
+//! inspector, which ones fit into a node box, and which image control to overlay.
 
-use rawgraph_core::{Graph, ImageId, Node, NodeId, NodeKind, ParamKind, ParamSpec, PortType};
+use rawgraph_core::{Graph, ImageId, Node, NodeId, NodeKind, ParamKind, ParamSpec};
 
 /// Most parameters a node box shows; the rest is summarised as "... +n".
 pub const MAX_BOX_ROWS: usize = 4;
@@ -232,38 +231,23 @@ pub fn box_row_count(kind: NodeKind) -> usize {
     n.min(MAX_BOX_ROWS) + usize::from(n > MAX_BOX_ROWS)
 }
 
-/// "Mask modulates: Exposure - ..." for nodes with an optional mask input;
-/// `None` for nodes whose mask input does not modulate a parameter.
-pub fn mask_text(graph: &Graph, id: NodeId) -> Option<String> {
-    let node = graph.node(id)?;
-    let (port, spec) = node.kind.inputs().iter().enumerate().find(|(_, s)| s.ty == PortType::Mask && s.modulates.is_some())?;
-    let param = node.kind.param_spec(spec.modulates?)?;
-    let connected = graph.input_of(id, port).is_some();
-    Some(if connected {
-        format!("Mask modulates: {} \u{2014} 0 = no change, 1 = full value", param.label)
-    } else {
-        format!("Mask input (optional): connect a mask to apply {} only where the mask is above 0 (0 = no change, 1 = full value).", param.label)
-    })
-}
-
-/// The mask node feeding the first connected mask input of `id`, if any:
-/// the node whose mask the overlay shows.
-pub fn overlay_source(graph: &Graph, id: NodeId) -> Option<NodeId> {
-    let node = graph.node(id)?;
-    node.kind.inputs().iter().enumerate().filter(|(_, s)| s.ty == PortType::Mask).find_map(|(port, _)| graph.input_of(id, port))
-}
-
 /// Which mask the viewer should overlay: only when the toggle is on and the
 /// selected node has a connected mask input.
 pub fn overlay_request(enabled: bool, graph: &Graph, selected: Option<NodeId>) -> Option<NodeId> {
-    // A selected Brush Mask is being painted: its own mask is always shown.
-    if let Some(node) = selected.and_then(|id| graph.node(id)).filter(|n| n.kind == NodeKind::BrushMask) {
+    // A selected Draw is being painted: its own mask is always shown.
+    if let Some(node) = selected.and_then(|id| graph.node(id)).filter(|n| n.kind == NodeKind::Draw) {
         return Some(node.id);
     }
     if !enabled {
         return None;
     }
-    overlay_source(graph, selected?)
+    let id = selected?;
+    let node = graph.node(id)?;
+    node.exposed_inputs().iter().enumerate().find_map(|(i, input)| {
+        let input = input.as_ref()?;
+        if input.parameter == "direction" { return None; }
+        graph.input_of(id, node.kind.inputs().len() + i)
+    })
 }
 
 #[cfg(test)]
@@ -425,33 +409,19 @@ mod tests {
     }
 
     #[test]
-    fn mask_text_names_the_modulated_parameter() {
-        let mut g = Graph::new();
-        let e = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
-        let m = g.add_node(NodeKind::RadialMask, [0.0, 0.0]);
-        let t = mask_text(&g, e).unwrap();
-        assert!(t.contains("Exposure") && t.contains("optional"), "{t}");
-        g.connect(m, e, 1).unwrap();
-        let t = mask_text(&g, e).unwrap();
-        assert!(t.starts_with("Mask modulates: Exposure"), "{t}");
-        assert!(t.contains("0 = no change, 1 = full value"));
-        let s = g.add_node(NodeKind::Source, [0.0, 0.0]);
-        assert_eq!(mask_text(&g, s), None);
-    }
-
-    #[test]
     fn overlay_needs_the_toggle_and_a_connected_mask() {
         let mut g = Graph::new();
         let e = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
-        let m = g.add_node(NodeKind::RadialMask, [0.0, 0.0]);
+        let m = g.add_node(NodeKind::Generator, [0.0, 0.0]);
         assert_eq!(overlay_request(true, &g, Some(e)), None, "no mask connected");
-        g.connect(m, e, 1).unwrap();
+        let port = g.expose_parameter(e, "ev", rawgraph_core::PortType::Images).unwrap();
+        g.connect(m, e, port).unwrap();
         assert_eq!(overlay_request(true, &g, Some(e)), Some(m));
         assert_eq!(overlay_request(false, &g, Some(e)), None, "toggle off");
         assert_eq!(overlay_request(true, &g, None), None, "nothing selected");
         assert_eq!(overlay_request(true, &g, Some(m)), None, "the mask node itself has no mask input");
-        // A brush mask is the exception: while it is selected its mask is shown without the toggle.
-        let b = g.add_node(NodeKind::BrushMask, [0.0, 0.0]);
+        // A drawing is the exception: while it is selected its mask is shown without the toggle.
+        let b = g.add_node(NodeKind::Draw, [0.0, 0.0]);
         assert_eq!(overlay_request(false, &g, Some(b)), Some(b));
         assert_eq!(overlay_request(true, &g, Some(b)), Some(b));
     }

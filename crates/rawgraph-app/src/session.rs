@@ -754,7 +754,7 @@ impl Session {
     pub fn tool_mode(&self) -> ToolMode {
         let Some(node) = self.selected_node.and_then(|id| self.project.graph.node(id)) else { return ToolMode::None };
         match node.kind {
-            NodeKind::BrushMask if self.viewed_node.is_none() || matches!(self.brush_plan(node.id), crate::frames::BrushPlan::Mapped { .. }) => ToolMode::Brush(node.id),
+            NodeKind::Draw if self.viewed_node.is_none() || matches!(self.brush_plan(node.id), crate::frames::BrushPlan::Mapped { .. }) => ToolMode::Brush(node.id),
             NodeKind::Transform if self.viewed_node.is_none() && self.project.graph.input_edge(node.id, 0).is_some() => ToolMode::Crop(node.id),
             _ => ToolMode::None,
         }
@@ -780,7 +780,7 @@ impl Session {
                 return Some((edge.from, Some(edge.from_port)));
             }
         }
-        // Painting a brush mask whose picture cannot be shown right behind later geometry:
+        // Painting a drawing whose picture cannot be shown right behind later geometry:
         // show the picture as it leaves the node that uses the mask.
         if let ToolMode::Brush(id) = self.tool_mode() {
             if let crate::frames::BrushPlan::ShowConsumer { consumer } = crate::frames::brush_plan(&self.project.graph, id, target.node) {
@@ -788,6 +788,29 @@ impl Session {
             }
         }
         target.node.map(|n| (n, None))
+    }
+
+    /// Draw uses its generated identity when it has no image input.
+    pub fn draw_image(&self, draw: NodeId, viewed_image: ImageId) -> ImageId {
+        if self.project.graph.input_edge(draw, 0).is_none() { ImageId(u64::MAX - draw.0) } else { viewed_image }
+    }
+
+    /// The selected photo, or a generated member when this view does not carry it.
+    pub fn image_for_target(&self, node: NodeId, port: Option<usize>) -> Option<ImageId> {
+        let eval = rawgraph_engine::Evaluator::new();
+        let graph = &self.project.graph;
+        let output = port.unwrap_or(0);
+        let provider = self.provider.as_ref();
+        // Normal photo views preserve the selection, including excluded photos.
+        // Metadata Split preview is the unfiltered input, not its first output.
+        if let Some(image) = self.selected {
+            if graph.node(node).is_some_and(|n| n.kind == NodeKind::MetadataSplit) && port.is_none()
+                || eval.contains_output(graph, node, output, image, provider) {
+                return Some(image);
+            }
+        }
+        let standalone = rawgraph_core::graph::Catalog { images: &[], capture: &|_| None };
+        graph.members(node, output, &standalone).first().copied().or(self.selected)
     }
 
     /// How the brush tool of `brush` paints on the picture that is shown.
@@ -890,7 +913,7 @@ pub fn fresh_project() -> Project {
 }
 
 /// Source -> Develop -> Capture EV -> White Balance -> Exposure -> Saturation
-/// -> Blur -> Output, with a Gradient Mask driving the Blur radius.
+/// -> Blur -> Output, with a Generator gradient driving the Blur radius.
 pub fn demo_graph() -> Graph {
     let mut g = Graph::new();
     let (dx, y) = (240.0, 40.0);
@@ -902,12 +925,17 @@ pub fn demo_graph() -> Graph {
     let sat = g.add_node(NodeKind::Saturation, [5.0 * dx, y]);
     let blur = g.add_node(NodeKind::Blur, [6.0 * dx, y]);
     let out = g.add_node(NodeKind::Output, [7.0 * dx, y]);
-    let mask = g.add_node(NodeKind::GradientMask, [5.0 * dx, y + 170.0]);
+    let mask = g.add_node(NodeKind::Generator, [5.0 * dx, y + 170.0]);
     let chain = [src, dev, cap, wb, exp, sat, blur, out];
     for pair in chain.windows(2) {
         g.connect(pair[0], pair[1], 0).expect("demo chain is valid");
     }
-    g.connect(mask, blur, 1).expect("demo mask is valid");
+    let port = g.expose_parameter(blur, "radius", rawgraph_core::PortType::Images).expect("Filter supports Radius");
+    g.connect(mask, blur, port).expect("demo control is valid");
+    // Keep the demo preview modest despite Radius mapping to its full range.
+    let map = g.node_mut(mask).unwrap();
+    for key in ["end_r", "end_g", "end_b"] { map.set_param(key, ImageId(0), 0.03); }
+    map.set_param("height", ImageId(0), 2.0);
     g
 }
 
@@ -962,12 +990,12 @@ pub mod tests {
                 NodeKind::Saturation,
                 NodeKind::Blur,
                 NodeKind::Output,
-                NodeKind::GradientMask
+                NodeKind::Generator
             ]
         );
         assert_eq!(g.edges().len(), 8);
         let blur = g.nodes().find(|n| n.kind == NodeKind::Blur).unwrap().id;
-        let mask = g.nodes().find(|n| n.kind == NodeKind::GradientMask).unwrap().id;
+        let mask = g.nodes().find(|n| n.kind == NodeKind::Generator).unwrap().id;
         assert_eq!(g.input_of(blur, 1), Some(mask));
     }
 
