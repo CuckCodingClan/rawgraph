@@ -25,7 +25,7 @@ pub fn entries() -> Vec<ImageEntry> {
         as_shot_kelvin: None,
         as_shot_tint: None,
         baseline_exposure: None,
-        path: None,
+        ..Default::default()
     };
     let captures = [
         cap(100.0, 1.0 / 125.0, Some(8.0), false),

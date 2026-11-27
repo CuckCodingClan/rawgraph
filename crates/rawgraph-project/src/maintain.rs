@@ -103,7 +103,8 @@ impl Project {
         }
         let (hash, size) = util::content_hash(&new_path)
             .map_err(|e| ProjectError::Io(format!("{}: {e}", new_path.display())))?;
-        if !force && (size != old_size || hash != old_hash) {
+        // An entry whose scan was interrupted before hashing has only its size to compare.
+        if !force && (size != old_size || (!old_hash.is_empty() && hash != old_hash)) {
             return Err(ProjectError::Mismatch(format!(
                 "{} differs from the original file (size {size} bytes instead of {old_size}, or different content)",
                 new_path.display()

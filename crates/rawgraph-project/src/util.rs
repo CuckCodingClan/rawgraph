@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Component, Path};
+use std::path::Path;
 
 /// Size of the hashed head and tail windows.
 pub const HASH_WINDOW: u64 = 64 * 1024;
@@ -54,23 +54,23 @@ pub fn content_hash(path: &Path) -> io::Result<(String, u64)> {
 /// so "img2" sorts before "img10". Equal-looking strings fall back to the
 /// plain comparison so the order is total and deterministic.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
-    let (mut ai, mut bi) = (a.chars().peekable(), b.chars().peekable());
+    let (mut ai, mut bi) = (a.char_indices().peekable(), b.char_indices().peekable());
     loop {
         match (ai.peek().copied(), bi.peek().copied()) {
             (None, None) => return a.cmp(b),
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) => {
+            (Some((_, x)), Some((_, y))) => {
                 if x.is_ascii_digit() && y.is_ascii_digit() {
-                    let da = take_digits(&mut ai);
-                    let db = take_digits(&mut bi);
+                    let da = take_digits(a, &mut ai);
+                    let db = take_digits(b, &mut bi);
                     let (ta, tb) = (da.trim_start_matches('0'), db.trim_start_matches('0'));
                     let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb));
                     if ord != Ordering::Equal {
                         return ord;
                     }
                 } else {
-                    let ord = lower(x).cmp(&lower(y));
+                    let ord = if x == y { Ordering::Equal } else { lower(x).cmp(&lower(y)) };
                     if ord != Ordering::Equal {
                         return ord;
                     }
@@ -83,33 +83,77 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
 }
 
 fn lower(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
+    if c.is_ascii() { c.to_ascii_lowercase() } else { c.to_lowercase().next().unwrap_or(c) }
 }
 
-fn take_digits(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
-    let mut s = String::new();
-    while let Some(c) = it.peek().copied() {
-        if c.is_ascii_digit() {
-            s.push(c);
-            it.next();
-        } else {
+/// The run of ASCII digits at the iterator's position, as a slice of `s` (no allocation:
+/// scan sorting compares every path pair this way).
+fn take_digits<'a>(s: &'a str, it: &mut std::iter::Peekable<std::str::CharIndices<'_>>) -> &'a str {
+    let start = it.peek().map_or(s.len(), |&(i, _)| i);
+    let mut end = start;
+    while let Some(&(i, c)) = it.peek() {
+        if !c.is_ascii_digit() {
             break;
         }
+        end = i + 1;
+        it.next();
     }
-    s
+    &s[start..end]
 }
 
 /// Natural order of two paths, component by component.
 pub fn path_cmp(a: &Path, b: &Path) -> Ordering {
-    let ca: Vec<Component<'_>> = a.components().collect();
-    let cb: Vec<Component<'_>> = b.components().collect();
-    for (x, y) in ca.iter().zip(cb.iter()) {
-        let ord = natural_cmp(&x.as_os_str().to_string_lossy(), &y.as_os_str().to_string_lossy());
-        if ord != Ordering::Equal {
-            return ord;
+    let (mut ac, mut bc) = (a.components(), b.components());
+    loop {
+        match (ac.next(), bc.next()) {
+            (Some(x), Some(y)) => {
+                let ord = natural_cmp(&x.as_os_str().to_string_lossy(), &y.as_os_str().to_string_lossy());
+                if ord != Ordering::Equal { return ord; }
+            }
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (None, None) => return a.cmp(b),
         }
     }
-    ca.len().cmp(&cb.len()).then_with(|| a.cmp(b))
+}
+
+/// Sorts listed files below `folder` in [`path_cmp`] order. Every path shares the
+/// folder prefix, so only the part below it is compared.
+pub fn sort_under<T>(folder: &Path, files: &mut [(std::path::PathBuf, T)]) {
+    if files.iter().all(|(p, _)| p.starts_with(folder)) {
+        // Components are converted once per file rather than once per comparison.
+        files.sort_by_cached_key(|(p, _)| NaturalPath::new(p.strip_prefix(folder).unwrap_or(p), p));
+    } else {
+        files.sort_by(|a, b| path_cmp(&a.0, &b.0));
+    }
+}
+
+/// Sort key equal to [`path_cmp`] order for paths below one folder.
+#[derive(PartialEq, Eq)]
+struct NaturalPath(Vec<String>, std::path::PathBuf);
+
+impl NaturalPath {
+    fn new(rel: &Path, full: &Path) -> Self {
+        Self(rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect(), full.to_path_buf())
+    }
+}
+
+impl Ord for NaturalPath {
+    fn cmp(&self, other: &Self) -> Ordering {
+        for (x, y) in self.0.iter().zip(&other.0) {
+            let ord = natural_cmp(x, y);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        self.0.len().cmp(&other.0.len()).then_with(|| self.1.cmp(&other.1))
+    }
+}
+
+impl PartialOrd for NaturalPath {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Key under which paths are compared for identity (case-insensitive on Windows).

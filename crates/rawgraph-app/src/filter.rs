@@ -62,13 +62,15 @@ impl FilterUi {
 pub fn sort_label(k: SortKey) -> &'static str {
     match k {
         SortKey::FileName => "Name",
+        SortKey::ModifiedDate => "Modified date",
+        SortKey::CaptureDate => "Capture date",
         SortKey::Iso => "ISO",
         SortKey::Ev100 => "EV100",
         SortKey::Rating => "Rating",
     }
 }
 
-pub const SORT_KEYS: [SortKey; 4] = [SortKey::FileName, SortKey::Iso, SortKey::Ev100, SortKey::Rating];
+pub const SORT_KEYS: [SortKey; 6] = [SortKey::FileName, SortKey::ModifiedDate, SortKey::CaptureDate, SortKey::Iso, SortKey::Ev100, SortKey::Rating];
 
 #[cfg(test)]
 mod tests {

@@ -22,6 +22,7 @@ mod ids;
 mod maintain;
 mod recovery;
 mod store;
+pub mod staged;
 mod thumbs;
 mod util;
 mod xmp;
@@ -83,7 +84,7 @@ pub struct ImageEntry {
     pub uuid: String,
     /// Absolute path of the source file.
     pub path: PathBuf,
-    /// Partial content hash (hex), see the crate documentation.
+    /// Partial content hash (hex), or empty until hashing succeeds.
     pub content_hash: String,
     pub file_size: u64,
     /// File modification time, milliseconds since the Unix epoch, if known.
@@ -153,9 +154,42 @@ pub struct Filter {
     pub include_missing: bool,
 }
 
+impl Filter {
+    pub fn matches(&self, e: &ImageEntry) -> bool {
+        if e.missing && !self.include_missing {
+            return false;
+        }
+        if self.iso_min.is_some() || self.iso_max.is_some() {
+            let Some(iso) = e.capture.iso else { return false };
+            if self.iso_min.is_some_and(|min| iso < min) || self.iso_max.is_some_and(|max| iso > max) {
+                return false;
+            }
+        }
+        if self.min_rating.is_some_and(|r| e.rating < r) {
+            return false;
+        }
+        if self.flag.is_some_and(|f| e.flag != f) {
+            return false;
+        }
+        if let Some(want) = self.flash_fired {
+            if e.capture.flash_fired != Some(want) {
+                return false;
+            }
+        }
+        if let Some(n) = &self.text {
+            if !e.file_name().to_lowercase().contains(&n.to_lowercase()) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortKey {
     FileName,
+    ModifiedDate,
+    CaptureDate,
     Iso,
     Ev100,
     Rating,
@@ -413,8 +447,8 @@ impl Project {
         if folder.is_dir() {
             self.note_folder(&folder, recursive);
         }
-        let mut files = collect_files(&folder, recursive, is_supported, &mut report.failed);
-        files.sort_by(|a, b| util::path_cmp(&a.0, &b.0));
+        let mut files = collect_files_with(&folder, recursive, is_supported, &mut report.failed, &mut |_| true);
+        util::sort_under(&folder, &mut files);
         let total = files.len();
         if total == 0 {
             return report;
@@ -425,7 +459,7 @@ impl Project {
         // Candidates for relinking, keyed by (size, hash).
         let mut by_content: HashMap<(u64, String), Vec<usize>> = HashMap::new();
         for (i, e) in self.images.iter().enumerate() {
-            by_content.entry((e.file_size, e.content_hash.clone())).or_default().push(i);
+            if !e.content_hash.is_empty() { by_content.entry((e.file_size, e.content_hash.clone())).or_default().push(i); }
         }
 
         // Decide up front which files need to be opened.
@@ -436,10 +470,10 @@ impl Project {
             .map(|((path, meta), mtime)| match by_path.get(&util::path_key(path)) {
                 Some(&i) => {
                     let e = &self.images[i];
-                    if e.file_size == meta.len() && mtime.is_some() && e.modified_unix_ms == *mtime {
+                    if !e.content_hash.is_empty() && !e.capture.scan_pending && e.file_size == meta.len() && mtime.is_some() && e.modified_unix_ms == *mtime {
                         Plan::Unchanged(i)
                     } else {
-                        Plan::Existing(i, e.file_size, e.content_hash.clone())
+                        Plan::Existing(i, e.file_size, if e.capture.scan_pending { String::new() } else { e.content_hash.clone() })
                     }
                 }
                 None => Plan::New,
@@ -613,38 +647,7 @@ impl Project {
 
     /// Ids of the images matching `filter`, in project order.
     pub fn filter(&self, filter: &Filter) -> Vec<ImageId> {
-        let needle = filter.text.as_ref().map(|t| t.to_lowercase());
-        let iso_bound = filter.iso_min.is_some() || filter.iso_max.is_some();
-        self.images
-            .iter()
-            .filter(|e| {
-                if e.missing && !filter.include_missing {
-                    return false;
-                }
-                if iso_bound {
-                    let Some(iso) = e.capture.iso else { return false };
-                    if filter.iso_min.is_some_and(|min| iso < min) || filter.iso_max.is_some_and(|max| iso > max) {
-                        return false;
-                    }
-                }
-                if filter.min_rating.is_some_and(|r| e.rating < r) {
-                    return false;
-                }
-                if filter.flag.is_some_and(|f| e.flag != f) {
-                    return false;
-                }
-                if let Some(want) = filter.flash_fired {
-                    if e.capture.flash_fired != Some(want) {
-                        return false;
-                    }
-                }
-                if let Some(n) = &needle {
-                    if !e.file_name().to_lowercase().contains(n.as_str()) {
-                        return false;
-                    }
-                }
-                true
-            })
+        self.images.iter().filter(|e| filter.matches(e))
             .map(|e| e.id)
             .collect()
     }
@@ -653,16 +656,19 @@ impl Project {
     /// and case-insensitive; for `Iso` and `Ev100` images without a value come
     /// last in both directions; ties keep (ascending) file-name order.
     pub fn sorted(&self, ids: &[ImageId], key: SortKey, descending: bool) -> Vec<ImageId> {
+        Self::sort_entries(ids.iter().filter_map(|id| self.image(*id)), key, descending)
+    }
+
+    pub fn sort_entries<'a>(entries: impl IntoIterator<Item = &'a ImageEntry>, key: SortKey, descending: bool) -> Vec<ImageId> {
         use std::cmp::Ordering;
         struct Item {
             id: ImageId,
             name: String,
             value: Option<f32>,
             rating: u8,
+            date: Option<i64>,
         }
-        let mut items: Vec<Item> = ids
-            .iter()
-            .filter_map(|id| self.image(*id))
+        let mut items: Vec<Item> = entries.into_iter()
             .map(|e| Item {
                 id: e.id,
                 name: e.file_name(),
@@ -672,12 +678,23 @@ impl Project {
                     _ => None,
                 },
                 rating: e.rating,
+                date: match key {
+                    SortKey::CaptureDate => e.capture.captured_unix_ms.or(e.modified_unix_ms),
+                    SortKey::ModifiedDate => e.modified_unix_ms,
+                    _ => None,
+                },
             })
             .collect();
         let by_name = |a: &Item, b: &Item| natural_cmp(&a.name, &b.name).then(a.id.cmp(&b.id));
         let directed = |ord: Ordering| if descending { ord.reverse() } else { ord };
         items.sort_by(|a, b| match key {
             SortKey::FileName => directed(by_name(a, b)),
+            SortKey::ModifiedDate | SortKey::CaptureDate => match (a.date, b.date) {
+                (Some(x), Some(y)) => directed(x.cmp(&y)).then_with(|| by_name(a, b)),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => by_name(a, b),
+            },
             SortKey::Rating => directed(a.rating.cmp(&b.rating)).then_with(|| by_name(a, b)),
             SortKey::Iso | SortKey::Ev100 => match (a.value, b.value) {
                 (Some(x), Some(y)) => directed(x.total_cmp(&y)).then_with(|| by_name(a, b)),
@@ -806,14 +823,17 @@ fn modified_ms(meta: &std::fs::Metadata) -> Option<i64> {
 }
 
 /// Supported files below `folder`, unsorted. Symlinked directories are not followed.
-fn collect_files(
+fn collect_files_with(
     folder: &Path,
     recursive: bool,
     is_supported: &(dyn Fn(&Path) -> bool + Sync),
     failed: &mut Vec<(PathBuf, String)>,
+    counting: &mut dyn FnMut(usize) -> bool,
 ) -> Vec<(PathBuf, std::fs::Metadata)> {
     let mut files = Vec::new();
     let mut stack = vec![folder.to_path_buf()];
+    let mut checked = 0;
+    if !counting(0) { return files; }
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
@@ -823,6 +843,8 @@ fn collect_files(
             }
         };
         for entry in entries {
+            checked += 1;
+            if checked % 256 == 0 && !counting(files.len()) { return files; }
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
@@ -838,6 +860,10 @@ fn collect_files(
                     continue;
                 }
             };
+            if file_type.is_dir() {
+                if recursive { stack.push(path); }
+                continue;
+            }
             // On Windows the directory listing already carries size and mtime,
             // so `entry.metadata()` costs no extra round trip to the NAS.
             let meta = if file_type.is_symlink() { std::fs::metadata(&path) } else { entry.metadata() };
@@ -848,12 +874,8 @@ fn collect_files(
                     continue;
                 }
             };
-            if meta.is_file() {
-                if is_supported(&path) {
-                    files.push((path, meta));
-                }
-            } else if file_type.is_dir() && recursive {
-                stack.push(path);
+            if meta.is_file() && is_supported(&path) {
+                files.push((path, meta));
             }
         }
     }

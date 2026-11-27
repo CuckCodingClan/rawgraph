@@ -1081,8 +1081,8 @@ impl GraphEditor {
             painter.text(node_rect.min + Vec2::new(NODE_W - 10.0, y) * z, Align2::RIGHT_CENTER, value, FontId::monospace(11.0 * z), color);
         }
         {
-            let text = match session.collection.counts.get(&id) {
-                Some(n) => format!("{} img", crate::collection::with_thousands(*n)),
+            let text = match session.count_for(node) {
+                Some(n) => format!("{} img", crate::collection::with_thousands(n)),
                 None => "... img".to_owned(),
             };
             let cy = node_rect.max.y - (PAD * 0.5 + COUNT_H * 0.5) * z;

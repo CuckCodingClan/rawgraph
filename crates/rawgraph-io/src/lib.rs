@@ -167,6 +167,12 @@ pub fn read_capture_info(path: &Path) -> Result<CaptureInfo, IoError> {
     }
 }
 
+/// EXIF typically omits a timezone; sort using the camera's recorded local clock.
+fn exif_date(s: &str) -> Option<i64> {
+    chrono::NaiveDateTime::parse_from_str(s.trim_matches('\0').trim(), "%Y:%m:%d %H:%M:%S")
+        .ok().map(|date| date.and_utc().timestamp_millis())
+}
+
 /// Small sRGB preview for filmstrips: the embedded preview if the file has one, otherwise a
 /// decoded proxy. Returns (width, height, RGBA8), orientation applied, long edge <= `max_dim`.
 pub fn load_thumbnail(path: &Path, max_dim: u32) -> Result<(u32, u32, Vec<u8>), IoError> {

@@ -43,6 +43,8 @@ pub struct Filmstrip {
     pub thumbs: ThumbLoader,
     last_selected: Option<rawgraph_core::ImageId>,
     last_range: Range<usize>,
+    scan_wanted: Vec<rawgraph_core::ImageId>,
+    scan_hash_pending: bool,
     /// Filled while drawing; the app drains it every frame.
     pub actions: Vec<FilmAction>,
     /// "n images have ratings in XMP" banner above the list (set by the app).
@@ -56,7 +58,7 @@ pub(crate) fn gallery_keyboard_available(ctx: &egui::Context) -> bool {
 
 impl Filmstrip {
     pub fn with_thumbs(thumbs: ThumbLoader) -> Self {
-        Self { thumbs, last_selected: None, last_range: 0..0, actions: Vec::new(), xmp_banner: None }
+        Self { thumbs, last_selected: None, last_range: 0..0, scan_wanted: Vec::new(), scan_hash_pending: false, actions: Vec::new(), xmp_banner: None }
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
@@ -67,6 +69,10 @@ impl Filmstrip {
     pub fn all_loaded(&self) -> bool {
         self.thumbs.wanted_loaded()
     }
+
+    pub fn scan_wanted(&self) -> &[rawgraph_core::ImageId] { &self.scan_wanted }
+
+    pub fn scan_thumbs_ready(&self) -> bool { !self.scan_hash_pending && self.all_loaded() }
 
     /// Header controls. Returns true if the filter or sort changed.
     fn header(ui: &mut egui::Ui, session: &mut Session) -> bool {
@@ -133,6 +139,8 @@ impl Filmstrip {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, session: &mut Session, mut target: ViewerTarget, members: Option<&std::collections::HashSet<rawgraph_core::ImageId>>) {
+        self.scan_wanted.clear();
+        self.scan_hash_pending = false;
         if Self::header(ui, session) {
             session.refresh_visible();
         }
@@ -227,6 +235,12 @@ impl Filmstrip {
         order.extend((range.end..hi).chain((lo..range.start).rev()));
         let wanted: Vec<_> = order.into_iter().flat_map(|r| ids.iter().skip(r * columns).take(columns).copied())
             .filter_map(|id| session.entry(id).filter(|e| !e.missing).map(|e| Wanted { id, path: e.path.clone(), hash: e.content_hash.clone() })).collect();
+        self.scan_wanted.extend(wanted.iter().map(|w| w.id));
+        let mut wanted = wanted;
+        if session.scanning && !session.demo {
+            wanted.retain(|w| !w.hash.is_empty());
+            self.scan_hash_pending = wanted.len() != self.scan_wanted.len();
+        }
         self.thumbs.set_wanted(&wanted);
     }
 

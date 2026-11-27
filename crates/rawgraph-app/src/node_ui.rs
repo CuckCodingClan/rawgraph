@@ -410,7 +410,7 @@ pub fn source_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
     let folder = source_folder(node);
     let legacy_catalog = !matches!(all_view(node).data(ImageId(0)), Some(NodeData::Folder(_)));
     let subfolders = source_subfolders(node);
-    let count = session.collection.counts.get(&id).copied();
+    let count = session.count_for(node);
     ui.add_space(4.0);
     ui.group(|ui| {
         ui.set_min_width(ui.available_width());

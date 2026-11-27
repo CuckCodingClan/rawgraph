@@ -31,6 +31,32 @@ on-disk thumbnail cache and the camera's embedded preview on a background worker
 and clears the badge. Edits to the current photo retain the last frame and show the
 badge only after 150 ms. Scopes wait for the graph result; Clean Feed can show the preview.
 
+Source scans run in stages so a large folder is usable at once:
+
+1. **Count**: the directory listing alone (no image file is opened). The Source
+   node and status bar show a running count while subfolders are listed.
+2. **List**: every image appears in the gallery with a placeholder thumbnail, in
+   natural name order, sortable by name or modified date. Unchanged files keep
+   their hash, thumbnail and metadata without any file access.
+3. **Thumbnails**: new or changed files are hashed (64 KiB head and tail),
+   on-screen gallery items first; thumbnails load as hashes arrive.
+4. **Metadata**: full capture details are read last, one file at a time, and pause
+   while visible thumbnails are still loading.
+
+On a synthetic folder of 10,000 tiny PNGs in 100 subfolders (Linux, NFS share,
+warm cache) the count arrives after about 55 ms and the full list after about
+100 ms. The previous scanner added images one at a time, each only after its hash
+and metadata were read; the full list took about 950 ms here with 8 workers and
+far longer for RAWs over SMB. A cold NFS cache made the first listing much slower
+(0.3–9.6 s for the same folder), so cold numbers vary with the server.
+Each later file stage costs one network open per file. Listing speed still
+depends on the NAS and the number of subfolders; Windows SMB numbers are
+unmeasured. Reproduce with:
+
+```text
+cargo run --release -p rawgraph-project --example scan_stages -- <folder-of-pngs> [staged|legacy|rescan]
+```
+
 Measure RAW decode stages and embedded preview extraction on your own files:
 
 ```text
@@ -216,6 +242,14 @@ The inset blue **+** tab at the left of the title bar adds supported input maps.
 ### Source nodes
 
 A new Source, including the starter Source, supplies no images until you choose a folder. Clearing the folder makes it empty again. **File → Open folder** assigns the path to a Source before scanning; it does not create an input shared by all nodes. Older saved Sources with no folder setting retain their catalog-wide behavior so saved graphs keep their inputs.
+
+The Source count updates as files are discovered. Once enumeration finishes,
+the gallery gets the list together; thumbnails and capture details fill in
+later. **Capture date** uses file modification time until an EXIF date is
+available. Cancelling keeps the listed images and a subsequent scan can finish
+pending work. A file that might be a renamed catalog image only joins the
+gallery after its hash is checked, so edits and graph references keep the
+original identity.
 
 ### Per-pixel image controls
 

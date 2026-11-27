@@ -192,6 +192,7 @@ pub struct Session {
     // Folder scan in progress: entries that finished so far (shown immediately).
     pub scanning: bool,
     scan_map: HashMap<ImageId, ImageEntry>,
+    pub scan_count: Option<(String, bool, usize)>,
     scan_edits: HashMap<ImageId, Edit>,
     /// Collection info for the graph (filled by the background worker).
     pub collection: CollectionResult,
@@ -237,6 +238,7 @@ impl Session {
             visible: Vec::new(),
             scanning: false,
             scan_map: HashMap::new(),
+            scan_count: None,
             scan_edits: HashMap::new(),
             collection: CollectionResult::default(),
             images_gen: 1,
@@ -328,18 +330,11 @@ impl Session {
         self.visible = if self.demo {
             self.demo_entries.iter().map(|e| e.id).collect()
         } else {
-            let mut ids = self.project.filter(&self.filter.to_filter());
-            if self.filter.missing_only {
-                ids.retain(|id| self.project.image(*id).is_some_and(|e| e.missing));
-            }
-            let mut v = self.project.sorted(&ids, self.filter.sort, self.filter.descending);
-            if self.scanning {
-                let have: HashSet<ImageId> = v.iter().copied().collect();
-                let mut extra: Vec<ImageId> = self.scan_map.keys().copied().filter(|id| !have.contains(id)).collect();
-                extra.sort();
-                v.extend(extra);
-            }
-            v
+            let filter = self.filter.to_filter();
+            let entries = self.project.images().iter().filter_map(|e| self.entry(e.id))
+                .chain(self.scan_map.values().filter(|e| self.project.image(e.id).is_none()));
+            Project::sort_entries(entries.filter(|e| filter.matches(e) && (!self.filter.missing_only || e.missing)), self.filter.sort, self.filter.descending)
+
         };
         if self.selected.is_none_or(|id| !self.visible.contains(&id)) {
             self.selected = self.visible.first().copied();
@@ -475,7 +470,7 @@ impl Session {
         if self.demo {
             return Vec::new();
         }
-        self.project.images().iter().filter(|e| e.capture.raw.is_none()).map(|e| (e.id, e.path.clone())).collect()
+        self.project.images().iter().filter(|e| !e.capture.scan_pending && e.capture.raw.is_none()).map(|e| (e.id, e.path.clone())).collect()
     }
 
     /// Applies re-read capture metadata. Marks the project unsaved when
@@ -602,31 +597,67 @@ impl Session {
 
     pub fn begin_scan(&mut self) {
         self.scanning = true;
+        self.scan_count = None;
         self.scan_map.clear();
         self.scan_edits.clear();
     }
 
-    /// A file finished during the scan: show it right away.
-    pub fn scan_entry(&mut self, entry: ImageEntry) {
-        if self.demo {
-            return;
-        }
-        let id = entry.id;
-        let is_new = !self.scan_map.contains_key(&id) && self.project.image(id).is_none();
-        self.provider.set_paths([(id, entry.path.clone())]);
-        // Keep culling edits the user made on this image while scanning.
-        let mut entry = entry;
-        if let Some((r, f, l)) = self.scan_edits.get(&id) {
-            entry.rating = *r;
-            entry.flag = *f;
-            entry.color_label = *l;
-        }
-        self.scan_map.insert(id, entry);
-        if is_new && !self.filter.is_active() && !self.visible.contains(&id) {
-            self.visible.push(id);
-            if self.selected.is_none() {
-                self.selected = Some(id);
+    pub fn count_for(&self, node: &rawgraph_core::Node) -> Option<usize> {
+        if node.kind == NodeKind::Source {
+            if let Some((folder, recursive, count)) = &self.scan_count {
+                if crate::node_ui::source_subfolders(node) == *recursive
+                    && crate::node_ui::source_folder(node).is_some_and(|p| {
+                        let path = std::path::absolute(&p).unwrap_or_else(|_| p.into());
+                        folder_key(&path.to_string_lossy()) == *folder
+                    })
+                { return Some(*count); }
             }
+        }
+        self.collection.counts.get(&node.id).copied()
+    }
+
+    pub fn scan_catalog(&mut self, entries: Vec<ImageEntry>) {
+        self.provider.set_paths(entries.iter().map(|e| (e.id, e.path.clone())));
+        self.provider.set_captures(entries.iter().map(|e| (e.id, e.capture.clone())));
+        self.scan_map.extend(entries.into_iter().map(|e| (e.id, e)));
+        self.images_gen += 1;
+        self.refresh_visible();
+    }
+
+    pub fn scan_metadata(&mut self, entries: Vec<ImageEntry>) {
+        self.provider.set_captures(entries.iter().map(|e| (e.id, e.capture.clone())));
+        for entry in entries {
+            if let Some(e) = self.scan_map.get_mut(&entry.id) { e.capture = entry.capture; }
+        }
+        self.images_gen += 1;
+        self.refresh_visible();
+    }
+
+    #[cfg(test)]
+    pub fn scan_entry(&mut self, entry: ImageEntry) {
+        self.scan_entries(vec![entry]);
+    }
+
+    pub fn scan_entries(&mut self, entries: Vec<ImageEntry>) {
+        let mut paths = Vec::new();
+        let mut captures = Vec::new();
+        for mut entry in entries {
+            let id = entry.id;
+            let old = self.entry(id);
+            if old.is_none_or(|e| e.path != entry.path) { paths.push((id, entry.path.clone())); }
+            if old.is_none_or(|e| e.capture != entry.capture) { captures.push((id, entry.capture.clone())); }
+            if let Some((r, f, l)) = self.scan_edits.get(&id) {
+                entry.rating = *r;
+                entry.flag = *f;
+                entry.color_label = *l;
+            }
+            self.scan_map.insert(id, entry);
+        }
+        if !paths.is_empty() || !captures.is_empty() {
+            self.provider.set_paths(paths);
+            self.provider.set_captures(captures);
+            self.images_gen += 1;
+            self.refresh_visible();
         }
     }
 
@@ -644,6 +675,7 @@ impl Session {
         self.project = finished;
         self.scan_map.clear();
         self.scanning = false;
+        self.scan_count = None;
         if changed {
             self.touch();
         }
@@ -652,6 +684,7 @@ impl Session {
     }
 
     pub fn cancel_scan_state(&mut self) {
+        self.scan_count = None;
         self.scanning = false;
         self.scan_map.clear();
         self.scan_edits.clear();
