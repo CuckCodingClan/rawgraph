@@ -840,8 +840,7 @@ impl Session {
         self.node_sel = sel;
     }
 
-    /// Deletes the selected nodes (one change of the graph). The last Source
-    /// stays. `Ok(n)` is the number removed; the error says why nothing was.
+    /// Deletes the selected nodes together (one graph history change).
     pub fn delete_selected(&mut self) -> Result<usize, String> {
         self.reconcile_selection();
         let ids: Vec<NodeId> = self.node_sel.ids().to_vec();
@@ -849,39 +848,16 @@ impl Session {
     }
 
     pub fn delete_nodes(&mut self, ids: &[NodeId]) -> Result<usize, String> {
-        let plan = plan_delete(&self.project.graph, ids);
-        if plan.delete.is_empty() {
-            return match plan.kept_source {
-                Some(_) => Err("The last Source node cannot be deleted".to_owned()),
-                None => Ok(0),
-            };
-        }
-        for id in &plan.delete {
+        let delete = plan_delete(&self.project.graph, ids);
+        for id in &delete {
             self.project.graph.remove_node(*id);
         }
         self.sanitize();
-        if plan.kept_source.is_some() {
-            return Err(format!("Deleted {} node(s); the last Source node cannot be deleted", plan.delete.len()));
-        }
-        Ok(plan.delete.len())
-    }
-
-    /// Why a node cannot be deleted, if it cannot.
-    pub fn delete_blocker(&self, id: NodeId) -> Option<String> {
-        let node = self.project.graph.node(id)?;
-        if node.kind == NodeKind::Source && self.project.graph.nodes().filter(|n| n.kind == NodeKind::Source).count() <= 1 {
-            return Some("The last Source node cannot be deleted".to_owned());
-        }
-        None
+        Ok(delete.len())
     }
 
     pub fn delete_node(&mut self, id: NodeId) -> Result<(), String> {
-        if let Some(why) = self.delete_blocker(id) {
-            return Err(why);
-        }
-        self.project.graph.remove_node(id);
-        self.sanitize();
-        Ok(())
+        self.delete_nodes(&[id]).map(|_| ())
     }
 
     /// Switches a node's mode (used by the CLI and tests).
@@ -1009,13 +985,15 @@ pub mod tests {
     }
 
     #[test]
-    fn last_source_cannot_be_deleted() {
+    fn last_source_can_be_deleted_and_clears_the_viewer_pin() {
         let mut s = demo_session();
-        let src = s.node_by_index(0).unwrap();
-        assert!(s.delete_node(src).is_err());
-        let extra = s.project.graph.add_node(NodeKind::Source, [0.0, 400.0]);
-        assert!(s.delete_node(src).is_ok());
-        assert!(s.delete_node(extra).is_err());
+        let source = s.node_by_index(0).unwrap();
+        s.selected_node = Some(source);
+        s.viewed_node = Some(source);
+        assert!(s.delete_node(source).is_ok());
+        assert!(s.project.graph.node(source).is_none());
+        assert_eq!(s.viewed_node, None);
+        assert_eq!(s.target_node(), None);
     }
 
     #[test]
@@ -1330,18 +1308,17 @@ pub mod tests {
     }
 
     #[test]
-    fn deleting_a_selection_removes_it_in_one_go_and_spares_the_last_source() {
+    fn deleting_a_selection_can_remove_the_entire_graph() {
         let mut s = demo_session();
         let ids: Vec<NodeId> = (1..=3).map(|i| s.node_by_index(i).unwrap()).collect();
         let before = s.project.graph.nodes().count();
         assert_eq!(s.delete_nodes(&ids), Ok(3));
         assert_eq!(s.project.graph.nodes().count(), before - 3);
         let all: Vec<NodeId> = s.project.graph.nodes().map(|n| n.id).collect();
-        let err = s.delete_nodes(&all).unwrap_err();
-        assert!(err.contains("last Source"), "{err}");
-        assert_eq!(s.project.graph.nodes().filter(|n| n.kind == NodeKind::Source).count(), 1);
-        let only_source = s.project.graph.nodes().find(|n| n.kind == NodeKind::Source).unwrap().id;
-        assert_eq!(s.delete_nodes(&[only_source]).unwrap_err(), "The last Source node cannot be deleted");
+        assert_eq!(s.delete_nodes(&all), Ok(all.len()));
+        assert_eq!(s.project.graph.nodes().count(), 0);
+        assert!(s.project.graph.validate().is_empty());
+        assert_eq!(s.render_target(), None);
         assert_eq!(s.delete_nodes(&[]), Ok(0));
     }
 

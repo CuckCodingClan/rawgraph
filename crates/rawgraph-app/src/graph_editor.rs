@@ -1664,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn backspace_deletes_the_selection_but_never_the_last_source() {
+    fn backspace_deletes_the_selection_including_the_last_source() {
         let (g, src, exp, _) = loose_graph();
         let mut h = Harness::new(g);
         h.click(h.node_title_pos(exp));
@@ -1673,8 +1673,9 @@ mod tests {
         assert!(h.s.project.graph.node(exp).is_none());
         h.click(h.node_title_pos(src));
         h.key(Key::Backspace);
-        assert!(h.s.project.graph.node(src).is_some(), "the last Source must stay");
-        assert!(h.st.current().is_some_and(|(t, e)| e && t.contains("last Source")));
+        assert!(h.s.project.graph.node(src).is_none());
+        assert!(!h.st.current().is_some_and(|(_, error)| error));
+        assert!(h.hist.undo().unwrap().node(src).is_some());
     }
 
     #[test]
@@ -2010,7 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_the_selection_in_one_step_and_keeps_the_last_source() {
+    fn delete_removes_the_selection_in_one_step_and_can_empty_the_graph() {
         let (g, a, b, c) = row_graph();
         let mut h = Harness::new(g);
         h.click(h.node_title_pos(b));
@@ -2021,12 +2022,14 @@ mod tests {
         assert!(h.s.project.graph.node(a).is_some());
         assert_eq!(h.undo_steps(), steps + 1, "one undo step for both nodes");
         assert!(h.sel().is_empty());
-        // Everything selected: the Source stays, with a message.
+        // Everything selected: deleting the Source leaves a valid empty graph.
         h.key_with(Key::A, Modifiers::COMMAND);
         h.key(Key::Backspace);
-        assert!(h.s.project.graph.node(a).is_some(), "the last Source stays");
-        assert!(h.st.current().is_some_and(|(t, e)| e && t.contains("last Source")));
-        // The back-history returns the deleted nodes.
+        assert_eq!(h.s.project.graph.nodes().count(), 0);
+        assert!(h.s.project.graph.validate().is_empty());
+        assert!(!h.st.current().is_some_and(|(_, error)| error));
+        assert!(h.hist.undo().unwrap().node(a).is_some());
+        // The earlier back-history returns the other deleted nodes.
         let g = h.hist.undo().unwrap();
         assert!(g.node(b).is_some() && g.node(c).is_some());
     }

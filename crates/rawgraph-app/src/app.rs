@@ -3513,6 +3513,42 @@ mod tests {
     }
 
     #[test]
+    fn deleting_last_source_blanks_viewer_and_gallery_and_undo_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        let ctx = egui::Context::default();
+        app.session.project.graph = Graph::new();
+        let source = app.session.project.graph.add_node(NodeKind::Source, [0.0; 2]);
+        app.history.reset(&app.session.project.graph);
+        app.session.set_node_selection(crate::selection::NodeSelection::single(source));
+        app.session.viewed_node = Some(source);
+        app.frames = SETTLE_FRAMES;
+        load_gallery(&mut app);
+        app.submit_if_needed();
+        let until = Instant::now() + Duration::from_secs(10);
+        while app.primary_frame().0.is_none() {
+            ctx.run_ui(egui::RawInput::default(), |_| app.poll_renderer(&ctx)).drop_without_applying_deltas();
+            assert!(Instant::now() < until, "source viewer frame did not arrive");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.run(Command::DeleteNode, &ctx);
+        assert!(app.history.commit_if_changed(&app.session.project.graph, false));
+        app.refresh_gallery();
+        app.submit_if_needed();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.filmstrip_panel(ui, 0);
+            app.viewer_area(ui, &mut Vec::new());
+        }).drop_without_applying_deltas();
+        assert!(App::gallery_members(app.gallery_result.as_ref(), app.primary_target()).is_none());
+        assert!(app.primary_frame().0.is_none());
+        assert!(app.last_key.is_none() && app.last_error.is_none());
+        assert!(!app.status.current().is_some_and(|(_, error)| error));
+        app.run(Command::Undo, &ctx);
+        assert_eq!(app.session.project.graph.node(source).unwrap().kind, NodeKind::Source);
+        app.shutdown();
+    }
+
+    #[test]
     fn extensions_are_enforced() {
         assert_eq!(ensure_extension(PathBuf::from("a/b"), GRAPH_EXT, Some(".json")), PathBuf::from("a/b.rawgraph.json"));
         assert_eq!(ensure_extension(PathBuf::from("a/b.json"), GRAPH_EXT, Some(".json")), PathBuf::from("a/b.rawgraph.json"));
