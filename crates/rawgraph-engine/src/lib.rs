@@ -478,7 +478,6 @@ impl Evaluator {
         self.misses
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// Start or disable request-local profiling. Disabled evaluation reads no profiling clock.
     pub fn set_timing_enabled(&mut self, enabled: bool) {
         self.timings = enabled.then(Vec::new);
@@ -488,6 +487,7 @@ impl Evaluator {
 
     pub fn timings(&self) -> Option<Vec<NodeTiming>> { self.timings.clone() }
 
+    #[allow(clippy::too_many_arguments)]
     fn eval_node(
         &mut self,
         graph: &Graph,
@@ -672,7 +672,7 @@ impl Evaluator {
             let Some(exposed) = exposed else { continue };
             let Some(Some(value)) = inputs.get(node.kind.inputs().len() + i) else { continue };
             let mask = match value {
-                Value::Images(m) => MaskBuf { width: m.width(), height: m.height(), data: m.data().chunks_exact(4).map(|p| 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2]).collect() },
+                Value::Images(m) => MaskBuf { width: m.width(), height: m.height(), data: m.data().as_chunks::<4>().0.iter().map(|p| 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2]).collect() },
                 Value::Mask(m) => (**m).clone(),
             };
             let mask = if (mask.width, mask.height) != (src.width(), src.height()) { fx::resize_mask(&mask, src.width(), src.height()) } else { mask };
@@ -1564,7 +1564,7 @@ fn output_channel(node: &rawgraph_core::Node, port: usize) -> Option<u8> {
 }
 fn output_value(graph: &Graph, node: NodeId, port: usize, value: Value) -> Value {
     let Some(channel) = graph.node(node).and_then(|n| output_channel(n, port)) else { return value };
-    match value { Value::Images(img) => modified(&img, |out| { for p in out.data_mut().chunks_exact_mut(4) {
+    match value { Value::Images(img) => modified(&img, |out| { for p in out.data_mut().as_chunks_mut::<4>().0 {
         let v = match channel { 0 => 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2], n => p[n as usize - 1] };
         p.copy_from_slice(&[v, v, v, 1.0]);
     }}), other => other }
@@ -1648,7 +1648,7 @@ fn depth_worker(image: &ImageBuf) -> Result<MaskBuf, String> {
     write_result.map_err(|e| format!("Depth Estimate worker input: {e}"))?;
     let count = (image.width() as usize).checked_mul(image.height() as usize).ok_or("Depth Estimate: image too large")?;
     if out.stdout.len() != 12 + count * 4 || &out.stdout[..4] != b"RGD1" || out.stdout[4..8] != image.width().to_le_bytes() || out.stdout[8..12] != image.height().to_le_bytes() { return Err("Depth Estimate: invalid worker response".into()); }
-    let data: Vec<f32> = out.stdout[12..].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+    let data: Vec<f32> = out.stdout[12..].as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
     if data.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)) { return Err("Depth Estimate: invalid depth values".into()); }
     Ok(MaskBuf { width: image.width(), height: image.height(), data })
 }
@@ -1712,7 +1712,7 @@ fn compute(
                 (m.width, m.height, m.data.iter().map(|v| -*v).collect())
             } else {
                 let src = input_image(inputs, 1, id)?;
-                (src.width(), src.height(), src.data().chunks_exact(4).map(|p| 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2]).collect())
+                (src.width(), src.height(), src.data().as_chunks::<4>().0.iter().map(|p| 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2]).collect())
             };
             Ok(Value::Images(Arc::new(normals_map(w, h, values, param("strength"), param("smoothing"), node.toggle("flip_y", image)))))
         }
@@ -1733,12 +1733,12 @@ fn compute(
             if let Some((i, _)) = node.exposed_inputs().iter().enumerate().find(|(_, p)| p.as_ref().is_some_and(|p| p.parameter == "ev")) {
                 if let Some(Some(map)) = inputs.get(node.kind.inputs().len() + i) {
                     let intensity = match map {
-                        Value::Images(m) => MaskBuf { width: m.width(), height: m.height(), data: m.data().chunks_exact(4).map(|p| 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2]).collect() },
+                        Value::Images(m) => MaskBuf { width: m.width(), height: m.height(), data: m.data().as_chunks::<4>().0.iter().map(|p| 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2]).collect() },
                         Value::Mask(m) => (**m).clone(),
                     };
                     let intensity = if (intensity.width, intensity.height) != (src.width(), src.height()) { fx::resize_mask(&intensity, src.width(), src.height()) } else { intensity };
                     let spec = node.kind.param_spec("ev").unwrap();
-                    return Ok(modified(&src, |out| { for (i, px) in out.data_mut().chunks_exact_mut(4).enumerate() {
+                    return Ok(modified(&src, |out| { for (i, px) in out.data_mut().as_chunks_mut::<4>().0.iter_mut().enumerate() {
                         let t = if intensity.data[i].is_finite() { intensity.data[i].clamp(0.0, 1.0) } else { 0.0 };
                         let ev = spec.min + t * (spec.max - spec.min);
                         let strength = mask.as_ref().map_or(1.0, |m| m.data[i].clamp(0.0, 1.0));
@@ -1964,7 +1964,7 @@ fn compute(
                 if p.as_ref().is_none_or(|p| p.parameter != "radius") { return None; }
                 let map = inputs.get(node.kind.inputs().len() + i)?.as_ref()?;
                 let m = match map {
-                    Value::Images(m) => MaskBuf { width: m.width(), height: m.height(), data: m.data().chunks_exact(4).map(|p| 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2]).collect() },
+                    Value::Images(m) => MaskBuf { width: m.width(), height: m.height(), data: m.data().as_chunks::<4>().0.iter().map(|p| 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2]).collect() },
                     Value::Mask(m) => (**m).clone(),
                 };
                 let mut m = if (m.width, m.height) != (src.width(), src.height()) { fx::resize_mask(&m, src.width(), src.height()) } else { m };
@@ -1995,7 +1995,7 @@ fn compute(
             // Center the signed RGB residual at 0.5 without clipping HDR values;
             // alpha is coverage, not a frequency component.
             let mut result = low;
-            for (out, original) in result.data_mut().chunks_exact_mut(4).zip(src.data().chunks_exact(4)) {
+            for (out, original) in result.data_mut().as_chunks_mut::<4>().0.iter_mut().zip(src.data().as_chunks::<4>().0) {
                 for c in 0..3 {
                     out[c] = 0.5 + original[c] - out[c];
                 }
@@ -2465,7 +2465,7 @@ mod tests {
         assert_eq!(&bytes[..4], b"RGD1");
         let w = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         let h = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let pixels = bytes[12..].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let pixels = bytes[12..].as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
         struct Fixture(Arc<ImageBuf>);
         impl ImageProvider for Fixture {
             fn image(&self, _: ImageId) -> Result<Arc<ImageBuf>, String> { Ok(self.0.clone()) }
@@ -2811,7 +2811,7 @@ mod tests {
                 assert_eq!(*low, expected);
                 set(&mut g, filter, "pass", A, 1.0);
                 let high = ev.eval_image(&g, filter, A, &p, &c).unwrap();
-                for ((a, b), h) in base.data().chunks_exact(4).zip(low.data().chunks_exact(4)).zip(high.data().chunks_exact(4)) {
+                for ((a, b), h) in base.data().as_chunks::<4>().0.iter().zip(low.data().as_chunks::<4>().0).zip(high.data().as_chunks::<4>().0) {
                     for channel in 0..3 { assert!((h[channel] - (0.5 + a[channel] - b[channel])).abs() < 1e-6); }
                     assert_eq!(h[3], a[3]);
                 }
@@ -3332,11 +3332,6 @@ mod tests {
         }
     }
 
-    fn gained(base: &ImageBuf, ev_stops: f32) -> ImageBuf {
-        let mut m = base.clone();
-        ops::apply_gain(&mut m, 2f32.powf(ev_stops));
-        m
-    }
 
     #[test]
     fn neutral_develop_nodes_do_not_repeat_raw_input_gain() {

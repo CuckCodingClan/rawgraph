@@ -31,6 +31,7 @@ fn value_at(t: f32, min: f32, max: f32, log: bool) -> f32 {
 }
 
 /// Draw a slider and an independently editable numeric field. The caller draws the label.
+#[allow(clippy::too_many_arguments)]
 pub fn show(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, default: f32, log: bool, label: &egui::Response, width: f32, decimals: usize) -> egui::Response {
     ui.horizontal(|ui| {
     let (min, max) = (*range.start(), *range.end());

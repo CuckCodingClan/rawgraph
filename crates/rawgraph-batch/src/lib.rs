@@ -496,7 +496,7 @@ impl Output {
 }
 
 fn data_map_output(img: &ImageBuf) -> Output {
-    let rgb = img.data().chunks_exact(4).flat_map(|p| p[..3].iter().map(|v| {
+    let rgb = img.data().as_chunks::<4>().0.iter().flat_map(|p| p[..3].iter().map(|v| {
         let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
         (v * 65535.0).round() as u16
     })).collect();
@@ -675,7 +675,7 @@ fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job
             let img = resized.as_ref().unwrap_or(&image);
             let display = settings.display.apply_in_space(img, settings.space);
             let rgb = to_rgb8(&display);
-            let rgba = rgb.chunks_exact(3).zip(img.data().chunks_exact(4)).flat_map(|(rgb, p)| {
+            let rgba = rgb.as_chunks::<3>().0.iter().zip(img.data().as_chunks::<4>().0).flat_map(|(rgb, p)| {
                 let alpha = if p[3].is_nan() { 0.0 } else { p[3].clamp(0.0, 1.0) };
                 [rgb[0], rgb[1], rgb[2], (alpha * 255.0).round() as u8]
             }).collect();

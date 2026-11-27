@@ -3,12 +3,14 @@ use crate::cli::Cli;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
+    #[cfg_attr(not(windows), allow(dead_code))]
     InitializingGpu,
     OpeningProject,
     PreparingEditor,
 }
 
 impl Stage {
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn text(self) -> &'static str {
         match self {
             Self::InitializingGpu => "Initializing GPU...",

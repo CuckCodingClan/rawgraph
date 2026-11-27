@@ -14,6 +14,9 @@ use crate::recovery_guard::{process_alive, remove_locks, scan_orphans, Orphans};
 use crate::relink::{self, RelinkError};
 use crate::xmp_import::{self, JobResult, XmpDialog, XmpFound, XmpJob, XmpOffer};
 
+/// What the pane's collection membership was last computed for.
+type MembershipKey = (rawgraph_core::Graph, u64, usize, Option<ImageId>, Option<NodeId>, Option<NodeId>);
+
 #[derive(Default)]
 pub(super) struct PaneRender {
     renderer: Option<Renderer>,
@@ -25,7 +28,7 @@ pub(super) struct PaneRender {
     compatible: Option<(ImageId, NodeId)>,
     resolved: Option<(ImageId, NodeId)>,
     fallback: bool,
-    membership_key: Option<(rawgraph_core::Graph, u64, usize, Option<ImageId>, Option<NodeId>, Option<NodeId>)>,
+    membership_key: Option<MembershipKey>,
 }
 
 impl App {

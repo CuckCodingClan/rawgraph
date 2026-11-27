@@ -254,6 +254,7 @@ impl GraphEditor {
     }
 
     /// Runs queued commands and the keyboard / clipboard events of this frame.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn run_edit_input(&mut self, ctx: &egui::Context, session: &mut Session, status: &mut Status, rect: Rect, xf: &Xform, pointer: Option<Pos2>, graph_focus: bool) {
         let at_pointer = pointer.filter(|p| rect.contains(*p)).map(|p| {
             let g = xf.to_graph(p);

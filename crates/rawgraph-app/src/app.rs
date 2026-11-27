@@ -2789,7 +2789,7 @@ impl App {
                 i.raw.viewports.get(&id).and_then(|v| v.focused) == Some(true)
             })
         });
-        let focus_key = egui::Id::new("clean_feed_editor_was_focused");
+        let focus_key = egui::Id::unique("clean_feed_editor_was_focused");
         let editor_refocused = ctx.data_mut(|data| {
             let was_focused = data.get_temp::<bool>(focus_key).unwrap_or(false);
             data.insert_temp(focus_key, editor_focused);

@@ -130,7 +130,7 @@ fn encode_rgb_to<W: Write + Seek>(mut w: W, width: u32, height: u32, bytes: &[u8
         ExtendedColorType::Rgb16 => 2,
         _ => return Err(IoError::Unsupported("expected RGB8 or RGB16".into())),
     };
-    if bytes.len() % bytes_per_sample != 0 {
+    if !bytes.len().is_multiple_of(bytes_per_sample) {
         return Err(IoError::Io("invalid RGB sample bytes".into()));
     }
     check_size(width, height, bytes.len() / bytes_per_sample)?;

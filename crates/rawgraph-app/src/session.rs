@@ -292,12 +292,14 @@ impl Session {
 
     /// Whether `image` is part of the collection at the viewed node; `None`
     /// while that is not known yet.
+    #[cfg(test)]
     pub fn in_view(&self, image: ImageId) -> Option<bool> {
         let ready = self.collection.view_node.is_some() && self.collection.view_node == self.target_node();
         ready.then(|| self.collection.view_members.contains(&image))
     }
 
     /// Number of listed images that are part of the viewed collection.
+    #[cfg(test)]
     pub fn in_view_count(&self) -> Option<usize> {
         self.in_view(ImageId(0))?;
         Some(self.visible.iter().filter(|id| self.collection.view_members.contains(id)).count())
@@ -342,6 +344,7 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub fn select_id(&mut self, id: ImageId) {
         if self.visible.contains(&id) {
             self.selected = Some(id);

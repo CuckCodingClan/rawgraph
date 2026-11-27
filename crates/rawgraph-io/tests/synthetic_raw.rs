@@ -392,7 +392,7 @@ fn raw_input_gain_uses_baseline_once_on_full_and_proxy() {
     for max_dim in [None, Some(32)] {
         let a = load(&untagged, max_dim).unwrap();
         let b = load(&tagged, max_dim).unwrap();
-        for (x, y) in a.image.data().chunks_exact(4).zip(b.image.data().chunks_exact(4)) {
+        for (x, y) in a.image.data().as_chunks::<4>().0.iter().zip(b.image.data().as_chunks::<4>().0) {
             for c in 0..3 { assert!((y[c] - 2.0*x[c]).abs() < 1e-4); }
             assert_eq!((x[3], y[3]), (1.0, 1.0));
         }

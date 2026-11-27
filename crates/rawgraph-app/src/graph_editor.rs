@@ -182,7 +182,7 @@ fn exposed_toolbar_rect(node: Rect) -> Rect {
 
 #[cfg(test)]
 fn record_port_control(response: &egui::Response, name: &'static str) {
-    response.ctx.data_mut(|data| data.insert_temp(egui::Id::new(("port_control", name)), response.rect));
+    response.ctx.data_mut(|data| data.insert_temp(egui::Id::unique(("port_control", name)), response.rect));
 }
 
 fn exposed_port_menus(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions: &mut Vec<Action>) {
@@ -1367,7 +1367,7 @@ mod tests {
         let id = graph.add_node(NodeKind::Exposure, [100.0, 100.0]);
         let mut h = Harness::new(graph);
         h.click(h.node_title_pos(id));
-        let control = |h: &Harness, name: &'static str| h.ctx.data(|d| d.get_temp::<Rect>(egui::Id::new(("port_control", name))).expect(name)).center();
+        let control = |h: &Harness, name: &'static str| h.ctx.data(|d| d.get_temp::<Rect>(egui::Id::unique(("port_control", name))).expect(name)).center();
         let original = h.s.project.graph.node(id).unwrap().pos;
         h.click(control(&h, "input"));
         h.click(control(&h, "input_item"));
@@ -1504,7 +1504,7 @@ mod tests {
             let out = self.ctx.run_ui(input, |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
                     if let Some(text) = other_input {
-                        ui.add(egui::TextEdit::singleline(text).id(egui::Id::new("test_other_input")));
+                        ui.add(egui::TextEdit::singleline(text).id(egui::Id::unique("test_other_input")));
                     }
                     ed.show(ui, s, st);
                 });
@@ -2049,7 +2049,7 @@ mod tests {
         let text = h.ed.last_copy().expect("copy with graph focus").to_owned();
         h.frame(vec![Event::Paste(text.clone())]);
         assert_eq!(h.s.project.graph.nodes().count(), 4);
-        h.ctx.memory_mut(|m| m.request_focus(egui::Id::new("other widget")));
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::unique("other widget")));
         h.frame(vec![Event::Paste(text)]);
         assert_eq!(h.s.project.graph.nodes().count(), 4);
     }
@@ -2061,7 +2061,7 @@ mod tests {
         h.click(h.node_title_pos(b));
         h.other_input = Some("abc".into());
         h.frame(vec![]);
-        let other = egui::Id::new("test_other_input");
+        let other = egui::Id::unique("test_other_input");
         h.ctx.memory_mut(|m| m.request_focus(other));
         h.key(Key::Delete);
         assert_eq!(h.ctx.memory(|m| m.focused()), Some(other));

@@ -53,6 +53,7 @@ pub fn choose_monitor(monitors: &[MonitorInfo], remembered: Option<&str>, avoid:
 }
 
 /// The monitor after `current`, wrapping around.
+#[cfg(test)]
 pub fn next_monitor(monitors: &[MonitorInfo], current: Option<usize>) -> Option<usize> {
     if monitors.is_empty() {
         return None;
@@ -206,6 +207,7 @@ impl AuxWindow {
 
     /// Shows the window (immediate viewport) if it is open. `content` paints
     /// into the window's root `Ui`.
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ctx: &egui::Context,

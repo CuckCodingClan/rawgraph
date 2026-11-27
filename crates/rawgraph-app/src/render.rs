@@ -951,7 +951,7 @@ fn codec_preview(buf: &ImageBuf, spec: &rawgraph_core::ExportSpec, transform: ra
     let encoded = rawgraph_io::encode_rgb(d.width, d.height, &rgb, image::ExtendedColorType::Rgb8, ext, &options).map_err(|e| e.to_string())?;
     let decoded = image::load_from_memory(&encoded).map_err(|e| e.to_string())?.to_rgb8();
     let inverse = invert(&rec709_to_output(spec.space));
-    let rgb = decoded.as_raw().chunks_exact(3).flat_map(|p| {
+    let rgb = decoded.as_raw().as_chunks::<3>().0.iter().flat_map(|p| {
         let linear = [p[0], p[1], p[2]].map(|v| { let x = v as f32 / 255.0; (match spec.space.transfer() { Transfer::Srgb => srgb_eotf(x), Transfer::Gamma(g) => x.powf(g as f32) }) as f64 });
         let v = mul_vec(&inverse, linear);
         v.map(|x| srgb_oetf(x as f32))
@@ -1131,10 +1131,10 @@ mod tests {
         };
         let jpeg = match render(&mut worker, g.clone()) { Reply::Frame(f) => f.rgba8, _ => panic!("JPEG frame missing") };
         let display = ViewSettings::default().transform().apply(&img);
-        let samples: Vec<u8> = display.to_rgba8().chunks_exact(4).flat_map(|p| p[..3].iter().copied()).collect();
+        let samples: Vec<u8> = display.to_rgba8().as_chunks::<4>().0.iter().flat_map(|p| p[..3].iter().copied()).collect();
         let bytes = rawgraph_io::encode_rgb(32, 32, &samples, image::ExtendedColorType::Rgb8, "jpg", &rawgraph_io::SaveOptions { jpeg_quality: 5, ..Default::default() }).unwrap();
         let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
-        let expected: Vec<u8> = decoded.as_raw().chunks_exact(3).flat_map(|p| [p[0],p[1],p[2],255]).collect();
+        let expected: Vec<u8> = decoded.as_raw().as_chunks::<3>().0.iter().flat_map(|p| [p[0],p[1],p[2],255]).collect();
         assert_eq!(jpeg, expected, "worker shows decoded JPEG samples");
         g.node_mut(exp).unwrap().set_param("format", ImageId(1), 1.0);
         let png = match render(&mut worker, g.clone()) { Reply::Frame(f) => f.rgba8, _ => panic!("PNG frame missing") };

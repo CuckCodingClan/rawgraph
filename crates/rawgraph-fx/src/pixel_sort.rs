@@ -84,8 +84,8 @@ mod tests {
                 });
                 let mut image = ImageBuf::from_rgba(w as u32,h as u32,source.clone()).unwrap();
                 pixel_sort(&mut image, metric, reverse);
-                for y in 0..h { for x in 0..w { for c in 0..4 {
-                    assert_eq!(image.data()[(y*w+x)*4+c].to_bits(), reference[x*h+y].1[c].to_bits(), "{metric:?} reverse={reverse} x={x} y={y} c={c}");
+                for y in 0..h { for x in 0..w { for (c, expected) in reference[x*h+y].1.iter().enumerate() {
+                    assert_eq!(image.data()[(y*w+x)*4+c].to_bits(), expected.to_bits(), "{metric:?} reverse={reverse} x={x} y={y} c={c}");
                 } } }
             }
         }
