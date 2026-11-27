@@ -9,6 +9,8 @@ pub enum ZoomMode {
     Fit,
     /// Screen points per image pixel.
     Custom(f32),
+    /// Magnification relative to the current aspect fit.
+    Relative(f32),
 }
 
 /// Pure zoom/pan maths, unit-testable without a window.
@@ -16,7 +18,7 @@ pub fn fit_scale(avail: Vec2, image: Vec2) -> f32 {
     if image.x <= 0.0 || image.y <= 0.0 {
         return 1.0;
     }
-    (avail.x / image.x).min(avail.y / image.y).max(1e-4)
+    (avail.x / image.x).min(avail.y / image.y).max(f32::MIN_POSITIVE)
 }
 
 /// New pan offset after changing the scale from `old` to `new` such that the
@@ -52,6 +54,10 @@ pub struct Viewer {
     /// The picture of a GPU frame (a native egui texture owned by the render worker).
     gpu_tex: Option<egui::TextureId>,
     pub frame_size: [u32; 2],
+    pub click_zoom: f32,
+    pub wheel_navigates: bool,
+    pub navigation_step: i32,
+    scroll_accum: f32,
     pub mode: ZoomMode,
     /// Offset of the image centre from the viewport centre, in points.
     pan: Vec2,
@@ -83,6 +89,10 @@ impl Default for Viewer {
             texture: None,
             gpu_tex: None,
             frame_size: [0, 0],
+            click_zoom: 2.0,
+            wheel_navigates: false,
+            navigation_step: 0,
+            scroll_accum: 0.0,
             mode: ZoomMode::Fit,
             pan: Vec2::ZERO,
             error: None,
@@ -100,6 +110,10 @@ impl Default for Viewer {
 }
 
 impl Viewer {
+    pub fn with_preferences(click_zoom: f32, wheel_navigates: bool) -> Self {
+        Self { click_zoom: if click_zoom == 3.0 { 3.0 } else { 2.0 }, wheel_navigates, ..Self::default() }
+    }
+
     /// The texture that shows the current picture (GPU or CPU frame).
     pub fn texture_id(&self) -> Option<egui::TextureId> {
         self.gpu_tex.or_else(|| self.texture.as_ref().map(|t| t.id()))
@@ -186,12 +200,26 @@ impl Viewer {
         self.last_scale * pixels_per_point * 100.0
     }
 
+    pub fn accumulate_navigation(&mut self, scroll: Vec2) {
+        let delta = if scroll.x.abs() > scroll.y.abs() { scroll.x } else { scroll.y };
+        if self.scroll_accum.signum() != delta.signum() && delta != 0.0 { self.scroll_accum = 0.0; }
+        self.scroll_accum += delta;
+        if self.scroll_accum.abs() >= 30.0 {
+            self.navigation_step = if self.scroll_accum < 0.0 { 1 } else { -1 };
+            self.scroll_accum = 0.0;
+        }
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui) -> Option<Geometry> {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::from_gray(14));
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, "Image viewer"));
 
+        if response.hovered() && self.wheel_navigates && !self.tool_active {
+            let scroll = ui.input(|i| i.smooth_scroll_delta);
+            self.accumulate_navigation(scroll);
+        }
         if let Some(msg) = &self.excluded {
             paint_notice(&painter, rect, msg, false);
             return None;
@@ -212,14 +240,17 @@ impl Viewer {
         let fit = fit_scale(rect.size(), image_size);
         let mut scale = match self.mode {
             ZoomMode::Fit => fit,
-            ZoomMode::Custom(s) => s,
+            ZoomMode::Custom(s) => s.max(fit),
+            ZoomMode::Relative(m) => fit * m,
         };
 
-        if response.double_clicked() && !self.tool_active {
+        if response.clicked() && !self.tool_active {
             if matches!(self.mode, ZoomMode::Fit) {
-                self.mode = ZoomMode::Custom(1.0 / ppp);
-                scale = 1.0 / ppp;
-                self.pan = Vec2::ZERO;
+                let new = fit * self.click_zoom;
+                let anchor = response.interact_pointer_pos().map_or(Vec2::ZERO, |p| p - rect.center());
+                self.pan = zoom_around(self.pan, anchor, scale, new);
+                self.mode = ZoomMode::Relative(self.click_zoom);
+                scale = new;
             } else {
                 self.fit();
                 scale = fit;
@@ -228,14 +259,15 @@ impl Viewer {
 
         if response.hovered() {
             let (scroll, pinch, cursor) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta(), i.pointer.hover_pos()));
+            let scroll = if self.wheel_navigates { 0.0 } else { scroll };
             let pinch = if self.pinch_to_tool { 1.0 } else { pinch };
             let factor = pinch * (scroll * 0.0025).exp();
             if (factor - 1.0).abs() > 1e-4 {
-                let new = (scale * factor).clamp(fit.min(0.05) * 0.5, 64.0 / ppp);
+                let new = (scale * factor).clamp(fit, (64.0 / ppp).max(fit));
                 let from_centre = cursor.map_or(Vec2::ZERO, |c| c - rect.center());
                 self.pan = zoom_around(self.pan, from_centre, scale, new);
                 scale = new;
-                self.mode = ZoomMode::Custom(scale);
+                if new <= fit { self.fit(); } else { self.mode = ZoomMode::Custom(scale); }
             }
         }
         let pan_delta = if self.tool_active {
@@ -259,7 +291,7 @@ impl Viewer {
 
         let size = image_size * scale;
         let image_rect = Rect::from_center_size(rect.center() + self.pan, size);
-        let tint = if self.error.is_some() || self.busy.is_some() { Color32::from_gray(70) } else { Color32::WHITE };
+        let tint = if self.error.is_some() { Color32::from_gray(70) } else { Color32::WHITE };
         match self.orient {
             Some(o) => paint_oriented(&painter, texture_id, image_rect, o, tint),
             None => {
@@ -280,8 +312,6 @@ impl Viewer {
         }
         if let Some(err) = &self.error {
             paint_notice(&painter, rect, err, true);
-        } else if let Some(msg) = &self.busy {
-            paint_notice(&painter, rect, msg, false);
         }
         Some(Geometry { viewport: rect, image_rect, scale, response })
     }
@@ -360,6 +390,33 @@ mod tests {
         assert_eq!(fit_scale(Vec2::new(960.0, 1000.0), Vec2::new(1920.0, 1280.0)), 0.5);
         assert!((fit_scale(Vec2::new(2000.0, 640.0), Vec2::new(1920.0, 1280.0)) - 0.5).abs() < 1e-6);
         assert_eq!(fit_scale(Vec2::new(100.0, 100.0), Vec2::ZERO), 1.0);
+    }
+
+    #[test]
+    fn fit_and_relative_zoom_cover_varied_image_sizes() {
+        let viewport = Vec2::new(800.0, 600.0);
+        for image in [Vec2::new(12000.0, 8000.0), Vec2::new(100.0, 300.0), Vec2::new(1.0e8, 1.0e8)] {
+            let fit = fit_scale(viewport, image);
+            let size = image * fit;
+            assert!(size.x <= viewport.x + 0.01 && size.y <= viewport.y + 0.01);
+            for m in [2.0, 3.0] { assert!(((fit * m) / fit - m).abs() < 1e-5); }
+        }
+        let v = Viewer::with_preferences(3.0, true);
+        assert_eq!(v.click_zoom, 3.0);
+        assert!(v.wheel_navigates);
+    }
+
+    #[test]
+    fn wheel_navigation_accumulates_and_changes_direction() {
+        let mut v = Viewer::default();
+        v.accumulate_navigation(Vec2::new(0.0, -20.0));
+        assert_eq!(v.navigation_step, 0);
+        v.accumulate_navigation(Vec2::new(0.0, -11.0));
+        assert_eq!(v.navigation_step, 1);
+        v.navigation_step = 0;
+        v.accumulate_navigation(Vec2::new(-20.0, 0.0));
+        v.accumulate_navigation(Vec2::new(31.0, 0.0));
+        assert_eq!(v.navigation_step, -1);
     }
 
     #[test]

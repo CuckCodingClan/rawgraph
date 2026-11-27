@@ -167,7 +167,7 @@ pub struct Session {
     pub node_sel: NodeSelection,
     /// Bumped by every change of the document (autosave looks at it).
     pub edit_gen: u64,
-    /// Node shown in the viewer; `None` means the Output node.
+    /// Pinned viewer target; None follows the primary selection (session-only).
     pub viewed_node: Option<NodeId>,
     pub view: ViewSettings,
     pub project_path: Option<PathBuf>,
@@ -259,6 +259,7 @@ impl Session {
         self.scan_map.clear();
         self.scan_edits.clear();
         self.selected_node = None;
+        self.node_sel.clear();
         self.viewed_node = None;
         self.provider.reset_paths();
         self.sync_paths();
@@ -360,6 +361,18 @@ impl Session {
         let cur = self.selected_index().unwrap_or(0) as i32;
         let next = (cur + delta).clamp(0, self.visible.len() as i32 - 1) as usize;
         self.selected = Some(self.visible[next]);
+    }
+
+    /// Navigate only the current selected-node collection, never cached membership.
+    pub fn step_viewer_image(&mut self, delta: i32) {
+        let Some(node) = self.selected_node.filter(|id| self.project.graph.node(*id).is_some()) else { return };
+        let (ids, captures) = self.id_captures();
+        let result = crate::collection::compute(&self.project.graph, &ids, &captures, Some(node));
+        let members: Vec<_> = self.visible.iter().copied().filter(|id| result.view_members.contains(id)).collect();
+        if members.is_empty() || delta == 0 { return; }
+        let index = self.selected.and_then(|id| members.iter().position(|x| *x == id));
+        let next = match index { Some(i) => (i as i64 + i64::from(delta)).clamp(0, members.len() as i64 - 1) as usize, None if delta > 0 => 0, None => members.len() - 1 };
+        self.selected = Some(members[next]);
     }
 
     /// Neighbours of the selection in the filtered order, for prefetching.
@@ -635,7 +648,7 @@ impl Session {
     }
 
     pub fn window_title(&self) -> String {
-        format!("{}{} - RawGraph", self.project_name(), if self.dirty { " *" } else { "" })
+        format!("{}{} - RawGraph {}", self.project_name(), if self.dirty { " *" } else { "" }, crate::display_version())
     }
 
     /// Replaces the document with an empty project and the default graph.
@@ -692,21 +705,22 @@ impl Session {
 
     // ------------------------------------------------------------ nodes
 
+    #[cfg(test)]
     pub fn output_node(&self) -> Option<NodeId> {
         self.project.graph.nodes().find(|n| n.kind == NodeKind::Output).map(|n| n.id)
     }
 
-    /// Node the viewer renders: the viewed node if it still exists, else Output.
+    /// Node the viewer renders: pinned target, otherwise the primary selection.
     pub fn target_node(&self) -> Option<NodeId> {
-        self.viewed_node.filter(|id| self.project.graph.node(*id).is_some()).or_else(|| self.output_node())
+        [self.viewed_node, self.selected_node].into_iter().flatten().find(|id| self.project.graph.node(*id).is_some())
     }
 
     /// The interactive tool the viewer offers for the selected node.
     pub fn tool_mode(&self) -> ToolMode {
         let Some(node) = self.selected_node.and_then(|id| self.project.graph.node(id)) else { return ToolMode::None };
         match node.kind {
-            NodeKind::BrushMask => ToolMode::Brush(node.id),
-            NodeKind::Transform if self.project.graph.input_edge(node.id, 0).is_some() => ToolMode::Crop(node.id),
+            NodeKind::BrushMask if self.viewed_node.is_none() || matches!(self.brush_plan(node.id), crate::frames::BrushPlan::Mapped { .. }) => ToolMode::Brush(node.id),
+            NodeKind::Transform if self.viewed_node.is_none() && self.project.graph.input_edge(node.id, 0).is_some() => ToolMode::Crop(node.id),
             _ => ToolMode::None,
         }
     }
@@ -716,8 +730,15 @@ impl Session {
     /// that enters the Crop / Rotate node.
     pub fn render_target(&self) -> Option<(NodeId, Option<usize>)> {
         if let ToolMode::Crop(id) = self.tool_mode() {
-            if let Some((up, port)) = self.project.graph.input_edge(id, 0) {
-                return Some((up, Some(port)));
+            let graph = &self.project.graph;
+            let mut inputs = graph.input_edges(id, 0);
+            if let Some(first) = inputs.next() {
+                let image = self.current_image();
+                let evaluator = rawgraph_engine::Evaluator::new();
+                let edge = std::iter::once(first).chain(inputs)
+                    .find(|e| evaluator.contains_output(graph, e.from, e.from_port, image, self.provider.as_ref()))
+                    .unwrap_or(first);
+                return Some((edge.from, Some(edge.from_port)));
             }
         }
         // Painting a brush mask whose picture cannot be shown right behind later geometry:
@@ -833,12 +854,13 @@ impl Session {
 }
 
 /// Graph of a new project: Source -> Develop -> Exposure -> Contrast ->
-/// Highlights / Shadows -> Saturation -> Output, everything neutral except the
+/// Highlights / Shadows -> Saturation, everything neutral except the
 /// Develop defaults (as-shot white balance, baseline exposure on).
 pub fn default_graph() -> Graph {
     let mut g = Graph::new();
-    let kinds = [NodeKind::Source, NodeKind::Develop, NodeKind::Exposure, NodeKind::Contrast, NodeKind::HighlightsShadows, NodeKind::Saturation, NodeKind::Output];
+    let kinds = [NodeKind::Source, NodeKind::Develop, NodeKind::Exposure, NodeKind::Contrast, NodeKind::HighlightsShadows, NodeKind::Saturation];
     let ids: Vec<NodeId> = kinds.iter().enumerate().map(|(i, k)| g.add_node(*k, [i as f32 * 240.0, 40.0])).collect();
+    crate::node_ui::set_source_folder(&mut g, ids[0], None);
     for pair in ids.windows(2) {
         g.connect(pair[0], pair[1], 0).expect("default chain is valid");
     }
@@ -958,15 +980,26 @@ pub mod tests {
     }
 
     #[test]
-    fn target_node_falls_back_to_output() {
+    fn target_follows_selection_and_pin_is_session_only() {
         let mut s = demo_session();
-        let out = s.output_node().unwrap();
-        assert_eq!(s.target_node(), Some(out));
         let exp = s.node_by_index(4).unwrap();
+        let src = s.node_by_index(0).unwrap();
+        assert_eq!(s.target_node(), None);
+        s.selected_node = Some(exp);
+        assert_eq!(s.target_node(), Some(exp));
         s.viewed_node = Some(exp);
+        s.selected_node = Some(src);
         assert_eq!(s.target_node(), Some(exp));
         s.project.graph.remove_node(exp);
-        assert_eq!(s.target_node(), Some(out));
+        s.sanitize();
+        assert_eq!(s.viewed_node, None);
+        assert_eq!(s.target_node(), Some(src));
+        s.selected_node = None;
+        assert_eq!(s.target_node(), None);
+        s.viewed_node = Some(src);
+        s.new_project();
+        assert_eq!(s.target_node(), None);
+        assert_eq!(s.viewed_node, None);
     }
 
     #[test]
@@ -1004,6 +1037,23 @@ pub mod tests {
     }
 
     #[test]
+    fn viewer_wheel_recomputes_membership_and_respects_empty_node() {
+        let mut s = demo_session();
+        let original = s.selected;
+        s.selected_node = None;
+        s.step_viewer_image(1);
+        assert_eq!(s.selected, original);
+        s.project.graph = default_graph();
+        let source = s.node_by_index(0).unwrap();
+        s.selected_node = Some(source);
+        // An explicitly empty Source must not use stale cached membership.
+        s.collection.view_node = Some(source);
+        s.collection.view_members = s.visible().iter().copied().collect();
+        s.step_viewer_image(1);
+        assert_eq!(s.selected, original);
+    }
+
+    #[test]
     fn culling_edits_the_right_entry_and_marks_unsaved() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = Session::new(png_project(dir.path(), 3), provider());
@@ -1028,7 +1078,8 @@ pub mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = Session::new(png_project(dir.path(), 4), provider());
         let ids = s.visible().to_vec();
-        let out = s.output_node().unwrap();
+        let out = s.node_by_index(0).unwrap();
+        s.selected_node = Some(out);
         assert_eq!(s.in_view(ids[0]), None, "unknown until the collection is computed");
         assert_eq!(s.in_view_count(), None);
         s.collection.view_node = Some(out);
@@ -1037,7 +1088,7 @@ pub mod tests {
         assert_eq!(s.in_view(ids[1]), Some(false));
         assert_eq!(s.in_view_count(), Some(2));
         // The result belongs to another node: not applicable to the viewed one.
-        let src = s.node_by_index(0).unwrap();
+        let src = s.node_by_index(1).unwrap();
         s.viewed_node = Some(src);
         assert_eq!(s.in_view(ids[1]), None);
     }
@@ -1049,10 +1100,12 @@ pub mod tests {
         let kinds: Vec<NodeKind> = g.nodes().map(|n| n.kind).collect();
         assert_eq!(
             kinds,
-            [NodeKind::Source, NodeKind::Develop, NodeKind::Exposure, NodeKind::Contrast, NodeKind::HighlightsShadows, NodeKind::Saturation, NodeKind::Output]
+            [NodeKind::Source, NodeKind::Develop, NodeKind::Exposure, NodeKind::Contrast, NodeKind::HighlightsShadows, NodeKind::Saturation]
         );
         // A plain chain: every node is fed by the one before it.
         let ids: Vec<NodeId> = g.nodes().map(|n| n.id).collect();
+        assert!(matches!(g.node(ids[0]).unwrap().data(ImageId(0)), Some(rawgraph_core::NodeData::Folder(f)) if f.is_empty()));
+        assert!(!g.contains_in(ids[0], ImageId(42), &rawgraph_core::Catalog { images: &[ImageId(42)], capture: &|_| None }));
         assert_eq!(g.edges().len(), ids.len() - 1);
         for pair in ids.windows(2) {
             assert_eq!(g.input_of(pair[1], 0), Some(pair[0]));

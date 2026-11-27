@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use rawgraph_core::{Graph, ImageBuf, ImageId, NodeId, PortType};
+use rawgraph_core::{Graph, ImageBuf, ImageId, NodeId, PortType, NodeKind, ExportFileFormat, export_spec};
 use rawgraph_engine::{CancelToken, EvalError, Evaluator, ImageProvider, Value};
 use rawgraph_scope_views::{PrepareSettings, PreparedScopes};
 use rawgraph_scopes::DisplayImage;
@@ -30,6 +30,7 @@ use crate::session::ViewSettings;
 /// What the app knows that decides between the CPU and the GPU path.
 #[derive(Clone, Debug, Default)]
 pub struct GpuHints {
+    pub timing: bool,
     /// The CPU has to be used for this request (renderer setting, compare view) and why.
     pub cpu_reason: Option<String>,
     /// Changes when the files or metadata behind the image change.
@@ -108,6 +109,8 @@ pub struct Frame {
     pub scope_step: usize,
     /// Worker time for analysis + preparation of the scopes.
     pub scopes_ms: f32,
+    pub node_timings: Option<Vec<rawgraph_engine::NodeTiming>>,
+    pub gpu_tail: bool,
     pub eval_ms: f32,
     pub display_ms: f32,
     pub hits: u64,
@@ -125,7 +128,7 @@ pub struct HistogramReply {
     pub bins: Vec<f32>,
 }
 
-/// Exact scopes of the resting GPU picture (sent once after the requests stopped).
+/// Exact scopes of the resting picture (sent once after the requests stopped).
 pub struct Refined {
     pub generation: u64,
     pub prepared: PreparedScopes,
@@ -437,22 +440,26 @@ fn worker<B: Backend>(
     let mut evaluator = Evaluator::new();
     let mut stash = None;
     let mut resting: Option<RestingScopes> = None;
+    let mut cpu_resting: Option<(Instant, u64, Arc<DisplayImage>, PrepareSettings, CancelToken)> = None;
     let base_ms: Cell<Option<f32>> = Cell::new(None);
     let mut preloader = Preloader::default();
     let mut job: Option<PreloadJob> = None;
     loop {
         let refine = gpu.as_ref().and_then(|g| g.scopes.refine_due());
         let preload = preloader.due();
+        let cpu_due = cpu_resting.as_ref().map(|r| r.0);
         let due = match (refine, preload) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        let due = match (due, cpu_due) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) };
         match next_message(&rx, &mut stash, due) {
             Next::Shutdown => return,
             Next::Render(request) => {
                 // Whatever was still to be preloaded is abandoned: the request comes first.
                 preloader.on_request();
                 job = None;
+                cpu_resting = None;
                 if request.cancel.is_cancelled() {
                     continue;
                 }
@@ -460,6 +467,13 @@ fn worker<B: Backend>(
                 let reply = run_request(&mut evaluator, &request, provider.as_ref(), gpu.as_mut(), &env, &mut resting);
                 if let Some(reply) = reply {
                     let gpu_frame = matches!(&reply, Reply::Frame(f) if f.path.is_gpu());
+                    if let Reply::Frame(frame) = &reply {
+                        if !frame.path.is_gpu() {
+                            if let Some(settings) = &request.scopes {
+                                cpu_resting = Some((Instant::now() + crate::gpu_path::SCOPE_IDLE, request.generation, frame.display.clone(), settings.clone(), request.cancel.clone()));
+                            }
+                        }
+                    }
                     let hist = request.hints.histogram.filter(|_| matches!(&reply, Reply::Frame(_)));
                     if tx.send(reply).is_err() {
                         return;
@@ -491,6 +505,20 @@ fn worker<B: Backend>(
             }
             Next::Refine => {
                 let now = Instant::now();
+                if cpu_resting.as_ref().is_some_and(|r| now >= r.0) {
+                    let (_, generation, display, settings, cancel) = cpu_resting.take().unwrap();
+                    if !cancel.is_cancelled() {
+                        let t = Instant::now();
+                        let set = rawgraph_scopes::analyze(&display, &settings.request());
+                        let prepared = rawgraph_scope_views::prepare(&set, &settings);
+                        if !cancel.is_cancelled() {
+                            let refined = Refined { generation, prepared, step: settings.step.max(1), scopes_ms: t.elapsed().as_secs_f32() * 1000.0 };
+                            if tx.send(Reply::Refined(Box::new(refined))).is_err() { return; }
+                            ctx.request_repaint();
+                        }
+                    }
+                    continue;
+                }
                 let refine_now = gpu.as_ref().is_some_and(|g| g.scopes.refine_due().is_some_and(|t| now >= t));
                 if !refine_now {
                     // Nothing else is waiting: upload one neighbour in the background (the next
@@ -568,6 +596,9 @@ struct Env<'a> {
 
 /// Why a request must use the CPU regardless of the GPU, if it must.
 fn forced_cpu_reason(req: &Request) -> Option<String> {
+    if req.graph.node(req.node).is_some_and(|n| n.kind == NodeKind::Export) {
+        return Some("Export codec preview".to_owned());
+    }
     if let Some(r) = &req.hints.cpu_reason {
         return Some(r.clone());
     }
@@ -601,6 +632,7 @@ fn run_request<B: Backend>(
     env: &Env<'_>,
     resting: &mut Option<RestingScopes>,
 ) -> Option<Reply> {
+    evaluator.set_timing_enabled(req.hints.timing);
     evaluator.retain_image(req.image);
     let started = Instant::now();
     let forced = forced_cpu_reason(req);
@@ -627,6 +659,9 @@ fn run_request<B: Backend>(
             (RenderPath::fallback(reason), None)
         }
     };
+    // A GPU attempt may have evaluated a base before falling back; the CPU pass is
+    // the frame being reported, so do not mix the abandoned attempt into its rows.
+    evaluator.set_timing_enabled(req.hints.timing);
     run_cpu(evaluator, req, provider, started, path, notice)
 }
 
@@ -686,22 +721,21 @@ fn run_gpu<B: Backend>(
         Shown::Failed(message) => return GpuStep::Done(Some(Reply::Error { generation: req.generation, message })),
     };
     let display_ms = t.elapsed().as_secs_f32() * 1000.0;
-    // Scopes: coarse while requests keep arriving, exact when they rest (see `ScopeScheduler`).
-    let t = Instant::now();
+    // Publish the picture without a GPU readback.  The idle refinement reads the
+    // latest picture after requests settle, and its generation gates UI delivery.
     let now = Instant::now();
-    let (prepared, scope_step) = match &req.scopes {
+    let scope_step = match &req.scopes {
         Some(settings) => {
-            let step = gpu.scopes.on_request(now, settings.step);
+            gpu.scopes.on_request(now, settings.step);
             *resting = Some(RestingScopes { generation: req.generation, settings: settings.clone() });
-            (read_scopes(gpu, settings, step, req.generation), step)
+            settings.step.max(1)
         }
         None => {
             gpu.scopes.on_request_without_scopes(now);
             *resting = None;
-            (None, 1)
+            1
         }
     };
-    let scopes_ms = t.elapsed().as_secs_f32() * 1000.0;
     if req.cancel.is_cancelled() {
         return GpuStep::Done(None);
     }
@@ -716,9 +750,11 @@ fn run_gpu<B: Backend>(
         path: RenderPath::Gpu,
         notice: None,
         display: Arc::new(DisplayImage { width: 0, height: 0, rgb: Vec::new() }),
-        prepared,
+        prepared: None,
         scope_step,
-        scopes_ms,
+        scopes_ms: 0.0,
+        node_timings: evaluator.timings(),
+        gpu_tail: true,
         eval_ms,
         display_ms,
         hits: evaluator.hits(),
@@ -846,15 +882,17 @@ fn run_cpu(evaluator: &mut Evaluator, req: &Request, provider: &dyn ImageProvide
         Value::Mask(mask) => Arc::new(mask_to_image(&mask)),
     };
     let t = Instant::now();
-    let (display, rgba8) = req.view.transform().apply_with_rgba8(&buf);
+    let (display, rgba8) = if let Some(node) = req.graph.node(req.node).filter(|n| n.kind == NodeKind::Export) {
+        let spec = export_spec(node, req.image);
+        match codec_preview(&buf, &spec, req.view.transform()) {
+            Ok(Some(d)) => { let rgba = d.to_rgba8(); (d, rgba) }
+            Ok(None) => return Some(Reply::Excluded { generation: req.generation, message: if spec.format == ExportFileFormat::Xmp { "XMP sidecar has no image preview".into() } else { format!("{} codec preview is not yet supported", spec.format.label()) } }),
+            Err(e) => return Some(Reply::Error { generation: req.generation, message: format!("Export preview: {e}") }),
+        }
+    } else { req.view.transform().apply_with_rgba8(&buf) };
     let display_ms = t.elapsed().as_secs_f32() * 1000.0;
-    let t = Instant::now();
-    let prepared = req.scopes.as_ref().map(|settings| {
-        let set = rawgraph_scopes::analyze(&display, &settings.request());
-        rawgraph_scope_views::prepare(&set, settings)
-    });
-    let scopes_ms = t.elapsed().as_secs_f32() * 1000.0;
     let scope_step = req.scopes.as_ref().map_or(1, |s| s.step.max(1));
+    let node_timings = evaluator.timings();
     // The overlay is best effort: a mask that cannot be computed just shows nothing.
     let overlay = req.overlay.and_then(|n| match &req.hints.overlay_frame {
         // A brush mask lives in the frame of the node that uses it; carry it through the crops
@@ -882,15 +920,43 @@ fn run_cpu(evaluator: &mut Evaluator, req: &Request, provider: &dyn ImageProvide
         path,
         notice,
         display: Arc::new(display),
-        prepared,
+        prepared: None,
         scope_step,
-        scopes_ms,
+        scopes_ms: 0.0,
+        node_timings,
+        gpu_tail: false,
         eval_ms,
         display_ms,
         hits: evaluator.hits(),
         misses: evaluator.misses(),
         overlay,
     })))
+}
+
+/// Roundtrip the same rendered samples and codec settings as batch export, without filesystem I/O.
+fn codec_preview(buf: &ImageBuf, spec: &rawgraph_core::ExportSpec, transform: rawgraph_scopes::DisplayTransform) -> Result<Option<DisplayImage>, String> {
+    use rawgraph_core::color::{invert, rec709_to_output, mul_vec, srgb_eotf, srgb_oetf, Transfer};
+    let ext = match spec.format { ExportFileFormat::Jpeg => "jpg", ExportFileFormat::Png => "png", _ => return Ok(None) };
+    let settings = rawgraph_batch::settings_from_spec(spec, transform);
+    let long = match (settings.long_edge, settings.percent) {
+        (Some(n), _) => Some(n),
+        (_, Some(p)) if p.is_finite() && p < 100.0 => Some(((buf.width().max(buf.height()) as f64 * p as f64 / 100.0).round() as u32).max(1)),
+        _ => None,
+    };
+    let resized = long.map(|n| rawgraph_batch::resize_to_long_edge(buf, n));
+    let source = resized.as_deref().unwrap_or(buf);
+    let d = transform.apply_in_space(source, spec.space);
+    let rgb: Vec<u8> = d.rgb.iter().map(|v| (if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) } * 255.0).round() as u8).collect();
+    let options = rawgraph_io::SaveOptions { jpeg_quality: spec.quality, embed_profile: spec.embed_profile, space: spec.space, ..Default::default() };
+    let encoded = rawgraph_io::encode_rgb(d.width, d.height, &rgb, image::ExtendedColorType::Rgb8, ext, &options).map_err(|e| e.to_string())?;
+    let decoded = image::load_from_memory(&encoded).map_err(|e| e.to_string())?.to_rgb8();
+    let inverse = invert(&rec709_to_output(spec.space));
+    let rgb = decoded.as_raw().chunks_exact(3).flat_map(|p| {
+        let linear = [p[0], p[1], p[2]].map(|v| { let x = v as f32 / 255.0; (match spec.space.transfer() { Transfer::Srgb => srgb_eotf(x), Transfer::Gamma(g) => x.powf(g as f32) }) as f64 });
+        let v = mul_vec(&inverse, linear);
+        v.map(|x| srgb_oetf(x as f32))
+    }).collect();
+    Ok(Some(DisplayImage { width: d.width, height: d.height, rgb }))
 }
 
 /// Shows a mask as a grey image.
@@ -1029,8 +1095,56 @@ mod tests {
         let mut g = Graph::new();
         let blur = g.add_node(NodeKind::Blur, [0.0, 0.0]);
         let text = describe_error(&g, &EvalError::MissingInput { node: blur, port: 0 });
-        assert_eq!(text, "Blur: input \"Images\" is not connected");
+        assert_eq!(text, "Filter: input \"Images\" is not connected");
         assert_eq!(g.validate()[0].message, text, "same wording as Graph::validate");
+    }
+
+    #[test]
+    fn export_viewer_worker_roundtrips_without_writing_files() {
+        use rawgraph_core::{ExportText, NodeData};
+        struct Provider(Arc<ImageBuf>);
+        impl ImageProvider for Provider {
+            fn image(&self, _: ImageId) -> Result<Arc<ImageBuf>, String> { Ok(self.0.clone()) }
+        }
+        let pixels: Vec<f32> = (0..32*32).flat_map(|i| if (i + i / 32) % 2 == 0 { [1.0, 0.0, 0.0, 1.0] } else { [0.0, 0.3, 1.0, 1.0] }).collect();
+        let img = Arc::new(ImageBuf::from_rgba(32, 32, pixels).unwrap());
+        let root = std::env::temp_dir().join(format!("rawgraph-preview-worker-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("untouched");
+        std::fs::write(&marker, b"original").unwrap();
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let exp = g.add_node(NodeKind::Export, [0.0; 2]);
+        g.connect(src, exp, 0).unwrap();
+        let n = g.node_mut(exp).unwrap();
+        n.set_data(ImageId(1), Some(NodeData::Export(ExportText { out_dir: root.to_string_lossy().into_owned(), ..Default::default() })));
+        n.set_param("quality", ImageId(1), 5.0);
+        let mut worker = Renderer::new(egui::Context::default(), Arc::new(Provider(img.clone())));
+        let render = |worker: &mut Renderer, graph: Graph| {
+            let generation = worker.submit(graph, exp, None, ImageId(1), ViewSettings::default(), None, None);
+            let start = Instant::now();
+            loop {
+                if let Some(reply) = worker.poll() { if reply.generation() == generation { break reply; } }
+                assert!(start.elapsed().as_secs() < 60, "worker timed out");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let jpeg = match render(&mut worker, g.clone()) { Reply::Frame(f) => f.rgba8, _ => panic!("JPEG frame missing") };
+        let display = ViewSettings::default().transform().apply(&img);
+        let samples: Vec<u8> = display.to_rgba8().chunks_exact(4).flat_map(|p| p[..3].iter().copied()).collect();
+        let bytes = rawgraph_io::encode_rgb(32, 32, &samples, image::ExtendedColorType::Rgb8, "jpg", &rawgraph_io::SaveOptions { jpeg_quality: 5, ..Default::default() }).unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        let expected: Vec<u8> = decoded.as_raw().chunks_exact(3).flat_map(|p| [p[0],p[1],p[2],255]).collect();
+        assert_eq!(jpeg, expected, "worker shows decoded JPEG samples");
+        g.node_mut(exp).unwrap().set_param("format", ImageId(1), 1.0);
+        let png = match render(&mut worker, g.clone()) { Reply::Frame(f) => f.rgba8, _ => panic!("PNG frame missing") };
+        assert_eq!(png, display.to_rgba8());
+        assert_ne!(jpeg, png, "lossy codec visibly changes the frame");
+        g.node_mut(exp).unwrap().set_param("format", ImageId(1), 7.0);
+        assert!(matches!(render(&mut worker, g), Reply::Excluded { message, .. } if message.contains("no image")));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1063,13 +1177,60 @@ mod tests {
                 assert_eq!(f.generation, gen2);
                 assert_eq!((f.width, f.height), (960, 640));
                 assert_eq!(f.rgba8.len(), 960 * 640 * 4);
-                assert!(f.prepared.is_some(), "scopes are prepared on the worker");
+                assert!(f.prepared.is_none(), "the frame precedes scope preparation");
                 assert_eq!(f.path.short(), "CPU");
             }
             Some(Reply::Error { message, .. } | Reply::Excluded { message, .. }) => panic!("unexpected error: {message}"),
             Some(_) => panic!("unexpected reply"),
             None => panic!("no frame arrived"),
         }
+    }
+
+    #[test]
+    fn cpu_worker_publishes_latest_frame_before_settled_scopes() {
+        let (requests, rx) = channel();
+        let (tx, replies) = channel();
+        let provider = demo_provider();
+        let graph = crate::session::demo_graph();
+        let out = output_node(&graph);
+        let thread = std::thread::spawn(move || {
+            worker::<FakeBackend>(rx, tx, provider, egui::Context::default(), None,
+                String::new(), RendererMode::Cpu, Arc::new(AtomicU64::new(0)), None);
+        });
+        let timeout = std::time::Duration::from_secs(30);
+        requests.send(Msg::Render(request(&graph, out, 1, 0.0, true))).unwrap();
+        assert!(matches!(replies.recv_timeout(timeout).unwrap(), Reply::Frame(f) if f.generation == 1 && f.prepared.is_none()));
+        requests.send(Msg::Render(request(&graph, out, 2, 0.5, true))).unwrap();
+        assert!(matches!(replies.recv_timeout(timeout).unwrap(), Reply::Frame(f) if f.generation == 2 && f.prepared.is_none()));
+        assert!(matches!(replies.recv_timeout(timeout).unwrap(), Reply::Refined(r) if r.generation == 2 && r.step == 1));
+        requests.send(Msg::Render(request(&graph, out, 3, 0.0, false))).unwrap();
+        assert!(matches!(replies.recv_timeout(timeout).unwrap(), Reply::Frame(f) if f.generation == 3 && f.prepared.is_none()));
+        assert!(matches!(replies.recv_timeout(crate::gpu_path::SCOPE_IDLE * 2), Err(RecvTimeoutError::Timeout)), "hidden scopes must not be prepared");
+        requests.send(Msg::Shutdown).unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn export_codec_frame_precedes_latest_generation_scopes() {
+        let (requests, rx) = channel();
+        let (tx, replies) = channel();
+        let provider = demo_provider();
+        let mut graph = Graph::new();
+        let source = graph.add_node(NodeKind::Source, [0.0; 2]);
+        let export = graph.add_node(NodeKind::Export, [0.0; 2]);
+        graph.connect(source, export, 0).unwrap();
+        let thread = std::thread::spawn(move || {
+            worker::<FakeBackend>(rx, tx, provider, egui::Context::default(), None,
+                String::new(), RendererMode::Cpu, Arc::new(AtomicU64::new(0)), None);
+        });
+        let timeout = std::time::Duration::from_secs(30);
+        requests.send(Msg::Render(request(&graph, export, 1, 0.0, true))).unwrap();
+        assert!(matches!(replies.recv_timeout(timeout).unwrap(), Reply::Frame(f) if f.generation == 1 && f.prepared.is_none()));
+        requests.send(Msg::Render(request(&graph, export, 2, 0.5, true))).unwrap();
+        assert!(matches!(replies.recv_timeout(timeout).unwrap(), Reply::Frame(f) if f.generation == 2 && f.prepared.is_none()));
+        assert!(matches!(replies.recv_timeout(timeout).unwrap(), Reply::Refined(r) if r.generation == 2 && r.step == 1));
+        requests.send(Msg::Shutdown).unwrap();
+        thread.join().unwrap();
     }
 
     // ---- the GPU path of the worker, with a fake GPU
@@ -1130,16 +1291,41 @@ mod tests {
         let f1 = frame_of(run(&mut session, RendererMode::Auto, &request(&g, out, 1, 0.0, true), &mut ev, prov.as_ref()));
         assert!(f1.path.is_gpu());
         assert!(f1.rgba8.is_empty() && f1.gpu.is_some(), "no pixels are read back for the picture");
-        assert!(f1.prepared.is_some());
+        assert!(f1.prepared.is_none(), "scope readback must not precede the frame");
         assert_eq!(f1.scope_step, 1, "the first request of a gesture is exact");
         // A slider drag: the tail changes, the base stays on the GPU.
         let f2 = frame_of(run(&mut session, RendererMode::Auto, &request(&g, out, 2, 0.5, true), &mut ev, prov.as_ref()));
         assert!(f2.path.is_gpu());
-        assert_eq!(f2.scope_step, 2, "scopes read every 2nd pixel while requests keep arriving");
+        assert!(f2.prepared.is_none(), "drag frames also avoid scope readback");
         let s = session.as_ref().unwrap();
         assert_eq!(s.stats.uploads, 1);
         assert_eq!(s.stats.renders, 2);
         assert!(s.scopes.refine_due().is_some(), "the exact reading is scheduled");
+    }
+
+    #[test]
+    fn gpu_worker_publishes_latest_frame_before_its_scopes() {
+        let (requests, rx) = channel();
+        let (tx, replies) = channel();
+        let provider = demo_provider();
+        let graph = crate::session::demo_graph();
+        let out = output_node(&graph);
+        let thread = std::thread::spawn(move || {
+            worker(rx, tx, provider, egui::Context::default(),
+                Some(GpuSession::new(FakeBackend::new(), RendererMode::Auto, None)),
+                String::new(), RendererMode::Auto, Arc::new(AtomicU64::new(0)), None);
+        });
+        requests.send(Msg::Render(request(&graph, out, 1, 0.0, true))).unwrap();
+        let timeout = std::time::Duration::from_secs(30);
+        assert!(matches!(replies.recv_timeout(timeout).unwrap(), Reply::Frame(f) if f.generation == 1 && f.prepared.is_none()));
+        requests.send(Msg::Render(request(&graph, out, 2, 0.5, true))).unwrap();
+        assert!(matches!(replies.recv_timeout(timeout).unwrap(), Reply::Frame(f) if f.generation == 2 && f.prepared.is_none()));
+        assert!(matches!(replies.recv_timeout(timeout).unwrap(), Reply::Refined(r) if r.generation == 2 && r.step == 1));
+        requests.send(Msg::Render(request(&graph, out, 3, 0.0, false))).unwrap();
+        assert!(matches!(replies.recv_timeout(timeout).unwrap(), Reply::Frame(f) if f.generation == 3 && f.prepared.is_none()));
+        assert!(matches!(replies.recv_timeout(crate::gpu_path::SCOPE_IDLE * 2), Err(RecvTimeoutError::Timeout)), "hidden scopes must not be prepared");
+        requests.send(Msg::Shutdown).unwrap();
+        thread.join().unwrap();
     }
 
     #[test]
@@ -1194,7 +1380,7 @@ mod tests {
         for i in 1..=3u64 {
             let f = frame_of(run(&mut session, RendererMode::Auto, &request(&g, out, i, 0.1 * i as f32, true), &mut ev, prov.as_ref()));
             assert!(!f.rgba8.is_empty() && f.gpu.is_none(), "a picture is always there");
-            assert!(f.prepared.is_some(), "the CPU frame has its scopes");
+            assert!(f.prepared.is_none(), "the CPU frame precedes scope preparation");
             assert!(matches!(&f.path, RenderPath::Cpu { reason, .. } if reason.contains("memory")), "{:?}", f.path);
         }
         assert_eq!(session.as_ref().unwrap().fallback.consecutive_oom(), 1, "one attempt for the image");

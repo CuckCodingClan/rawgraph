@@ -115,6 +115,15 @@ struct Entry {
     value: Value,
 }
 
+/// One node's exclusive CPU evaluation work for a single preview request.
+#[derive(Clone, Debug)]
+pub struct NodeTiming {
+    pub node: NodeId,
+    pub cpu: std::time::Duration,
+    pub computed: u64,
+    pub cache_hits: u64,
+}
+
 /// Caching graph evaluator.
 pub struct Evaluator {
     cache: HashMap<Key, Entry>,
@@ -125,11 +134,14 @@ pub struct Evaluator {
     hits: u64,
     misses: u64,
     keep_intermediates: bool,
+    timings: Option<Vec<NodeTiming>>,
+    timing_children: Vec<std::time::Duration>,
+    timing_hit: Vec<bool>,
 }
 
 impl Default for Evaluator {
     fn default() -> Self {
-        Self { cache: HashMap::new(), pre_tone: HashMap::new(), hits: 0, misses: 0, keep_intermediates: true }
+        Self { cache: HashMap::new(), pre_tone: HashMap::new(), hits: 0, misses: 0, keep_intermediates: true, timings: None, timing_children: Vec::new(), timing_hit: Vec::new() }
     }
 }
 
@@ -153,12 +165,19 @@ impl Env<'_> {
         self.cat(|c| graph.contains_output_in(node, port, image, c))
     }
 
+    /// Resolve image inputs by collection membership, retaining wire order.
+    fn input_edge(&self, graph: &Graph, node: NodeId, port: usize, image: ImageId) -> Option<(NodeId, usize)> {
+        let n = graph.node(node)?;
+        if !n.is_collection_input(port) { return graph.input_edge(node, port).filter(|(up, p)| n.input_type(port) != Some(PortType::Images) || self.contains_output(graph, *up, *p, image)); }
+        graph.input_edges(node, port).find(|e| self.contains_output(graph, e.from, e.from_port, image)).map(|e| (e.from, e.from_port))
+    }
+
     /// Membership for viewing `node` (output port 0). Viewing a Metadata Split passes its
     /// whole input collection through.
     fn viewing_member(&self, graph: &Graph, node: NodeId, image: ImageId) -> bool {
         let is_split = graph.node(node).is_some_and(|n| n.kind == NodeKind::MetadataSplit);
         if is_split {
-            graph.input_edge(node, 0).is_some_and(|(up, up_port)| self.contains_output(graph, up, up_port, image))
+            self.input_edge(graph, node, 0, image).is_some()
         } else {
             self.contains_output(graph, node, 0, image)
         }
@@ -214,7 +233,7 @@ impl Evaluator {
         cancel: &CancelToken,
     ) -> Result<Value, EvalError> {
         let member = env.contains_output(graph, node, port, image);
-        self.eval_checked(graph, node, member, image, env, cancel)
+        self.eval_checked(graph, node, member, image, env, cancel).map(|v| output_value(graph, node, port, v))
     }
 
     fn eval_checked(
@@ -292,6 +311,7 @@ impl Evaluator {
         let mut base_before_tone = false;
         loop {
             let n = graph.node(cur).ok_or(EvalError::UnknownNode(cur))?;
+            if output_channel(n, cur_port).is_some() { break; }
             if visited.contains(&cur) {
                 return Err(EvalError::MissingInput { node: cur, port: 0 });
             }
@@ -310,7 +330,7 @@ impl Evaluator {
             } else {
                 0
             };
-            let (up, up_port) = graph.input_edge(cur, port).ok_or(EvalError::MissingInput { node: cur, port })?;
+            let (up, up_port) = env.input_edge(graph, cur, port, image).ok_or(EvalError::MissingInput { node: cur, port })?;
             (cur, cur_port) = (up, up_port);
         }
         let ops: Vec<TailOp> = groups.into_iter().rev().flatten().collect();
@@ -323,6 +343,7 @@ impl Evaluator {
                 None => node_fingerprint(graph, cur, image, &env, &mut memo, &mut Vec::new())?,
             }
         };
+        let base_fingerprint = if output_channel(graph.node(cur).unwrap(), cur_port).is_some() { let mut h = DefaultHasher::new(); base_fingerprint.hash(&mut h); cur_port.hash(&mut h); output_channel(graph.node(cur).unwrap(), cur_port).hash(&mut h); h.finish() } else { base_fingerprint };
         Ok(TailPlan { base: cur, base_port: cur_port, ops, base_fingerprint, base_before_tone })
     }
 
@@ -458,6 +479,15 @@ impl Evaluator {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Start or disable request-local profiling. Disabled evaluation reads no profiling clock.
+    pub fn set_timing_enabled(&mut self, enabled: bool) {
+        self.timings = enabled.then(Vec::new);
+        self.timing_children.clear();
+        self.timing_hit.clear();
+    }
+
+    pub fn timings(&self) -> Option<Vec<NodeTiming>> { self.timings.clone() }
+
     fn eval_node(
         &mut self,
         graph: &Graph,
@@ -477,9 +507,31 @@ impl Evaluator {
             // Graphs built through `connect` are acyclic; a hand-edited file may not be.
             return Err(EvalError::MissingInput { node: id, port: 0 });
         }
+        let start = self.timings.as_ref().map(|_| std::time::Instant::now());
+        if start.is_some() {
+            self.timing_children.push(std::time::Duration::ZERO);
+            self.timing_hit.push(false);
+        }
         visiting.push(id);
         let result = self.eval_node_inner(graph, node, image, size, env, cancel, visiting, memo);
         visiting.pop();
+        if let Some(start) = start {
+            let elapsed = start.elapsed();
+            let children = self.timing_children.pop().unwrap();
+            let hit = self.timing_hit.pop().unwrap();
+            if let Some(parent) = self.timing_children.last_mut() { *parent += elapsed; }
+            if result.is_ok() {
+                let rows = self.timings.as_mut().unwrap();
+                let i = rows.iter().position(|r| r.node == id).unwrap_or_else(|| {
+                    rows.push(NodeTiming { node: id, cpu: std::time::Duration::ZERO, computed: 0, cache_hits: 0 });
+                    rows.len() - 1
+                });
+                if hit { rows[i].cache_hits += 1; } else {
+                    rows[i].computed += 1;
+                    rows[i].cpu += elapsed.saturating_sub(children);
+                }
+            }
+        }
         result
     }
 
@@ -524,7 +576,7 @@ impl Evaluator {
         let mut used: Vec<NodeId> = Vec::new();
 
         let specs = node.kind.inputs();
-        let mut inputs: Vec<Option<Value>> = vec![None; specs.len()];
+        let mut inputs: Vec<Option<Value>> = vec![None; specs.len() + node.exposed_inputs().len()];
         // Images first, so that a mask can be evaluated for the size of the image it modulates.
         for pass in [PortType::Images, PortType::Mask] {
             let up_size = if pass == PortType::Mask {
@@ -540,13 +592,15 @@ impl Evaluator {
                 None
             };
             for (port, spec) in specs.iter().enumerate().filter(|(_, s)| s.ty == pass) {
+                if node.kind == NodeKind::Normals && port != node.choice("mode", image) { continue; }
                 if chosen.is_some_and(|c| c != port) {
                     continue;
                 }
-                match graph.input_edge(id, port) {
-                    Some((up, _)) => {
+                match env.input_edge(graph, id, port, image) {
+                    Some((up, up_port)) => {
                         used.push(up);
                         let (_, value) = self.eval_node(graph, up, image, up_size, env, cancel, visiting, memo)?;
+                        let value = output_value(graph, up, up_port, value);
                         let ty = match value {
                             Value::Images(_) => PortType::Images,
                             Value::Mask(_) => PortType::Mask,
@@ -556,9 +610,20 @@ impl Evaluator {
                         }
                         inputs[port] = Some(value);
                     }
-                    None if spec.required => return Err(EvalError::MissingInput { node: id, port }),
+                    None if (spec.required && !(node.kind == NodeKind::Generator && graph.input_edges(id, 0).next().is_none())) || node.kind == NodeKind::Normals => return Err(EvalError::MissingInput { node: id, port }),
                     None => {}
                 }
+            }
+        }
+
+        for (i, exposed) in node.exposed_inputs().iter().enumerate() {
+            let Some(exposed) = exposed else { continue };
+            let port = specs.len() + i;
+            if let Some((up, up_port)) = env.input_edge(graph, id, port, image) {
+                used.push(up);
+                let target = inputs.iter().flatten().find_map(|v| match v { Value::Images(img) => Some((img.width(), img.height())), _ => None });
+                let (_, v) = self.eval_node(graph, up, image, if exposed.ty == PortType::Mask { target } else { None }, env, cancel, visiting, memo)?;
+                inputs[port] = Some(output_value(graph, up, up_port, v));
             }
         }
 
@@ -566,6 +631,7 @@ impl Evaluator {
         if let Some(entry) = self.cache.get(&key) {
             if entry.fingerprint == fingerprint {
                 self.hits += 1;
+                if let Some(hit) = self.timing_hit.last_mut() { *hit = true; }
                 let value = entry.value.clone();
                 self.release(&used, image);
                 return Ok((fingerprint, value));
@@ -598,15 +664,54 @@ impl Evaluator {
         memo: &mut FingerprintMemo,
     ) -> Result<Value, EvalError> {
         let src = input_image(inputs, 0, node.id)?;
-        let tone = tone_ops(&develop_tone(node, image));
+        let values = develop_tone(node, image);
+        let local = node.choice("tone_version", image) == 1;
+        let tone = tone_ops(&values);
+        let mut mapped = std::collections::HashMap::new();
+        for (i, exposed) in node.exposed_inputs().iter().enumerate() {
+            let Some(exposed) = exposed else { continue };
+            let Some(Some(value)) = inputs.get(node.kind.inputs().len() + i) else { continue };
+            let mask = match value {
+                Value::Images(m) => MaskBuf { width: m.width(), height: m.height(), data: m.data().chunks_exact(4).map(|p| 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2]).collect() },
+                Value::Mask(m) => (**m).clone(),
+            };
+            let mask = if (mask.width, mask.height) != (src.width(), src.height()) { fx::resize_mask(&mask, src.width(), src.height()) } else { mask };
+            let spec = node.kind.param_spec(&exposed.parameter).unwrap();
+            let data: Vec<f32> = mask.data.into_iter().map(|v| { let t = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 }; spec.min + t * (spec.max - spec.min) }).collect();
+            mapped.insert(exposed.parameter.as_str(), data);
+        }
+        if !mapped.is_empty() {
+            let fp_pre = pre_tone_fingerprint(graph, node, image, env, memo)?;
+            let pre = self.develop_pre_from(node, image, src, fp_pre, env.provider);
+            let get = |name| mapped.get(name).map(Vec::as_slice);
+            let maps = ops::DevelopControlMaps { exposure: get("exposure"), contrast: get("contrast"), highlights: get("highlights"), shadows: get("shadows"), whites: get("whites"), blacks: get("blacks") };
+            return Ok(modified(&pre, |img| {
+                if local {
+                    let mut exposure = DevelopTone::default(); exposure.exposure = values.exposure;
+                    ops::develop_legacy_mapped(img, exposure, &ops::DevelopControlMaps { exposure: maps.exposure, ..Default::default() });
+                    ops::develop_local_tone_mapped(img, values.highlights, values.shadows, values.whites, values.blacks, &maps);
+                    let mut contrast = DevelopTone::default(); contrast.contrast = values.contrast;
+                    ops::develop_legacy_mapped(img, contrast, &ops::DevelopControlMaps { contrast: maps.contrast, ..Default::default() });
+                } else { ops::develop_legacy_mapped(img, values, &maps); }
+                let mut rest = values;
+                rest.exposure = 0.0; rest.whites = 0.0; rest.blacks = 0.0; rest.highlights = 0.0; rest.shadows = 0.0; rest.contrast = 0.0;
+                for op in tone_ops(&rest) { apply_op(img, &op); }
+            }));
+        }
         if tone.is_empty() {
             return Ok(Value::Images(develop_base(node, image, src, env.provider)));
         }
         let fp_pre = pre_tone_fingerprint(graph, node, image, env, memo)?;
         let pre = self.develop_pre_from(node, image, src, fp_pre, env.provider);
         Ok(modified(&pre, |img| {
-            for op in &tone {
-                apply_op(img, op);
+            if local {
+                if values.exposure != 0.0 { ops::apply_gain(img, 2f32.powf(values.exposure)); }
+                ops::develop_local_tone(img, values.highlights, values.shadows, values.whites, values.blacks);
+                let mut rest = values;
+                rest.exposure = 0.0; rest.whites = 0.0; rest.blacks = 0.0; rest.highlights = 0.0; rest.shadows = 0.0;
+                for op in tone_ops(&rest) { apply_op(img, &op); }
+            } else {
+                for op in &tone { apply_op(img, op); }
             }
         }))
     }
@@ -667,7 +772,7 @@ impl Evaluator {
         if cancel.is_cancelled() {
             return Err(EvalError::Cancelled);
         }
-        let (up, _) = graph.input_edge(id, 0).ok_or(EvalError::MissingInput { node: id, port: 0 })?;
+        let (up, _) = env.input_edge(graph, id, 0, image).ok_or(EvalError::MissingInput { node: id, port: 0 })?;
         let mut visiting = vec![id];
         let (_, value) = self.eval_node(graph, up, image, None, env, cancel, &mut visiting, &mut memo)?;
         let Value::Images(src) = value else {
@@ -695,6 +800,7 @@ impl Evaluator {
         if let Some(entry) = self.cache.get(&key) {
             if entry.fingerprint == fingerprint {
                 self.hits += 1;
+                if let Some(hit) = self.timing_hit.last_mut() { *hit = true; }
                 return Ok((fingerprint, entry.value.clone()));
             }
         }
@@ -763,12 +869,12 @@ impl Evaluator {
         cancel: &CancelToken,
         visiting: &mut Vec<NodeId>,
     ) -> Result<Arc<ImageBuf>, EvalError> {
-        let (up, _) = graph.input_edge(node.id, layer).ok_or(EvalError::MissingInput { node: node.id, port: layer })?;
+        let (up, up_port) = graph.input_edge(node.id, layer).ok_or(EvalError::MissingInput { node: node.id, port: layer })?;
         // Fingerprints are per image, so a source image gets its own memo.
         let mut memo = FingerprintMemo::new();
         let (_, value) = self.eval_node(graph, up, src, None, env, cancel, visiting, &mut memo)?;
         self.release(&[up], src);
-        match value {
+        match output_value(graph, up, up_port, value) {
             Value::Images(img) => Ok(img),
             Value::Mask(_) => Err(EvalError::WrongType { node: node.id, port: layer }),
         }
@@ -854,6 +960,13 @@ fn hash_node_data(data: Option<&NodeData>, hasher: &mut DefaultHasher) {
     }
     match data {
         None => hasher.write_u8(0),
+        Some(NodeData::GradientRamp(r)) => {
+            hasher.write_u8(7);
+            hasher.write_usize(r.colors.len());
+            for s in &r.colors { hasher.write_u32(s.position.to_bits()); for v in s.color { hasher.write_u32(v.to_bits()); } hasher.write_u32(s.midpoint.to_bits()); }
+            hasher.write_usize(r.opacities.len());
+            for s in &r.opacities { hasher.write_u32(s.position.to_bits()); hasher.write_u32(s.opacity.to_bits()); hasher.write_u32(s.midpoint.to_bits()); }
+        }
         Some(NodeData::Curve(points)) => {
             hasher.write_u8(1);
             hasher.write_usize(points.len());
@@ -1006,6 +1119,11 @@ fn node_fingerprint_inner(
     let provider = env.provider;
     let mut hasher = DefaultHasher::new();
     node.kind.hash(&mut hasher);
+    if node.kind == NodeKind::DepthEstimate {
+        std::env::var_os("RAWGRAPH_DEPTH_WORKER").hash(&mut hasher);
+        std::env::var_os("RAWGRAPH_DEPTH_SCRIPT").hash(&mut hasher);
+        std::env::var_os("RAWGRAPH_DEPTH_MODEL").hash(&mut hasher);
+    }
     image.hash(&mut hasher);
     provider.revision(image).hash(&mut hasher);
     for spec in node.kind.params() {
@@ -1064,6 +1182,7 @@ fn node_fingerprint_inner(
             provider_full_size(provider, src).hash(&mut hasher);
             let (up, up_port) = graph.input_edge(id, layer).ok_or(EvalError::MissingInput { node: id, port: layer })?;
             up_port.hash(&mut hasher);
+            output_channel(graph.node(up).unwrap(), up_port).hash(&mut hasher);
             let fp = node_fingerprint(graph, up, src, env, memos.entry(src).or_default(), visiting)?;
             if graph.node(up).and_then(|u| u.kind.output()) != Some(PortType::Images) {
                 return Err(EvalError::WrongType { node: id, port: layer });
@@ -1076,12 +1195,14 @@ fn node_fingerprint_inner(
     let specs = node.kind.inputs();
     for pass in [PortType::Images, PortType::Mask] {
         for (port, spec) in specs.iter().enumerate().filter(|(_, s)| s.ty == pass) {
+            if node.kind == NodeKind::Normals && port != node.choice("mode", image) { continue; }
             if chosen.is_some_and(|c| c != port) {
                 continue;
             }
-            match graph.input_edge(id, port) {
+            match env.input_edge(graph, id, port, image) {
                 Some((up, up_port)) => {
                     up_port.hash(&mut hasher);
+                    output_channel(graph.node(up).unwrap(), up_port).hash(&mut hasher);
                     if graph.node(up).is_some_and(|u| u.kind == NodeKind::MetadataSplit) {
                         // The port decision of the split this input hangs on.
                         env.cat(|c| graph.split_port_in(up, image, c)).hash(&mut hasher);
@@ -1092,10 +1213,21 @@ fn node_fingerprint_inner(
                     }
                     fp.hash(&mut hasher);
                 }
-                None if spec.required => return Err(EvalError::MissingInput { node: id, port }),
+                None if (spec.required && !(node.kind == NodeKind::Generator && graph.input_edges(id, 0).next().is_none())) || node.kind == NodeKind::Normals => return Err(EvalError::MissingInput { node: id, port }),
                 None => u64::MAX.hash(&mut hasher),
             }
         }
+    }
+    for (i, exposed) in node.exposed_inputs().iter().enumerate() {
+        let Some(exposed) = exposed else { continue };
+        let port = specs.len() + i;
+        port.hash(&mut hasher);
+        exposed.parameter.hash(&mut hasher);
+        if let Some((up, up_port)) = env.input_edge(graph, id, port, image) {
+            up_port.hash(&mut hasher);
+            output_channel(graph.node(up).unwrap(), up_port).hash(&mut hasher);
+            node_fingerprint(graph, up, image, env, memo, visiting)?.hash(&mut hasher);
+        } else { u64::MAX.hash(&mut hasher); }
     }
     Ok(hasher.finish())
 }
@@ -1247,7 +1379,7 @@ fn develop_base_is_neutral(settings: &DevelopSettings) -> bool {
 fn tail_step(graph: &Graph, node: &rawgraph_core::Node, image: ImageId, provider: &dyn ImageProvider) -> TailStep {
     let id = node.id;
     let param = |name: &str| node.param(name, image);
-    let masked = graph.input_edge(id, 1).is_some();
+    let masked = graph.input_edge(id, 1).is_some() || node.exposed_inputs().iter().enumerate().any(|(i, p)| p.is_some() && graph.input_edge(id, node.kind.inputs().len() + i).is_some());
     match node.kind {
         NodeKind::Output | NodeKind::Export | NodeKind::MetadataFilter | NodeKind::MetadataSplit | NodeKind::Merge => {
             TailStep::Through(Vec::new())
@@ -1255,6 +1387,10 @@ fn tail_step(graph: &Graph, node: &rawgraph_core::Node, image: ImageId, provider
         NodeKind::CaptureEv => TailStep::Through(gain_op(param("delta"))),
         NodeKind::Exposure if !masked => TailStep::Through(gain_op(param("ev"))),
         NodeKind::Develop => {
+            if masked { return TailStep::Base; }
+            if node.choice("tone_version", image) == 1 && !develop_tone(node, image).is_identity() {
+                return TailStep::Base;
+            }
             let tone = tone_ops(&develop_tone(node, image));
             if !tone.is_empty() {
                 return TailStep::Tone(tone);
@@ -1420,6 +1556,20 @@ fn missing_input(graph: &Graph, id: NodeId, seen: &mut Vec<NodeId>) -> Option<(N
     None
 }
 
+// Reserved exposed-output labels extract a linear data channel into RGB; alpha is opaque.
+fn output_channel(node: &rawgraph_core::Node, port: usize) -> Option<u8> {
+    if node.output_type(port) != Some(PortType::Images) { return None; }
+    let alias = node.exposed_outputs().get(port.checked_sub(node.kind.outputs().len())?)?.as_ref()?;
+    match alias.label.as_str() { "Luma" => Some(0), "R" => Some(1), "G" => Some(2), "B" => Some(3), "A" => Some(4), _ => None }
+}
+fn output_value(graph: &Graph, node: NodeId, port: usize, value: Value) -> Value {
+    let Some(channel) = graph.node(node).and_then(|n| output_channel(n, port)) else { return value };
+    match value { Value::Images(img) => modified(&img, |out| { for p in out.data_mut().chunks_exact_mut(4) {
+        let v = match channel { 0 => 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2], n => p[n as usize - 1] };
+        p.copy_from_slice(&[v, v, v, 1.0]);
+    }}), other => other }
+}
+
 fn input_image(inputs: &[Option<Value>], port: usize, node: NodeId) -> Result<Arc<ImageBuf>, EvalError> {
     match inputs.get(port) {
         Some(Some(Value::Images(img))) => Ok(img.clone()),
@@ -1475,6 +1625,66 @@ fn long_edge(img: &ImageBuf) -> f32 {
     img.width().max(img.height()) as f32
 }
 
+
+// One-shot, versioned binary protocol. No shell or network access is invoked by RawGraph.
+fn depth_worker(image: &ImageBuf) -> Result<MaskBuf, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let worker = std::env::var_os("RAWGRAPH_DEPTH_WORKER").ok_or("Depth Estimate: set RAWGRAPH_DEPTH_WORKER to the configured executable; see docs/depth-estimate.md")?;
+    let mut command = Command::new(worker);
+    if let Some(script) = std::env::var_os("RAWGRAPH_DEPTH_SCRIPT") { command.arg(script); }
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("Depth Estimate: cannot start worker: {e}"))?;
+    let write_result = (|| -> std::io::Result<()> {
+        let mut input = std::io::BufWriter::new(child.stdin.take().unwrap());
+        input.write_all(b"RGD1")?;
+        input.write_all(&image.width().to_le_bytes())?;
+        input.write_all(&image.height().to_le_bytes())?;
+        for v in image.data() { input.write_all(&v.to_le_bytes())?; }
+        input.flush()?;
+        Ok(())
+    })();
+    let out = child.wait_with_output().map_err(|e| format!("Depth Estimate worker: {e}"))?;
+    if !out.status.success() { return Err(format!("Depth Estimate worker failed: {}", String::from_utf8_lossy(&out.stderr))); }
+    write_result.map_err(|e| format!("Depth Estimate worker input: {e}"))?;
+    let count = (image.width() as usize).checked_mul(image.height() as usize).ok_or("Depth Estimate: image too large")?;
+    if out.stdout.len() != 12 + count * 4 || &out.stdout[..4] != b"RGD1" || out.stdout[4..8] != image.width().to_le_bytes() || out.stdout[8..12] != image.height().to_le_bytes() { return Err("Depth Estimate: invalid worker response".into()); }
+    let data: Vec<f32> = out.stdout[12..].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+    if data.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)) { return Err("Depth Estimate: invalid depth values".into()); }
+    Ok(MaskBuf { width: image.width(), height: image.height(), data })
+}
+
+/// Render a Generator independently of any source image or provider. Callers are
+/// responsible for assigning the generated image an identity and choosing dimensions.
+fn render_generator(node: &rawgraph_core::Node, image: ImageId, width: u32, height: u32) -> Result<Arc<ImageBuf>, EvalError> {
+    use rawgraph_core::generator::{generate_with_ramp, Pattern};
+    let param = |name: &str| node.param(name, image);
+    let pattern = match node.choice("type", image) {
+        1 => Pattern::Noise { seed: param("seed").round() as u32 },
+        2 => Pattern::Checker { cell_size: (param("cell_size").round() as u32).max(1), invert: node.toggle("invert", image) },
+        _ => Pattern::StyledGradient {
+            ramp: rawgraph_core::generator::Ramp {
+                color_middle: node.toggle("ramp_middle_color", image).then(|| (param("ramp_color_position") / 100.0, [param("ramp_color_r"), param("ramp_color_g"), param("ramp_color_b")])),
+                color_midpoints: [param("ramp_color_midpoint_1") / 100.0, param("ramp_color_midpoint_2") / 100.0],
+                alpha: [param("ramp_alpha_start") / 100.0, param("ramp_alpha_middle") / 100.0, param("ramp_alpha_end") / 100.0],
+                alpha_middle: node.toggle("ramp_middle_alpha", image).then(|| param("ramp_alpha_position") / 100.0),
+                alpha_midpoints: [param("ramp_alpha_midpoint_1") / 100.0, param("ramp_alpha_midpoint_2") / 100.0],
+                smooth: if node.choice("ramp_interpolation", image) == 1 { param("ramp_smoothness") / 100.0 } else { 0.0 },
+                dither: node.toggle("ramp_dither", image),
+            },
+            style: node.choice("gradient_style", image) as u32,
+            angle: param("gradient_angle"),
+            scale: param("gradient_scale") / 100.0,
+            reverse: node.toggle("gradient_reverse", image),
+            start: [param("start_r"), param("start_g"), param("start_b")],
+            end: [param("end_r"), param("end_g"), param("end_b")],
+            vertical: node.toggle("vertical", image),
+        },
+    };
+    let ramp = match node.data(image) { Some(NodeData::GradientRamp(r)) => Some(r), _ => None };
+    generate_with_ramp(width, height, pattern, ramp).map(Arc::new)
+        .map_err(|e| EvalError::Provider(format!("Generator: {e}")))
+}
+
 fn compute(
     node: &rawgraph_core::Node,
     image: ImageId,
@@ -1487,7 +1697,32 @@ fn compute(
     let param = |name: &str| node.param(name, image);
     let (mask_w, mask_h) = size.unwrap_or((0, 0));
     match node.kind {
+        NodeKind::Generator => {
+            let (width, height) = match inputs.first().and_then(|v| v.as_ref()) {
+                Some(Value::Images(src)) => (src.width(), src.height()),
+                _ => (param("width").round().clamp(1.0, 8192.0) as u32, param("height").round().clamp(1.0, 8192.0) as u32),
+            };
+            render_generator(node, image, width, height).map(Value::Images)
+        }
+        NodeKind::Normals => {
+            let (w, h, values) = if node.choice("mode", image) == 0 {
+                let m = input_mask(inputs, 0, id)?;
+                if m.data.len() != m.width as usize * m.height as usize { return Err(EvalError::Provider("invalid depth mask shape".into())); }
+                // Depth increases away from the viewer; convert to height towards it.
+                (m.width, m.height, m.data.iter().map(|v| -*v).collect())
+            } else {
+                let src = input_image(inputs, 1, id)?;
+                (src.width(), src.height(), src.data().chunks_exact(4).map(|p| 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2]).collect())
+            };
+            Ok(Value::Images(Arc::new(normals_map(w, h, values, param("strength"), param("smoothing"), node.toggle("flip_y", image)))))
+        }
         NodeKind::Source => provider.image(image).map(Value::Images).map_err(EvalError::Provider),
+        NodeKind::DepthEstimate => {
+            let src = input_image(inputs, 0, id)?;
+            let mask = depth_worker(&src).map_err(EvalError::Provider)?;
+            let mask = if (mask.width, mask.height) != (mask_w, mask_h) && mask_w > 0 && mask_h > 0 { fx::resize_mask(&mask, mask_w, mask_h) } else { mask };
+            Ok(Value::Mask(Arc::new(mask)))
+        },
         NodeKind::MetadataFilter | NodeKind::MetadataSplit | NodeKind::Output | NodeKind::Export => {
             Ok(Value::Images(input_image(inputs, 0, id)?))
         }
@@ -1495,6 +1730,23 @@ fn compute(
         NodeKind::Exposure => {
             let src = input_image(inputs, 0, id)?;
             let mask = optional_mask(inputs, 1, &src);
+            if let Some((i, _)) = node.exposed_inputs().iter().enumerate().find(|(_, p)| p.as_ref().is_some_and(|p| p.parameter == "ev")) {
+                if let Some(Some(map)) = inputs.get(node.kind.inputs().len() + i) {
+                    let intensity = match map {
+                        Value::Images(m) => MaskBuf { width: m.width(), height: m.height(), data: m.data().chunks_exact(4).map(|p| 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2]).collect() },
+                        Value::Mask(m) => (**m).clone(),
+                    };
+                    let intensity = if (intensity.width, intensity.height) != (src.width(), src.height()) { fx::resize_mask(&intensity, src.width(), src.height()) } else { intensity };
+                    let spec = node.kind.param_spec("ev").unwrap();
+                    return Ok(modified(&src, |out| { for (i, px) in out.data_mut().chunks_exact_mut(4).enumerate() {
+                        let t = if intensity.data[i].is_finite() { intensity.data[i].clamp(0.0, 1.0) } else { 0.0 };
+                        let ev = spec.min + t * (spec.max - spec.min);
+                        let strength = mask.as_ref().map_or(1.0, |m| m.data[i].clamp(0.0, 1.0));
+                        let gain = 1.0 + (2f32.powf(ev) - 1.0) * strength;
+                        for c in &mut px[..3] { *c *= gain; }
+                    }}));
+                }
+            }
             Ok(gain(src, param("ev"), mask.as_deref()))
         }
         // Develop is computed by `Evaluator::compute_develop` (pre-tone cache), Layer by `Evaluator::eval_layer`.
@@ -1518,6 +1770,15 @@ fn compute(
                 Some(m) => Ok(modified(&src, |img| fx::saturation_masked(img, amount, &m))),
                 None => Ok(modified(&src, |img| ops::saturation(img, amount))),
             }
+        }
+        NodeKind::PixelSort => {
+            let src = input_image(inputs, 0, id)?;
+            let metric = match node.choice("metric", image) {
+                1 => fx::SortMetric::Saturation,
+                2 => fx::SortMetric::Hue,
+                _ => fx::SortMetric::Brightness,
+            };
+            Ok(modified(&src, |img| fx::pixel_sort(img, metric, node.toggle("reverse", image))))
         }
         NodeKind::ColorWheels => {
             let src = input_image(inputs, 0, id)?;
@@ -1699,14 +1960,48 @@ fn compute(
         }
         NodeKind::Blur => {
             let src = input_image(inputs, 0, id)?;
-            let sigma = param("radius") / 1000.0 * long_edge(&src);
-            if sigma.round() <= 0.0 {
+            let radius_map = node.exposed_inputs().iter().enumerate().find_map(|(i, p)| {
+                if p.as_ref().is_none_or(|p| p.parameter != "radius") { return None; }
+                let map = inputs.get(node.kind.inputs().len() + i)?.as_ref()?;
+                let m = match map {
+                    Value::Images(m) => MaskBuf { width: m.width(), height: m.height(), data: m.data().chunks_exact(4).map(|p| 0.272_228_7*p[0] + 0.674_081_8*p[1] + 0.053_689_5*p[2]).collect() },
+                    Value::Mask(m) => (**m).clone(),
+                };
+                let mut m = if (m.width, m.height) != (src.width(), src.height()) { fx::resize_mask(&m, src.width(), src.height()) } else { m };
+                for v in &mut m.data { *v = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 }; }
+                Some(m)
+            });
+            let sigma = (if radius_map.is_some() { node.kind.param_spec("radius").unwrap().max } else { param("radius") }) / 1000.0 * long_edge(&src);
+            let high = node.choice("pass", image) == 1;
+            let kernel = node.choice("kernel", image);
+            if sigma.round() <= 0.0 && !high {
                 return Ok(Value::Images(src));
             }
-            match optional_mask(inputs, 1, &src) {
-                Some(mask) => Ok(Value::Images(Arc::new(ops::blur_modulated(&src, sigma, &mask)))),
-                None => Ok(Value::Images(Arc::new(ops::blur(&src, sigma)))),
+            let mut mask = optional_mask(inputs, 1, &src).map(|m| (*m).clone());
+            if let Some(map) = radius_map {
+                if let Some(existing) = &mut mask { for (a, b) in existing.data.iter_mut().zip(&map.data) { *a = a.clamp(0.0, 1.0) * b; } } else { mask = Some(map); }
             }
+            let low = match mask {
+                Some(mask) if kernel < 2 => ops::filter_low_modulated(&src, sigma, &mask, kernel == 1),
+                None if kernel < 2 => ops::filter_low(&src, sigma, kernel == 1),
+                mask => {
+                    let direction = match inputs.get(2).and_then(Option::as_ref) { Some(Value::Images(img)) => Some(img.as_ref()), _ => None };
+                    ops::filter_sampled_direction(&src, sigma, kernel, param("angle"), mask.as_ref(), direction)
+                },
+            };
+            if !high {
+                return Ok(Value::Images(Arc::new(low)));
+            }
+            // Center the signed RGB residual at 0.5 without clipping HDR values;
+            // alpha is coverage, not a frequency component.
+            let mut result = low;
+            for (out, original) in result.data_mut().chunks_exact_mut(4).zip(src.data().chunks_exact(4)) {
+                for c in 0..3 {
+                    out[c] = 0.5 + original[c] - out[c];
+                }
+                out[3] = original[3];
+            }
+            Ok(Value::Images(Arc::new(result)))
         }
     }
 }
@@ -1826,6 +2121,442 @@ mod tests {
         }
     }
 
+    #[test]
+    fn standalone_generator_graph_members_and_pixels() {
+        let mut graph = Graph::default();
+        let id = graph.add_node(NodeKind::Generator, [0.0; 2]);
+        let provider = TestProvider::default();
+        let mut eval = Evaluator::new();
+        let members = eval.members(&graph, id, 0, &provider);
+        assert_eq!(members, vec![ImageId(u64::MAX - id.0)]);
+        let result = eval.eval(&graph, id, members[0], &provider, &CancelToken::new()).unwrap();
+        assert!(matches!(result, Value::Images(_)));
+    }
+
+    #[test]
+    fn standalone_generator_normals_members_follow_selected_input() {
+        let mut graph = Graph::new();
+        let generator = graph.add_node(NodeKind::Generator, [0.0; 2]);
+        let normals = graph.add_node(NodeKind::Normals, [0.0; 2]);
+        graph.connect(generator, normals, 1).unwrap();
+        let image = ImageId(u64::MAX - generator.0);
+        let provider = TestProvider::default();
+        let mut eval = Evaluator::new();
+        assert!(eval.members(&graph, normals, 0, &provider).is_empty());
+        assert!(graph.node_mut(normals).unwrap().set_param("mode", image, 1.0));
+        let graph = Graph::from_json(&graph.to_json()).unwrap();
+        assert_eq!(eval.members(&graph, normals, 0, &provider), vec![image]);
+        assert!(matches!(eval.eval(&graph, normals, image, &provider, &CancelToken::new()).unwrap(), Value::Images(_)));
+    }
+
+    #[test]
+    fn generator_render_needs_no_provider_or_photo() {
+        let mut graph = Graph::default();
+        let id = graph.add_node(NodeKind::Generator, [0.0; 2]);
+        let node = graph.node(id).unwrap();
+        let generated = render_generator(node, ImageId(42), 5, 3).unwrap();
+        assert_eq!((generated.width(), generated.height()), (5, 3));
+        assert_eq!(generated.pixel(0, 0), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(generated.pixel(4, 0), [1.0, 1.0, 1.0, 1.0]);
+        assert!(render_generator(node, ImageId(42), 0, 3).is_err());
+        assert!(render_generator(node, ImageId(42), u32::MAX, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn exposed_intensity_and_channels_affect_cpu_cache_and_tail() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let exp = g.add_node(NodeKind::Exposure, [0.0; 2]);
+        let out = g.add_node(NodeKind::Output, [0.0; 2]);
+        g.connect(src, exp, 0).unwrap();
+        g.connect(exp, out, 0).unwrap();
+        let input = g.expose_parameter(exp, "ev", PortType::Images).unwrap();
+        let red = g.expose_output(src, 0, "R").unwrap();
+        let green = g.expose_output(src, 0, "G").unwrap();
+        let blue = g.expose_output(src, 0, "B").unwrap();
+        let alpha = g.expose_output(src, 0, "A").unwrap();
+        let luma = g.expose_output(src, 0, "Luma").unwrap();
+        g.connect_ports(src, red, exp, input).unwrap();
+        let p = TestProvider::default();
+        *p.catalog.lock().unwrap() = vec![A];
+        *p.dims.lock().unwrap() = Some((2, 1));
+        p.flat.lock().unwrap().insert(A.0, [0.25, 0.5, 0.75]);
+        let mut ev = Evaluator::new();
+        let cancel = CancelToken::new();
+        for (port, value) in [(red, 0.25), (green, 0.5), (blue, 0.75), (alpha, 1.0), (luma, 0.272_228_7*0.25 + 0.674_081_8*0.5 + 0.053_689_5*0.75)] {
+            let Value::Images(img) = ev.eval_output(&g, src, port, A, &p, &cancel).unwrap() else { panic!() };
+            assert!((img.pixel(0, 0)[0] - value).abs() < 1e-6);
+            assert_eq!(img.pixel(0, 0)[3], 1.0);
+        }
+        let first = run(&g, out, A, &p, &mut ev);
+        assert!((first.pixel(0,0)[0] - 0.25 * 2f32.powf(-3.0)).abs() < 1e-6);
+        let fp = fingerprint_of(&g, out, A, &p);
+        let plan = ev.plan_tail(&g, out, A, &p).unwrap();
+        assert_eq!(plan.base, exp);
+        let base = ev.eval_base(&g, &plan, A, &p, &cancel).unwrap();
+        assert_eq!(apply_tail_cpu(&base, &plan.ops), *first);
+        g.connect_ports(src, green, exp, input).unwrap();
+        assert_ne!(fp, fingerprint_of(&g, out, A, &p));
+        let second = run(&g, out, A, &p, &mut ev);
+        assert!((second.pixel(0,0)[0] - 0.25).abs() < 1e-6);
+        assert_ne!(*first, *second);
+        let restored = Graph::from_json(&g.to_json()).unwrap();
+        assert_eq!(*second, *run(&restored, out, A, &p, &mut ev));
+    }
+
+    #[test]
+    fn develop_mapped_controls_match_scalar_and_invalidate_tail() {
+        for local in [0.0, 1.0] {
+            for name in ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"] {
+                let mut g = Graph::new();
+                let src = g.add_node(NodeKind::Source, [0.0; 2]);
+                let dev = g.add_node(NodeKind::Develop, [0.0; 2]);
+                let out = g.add_node(NodeKind::Output, [0.0; 2]);
+                g.connect(src, dev, 0).unwrap(); g.connect(dev, out, 0).unwrap();
+                set(&mut g, dev, "tone_version", A, local);
+                let port = g.expose_parameter(dev, name, PortType::Images).unwrap();
+                let red = g.expose_output(src, 0, "R").unwrap();
+                let green = g.expose_output(src, 0, "G").unwrap();
+                g.connect_ports(src, red, dev, port).unwrap();
+                let p = TestProvider::default(); *p.catalog.lock().unwrap() = vec![A]; *p.dims.lock().unwrap() = Some((2, 1));
+                p.flat.lock().unwrap().insert(A.0, [0.25, 0.75, 0.5]);
+                let mut ev = Evaluator::new();
+                let mapped = run(&g, out, A, &p, &mut ev);
+                let plan = ev.plan_tail(&g, out, A, &p).unwrap(); assert_eq!(plan.base, dev);
+                let base = ev.eval_base(&g, &plan, A, &p, &CancelToken::new()).unwrap(); assert_eq!(apply_tail_cpu(&base, &plan.ops), *mapped);
+                let restored = Graph::from_json(&g.to_json()).unwrap(); assert_eq!(*mapped, *run(&restored, out, A, &p, &mut ev));
+                g.connect_ports(src, green, dev, port).unwrap(); let changed = run(&g, out, A, &p, &mut ev);
+                if name == "exposure" || name == "contrast" { assert_ne!(*mapped, *changed, "{name} local={local}"); }
+                g.remove_exposed_input(dev, port);
+                let spec = NodeKind::Develop.param_spec(name).unwrap(); set(&mut g, dev, name, A, spec.min + 0.75*(spec.max-spec.min));
+                let scalar = run(&g, out, A, &p, &mut ev);
+                for (a,b) in changed.data().iter().zip(scalar.data()) { assert!((a-b).abs() < 1e-5, "{name} local={local}: {a} {b}"); }
+            }
+        }
+    }
+
+    #[test]
+    fn develop_spatial_intensity_matches_full_frame_scalar_reference() {
+        for local in [0.0, 1.0] {
+            for name in ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"] {
+                let mut g = Graph::new();
+                let src = g.add_node(NodeKind::Source, [0.0; 2]);
+                let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
+                let dev = g.add_node(NodeKind::Develop, [0.0; 2]);
+                let out = g.add_node(NodeKind::Output, [0.0; 2]);
+                g.connect(src, generator, 0).unwrap();
+                g.connect(src, dev, 0).unwrap();
+                g.connect(dev, out, 0).unwrap();
+                set(&mut g, dev, "tone_version", A, local);
+                let port = g.expose_parameter(dev, name, PortType::Images).unwrap();
+                g.connect(generator, dev, port).unwrap();
+                let p = TestProvider::default();
+                *p.catalog.lock().unwrap() = vec![A];
+                *p.dims.lock().unwrap() = Some((5, 1));
+                let mut ev = Evaluator::new();
+                let mapped = run(&g, out, A, &p, &mut ev);
+                let restored = Graph::from_json(&g.to_json()).unwrap();
+                assert_eq!(*mapped, *run(&restored, out, A, &p, &mut ev));
+                let plan = ev.plan_tail(&g, out, A, &p).unwrap();
+                let base = ev.eval_base(&g, &plan, A, &p, &CancelToken::new()).unwrap();
+                assert_eq!(apply_tail_cpu(&base, &plan.ops), *mapped);
+                g.remove_exposed_input(dev, port);
+                let spec = NodeKind::Develop.param_spec(name).unwrap();
+                for x in 0..5 {
+                    let value = spec.min + (x as f32 / 4.0) * (spec.max - spec.min);
+                    set(&mut g, dev, name, A, value);
+                    let scalar = run(&g, out, A, &p, &mut ev);
+                    for (a, b) in mapped.pixel(x, 0).iter().zip(scalar.pixel(x, 0)) {
+                        assert!((a-b).abs() < 1e-5, "{name} local={local} x={x}: {a} {b}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generator_graph_pixels_serialization_and_cache() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let gen = g.add_node(NodeKind::Generator, [0.0; 2]);
+        let out = g.add_node(NodeKind::Output, [0.0; 2]);
+        g.connect(src, gen, 0).unwrap();
+        g.connect(gen, out, 0).unwrap();
+        let p = TestProvider::default();
+        *p.dims.lock().unwrap() = Some((3, 2));
+        let mut ev = Evaluator::new();
+        let gradient = run(&g, out, A, &p, &mut ev);
+        assert_eq!(gradient.pixel(0, 0), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(gradient.pixel(1, 0), [0.5, 0.5, 0.5, 1.0]);
+        assert_eq!(gradient.pixel(2, 1), [1.0; 4]);
+        set(&mut g, gen, "type", A, 2.0);
+        set(&mut g, gen, "cell_size", A, 1.0);
+        let g2 = Graph::from_json(&g.to_json()).unwrap();
+        let checker = run(&g2, out, A, &p, &mut ev);
+        assert_eq!(checker.pixel(0, 0), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(checker.pixel(1, 0), [1.0; 4]);
+        assert_eq!(checker.pixel(0, 1), [1.0; 4]);
+        set(&mut g, gen, "type", A, 1.0);
+        set(&mut g, gen, "seed", A, 42.0);
+        let noise = run(&g, out, A, &p, &mut ev);
+        let restored = Graph::from_json(&g.to_json()).unwrap();
+        assert_eq!(noise, run(&restored, out, A, &p, &mut ev));
+        set(&mut g, gen, "seed", A, 43.0);
+        assert_ne!(noise, run(&g, out, A, &p, &mut ev));
+    }
+
+    #[test]
+    fn gradient_ramp_edits_render_roundtrip_and_invalidate_cache() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
+        let out = g.add_node(NodeKind::Output, [0.0; 2]);
+        g.connect(src, generator, 0).unwrap(); g.connect(generator, out, 0).unwrap();
+        let p = TestProvider::default(); *p.dims.lock().unwrap() = Some((9, 1));
+        let mut ev = Evaluator::new();
+        let baseline = run(&g, out, A, &p, &mut ev);
+        set(&mut g, generator, "ramp_middle_color", A, 1.0);
+        set(&mut g, generator, "ramp_color_r", A, 1.0);
+        set(&mut g, generator, "ramp_color_g", A, 0.0);
+        set(&mut g, generator, "ramp_color_b", A, 0.0);
+        set(&mut g, generator, "ramp_middle_alpha", A, 1.0);
+        set(&mut g, generator, "ramp_alpha_middle", A, 25.0);
+        let edited = run(&g, out, A, &p, &mut ev);
+        assert_ne!(baseline, edited);
+        assert_eq!(edited.pixel(4, 0), [1.0, 0.0, 0.0, 0.25]);
+        set(&mut g, generator, "ramp_color_midpoint_1", A, 25.0);
+        set(&mut g, generator, "ramp_alpha_midpoint_1", A, 25.0);
+        let shifted = run(&g, out, A, &p, &mut ev);
+        assert_ne!(edited.pixel(1, 0), shifted.pixel(1, 0));
+        set(&mut g, generator, "ramp_interpolation", A, 1.0);
+        let smooth = run(&g, out, A, &p, &mut ev);
+        assert_ne!(shifted.pixel(2, 0), smooth.pixel(2, 0));
+        set(&mut g, generator, "ramp_dither", A, 1.0);
+        let dither = run(&g, out, A, &p, &mut ev);
+        assert_ne!(smooth, dither);
+        let restored = Graph::from_json(&g.to_json()).unwrap();
+        assert_eq!(dither, run(&restored, out, A, &p, &mut Evaluator::new()));
+        set(&mut g, generator, "ramp_dither", A, 0.0);
+        set(&mut g, generator, "gradient_reverse", A, 1.0);
+        let reverse = run(&g, out, A, &p, &mut ev);
+        for x in 0..9 { assert_eq!(reverse.pixel(x, 0), smooth.pixel(8-x, 0)); }
+    }
+
+    #[test]
+    fn structured_ramp_cache_inheritance_and_graph_roundtrip() {
+        use rawgraph_core::{GradientRamp, ColorStop, OpacityStop, Mode};
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
+        let out = g.add_node(NodeKind::Output, [0.0; 2]);
+        g.connect(src, generator, 0).unwrap(); g.connect(generator, out, 0).unwrap();
+        let p = TestProvider::default(); *p.dims.lock().unwrap() = Some((9, 1));
+        let mut ramp = GradientRamp::default();
+        ramp.colors.insert(1, ColorStop { position: 0.5, color: [1.0, 0.0, 0.0], midpoint: 0.5 });
+        ramp.opacities.insert(1, OpacityStop { position: 0.5, opacity: 0.25, midpoint: 0.5 });
+        assert!(g.node_mut(generator).unwrap().set_data(A, Some(NodeData::GradientRamp(ramp.clone()))));
+        let mut ev = Evaluator::new();
+        let original = run(&g, out, A, &p, &mut ev);
+        assert_eq!(original.pixel(4, 0), [1.0, 0.0, 0.0, 0.25]);
+        ramp.colors[0].midpoint = 0.25;
+        assert!(g.node_mut(generator).unwrap().set_data(A, Some(NodeData::GradientRamp(ramp.clone()))));
+        let edited = run(&g, out, A, &p, &mut ev);
+        assert_ne!(original.pixel(1, 0), edited.pixel(1, 0));
+        let n = g.node_mut(generator).unwrap(); n.mode = Mode::Individual;
+        assert_eq!(n.data(A), Some(&NodeData::GradientRamp(ramp.clone())));
+        ramp.colors[1].color = [0.0, 1.0, 0.0];
+        assert!(n.set_data(A, Some(NodeData::GradientRamp(ramp))));
+        let individual = run(&g, out, A, &p, &mut ev);
+        assert_eq!(individual.pixel(4, 0), [0.0, 1.0, 0.0, 0.25]);
+        let restored = Graph::from_json(&g.to_json()).unwrap();
+        assert_eq!(individual, run(&restored, out, A, &p, &mut Evaluator::new()));
+        g.node_mut(generator).unwrap().mode = Mode::All;
+        assert_eq!(edited, run(&g, out, A, &p, &mut ev));
+    }
+
+    #[test]
+    fn generator_styles_angle_scale_reverse_roundtrip_and_cache() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
+        let out = g.add_node(NodeKind::Output, [0.0; 2]);
+        g.connect(src, generator, 0).unwrap();
+        g.connect(generator, out, 0).unwrap();
+        let p = TestProvider::default();
+        *p.dims.lock().unwrap() = Some((5, 5));
+        let mut ev = Evaluator::new();
+        let base = run(&g, out, A, &p, &mut ev);
+        assert_eq!(base.pixel(0, 0), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(base.pixel(4, 0), [1.0; 4]);
+        set(&mut g, generator, "gradient_reverse", A, 1.0);
+        let rev = run(&g, out, A, &p, &mut ev);
+        assert_eq!(rev.pixel(0, 0), [1.0; 4]);
+        assert_eq!(rev.pixel(4, 0), [0.0, 0.0, 0.0, 1.0]);
+        set(&mut g, generator, "gradient_reverse", A, 0.0);
+        set(&mut g, generator, "gradient_angle", A, 90.0);
+        let rotated = run(&g, out, A, &p, &mut ev);
+        assert!((rotated.pixel(2, 0)[0] - 0.0).abs() < 1e-6);
+        assert!((rotated.pixel(2, 4)[0] - 1.0).abs() < 1e-6);
+        set(&mut g, generator, "gradient_scale", A, 200.0);
+        let scaled = run(&g, out, A, &p, &mut ev);
+        assert!((scaled.pixel(2, 0)[0] - 0.25).abs() < 1e-6);
+        for style in 1..=4 {
+            set(&mut g, generator, "gradient_style", A, style as f32);
+            let frame = run(&g, out, A, &p, &mut ev);
+            assert_ne!(frame, scaled);
+            let restored = Graph::from_json(&g.to_json()).unwrap();
+            assert_eq!(frame, run(&restored, out, A, &p, &mut ev));
+            for y in 0..5 { for x in 0..5 { assert_eq!(frame.pixel(x, y)[3], 1.0); } }
+        }
+    }
+
+    #[test]
+    fn normals_mask_path_works_without_catalog_and_height_requires_explicit_mode() {
+        let mut g = Graph::new();
+        let mask = g.add_node(NodeKind::GradientMask, [0.0; 2]);
+        let normals = g.add_node(NodeKind::Normals, [0.0; 2]);
+        let out = g.add_node(NodeKind::Output, [0.0; 2]);
+        g.connect(mask, normals, 0).unwrap();
+        g.connect(normals, out, 0).unwrap();
+        let provider = TestProvider::default();
+        let mut evaluator = Evaluator::new();
+        let result = run(&g, out, A, &provider, &mut evaluator);
+        assert_eq!((result.width(), result.height()), (64, 64));
+        assert_eq!(evaluator.plan_tail(&g, out, A, &provider).unwrap().base, normals);
+        let source = g.add_node(NodeKind::Source, [0.0; 2]);
+        g.connect(source, normals, 1).unwrap();
+        set(&mut g, normals, "mode", A, 1.0);
+        let height = run(&g, out, A, &provider, &mut evaluator);
+        assert_ne!(result.data(), height.data());
+    }
+
+    #[test]
+    fn depth_missing_worker_is_actionable() {
+        if std::env::var_os("RAWGRAPH_DEPTH_WORKER").is_some() { return; }
+        let err = depth_worker(&ImageBuf::new(1, 1)).unwrap_err();
+        assert!(err.contains("RAWGRAPH_DEPTH_WORKER"), "{err}");
+    }
+
+    #[test]
+    fn depth_schema_and_membership_follow_input() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let depth = g.add_node(NodeKind::DepthEstimate, [0.0; 2]);
+        let exp = g.add_node(NodeKind::Exposure, [0.0; 2]);
+        set_data(&mut g, src, A, Some(NodeData::Folder("/a".into())));
+        g.connect(src, depth, 0).unwrap();
+        g.connect(src, exp, 0).unwrap();
+        g.connect(depth, exp, 1).unwrap();
+        let g = Graph::from_json(&g.to_json()).unwrap();
+        let p = TestProvider::default();
+        *p.catalog.lock().unwrap() = vec![A, B];
+        p.paths.lock().unwrap().insert(A.0, "/a/yes.jpg".into());
+        p.paths.lock().unwrap().insert(B.0, "/b/no.jpg".into());
+        let env = Env { provider: &p, images: &[A, B] };
+        assert_eq!(env.cat(|c| g.members(depth, 0, c)), vec![A]);
+        assert!(env.contains_output(&g, depth, 0, A));
+        assert!(!env.contains_output(&g, depth, 0, B));
+    }
+
+    #[test]
+    #[ignore = "requires configured ONNX worker and RAWGRAPH_DEPTH_FIXTURE RGD1 float fixture"]
+    fn depth_real_fixture_graph() {
+        let bytes = std::fs::read(std::env::var("RAWGRAPH_DEPTH_FIXTURE").unwrap()).unwrap();
+        assert_eq!(&bytes[..4], b"RGD1");
+        let w = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let h = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let pixels = bytes[12..].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        struct Fixture(Arc<ImageBuf>);
+        impl ImageProvider for Fixture {
+            fn image(&self, _: ImageId) -> Result<Arc<ImageBuf>, String> { Ok(self.0.clone()) }
+        }
+        let p = Fixture(Arc::new(ImageBuf::from_rgba(w, h, pixels).unwrap()));
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let depth = g.add_node(NodeKind::DepthEstimate, [0.0; 2]);
+        let exp = g.add_node(NodeKind::Exposure, [0.0; 2]);
+        g.connect(src, depth, 0).unwrap();
+        g.connect(src, exp, 0).unwrap();
+        g.connect(depth, exp, 1).unwrap();
+        set(&mut g, exp, "ev", A, 1.0);
+        let g = Graph::from_json(&g.to_json()).unwrap();
+        let mut ev = Evaluator::new();
+        let mask = match ev.eval(&g, depth, A, &p, &CancelToken::new()).unwrap() { Value::Mask(m) => m, _ => panic!("expected mask") };
+        assert_eq!((mask.width, mask.height), (w, h));
+        let (lo, hi) = mask.data.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a,b), &v| (a.min(v), b.max(v)));
+        assert!(lo >= 0.0 && hi <= 1.0 && hi - lo > 0.9, "range {lo}..{hi}");
+        let rendered = ev.eval_image(&g, exp, A, &p, &CancelToken::new()).unwrap();
+        assert!(rendered.data().iter().zip(p.0.data()).any(|(a,b)| (a-b).abs() > 0.01));
+        let hits = ev.hits();
+        ev.eval_image(&g, exp, A, &p, &CancelToken::new()).unwrap();
+        assert!(ev.hits() > hits);
+        println!("fixture {w}x{h} depth range {lo}..{hi}");
+    }
+
+    #[test]
+    fn ordinary_image_fanin_routes_members_and_plans_consistently() {
+        let mut g = Graph::new();
+        let narrow = g.add_node(NodeKind::Source, [0.0; 2]);
+        let broad = g.add_node(NodeKind::Source, [0.0; 2]);
+        let first = g.add_node(NodeKind::Exposure, [0.0; 2]);
+        let second = g.add_node(NodeKind::Exposure, [0.0; 2]);
+        let out = g.add_node(NodeKind::Output, [0.0; 2]);
+        set_data(&mut g, narrow, A, Some(NodeData::Folder("/a/b".into())));
+        set_data(&mut g, broad, A, Some(NodeData::Folder("/a".into())));
+        set(&mut g, first, "ev", A, 1.0);
+        set(&mut g, second, "ev", A, 2.0);
+        g.connect(narrow, first, 0).unwrap();
+        g.connect(broad, second, 0).unwrap();
+        g.connect(first, out, 0).unwrap();
+        g.connect(second, out, 0).unwrap();
+        let g = Graph::from_json(&g.to_json()).unwrap();
+        let p = TestProvider::default();
+        *p.catalog.lock().unwrap() = vec![A, B];
+        p.paths.lock().unwrap().insert(A.0, "/a/b/one.jpg".into());
+        p.paths.lock().unwrap().insert(B.0, "/a/two.jpg".into());
+        let env = Env { provider: &p, images: &[A, B] };
+        assert_eq!(env.cat(|c| g.members(out, 0, c)), vec![A, B]);
+        assert_eq!(env.input_edge(&g, out, 0, A), Some((first, 0)));
+        assert_eq!(env.input_edge(&g, out, 0, B), Some((second, 0)));
+        let mut ev = Evaluator::new();
+        for (image, branch) in [(A, first), (B, second)] {
+            let rendered = ev.eval_image(&g, out, image, &p, &CancelToken::new()).unwrap();
+            let expected = ev.eval_image(&g, branch, image, &p, &CancelToken::new()).unwrap();
+            assert_eq!(*rendered, *expected);
+            let plan = ev.plan_tail(&g, out, image, &p).unwrap();
+            let branch_plan = ev.plan_tail(&g, branch, image, &p).unwrap();
+            assert_eq!(plan.base, branch_plan.base);
+            assert_eq!(plan.base_fingerprint, branch_plan.base_fingerprint);
+        }
+        let before = fingerprint_of(&g, out, B, &p);
+        let mut changed = g.clone();
+        set(&mut changed, second, "ev", A, 3.0);
+        assert_ne!(before, fingerprint_of(&changed, out, B, &p));
+        assert_eq!(fingerprint_of(&g, out, A, &p), fingerprint_of(&changed, out, A, &p));
+    }
+
+    #[test]
+    fn pixel_sort_graph_evaluation_and_parameter_cache() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let sort = g.add_node(NodeKind::PixelSort, [0.0; 2]);
+        g.connect(src, sort, 0).unwrap();
+        let p = TestProvider::default();
+        *p.dims.lock().unwrap() = Some((2, 2));
+        let original = p.image(A).unwrap();
+        let mut expected = (*original).clone();
+        fx::pixel_sort(&mut expected, fx::SortMetric::Brightness, false);
+        let mut evaluator = Evaluator::new();
+        let actual = evaluator.eval_image(&g, sort, A, &p, &CancelToken::new()).unwrap();
+        assert_eq!(*actual, expected);
+        set(&mut g, sort, "reverse", A, 1.0);
+        let mut expected_reverse = (*original).clone();
+        fx::pixel_sort(&mut expected_reverse, fx::SortMetric::Brightness, true);
+        let actual = evaluator.eval_image(&g, sort, A, &p, &CancelToken::new()).unwrap();
+        assert_eq!(*actual, expected_reverse);
+        assert_ne!(expected, expected_reverse);
+    }
+
     /// Source -> Exposure -> Saturation -> Output.
     fn chain() -> (Graph, [NodeId; 4]) {
         let mut g = Graph::new();
@@ -1881,6 +2612,26 @@ mod tests {
         ops::apply_gain(&mut manual, 2f32.powf(1.5));
         ops::saturation(&mut manual, 0.3);
         assert_eq!(*res, manual);
+    }
+
+    #[test]
+    fn node_timings_are_request_local_and_distinguish_cache_hits() {
+        let (g, ids) = chain();
+        let (p, mut ev, c) = (TestProvider::default(), Evaluator::new(), CancelToken::new());
+        assert!(ev.timings().is_none());
+        ev.set_timing_enabled(true);
+        ev.eval(&g, ids[3], A, &p, &c).unwrap();
+        let rows = ev.timings().unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|r| r.computed == 1 && r.cache_hits == 0));
+        ev.set_timing_enabled(true);
+        ev.eval(&g, ids[3], A, &p, &c).unwrap();
+        let rows = ev.timings().unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|r| r.computed == 0 && r.cache_hits == 1 && r.cpu.is_zero()));
+        ev.set_timing_enabled(false);
+        ev.eval(&g, ids[3], A, &p, &c).unwrap();
+        assert!(ev.timings().is_none());
     }
 
     #[test]
@@ -1982,6 +2733,91 @@ mod tests {
         let sigma = 30.0 / 1000.0 * 64.0;
         assert_eq!(*masked, ops::blur_modulated(&base, sigma, &m));
         assert_eq!(*plain, ops::blur(&base, sigma));
+    }
+
+    #[test]
+    fn exposed_filter_radius_uses_spatial_map_and_invalidates() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let map = g.add_node(NodeKind::GradientMask, [0.0; 2]);
+        let filter = g.add_node(NodeKind::Blur, [0.0; 2]);
+        g.connect(src, filter, 0).unwrap();
+        let port = g.expose_parameter(filter, "radius", PortType::Mask).unwrap();
+        g.connect(map, filter, port).unwrap();
+        let (p, mut ev, c) = (TestProvider::default(), Evaluator::new(), CancelToken::new());
+        let out = ev.eval_image(&g, filter, A, &p, &c).unwrap();
+        let m = ops::linear_gradient_mask(64, 64, 90.0, 0.5, 0.5);
+        let max = NodeKind::Blur.param_spec("radius").unwrap().max / 1000.0 * 64.0;
+        assert_eq!(*out, ops::filter_low_modulated(&p.image(A).unwrap(), max, &m, false));
+        let misses = ev.misses();
+        set(&mut g, map, "angle", A, 0.0);
+        let changed = ev.eval_image(&g, filter, A, &p, &c).unwrap();
+        assert!(ev.misses() > misses);
+        assert_ne!(*out, *changed);
+    }
+
+    #[test]
+    fn motion_direction_map_is_auxiliary_and_invalidates_cache() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let map = g.add_node(NodeKind::Generator, [0.0; 2]);
+        let filter = g.add_node(NodeKind::Blur, [0.0; 2]);
+        g.connect(src, filter, 0).unwrap();
+        g.connect(src, map, 0).unwrap();
+        set(&mut g, filter, "radius", A, 60.0);
+        set(&mut g, filter, "kernel", A, 3.0);
+        let (p, mut ev, c) = (TestProvider::default(), Evaluator::new(), CancelToken::new());
+        let base = p.image(A).unwrap();
+        g.connect(map, filter, 2).unwrap();
+        set(&mut g, map, "start_r", A, 1.0);
+        set(&mut g, map, "end_r", A, 1.0);
+        set(&mut g, map, "start_g", A, 0.5);
+        set(&mut g, map, "end_g", A, 0.5);
+        let direction = ev.eval_image(&g, map, A, &p, &c).unwrap();
+        let horizontal = ev.eval_image(&g, filter, A, &p, &c).unwrap();
+        assert_eq!(*horizontal, ops::filter_sampled_direction(&base, 3.84, 3, 0.0, None, Some(&direction)));
+        set(&mut g, map, "start_r", A, 0.5);
+        set(&mut g, map, "end_r", A, 0.5);
+        set(&mut g, map, "start_g", A, 1.0);
+        set(&mut g, map, "end_g", A, 1.0);
+        let vertical = ev.eval_image(&g, filter, A, &p, &c).unwrap();
+        assert_ne!(*horizontal, *vertical);
+        let direction = ev.eval_image(&g, map, A, &p, &c).unwrap();
+        assert_eq!(*vertical, ops::filter_sampled_direction(&base, 3.84, 3, 0.0, None, Some(&direction)));
+    }
+
+    #[test]
+    fn filter_modes_kernels_and_mask_use_centered_residual() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let mask = g.add_node(NodeKind::GradientMask, [0.0; 2]);
+        let filter = g.add_node(NodeKind::Blur, [0.0; 2]);
+        g.connect(src, filter, 0).unwrap();
+        set(&mut g, filter, "radius", A, 30.0);
+        let (p, mut ev, c) = (TestProvider::default(), Evaluator::new(), CancelToken::new());
+        let base = p.image(A).unwrap();
+        for kernel in 0..=8 {
+            set(&mut g, filter, "kernel", A, kernel as f32);
+            for masked in [false, true] {
+                if masked { g.connect(mask, filter, 1).unwrap(); }
+                set(&mut g, filter, "pass", A, 0.0);
+                let low = ev.eval_image(&g, filter, A, &p, &c).unwrap();
+                let expected = if masked {
+                    let m = ops::linear_gradient_mask(64, 64, 90.0, 0.5, 0.5);
+                    if kernel < 2 { ops::filter_low_modulated(&base, 1.92, &m, kernel == 1) }
+                    else { ops::filter_sampled(&base, 1.92, kernel, 0.0, Some(&m)) }
+                } else if kernel < 2 { ops::filter_low(&base, 1.92, kernel == 1) }
+                else { ops::filter_sampled(&base, 1.92, kernel, 0.0, None) };
+                assert_eq!(*low, expected);
+                set(&mut g, filter, "pass", A, 1.0);
+                let high = ev.eval_image(&g, filter, A, &p, &c).unwrap();
+                for ((a, b), h) in base.data().chunks_exact(4).zip(low.data().chunks_exact(4)).zip(high.data().chunks_exact(4)) {
+                    for channel in 0..3 { assert!((h[channel] - (0.5 + a[channel] - b[channel])).abs() < 1e-6); }
+                    assert_eq!(h[3], a[3]);
+                }
+                if masked { g.disconnect(filter, 1); }
+            }
+        }
     }
 
     #[test]
@@ -2117,6 +2953,19 @@ mod tests {
 
     fn set_iso(p: &TestProvider, i: ImageId, iso: f32) {
         p.iso.lock().unwrap().insert(i.0, iso);
+    }
+
+    #[test]
+    fn empty_source_excludes_preview_without_loading_catalog_image() {
+        let (mut g, [src, _, _, out]) = chain();
+        let p = TestProvider::default();
+        p.catalog.lock().unwrap().push(A);
+        g.node_mut(src).unwrap().set_data(A, Some(rawgraph_core::NodeData::Folder(String::new())));
+        let mut ev = Evaluator::new();
+        assert!(!ev.contains(&g, out, A, &p));
+        assert!(matches!(ev.eval(&g, out, A, &p, &CancelToken::new()), Err(EvalError::NotInCollection { .. })));
+        assert!(matches!(ev.plan_tail(&g, out, A, &p), Err(EvalError::NotInCollection { .. })));
+        assert_eq!(p.calls(), 0);
     }
 
     #[test]
@@ -2490,32 +3339,38 @@ mod tests {
     }
 
     #[test]
+    fn neutral_develop_nodes_do_not_repeat_raw_input_gain() {
+        let p = TestProvider::default();
+        p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(0.5)));
+        let mut ev = Evaluator::new();
+        let (mut g, src, first) = one(NodeKind::Develop);
+        let second = add(&mut g, NodeKind::Develop);
+        g.connect(first, second, 0).unwrap();
+        let base = run(&g, src, A, &p, &mut ev);
+        assert_eq!(*run(&g, first, A, &p, &mut ev), *base);
+        assert_eq!(*run(&g, second, A, &p, &mut ev), *base);
+        let plan = ev.plan_tail(&g, second, A, &p).unwrap();
+        assert!(plan.ops.is_empty());
+    }
+
+    #[test]
     fn develop_baseline_sources() {
         let p = TestProvider::default();
         let mut ev = Evaluator::new();
         let (g, src, n) = one(NodeKind::Develop);
         let base = run(&g, src, A, &p, &mut ev);
 
-        // RAW with a tag: tag + brightness (defaults: brightness 1.6 EV, so 0.5 + 1.6 = 2.1).
-        p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(0.5)));
-        assert_eq!(*run(&g, n, A, &p, &mut ev), gained(&base, 2.1));
-        let s = develop_settings(g.node(n).unwrap(), A, p.capture(A).as_ref());
-        assert_eq!(s.baseline_source, rawgraph_core::BaselineSource::File);
-        assert_eq!((s.baseline_ev, s.brightness_ev, s.gain_ev), (0.5, 1.6, 0.5 + 1.6));
-
-        // RAW without a tag: baseline_default (0.35) + brightness (1.6) = 1.95.
-        p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), None));
-        assert_eq!(*run(&g, n, A, &p, &mut ev), gained(&base, 1.95));
-        let s = develop_settings(g.node(n).unwrap(), A, p.capture(A).as_ref());
-        assert_eq!(s.baseline_source, rawgraph_core::BaselineSource::Default);
-        assert_eq!((s.baseline_ev, s.brightness_ev), (0.35, 1.6));
-
-        // Derived from the node parameters instead of literals: baseline toggle off keeps brightness.
+        // The provider supplies already-decoded pixels; Develop must not add input gain.
+        for baseline in [Some(0.5), None] {
+            p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), baseline));
+            assert_eq!(*run(&g, n, A, &p, &mut ev), *base);
+            let s = develop_settings(g.node(n).unwrap(), A, p.capture(A).as_ref());
+            assert_eq!((s.baseline_ev, s.brightness_ev, s.gain_ev), (0.0, 0.0, 0.0));
+        }
         let mut g2 = g.clone();
         set(&mut g2, n, "baseline", A, 0.0);
-        let s = develop_settings(g2.node(n).unwrap(), A, p.capture(A).as_ref());
-        assert_eq!((s.baseline_ev, s.gain_ev), (0.0, g2.node(n).unwrap().param("brightness", A)));
-        assert_eq!(*run(&g2, n, A, &p, &mut ev), gained(&base, s.gain_ev));
+        set(&mut g2, n, "brightness", A, -1.0);
+        assert_eq!(*run(&g2, n, A, &p, &mut ev), *base);
 
         // Rendered and unknown sources are never brightened.
         p.caps.lock().unwrap().insert(A.0, CaptureInfo { raw: Some(false), baseline_exposure: Some(0.5), ..Default::default() });
@@ -2555,8 +3410,8 @@ mod tests {
         // Metadata changes without a provider revision bump.
         p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(1.5)));
         let second = run(&g, n, A, &p, &mut ev);
-        assert_eq!(*first, gained(&base, 0.5));
-        assert_eq!(*second, gained(&base, 1.5));
+        assert_eq!(*first, *base);
+        assert_eq!(*second, *base);
         // As-shot temperature matters for a custom white balance.
         set(&mut g, n, "wb", A, 1.0);
         set(&mut g, n, "temperature", A, 4000.0);
@@ -3093,11 +3948,11 @@ mod tests {
         // Rendered / unknown source: Develop is neutral, so is everything else.
         let tp = plan(&g, out, A, &p);
         assert_eq!((tp.base, tp.base_port, tp.ops.len()), (src, 0, 0));
-        // RAW with a file baseline: one Gain(2^(0.5 + 1.6)).
+        // RAW input gain is already present in the source pixels.
         p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(0.5)));
         let tp = plan(&g, out, A, &p);
         assert_eq!(tp.base, src);
-        assert_eq!(tp.ops, vec![TailOp::Gain(2f32.powf(0.5 + 1.6))]);
+        assert!(tp.ops.is_empty());
         set(&mut g, exp, "ev", A, 1.0);
         set(&mut g, con, "amount", A, 0.4);
         set(&mut g, hs, "shadows", A, 0.3);
@@ -3111,7 +3966,6 @@ mod tests {
             tp.ops,
             vec![
                 TailOp::Matrix(m),
-                TailOp::Gain(2f32.powf(0.5 + 1.6)),
                 TailOp::Gain(2.0),
                 TailOp::Contrast { amount: 0.4, pivot },
                 TailOp::HighlightsShadows { highlights: 0.0, shadows: 0.3 },
@@ -3279,8 +4133,8 @@ mod tests {
         let mut g = Graph::new();
         let out = all_ops_graph(&mut g);
         let tp = check_invariant(&g, out, A, &p);
-        // HS, WB matrix, CaptureEv gain, Saturation, Develop matrix + gain, Contrast, Exposure gain.
-        assert_eq!(tp.ops.len(), 8, "{:?}", tp.ops);
+        // HS, WB matrix, CaptureEv gain, Saturation, Develop matrix, Contrast, Exposure gain.
+        assert_eq!(tp.ops.len(), 7, "{:?}", tp.ops);
         for kind in ["gain", "matrix", "sat", "contrast", "hs"] {
             let found = tp.ops.iter().any(|o| match o {
                 TailOp::Gain(_) => kind == "gain",
@@ -3311,8 +4165,8 @@ mod tests {
         // Develop on its own: file baseline, default baseline, rendered source, custom white balance.
         let (mut g, src, dev) = one(NodeKind::Develop);
         for (cap, expect_ops) in [
-            (raw_capture(Some(5200.0), Some(0.5)), 1usize),
-            (raw_capture(Some(5200.0), None), 1),
+            (raw_capture(Some(5200.0), Some(0.5)), 0usize),
+            (raw_capture(Some(5200.0), None), 0),
             (CaptureInfo { raw: Some(false), ..Default::default() }, 0),
         ] {
             p.caps.lock().unwrap().insert(A.0, cap);
@@ -3323,7 +4177,7 @@ mod tests {
         set(&mut g, dev, "temperature", A, 3200.0);
         p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(0.5)));
         let tp = check_invariant(&g, dev, A, &p);
-        assert!(matches!(tp.ops.as_slice(), [TailOp::Matrix(_), TailOp::Gain(_)]), "matrix before gain: {:?}", tp.ops);
+        assert!(matches!(tp.ops.as_slice(), [TailOp::Matrix(_)]), "{:?}", tp.ops);
         set(&mut g, dev, "brightness", A, 0.0);
         set(&mut g, dev, "baseline", A, 0.0);
         let tp = check_invariant(&g, dev, A, &p);
@@ -3484,7 +4338,7 @@ mod tests {
         p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(1.5)));
         let after = plan(&g2, d2, A, &p);
         assert_eq!(before.base_fingerprint, after.base_fingerprint);
-        assert_ne!(before.ops, after.ops);
+        assert_eq!(before.ops, after.ops);
     }
 
     #[test]
@@ -3494,6 +4348,7 @@ mod tests {
         let (mut g, [_, exp, sat, out]) = chain();
         let blur = add(&mut g, NodeKind::Blur);
         g.connect(exp, blur, 0).unwrap();
+        g.disconnect(sat, 0);
         g.connect(blur, sat, 0).unwrap();
         set(&mut g, exp, "ev", A, 1.0);
         set(&mut g, sat, "amount", A, 0.4);
@@ -4392,9 +5247,9 @@ mod tests {
         let base = run(&g, src, A, &p, &mut ev);
         // Untouched: bit-identical to the old result (the same Arc for a rendered file).
         assert!(Arc::ptr_eq(&base, &run(&g, dev, A, &p, &mut ev)));
-        // RAW: still exactly the old base part.
+        // RAW: the provider already applied input gain.
         p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(0.5)));
-        assert_eq!(*run(&g, dev, A, &p, &mut ev), gained(&base, 2.1));
+        assert_eq!(*run(&g, dev, A, &p, &mut ev), *base);
 
         // Every tone slider, RAW and rendered (JPEG-like) alike, against the hand-written sequence.
         for caps in [CaptureInfo { raw: Some(false), ..Default::default() }, raw_capture(Some(5200.0), Some(0.5))] {
@@ -4403,7 +5258,7 @@ mod tests {
             for (name, v) in TONE {
                 set(&mut g, dev, name, A, v);
             }
-            let pre = if is_raw { gained(&base, 2.1) } else { (*base).clone() };
+            let pre = (*base).clone();
             let got = run(&g, dev, A, &p, &mut ev);
             assert_eq!(*got, hand_tone(&pre, &TONE), "raw {is_raw}");
             assert!(*got != pre);
@@ -4605,11 +5460,11 @@ mod tests {
         assert_eq!(tp.base, ids[2]);
         assert_eq!(tp.ops.len(), 3 + 1 + 1 + 1);
         assert!(tp.ops.iter().any(|o| matches!(o, TailOp::Vibrance(_))));
-        // The base is the Develop output before its tone part: matrix/gain of the RAW base, no tone.
+        // The base is the Develop output before its tone part: white balance of the RAW base, no tone.
         let mut ev = Evaluator::new();
         let blurred = ev.eval_image(&g, ids[1], A, &p, &CancelToken::new()).unwrap();
         let base = ev.eval_base(&g, &tp, A, &p, &CancelToken::new()).unwrap();
-        assert_eq!(*base, gained(&blurred, 2.1));
+        assert_eq!(*base, *blurred);
 
         // Develop behind a non-pointwise node: the walk ends at the blur, nothing special.
         let (mut g, ids, out) = build(&[
@@ -4624,13 +5479,23 @@ mod tests {
     }
 
     #[test]
+    fn local_develop_is_a_cpu_tail_boundary() {
+        let p = TestProvider::default();
+        let (mut g, ids, out) = build(&[(NodeKind::Develop, &[("highlights", -0.5)]), (NodeKind::Exposure, &[("ev", 0.5)])]);
+        set(&mut g, ids[1], "tone_version", A, 1.0);
+        let tp = check_invariant(&g, out, A, &p);
+        assert_eq!((tp.base, tp.base_before_tone), (ids[1], false));
+        assert_eq!(tp.ops, vec![TailOp::Gain(2f32.powf(0.5))]);
+    }
+
+    #[test]
     fn neutral_develop_tone_keeps_the_old_plan() {
         let p = TestProvider::default();
         p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(0.5)));
         let (g, ids, out) = build(&[(NodeKind::Develop, &[])]);
         let tp = check_invariant(&g, out, A, &p);
         assert_eq!((tp.base, tp.base_before_tone), (ids[0], false));
-        assert_eq!(tp.ops, vec![TailOp::Gain(2f32.powf(0.5 + 1.6))]);
+        assert!(tp.ops.is_empty());
     }
 
     #[test]
@@ -4647,7 +5512,7 @@ mod tests {
         assert_eq!((tp.base, tp.ops.clone()), (dev, vec![TailOp::Gain(2f32.powf(0.4))]));
         let base1 = ev.eval_base(&g, &tp, A, &p, &c).unwrap();
         let src = p.image(A).unwrap();
-        assert_eq!(*base1, gained(&src, 2.1), "base = Develop before the tone part");
+        assert_eq!(*base1, *src, "base = Develop before the tone part");
         let (calls, misses, hits) = (p.calls(), ev.misses(), ev.hits());
         assert_eq!(ev.eval_base(&g, &tp, A, &p, &c).unwrap().as_ref() as *const _, base1.as_ref() as *const _);
         assert_eq!(ev.hits(), hits + 1);
@@ -4762,5 +5627,49 @@ mod tests {
             assert!(ev.contains_output(&g, sp, 0, ImageId(id), &p));
             assert!(ev2.eval(&g, exp, ImageId(id), &p, &c).is_ok());
         }
+    }
+}
+
+/// Linear RGB encodes tangent XYZ from [-1,1] to [0,1]. Image Y points down.
+fn normals_map(w: u32, h: u32, mut values: Vec<f32>, strength: f32, smoothing: f32, flip_y: bool) -> ImageBuf {
+    let mut out = ImageBuf::new(w,h);
+    if w == 0 || h == 0 { return out; }
+    let radius = smoothing.round().clamp(0.0, 8.0) as i32;
+    if radius > 0 {
+        let mut blurred = values.clone();
+        for y in 0..h { for x in 0..w {
+            let mut sum = 0.0; let mut count = 0.0;
+            for dy in -radius..=radius { for dx in -radius..=radius {
+                let xx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
+                let yy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
+                sum += values[yy*w as usize+xx]; count += 1.0;
+            }}
+            blurred[y as usize*w as usize+x as usize] = sum/count;
+        }}
+        values = blurred;
+    }
+    let get = |x: u32,y: u32| values[y as usize*w as usize+x as usize];
+    for y in 0..h { for x in 0..w {
+        let l=x.saturating_sub(1); let r=(x+1).min(w-1); let t=y.saturating_sub(1); let b=(y+1).min(h-1);
+        let dx = (get(r,y)-get(l,y)) / (r-l).max(1) as f32;
+        let dy = (get(x,b)-get(x,t)) / (b-t).max(1) as f32;
+        let nx=-dx*strength; let ny=-dy*strength * if flip_y {-1.0} else {1.0};
+        let inv=(nx*nx+ny*ny+1.0).sqrt().recip();
+        out.set_pixel(x,y,[0.5+0.5*nx*inv,0.5+0.5*ny*inv,0.5+0.5*inv,1.0]);
+    }}
+    out
+}
+
+#[cfg(test)]
+mod normals_tests {
+    use super::*;
+    #[test] fn flat_and_slopes() {
+        let flat = normals_map(3,3,vec![0.5;9],1.0,0.0,false);
+        assert_eq!(flat.pixel(1,1),[0.5,0.5,1.0,1.0]);
+        let x = normals_map(3,3,vec![0.,1.,2.,0.,1.,2.,0.,1.,2.],1.0,0.0,false);
+        assert!(x.pixel(1,1)[0] < 0.5);
+        let y = vec![0.,0.,0.,1.,1.,1.,2.,2.,2.];
+        assert!(normals_map(3,3,y.clone(),1.0,0.0,false).pixel(1,1)[1] < 0.5);
+        assert!(normals_map(3,3,y,1.0,0.0,true).pixel(1,1)[1] > 0.5);
     }
 }

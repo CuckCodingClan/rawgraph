@@ -22,7 +22,7 @@ mod orient;
 pub mod raw;
 pub mod rendered;
 
-pub use export::{save_avif8, save_exr, save_srgb16_with, save_srgb8, save_srgb8_with, SaveOptions};
+pub use export::{encode_rgb, save_avif8, save_webp8, save_exr, save_srgb16_with, save_srgb8, save_srgb8_with, SaveOptions};
 pub use icc::{icc_profile, srgb_icc_profile};
 pub use lens::read_lens_profile;
 pub use meta::{read_export_metadata, read_xmp_packet, ExportMetadata, GpsInfo};

@@ -16,6 +16,7 @@ mod develop;
 mod dialogs;
 mod export;
 mod filmstrip;
+mod fine_slider;
 mod filter;
 mod frames;
 mod gpu_path;
@@ -27,6 +28,8 @@ mod groups;
 mod histogram;
 mod history;
 mod inspector;
+mod gradient_editor;
+mod icons;
 mod missing_check;
 mod node_ui;
 mod prefetch;
@@ -58,7 +61,18 @@ mod xmp_import;
 
 use std::sync::atomic::Ordering;
 
+fn display_version() -> String {
+    let build: u32 = env!("CARGO_PKG_VERSION_PATCH").parse().expect("numeric Cargo patch version");
+    let year: u32 = env!("CARGO_PKG_VERSION_MAJOR").parse().expect("numeric Cargo major version");
+    let month: u32 = env!("CARGO_PKG_VERSION_MINOR").parse().expect("numeric Cargo minor version");
+    format!("{year:02}{month:02}.{build:03}")
+}
+
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--version")) {
+        println!("RawGraph {}", display_version());
+        return;
+    }
     let cli = match cli::parse_args(std::env::args().skip(1)) {
         Ok(c) => c,
         Err(e) => {
@@ -105,3 +119,5 @@ fn main() {
     }
 }
 
+
+mod xmp_export;

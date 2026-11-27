@@ -357,6 +357,7 @@ pub fn parse_kind(name: &str) -> Option<rawgraph_core::NodeKind> {
     }
     // Names that differ from the label.
     match want.as_str() {
+        "blur" => return Some(NodeKind::Blur),
         "transform" | "crop" | "rotate" => return Some(NodeKind::Transform),
         "huesat" | "hsl" => return Some(NodeKind::HueSaturation),
         "bw" | "blackandwhite" => return Some(NodeKind::BlackWhite),

@@ -11,6 +11,7 @@ pub mod color;
 pub mod develop;
 pub mod export;
 pub mod graph;
+pub mod generator;
 pub mod image;
 pub mod layer;
 pub mod lens;
@@ -31,6 +32,7 @@ pub use graph::{
     CurveEntry, DataKind, Edge, Graph, GraphError, ImageId, Issue, Mode, NamedRange, Node, NodeData, NodeId, NodeKind,
     OutputSpec, ParamKind, ParamSpec, PortType, Subgraph, CURVE_CHANNELS, GRAPH_FORMAT_VERSION,
 };
+pub use generator::{ColorStop, OpacityStop, GradientRamp};
 pub use image::{ImageBuf, MaskBuf};
 pub use layer::{
     layer_settings, BlendMode, FitMode, LayerSettings, ResampleFilter, LAYER_BLEND_MODES, LAYER_FILTERS, LAYER_FITS,

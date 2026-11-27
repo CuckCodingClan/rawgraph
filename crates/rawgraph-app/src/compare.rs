@@ -4,111 +4,39 @@
 //! act on it.
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Vec2};
-use rawgraph_core::ImageId;
+use rawgraph_core::{ImageId, graph::NodeId};
 use rawgraph_project::{Flag, ImageEntry};
 
 use crate::viewer::{fit_scale, zoom_around, ZoomMode};
 
-/// Compare state, independent of any UI.
+/// A pane independently follows or pins each selection dimension.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Pane {
+    pub image: Option<ImageId>,
+    pub node: Option<NodeId>,
+}
+impl Pane {
+    pub fn target(&self, image: Option<ImageId>, node: Option<NodeId>) -> (Option<ImageId>, Option<NodeId>) {
+        (self.image.or(image), self.node.or(node))
+    }
+    pub fn toggle_image(&mut self, selected: Option<ImageId>) {
+        self.image = if self.image.is_some() { None } else { selected };
+    }
+    pub fn toggle_node(&mut self, selected: Option<NodeId>) {
+        self.node = if self.node.is_some() { None } else { selected };
+    }
+}
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Compare {
     active: bool,
-    /// Chosen with "Set as reference"; kept until another image is chosen.
-    explicit: Option<ImageId>,
-    /// The reference of the running compare (always valid while active).
-    reference: Option<ImageId>,
-    current: Option<ImageId>,
-    /// The image that was selected before `current`.
-    previous: Option<ImageId>,
+    pub panes: [Pane; 2],
 }
-
 impl Compare {
-    pub fn active(&self) -> bool {
-        self.active
-    }
-
-    pub fn reference(&self) -> Option<ImageId> {
-        self.active.then_some(self.reference).flatten()
-    }
-
-    /// Call every frame with the selected image: remembers the one before it.
-    pub fn note_selection(&mut self, selected: Option<ImageId>) {
-        if selected != self.current {
-            if self.current.is_some() {
-                self.previous = self.current;
-            }
-            self.current = selected;
-        }
-        if self.active {
-            self.fix_reference(selected, &[]);
-        }
-    }
-
-    /// Image to compare with by default: the explicit choice, else the image
-    /// selected before, else the neighbour in the list.
-    fn pick_reference(&self, selected: ImageId, visible: &[ImageId]) -> Option<ImageId> {
-        let ok = |id: &ImageId| *id != selected;
-        self.explicit
-            .filter(ok)
-            .or(self.previous.filter(ok))
-            .or_else(|| {
-                let i = visible.iter().position(|x| *x == selected)?;
-                visible.get(i.wrapping_sub(1)).or_else(|| visible.get(i + 1)).copied()
-            })
-            .or_else(|| visible.iter().copied().find(ok))
-    }
-
-    /// Turns compare on. Returns false when there is nothing to compare with.
-    pub fn enter(&mut self, selected: Option<ImageId>, visible: &[ImageId]) -> bool {
-        let Some(sel) = selected else { return false };
-        self.current = Some(sel);
-        match self.pick_reference(sel, visible) {
-            Some(r) => {
-                self.reference = Some(r);
-                self.active = true;
-                true
-            }
-            None => false,
-        }
-    }
-
-    pub fn leave(&mut self) {
-        self.active = false;
-    }
-
-    pub fn toggle(&mut self, selected: Option<ImageId>, visible: &[ImageId]) -> bool {
-        if self.active {
-            self.leave();
-            true
-        } else {
-            self.enter(selected, visible)
-        }
-    }
-
-    /// "Set as reference": used now when compare is on, and by the next compare otherwise.
-    pub fn set_reference(&mut self, id: ImageId) {
-        self.explicit = Some(id);
-        if self.active {
-            self.reference = Some(id);
-        }
-    }
-
-    /// After the selection moved onto the reference, the previous image takes its place.
-    fn fix_reference(&mut self, selected: Option<ImageId>, visible: &[ImageId]) {
-        let Some(sel) = selected else { return };
-        if self.reference == Some(sel) || self.reference.is_none() {
-            // Stepping onto the reference: keep both halves different.
-            let prev = self.previous.filter(|p| *p != sel);
-            self.reference = prev.or_else(|| self.pick_reference(sel, visible));
-            if self.reference.is_none() {
-                self.active = false;
-            }
-        }
-    }
-
-    pub fn forget(&mut self) {
-        *self = Self::default();
-    }
+    pub fn active(&self) -> bool { self.active }
+    pub fn toggle(&mut self) { self.active = !self.active; }
+    pub fn leave(&mut self) { self.active = false; }
+    pub fn set_reference(&mut self, id: ImageId) { self.panes[0].image = Some(id); }
+    pub fn forget(&mut self) { *self = Self::default(); }
 }
 
 /// Zoom and pan shared by both halves.
@@ -144,13 +72,14 @@ pub fn halves(rect: Rect) -> (Rect, Rect) {
 /// The scale both halves use: the common fit while in Fit mode.
 pub fn shared_scale(mode: ZoomMode, avail: Vec2, sizes: [Option<Vec2>; 2]) -> f32 {
     match mode {
-        ZoomMode::Custom(s) => s,
+        ZoomMode::Custom(s) => s.max(shared_scale(ZoomMode::Fit, avail, sizes)),
+        ZoomMode::Relative(factor) => shared_scale(ZoomMode::Fit, avail, sizes) * factor,
         ZoomMode::Fit => sizes.into_iter().flatten().map(|s| fit_scale(avail, s)).fold(f32::INFINITY, f32::min).clamp(1e-4, 1e6),
     }
 }
 
 /// Paints both halves; handles wheel zoom, drag pan and double-click for the pair.
-pub fn show(ui: &mut egui::Ui, view: &mut SharedView, left: &Half<'_>, right: &Half<'_>) -> f32 {
+pub fn show(ui: &mut egui::Ui, view: &mut SharedView, viewer: &mut crate::viewer::Viewer, left: &Half<'_>, right: &Half<'_>) -> f32 {
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, "Compare view"));
     let painter = ui.painter_at(rect);
@@ -162,10 +91,10 @@ pub fn show(ui: &mut egui::Ui, view: &mut SharedView, left: &Half<'_>, right: &H
     let fit = shared_scale(ZoomMode::Fit, lr.size(), sizes);
     let mut scale = shared_scale(view.mode, lr.size(), sizes);
 
-    if response.double_clicked() {
+    if response.clicked() {
         if matches!(view.mode, ZoomMode::Fit) {
-            view.mode = ZoomMode::Custom(1.0 / ppp);
-            scale = 1.0 / ppp;
+            view.mode = ZoomMode::Relative(viewer.click_zoom);
+            scale = fit * viewer.click_zoom;
         } else {
             view.mode = ZoomMode::Fit;
             scale = fit;
@@ -173,16 +102,17 @@ pub fn show(ui: &mut egui::Ui, view: &mut SharedView, left: &Half<'_>, right: &H
         view.pan = Vec2::ZERO;
     }
     if response.hovered() {
-        let (scroll, pinch, cursor) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta(), i.pointer.hover_pos()));
-        let factor = pinch * (scroll * 0.0025).exp();
+        let (scroll, pinch, cursor) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos()));
+        if viewer.wheel_navigates { viewer.accumulate_navigation(scroll); }
+        let factor = pinch * (if viewer.wheel_navigates { 0.0 } else { scroll.y } * 0.0025).exp();
         if (factor - 1.0).abs() > 1e-4 {
-            let new = (scale * factor).clamp(fit.min(0.05) * 0.5, 64.0 / ppp);
+            let new = (scale * factor).clamp(fit, (64.0 / ppp).max(fit));
             // Zoom around the cursor measured from the centre of the half it is over.
             let centre = cursor.map_or(lr.center(), |c| if c.x < rect.center().x { lr.center() } else { rr.center() });
             let from_centre = cursor.map_or(Vec2::ZERO, |c| c - centre);
             view.pan = zoom_around(view.pan, from_centre, scale, new);
             scale = new;
-            view.mode = ZoomMode::Custom(scale);
+            view.mode = if new <= fit { ZoomMode::Fit } else { ZoomMode::Custom(scale) };
         }
     }
     if response.dragged() {
@@ -200,8 +130,11 @@ pub fn show(ui: &mut egui::Ui, view: &mut SharedView, left: &Half<'_>, right: &H
         match (half.texture, size_of(half)) {
             (Some(t), Some(sz)) => {
                 let img = Rect::from_center_size(area.center() + view.pan, sz * scale);
-                let tint = if half.note.is_some() { Color32::from_gray(70) } else { Color32::WHITE };
-                p.image(t, img, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), tint);
+                p.image(t, img, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                if let Some(note) = &half.note {
+                    let pos = area.right_bottom() - Vec2::new(10.0, 10.0);
+                    p.text(pos, egui::Align2::RIGHT_BOTTOM, note, egui::FontId::proportional(12.0), Color32::WHITE);
+                }
             }
             _ => {
                 let text = half.note.clone().unwrap_or_else(|| "Rendering...".to_owned());
@@ -243,77 +176,36 @@ fn paint_label(p: &egui::Painter, area: Rect, half: &Half<'_>) {
 mod tests {
     use super::*;
 
-    const A: ImageId = ImageId(1);
-    const B: ImageId = ImageId(2);
-    const C: ImageId = ImageId(3);
-
-    fn list() -> Vec<ImageId> {
-        vec![A, B, C]
-    }
-
     #[test]
-    fn the_default_reference_is_the_image_selected_before() {
+    fn independent_pins_follow_and_unpin() {
         let mut c = Compare::default();
-        c.note_selection(Some(A));
-        c.note_selection(Some(C));
-        assert!(c.enter(Some(C), &list()));
-        assert_eq!((c.active(), c.reference()), (true, Some(A)));
-        c.leave();
-        assert_eq!(c.reference(), None, "no reference while compare is off");
-    }
-
-    #[test]
-    fn without_history_the_neighbour_is_used_and_a_lone_image_cannot_compare() {
-        let mut c = Compare::default();
-        assert!(c.enter(Some(B), &list()));
-        assert_eq!(c.reference(), Some(A), "previous in the list");
-        let mut d = Compare::default();
-        assert!(d.enter(Some(A), &list()));
-        assert_eq!(d.reference(), Some(B), "first image: the next one");
-        let mut e = Compare::default();
-        assert!(!e.enter(Some(A), &[A]) && !e.active(), "nothing to compare with");
-        assert!(!e.enter(None, &list()));
-    }
-
-    #[test]
-    fn set_as_reference_is_used_now_and_remembered() {
-        let mut c = Compare::default();
-        c.note_selection(Some(A));
-        c.note_selection(Some(B));
-        c.set_reference(C);
+        c.toggle();
+        let (a, b) = (ImageId(1), ImageId(2));
+        let (x, y) = (NodeId(1), NodeId(2));
+        c.panes[0].toggle_image(Some(a));
+        c.panes[1].toggle_node(Some(x));
+        assert_eq!(c.panes[0].target(Some(b), Some(y)), (Some(a), Some(y)));
+        assert_eq!(c.panes[1].target(Some(b), Some(y)), (Some(b), Some(x)));
+        c.panes[0].toggle_image(Some(b));
+        c.panes[1].toggle_node(Some(y));
+        assert_eq!(c.panes[0].target(Some(b), Some(y)), (Some(b), Some(y)));
+        assert_eq!(c.panes[1].target(Some(b), Some(y)), (Some(b), Some(y)));
+        c.toggle();
         assert!(!c.active());
-        assert!(c.enter(Some(B), &list()));
-        assert_eq!(c.reference(), Some(C), "the explicit choice beats the previous selection");
-        c.set_reference(A);
-        assert_eq!(c.reference(), Some(A), "changes at once while compare is on");
-        // An explicit reference equal to the selected image falls back.
-        c.leave();
-        assert!(c.enter(Some(A), &list()));
-        assert_ne!(c.reference(), Some(A));
-    }
-
-    #[test]
-    fn stepping_moves_the_right_side_and_never_shows_one_image_twice() {
-        let mut c = Compare::default();
-        c.note_selection(Some(A));
-        assert!(c.enter(Some(A), &list()));
-        assert_eq!(c.reference(), Some(B));
-        // Right arrow: the selection moves to B, which is the reference.
-        c.note_selection(Some(B));
-        assert_eq!(c.reference(), Some(A), "the image that was on the right becomes the reference");
-        // Further stepping leaves the reference alone.
-        c.note_selection(Some(C));
-        assert_eq!(c.reference(), Some(A));
+        c.toggle();
         assert!(c.active());
-    }
-
-    #[test]
-    fn toggle_enters_and_leaves() {
-        let mut c = Compare::default();
-        assert!(c.toggle(Some(B), &list()) && c.active());
-        assert!(c.toggle(Some(B), &list()) && !c.active());
         c.forget();
         assert_eq!(c, Compare::default());
+    }
+    #[test]
+    fn absent_selection_does_not_pin_and_deleted_ids_stay_explicit() {
+        let mut p = Pane::default();
+        p.toggle_image(None);
+        p.toggle_node(None);
+        assert_eq!(p.target(None, None), (None, None));
+        p.image = Some(ImageId(9));
+        p.node = Some(NodeId(9));
+        assert_eq!(p.target(None, None), (Some(ImageId(9)), Some(NodeId(9))));
     }
 
     #[test]

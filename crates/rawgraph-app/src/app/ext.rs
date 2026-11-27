@@ -14,6 +14,20 @@ use crate::recovery_guard::{process_alive, remove_locks, scan_orphans, Orphans};
 use crate::relink::{self, RelinkError};
 use crate::xmp_import::{self, JobResult, XmpDialog, XmpFound, XmpJob, XmpOffer};
 
+#[derive(Default)]
+pub(super) struct PaneRender {
+    renderer: Option<Renderer>,
+    viewer: Viewer,
+    key: Option<RequestKey>,
+    scopes: Option<rawgraph_scope_views::PrepareSettings>,
+    image: Option<ImageId>,
+    error: Option<String>,
+    compatible: Option<(ImageId, NodeId)>,
+    resolved: Option<(ImageId, NodeId)>,
+    fallback: bool,
+    membership_key: Option<(rawgraph_core::Graph, u64, usize, Option<ImageId>, Option<NodeId>, Option<NodeId>)>,
+}
+
 impl App {
     // ------------------------------------------------------------ missing files
 
@@ -215,100 +229,155 @@ impl App {
     // ------------------------------------------------------------------- compare
 
     pub(super) fn toggle_compare(&mut self) {
-        let visible = self.session.visible().to_vec();
-        let was = self.compare.active();
-        if !self.compare.toggle(self.session.selected, &visible) && !was {
-            self.status.info("Compare needs a second image");
-            return;
-        }
+        self.compare.toggle();
         if self.compare.active() {
+            self.cmp_panes[1].key = None; // Restore primary scopes even if the pins did not change.
             self.compare_started = Some(Instant::now());
-            self.cmp_key = None;
             self.compare_reported = false;
         }
     }
 
-    /// C toggles, Esc leaves; neither while a text field or a popup has the keyboard.
     pub(super) fn handle_compare_keys(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.prompt.is_some() {
-            return;
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
-            self.toggle_compare();
-        }
-        if self.compare.active() && !self.editor.search_open() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-            self.compare.leave();
-        }
+        if ctx.egui_wants_keyboard_input() || self.prompt.is_some() { return; }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) { self.toggle_compare(); }
+        if self.compare.active() && !self.editor.search_open() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) { self.compare.leave(); }
+    }
+
+    fn pane_key_for(session: &Session, compare: &Compare, panes: &[PaneRender; 2], index: usize) -> Result<RequestKey, String> {
+        let (image, node) = compare.panes[index].target(session.selected, session.selected_node);
+        let (image, node) = panes[index].resolved.map_or((image, node), |(i, n)| (Some(i), Some(n)));
+        let image = image.ok_or_else(|| "No image selected".to_owned())?;
+        if session.entry(image).is_none() { return Err(format!("Missing image #{}", image.0)); }
+        let node = node.ok_or_else(|| "No node selected".to_owned())?;
+        if session.project.graph.node(node).is_none() { return Err(format!("Missing node #{}", node.0)); }
+        Ok(RequestKey::for_image(session, image, node, None, None, None))
     }
 
     pub(super) fn compare_step(&mut self, ctx: &egui::Context) {
-        self.compare.note_selection(self.session.selected);
-        if !self.compare.active() {
-            return;
-        }
-        let Some(reference) = self.compare.reference() else { return };
-        if self.cmp_renderer.is_none() {
-            let provider: Arc<dyn rawgraph_engine::ImageProvider> = self.session.provider.clone();
-            self.cmp_renderer = Some(Renderer::new(ctx.clone(), provider));
-        }
-        if let Some(reply) = self.cmp_renderer.as_mut().and_then(|r| r.poll()) {
-            match reply {
-                Reply::Frame(f) => {
-                    self.cmp_viewer.set_frame(ctx, &f);
-                    self.cmp_image = Some(f.image);
-                    self.cmp_error = None;
-                }
-                Reply::Error { message, .. } | Reply::Excluded { message, .. } => {
-                    self.cmp_error = Some(message);
-                    self.cmp_image = Some(reference);
-                }
-                Reply::Refined(_) | Reply::Dumped { .. } | Reply::Histogram(_) => {}
+        if !self.compare.active() { return; }
+        let (ids, captures) = self.session.id_captures();
+        for index in 0..2 {
+            let scopes = (index == 1 && self.scopes_pos != ScopesPos::Hidden).then(|| self.scope_panel.prepare_settings());
+            let (image, node) = self.compare.panes[index].target(self.session.selected, self.session.selected_node);
+            let pane = &mut self.cmp_panes[index];
+            let membership_key = (self.session.project.graph.clone(), self.session.images_gen, self.session.scan_found(), self.compare.panes[index].image, self.compare.panes[index].node, self.session.selected_node);
+            if pane.membership_key.as_ref() != Some(&membership_key) {
+                pane.membership_key = Some(membership_key);
+                pane.resolved = None;
+                pane.fallback = false;
+                if self.compare.panes[index].image.is_some() && self.compare.panes[index].node.is_none() {
+                    if let (Some(image), Some(node)) = (image, node) {
+                        if self.session.project.graph.node(node).is_some() {
+                            let members = crate::collection::compute(&self.session.project.graph, &ids, &captures, Some(node));
+                            if members.view_members.contains(&image) {
+                                pane.compatible = Some((image, node));
+                            } else if let Some((old_image, old_node)) = pane.compatible.filter(|(i, n)| *i == image && self.session.project.graph.node(*n).is_some()) {
+                                let previous = crate::collection::compute(&self.session.project.graph, &ids, &captures, Some(old_node));
+                                if previous.view_members.contains(&old_image) { pane.resolved = Some((old_image, old_node)); pane.fallback = true; }
+                            }
+                        }
+                    }
+                } else { pane.compatible = None; }
             }
-        }
-        if self.session.selected.is_none() || self.frames < SETTLE_FRAMES {
-            return;
-        }
-        let Some((node, port)) = self.session.render_target() else { return };
-        let key = RequestKey::for_image(&self.session, reference, node, port, None, None);
-        if self.cmp_key.as_ref() != Some(&key) {
-            if let Some(r) = &mut self.cmp_renderer {
-                r.submit(self.session.project.graph.clone(), node, port, reference, self.session.view, None, None);
+            let key = Self::pane_key_for(&self.session, &self.compare, &self.cmp_panes, index);
+            let pane = &mut self.cmp_panes[index];
+            let key = match key {
+                Ok(key) => key,
+                Err(message) => { pane.key = None; pane.image = None; pane.error = Some(message); continue; }
+            };
+            if self.frames < SETTLE_FRAMES { continue; }
+            if pane.renderer.is_none() {
+                let provider: Arc<dyn rawgraph_engine::ImageProvider> = self.session.provider.clone();
+                pane.renderer = Some(Renderer::new(ctx.clone(), provider));
             }
-            self.cmp_key = Some(key);
-            self.cmp_image = self.cmp_image.filter(|i| *i == reference);
+            if pane.key.as_ref() != Some(&key) || pane.scopes != scopes {
+                pane.renderer.as_mut().unwrap().submit(self.session.project.graph.clone(), key.node, key.port, key.image, self.session.view, scopes.clone(), None);
+                pane.scopes = scopes;
+                pane.key = Some(key.clone());
+                pane.image = None;
+                pane.error = None;
+            }
+            if let Some(reply) = pane.renderer.as_mut().and_then(|r| r.poll()) {
+                match reply {
+                    Reply::Frame(f) => {
+                        pane.viewer.set_frame(ctx, &f);
+                        pane.image = Some(f.image);
+                        pane.error = None;
+                        if index == 1 {
+                            if let Some(prepared) = f.prepared.clone() {
+                                self.scope_panel.set_prepared(ctx, prepared);
+                                self.scope_worker_ms = f.scopes_ms;
+                                self.scopes_stale = false;
+                            }
+                        }
+                    }
+                    Reply::Error { message, .. } | Reply::Excluded { message, .. } => { pane.error = Some(message); pane.image = Some(key.image); }
+                    Reply::Refined(_) | Reply::Dumped { .. } | Reply::Histogram(_) => {}
+                }
+            }
+            if let Some(refined) = pane.renderer.as_mut().and_then(|r| r.take_refined()) {
+                if index == 1 {
+                    self.scope_panel.set_prepared(ctx, refined.prepared);
+                    self.scope_worker_ms = refined.scopes_ms;
+                    self.scopes_stale = false;
+                }
+            }
         }
         if !self.compare_reported && self.cmp_ready() {
-            if let Some(t) = self.compare_started {
-                eprintln!("COMPARE both halves shown {:.0} ms after switching it on", t.elapsed().as_secs_f32() * 1000.0);
-            }
+            if let Some(t) = self.compare_started { eprintln!("COMPARE both halves shown {:.0} ms after switching it on", t.elapsed().as_secs_f32() * 1000.0); }
             self.compare_reported = true;
         }
     }
 
-    /// Both halves hold the frame of their image.
     pub(super) fn cmp_ready(&self) -> bool {
-        let right_ready = self.viewer.texture_id().is_some() && !self.renderer.pending() && self.last_key.is_some();
-        let left_ready = self.compare.reference().is_some_and(|r| self.cmp_image == Some(r)) && self.cmp_renderer.as_ref().is_some_and(|r| !r.pending());
-        right_ready && left_ready
+        (0..2).all(|i| {
+            let pane = &self.cmp_panes[i];
+            match Self::pane_key_for(&self.session, &self.compare, &self.cmp_panes, i) {
+                Err(_) => true,
+                Ok(key) => pane.key.as_ref() == Some(&key) && pane.image == Some(key.image) && pane.renderer.as_ref().is_some_and(|r| !r.pending()),
+            }
+        })
+    }
+
+    pub(super) fn primary_split_frame(&self) -> (Option<egui::TextureId>, [u32; 2]) {
+        let pane = &self.cmp_panes[1];
+        let has_target = Self::pane_key_for(&self.session, &self.compare, &self.cmp_panes, 1).is_ok();
+        (if has_target && pane.error.is_none() { pane.viewer.texture_id() } else { None }, pane.viewer.frame_size)
     }
 
     pub(super) fn compare_area(&mut self, ui: &mut egui::Ui) {
-        let name = |e: &Option<rawgraph_project::ImageEntry>| e.as_ref().map(display_name).unwrap_or_default();
-        let ref_entry = self.compare.reference().and_then(|r| self.session.entry(r)).cloned();
-        let sel_entry = self.session.current_entry().cloned();
-        let left_stale = self.cmp_image != self.compare.reference() || self.cmp_renderer.as_ref().is_some_and(|r| r.pending());
-        let left = Half {
-            texture: self.cmp_viewer.texture_id(),
-            size: self.cmp_viewer.frame_size,
-            label: name(&ref_entry),
-            entry: ref_entry.as_ref(),
-            note: self.cmp_error.clone().or_else(|| left_stale.then(String::new)),
-            tag: "REFERENCE",
+        ui.columns(2, |columns| {
+            for (i, ui) in columns.iter_mut().enumerate() {
+                let pane = &mut self.compare.panes[i];
+                ui.horizontal(|ui| {
+                    ui.label(if i == 0 { "Reference" } else { "Primary · Clean Feed" });
+                    if ui.selectable_label(pane.image.is_some(), "Pin image").on_hover_text("Pin or follow the selected image").clicked() { pane.toggle_image(self.session.selected); }
+                    if ui.selectable_label(pane.node.is_some(), "Pin node").on_hover_text("Pin or follow the selected node").clicked() { pane.toggle_node(self.session.selected_node); }
+                });
+            }
+        });
+        let session = &self.session;
+        let compare_state = &self.compare;
+        let panes = &self.cmp_panes;
+        let make_half = |i: usize| {
+            let pane = &panes[i];
+            let (image, node) = compare_state.panes[i].target(session.selected, session.selected_node);
+            let (image, node) = pane.resolved.map_or((image, node), |(i, n)| (Some(i), Some(n)));
+            let entry = image.and_then(|id| session.entry(id));
+            let image_label = entry.map(display_name).unwrap_or_else(|| image.map(|id| format!("Missing image #{}", id.0)).unwrap_or_else(|| "No image".into()));
+            let node_label = node.map(|id| session.project.graph.node(id).map(|n| format!("{} #{}", n.kind.label(), id.0)).unwrap_or_else(|| format!("Missing node #{}", id.0))).unwrap_or_else(|| "No node".into());
+            let desired = Self::pane_key_for(session, compare_state, panes, i);
+            let valid = desired.as_ref().is_ok_and(|key| pane.key.as_ref() == Some(key) && pane.image == Some(key.image) && pane.renderer.as_ref().is_some_and(|r| !r.pending()));
+            let texture = if desired.is_ok() && (!valid || pane.error.is_none()) { pane.viewer.texture_id() } else { None };
+            let note = desired.err().or_else(|| if valid { pane.error.clone() } else { Some("Rendering…".into()) });
+            Half { texture, size: pane.viewer.frame_size, label: format!("{} — {}{}", image_label, node_label, if pane.fallback { " (last compatible; selected node excludes image)" } else { "" }), entry, note, tag: if i == 0 { "LEFT" } else { "RIGHT" } }
         };
-        let right_note = self.last_error.clone().or_else(|| self.renderer.pending().then(String::new));
-        let right = Half { texture: self.viewer.texture_id(), size: self.viewer.frame_size, label: name(&sel_entry), entry: sel_entry.as_ref(), note: right_note, tag: "SELECTED" };
-        let scale = compare::show(ui, &mut self.cmp_view, &left, &right);
+        let left = make_half(0);
+        let right = make_half(1);
+        let scale = compare::show(ui, &mut self.cmp_view, &mut self.viewer, &left, &right);
         self.viewer.last_scale = scale;
+        let step = std::mem::take(&mut self.viewer.navigation_step);
+        if step != 0 { self.session.step_viewer_image(step); }
     }
 
     // ----------------------------------------------------------------------- XMP
@@ -436,9 +505,6 @@ impl App {
                     self.compare.set_reference(id);
                     let name = self.session.entry(id).map(display_name).unwrap_or_default();
                     self.status.info(format!("Reference for compare: {name}"));
-                    if self.compare.active() {
-                        self.cmp_key = None;
-                    }
                 }
                 FilmAction::Locate(id) => self.open_dialog(DialogKind::LocateFile(id)),
                 FilmAction::RelinkFolder(id) => self.open_relink_folder(id),

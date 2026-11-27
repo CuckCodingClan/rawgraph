@@ -13,3 +13,5 @@ avif-serialize = "0.8.9"
 ravif = { version = "0.13.0", default-features = false, features = ["threading"] }
 rawler = "0.8.0"
 rayon.workspace = true
+
+webp-rust = "=0.3.1"

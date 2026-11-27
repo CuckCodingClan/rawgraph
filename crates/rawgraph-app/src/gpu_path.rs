@@ -347,11 +347,10 @@ impl ScopeScheduler {
         let base = base.max(1);
         let dragging = self.last_request.is_some_and(|t| now.saturating_duration_since(t) < SCOPE_IDLE);
         self.last_request = Some(now);
+        self.refine_at = Some(now + SCOPE_IDLE);
         if dragging {
-            self.refine_at = Some(now + SCOPE_IDLE);
             base.max(2)
         } else {
-            self.refine_at = None;
             base
         }
     }
@@ -602,7 +601,7 @@ mod tests {
         let mut s = ScopeScheduler::default();
         // The first request of a gesture is read exactly.
         assert_eq!(s.on_request(ms(0), 1), 1);
-        assert!(s.refine_due().is_none());
+        assert_eq!(s.refine_due(), Some(ms(150)));
         // Requests every 16 ms: every 2nd pixel, a refinement is scheduled 150 ms after the last.
         assert_eq!(s.on_request(ms(16), 1), 2);
         assert_eq!(s.on_request(ms(32), 1), 2);

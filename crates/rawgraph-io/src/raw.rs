@@ -31,7 +31,7 @@
 //! 6. **Crop** to the camera's default crop (DNG `DefaultCrop` / `rawler` camera definition).
 //! 7. **Orientation** from the EXIF orientation tag is applied last.
 //!
-//! Not done, on purpose: tone curve, gamma, baseline exposure, sharpening, noise reduction,
+//! Not done, on purpose: tone curve, gamma, sharpening, noise reduction,
 //! real highlight reconstruction (detail in clipped areas is not recovered), lens corrections,
 //! DNG opcode lists, dual-illuminant matrix interpolation, `ForwardMatrix`/`ProfileHueSatMap`
 //! (those are look/profile decisions of later graph nodes).
@@ -1091,6 +1091,12 @@ fn finish(
     capture: CaptureInfo,
     crop_size: (usize, usize),
 ) -> Result<(Loaded, Stages), IoError> {
+    // Apply the RAW input rendering gain once, independent of the graph. Both full
+    // and proxy decoders converge here; never apply it to rendered files.
+    let ev = capture.baseline_exposure.filter(|v| v.is_finite()).unwrap_or(0.35) + 1.6;
+    let gain = 2.0f32.powf(ev);
+    let mut data = data;
+    data.par_chunks_mut(4).for_each(|p| { for c in &mut p[..3] { *c *= gain; } });
     let (w, h, data) = st.time("orientation", || orient_rgba(w as u32, h as u32, data, orientation));
     let image = ImageBuf::from_rgba(w, h, data).ok_or_else(|| IoError::Decode("internal buffer size mismatch".into()))?;
     let full_size = oriented_size(crop_size.0 as u32, crop_size.1 as u32, orientation);

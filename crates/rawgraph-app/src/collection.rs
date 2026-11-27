@@ -91,7 +91,11 @@ pub struct CollectionResult {
 
 /// The collection entering input `port` of `node` (empty when nothing is connected).
 fn input_members(graph: &Graph, catalog: &Catalog, node: NodeId, port: usize) -> Vec<ImageId> {
-    graph.input_edge(node, port).map(|(up, up_port)| graph.members(up, up_port, catalog)).unwrap_or_default()
+    let mut seen = HashSet::new();
+    graph.input_edges(node, port)
+        .flat_map(|edge| graph.members(edge.from, edge.from_port, catalog))
+        .filter(|image| seen.insert(*image))
+        .collect()
 }
 
 /// Pure computation of everything above. Every collection is listed once per node with

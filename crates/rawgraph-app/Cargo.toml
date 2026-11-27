@@ -7,19 +7,22 @@ publish.workspace = true
 [dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "accesskit", "persistence", "default_fonts", "wayland", "x11"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-rawgraph-batch = { version = "0.1.0", path = "../rawgraph-batch" }
+rawgraph-batch = { version = "26.11.1", path = "../rawgraph-batch" }
 rawgraph-core.workspace = true
-rawgraph-engine = { version = "0.1.0", path = "../rawgraph-engine" }
+rawgraph-engine = { version = "26.11.1", path = "../rawgraph-engine" }
 rawgraph-fx = { path = "../rawgraph-fx" }
 rawgraph-gpu = { path = "../rawgraph-gpu" }
-rawgraph-io = { version = "0.1.0", path = "../rawgraph-io" }
-rawgraph-project = { version = "0.1.0", path = "../rawgraph-project" }
-rawgraph-scope-views = { version = "0.1.0", path = "../rawgraph-scope-views" }
-rawgraph-scopes = { version = "0.1.0", path = "../rawgraph-scopes" }
+rawgraph-io = { version = "26.11.1", path = "../rawgraph-io" }
+rawgraph-project = { version = "26.11.1", path = "../rawgraph-project" }
+rawgraph-scope-views = { version = "26.11.1", path = "../rawgraph-scope-views" }
+rawgraph-scopes = { version = "26.11.1", path = "../rawgraph-scopes" }
 arboard = { version = "3", default-features = false }
 rayon.workspace = true
 rfd = "0.18.0"
 serde = { workspace = true, features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

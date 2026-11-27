@@ -103,6 +103,14 @@ pub enum NodeKind {
     Layer,
     /// Writes the incoming images to files; passes the collection through.
     Export,
+    /// Sort complete pixels over the whole image.
+    PixelSort,
+    /// Convert relative depth or luminance height to tangent-space normals.
+    Normals,
+    /// Relative depth estimated by an explicitly configured local worker.
+    DepthEstimate,
+    /// Generate pixels at the incoming image dimensions.
+    Generator,
 }
 
 /// How a parameter is edited and which values it accepts.
@@ -234,12 +242,52 @@ const AMOUNT_MASK_INPUTS: &[InputSpec] = &[IMAGE_IN, mask_in("Amount mask", fals
 const MASK_ADJUST_INPUTS: &[InputSpec] = &[mask_in("Mask", true, None)];
 const MASK_COMBINE_INPUTS: &[InputSpec] = &[mask_in("A", true, None), mask_in("B", true, None)];
 
+const NORMALS_INPUTS: &[InputSpec] = &[mask_in("Relative depth", false, None), InputSpec { label: "Height image", ty: PortType::Images, required: false, modulates: None }];
+const NORMALS_PARAMS: &[ParamSpec] = &[choice("mode", "Input", &["Relative depth mask", "Image luminance height"], 0), p("strength", "Strength", "", 0.0, 100.0, 1.0), p("smoothing", "Smoothing", "px", 0.0, 8.0, 0.0), toggle("flip_y", "Flip Y", false)];
+
 const BLUR_INPUTS: &[InputSpec] = &[
     IMAGE_IN,
     InputSpec { label: "Radius mask", ty: PortType::Mask, required: false, modulates: Some("radius") },
+    InputSpec { label: "Direction normal (RGB)", ty: PortType::Images, required: false, modulates: None },
 ];
 
 // Change to the capture-derived exposure value; +1 EV renders one stop brighter.
+const PIXEL_SORT_PARAMS: &[ParamSpec] = &[
+    choice("metric", "Sort by", &["Brightness", "Saturation", "Hue"], 0),
+    toggle("reverse", "Reverse", false),
+];
+const GENERATOR_PARAMS: &[ParamSpec] = &[
+    p("width", "Width", "px", 1.0, 8192.0, 1024.0),
+    p("height", "Height", "px", 1.0, 8192.0, 1024.0),
+    choice("type", "Type", &["Gradient", "Noise", "Pattern"], 0),
+    toggle("vertical", "Vertical gradient (legacy)", false),
+    choice("gradient_style", "Gradient style", &["Linear", "Radial", "Angle", "Reflected", "Diamond"], 0),
+    p("gradient_angle", "Gradient angle", "deg", -180.0, 180.0, 0.0),
+    p("gradient_scale", "Gradient scale", "%", 1.0, 400.0, 100.0),
+    toggle("gradient_reverse", "Reverse gradient", false),
+    p("start_r", "Start red", "", -4.0, 4.0, 0.0), p("start_g", "Start green", "", -4.0, 4.0, 0.0), p("start_b", "Start blue", "", -4.0, 4.0, 0.0),
+    p("end_r", "End red", "", -4.0, 4.0, 1.0), p("end_g", "End green", "", -4.0, 4.0, 1.0), p("end_b", "End blue", "", -4.0, 4.0, 1.0),
+    toggle("ramp_middle_color", "Use middle colour stop", false),
+    p("ramp_color_position", "Middle colour position", "%", 0.0, 100.0, 50.0),
+    p("ramp_color_r", "Middle red", "", -4.0, 4.0, 0.5),
+    p("ramp_color_g", "Middle green", "", -4.0, 4.0, 0.5),
+    p("ramp_color_b", "Middle blue", "", -4.0, 4.0, 0.5),
+    p("ramp_color_midpoint_1", "Colour midpoint 1", "%", 1.0, 99.0, 50.0),
+    p("ramp_color_midpoint_2", "Colour midpoint 2", "%", 1.0, 99.0, 50.0),
+    p("ramp_alpha_start", "Start opacity", "%", 0.0, 100.0, 100.0),
+    toggle("ramp_middle_alpha", "Use middle opacity stop", false),
+    p("ramp_alpha_position", "Middle opacity position", "%", 0.0, 100.0, 50.0),
+    p("ramp_alpha_middle", "Middle opacity", "%", 0.0, 100.0, 100.0),
+    p("ramp_alpha_end", "End opacity", "%", 0.0, 100.0, 100.0),
+    p("ramp_alpha_midpoint_1", "Opacity midpoint 1", "%", 1.0, 99.0, 50.0),
+    p("ramp_alpha_midpoint_2", "Opacity midpoint 2", "%", 1.0, 99.0, 50.0),
+    choice("ramp_interpolation", "Ramp interpolation", &["Linear", "Smooth"], 0),
+    p("ramp_smoothness", "Ramp smoothness", "%", 0.0, 100.0, 100.0),
+    toggle("ramp_dither", "Ramp dither", false),
+    p("seed", "Noise seed", "", 0.0, 65535.0, 0.0),
+    p("cell_size", "Pattern cell size", "px", 1.0, 1024.0, 32.0),
+    toggle("invert", "Invert pattern", false),
+];
 const CAPTURE_EV_PARAMS: &[ParamSpec] = &[p("delta", "EV change", "EV", -6.0, 6.0, 0.0)];
 const EXPOSURE_PARAMS: &[ParamSpec] = &[p("ev", "Exposure", "stops", -6.0, 6.0, 0.0)];
 const WHITE_BALANCE_PARAMS: &[ParamSpec] = &[
@@ -253,7 +301,12 @@ const GRADIENT_MASK_PARAMS: &[ParamSpec] = &[
     p("width", "Width", "", 0.0, 1.0, 0.5),
 ];
 // Radius as per-mille of the long edge, so preview and export agree.
-const BLUR_PARAMS: &[ParamSpec] = &[p("radius", "Radius", "\u{2030} of long edge", 0.0, 30.0, 5.0)];
+const BLUR_PARAMS: &[ParamSpec] = &[
+    plog("radius", "Radius", "\u{2030} of long edge", 0.0, 1000.0, 5.0),
+    choice("pass", "Pass", &["Low pass", "High pass"], 0),
+    choice("kernel", "Kernel", &["Gaussian", "Box", "Lens (disk)", "Motion", "Radial zoom", "Radial spin", "Shape (diamond)", "Median", "Bilateral"], 0),
+    p("angle", "Motion angle", "deg", 0.0, 360.0, 0.0),
+];
 const CONTRAST_PARAMS: &[ParamSpec] = &[
     p("amount", "Amount", "", -1.0, 1.0, 0.0),
     plog("pivot", "Pivot", "scene linear", 0.02, 1.0, 0.18),
@@ -336,6 +389,7 @@ const DEVELOP_PARAMS: &[ParamSpec] = &[
     // Rendering offset for RAW files, calibrated against embedded camera previews
     // (see examples/calibrate_brightness.rs).
     p("brightness", "Brightness", "EV", -3.0, 3.0, 1.6),
+    choice("tone_version", "Tone processing", &["Legacy", "Local v1"], 0),
 ];
 const TONE_CURVE_PARAMS: &[ParamSpec] = &[
     p("shadows", "Shadows", "", -1.0, 1.0, 0.0),
@@ -483,6 +537,7 @@ const OUTPUT_SPACE_OPTIONS: &[&str] = &OUTPUT_SPACES;
 const EXPORT_PARAMS: &[ParamSpec] = &[
     choice("format", "Format", EXPORT_FORMAT_OPTIONS, 0),
     p("quality", "Quality", "", 1.0, 100.0, 92.0),
+    toggle("webp_lossless", "WebP lossless", false),
     choice("size", "Size", EXPORT_SIZE_OPTIONS, 0),
     plog("long_edge", "Long edge", "px", EXPORT_LONG_EDGE_MIN as f32, EXPORT_LONG_EDGE_MAX as f32, 2048.0),
     p("percent", "Percent", "%", 1.0, 100.0, 100.0),
@@ -596,7 +651,7 @@ pub fn curve_set(node: &Node, image: ImageId) -> Vec<CurveEntry> {
 }
 
 impl NodeKind {
-    pub const ALL: [NodeKind; 33] = [
+    pub const ALL: [NodeKind; 37] = [
         NodeKind::Source,
         NodeKind::CaptureEv,
         NodeKind::Exposure,
@@ -630,6 +685,10 @@ impl NodeKind {
         NodeKind::Clarity,
         NodeKind::Layer,
         NodeKind::Export,
+        NodeKind::PixelSort,
+        NodeKind::Normals,
+        NodeKind::DepthEstimate,
+        NodeKind::Generator,
     ];
 
     /// Menu group of this kind.
@@ -646,7 +705,7 @@ impl NodeKind {
             NodeKind::ColorWheels => "Colour",
             NodeKind::NoiseReduction | NodeKind::Sharpen | NodeKind::Blur | NodeKind::Clarity => "Detail",
             NodeKind::Transform | NodeKind::LensManual => "Geometry",
-            NodeKind::Vignette => "Effects",
+            NodeKind::Vignette | NodeKind::PixelSort | NodeKind::Normals | NodeKind::Generator => "Effects",
             NodeKind::MetadataFilter | NodeKind::Merge | NodeKind::MetadataSplit | NodeKind::Layer => "Collection",
             NodeKind::GradientMask
             | NodeKind::RadialMask
@@ -654,7 +713,7 @@ impl NodeKind {
             | NodeKind::HueMask
             | NodeKind::MaskAdjust
             | NodeKind::MaskCombine
-            | NodeKind::BrushMask => "Mask",
+            | NodeKind::BrushMask | NodeKind::DepthEstimate => "Mask",
         }
     }
 
@@ -666,7 +725,7 @@ impl NodeKind {
             NodeKind::WhiteBalance => "White Balance (relative)",
             NodeKind::Saturation => "Saturation",
             NodeKind::GradientMask => "Gradient Mask",
-            NodeKind::Blur => "Blur",
+            NodeKind::Blur => "Filter",
             NodeKind::Output => "Output",
             NodeKind::Contrast => "Contrast",
             NodeKind::HighlightsShadows => "Highlights / Shadows",
@@ -693,6 +752,10 @@ impl NodeKind {
             NodeKind::Clarity => "Clarity / Texture",
             NodeKind::Layer => "Layer",
             NodeKind::Export => "Export",
+            NodeKind::PixelSort => "Pixel Sort",
+            NodeKind::Normals => "Normals",
+            NodeKind::DepthEstimate => "Depth Estimate",
+            NodeKind::Generator => "Generator",
         }
     }
 
@@ -731,6 +794,10 @@ impl NodeKind {
             NodeKind::MetadataSplit => METADATA_SPLIT_PARAMS,
             NodeKind::ColorWheels => COLOR_WHEELS_PARAMS,
             NodeKind::Clarity => CLARITY_PARAMS,
+            NodeKind::PixelSort => PIXEL_SORT_PARAMS,
+            NodeKind::Normals => NORMALS_PARAMS,
+            NodeKind::DepthEstimate => &[],
+            NodeKind::Generator => GENERATOR_PARAMS,
         }
     }
 
@@ -738,6 +805,7 @@ impl NodeKind {
         match self {
             NodeKind::Source | NodeKind::GradientMask | NodeKind::RadialMask | NodeKind::BrushMask => &[],
             NodeKind::Blur => BLUR_INPUTS,
+            NodeKind::Normals => NORMALS_INPUTS,
             NodeKind::Merge => MERGE_INPUTS,
             NodeKind::Layer => LAYER_INPUTS,
             NodeKind::Exposure => EXPOSURE_INPUTS,
@@ -758,7 +826,7 @@ impl NodeKind {
             | NodeKind::HueMask
             | NodeKind::MaskAdjust
             | NodeKind::MaskCombine
-            | NodeKind::BrushMask => MASK_OUTPUTS,
+            | NodeKind::BrushMask | NodeKind::DepthEstimate => MASK_OUTPUTS,
             NodeKind::MetadataSplit => SPLIT_OUTPUTS,
             _ => IMAGE_OUTPUTS,
         }
@@ -780,6 +848,7 @@ impl NodeKind {
     pub fn data_kinds(self) -> &'static [DataKind] {
         match self {
             NodeKind::PointCurve => &[DataKind::Curve, DataKind::CurveSet],
+            NodeKind::Generator => &[DataKind::GradientRamp],
             NodeKind::BrushMask => &[DataKind::Strokes],
             NodeKind::MetadataSplit => &[DataKind::Ranges],
             NodeKind::Source => &[DataKind::Folder],
@@ -817,6 +886,7 @@ pub struct NamedRange {
 /// All/Individual semantics as parameters.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum NodeData {
+    GradientRamp(crate::generator::GradientRamp),
     /// (input, output) points on the perceptual axis, x strictly increasing.
     Curve(Vec<[f32; 2]>),
     Strokes(Vec<BrushStroke>),
@@ -831,6 +901,7 @@ pub enum NodeData {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataKind {
+    GradientRamp,
     Curve,
     Strokes,
     Ranges,
@@ -842,6 +913,7 @@ pub enum DataKind {
 impl NodeData {
     pub fn kind(&self) -> DataKind {
         match self {
+            NodeData::GradientRamp(_) => DataKind::GradientRamp,
             NodeData::Curve(_) => DataKind::Curve,
             NodeData::Strokes(_) => DataKind::Strokes,
             NodeData::Ranges(_) => DataKind::Ranges,
@@ -873,6 +945,7 @@ fn validate_data(kind: NodeKind, data: &NodeData) -> Result<(), String> {
         Some(_) => {}
     }
     match data {
+        NodeData::GradientRamp(ramp) => ramp.validate().map_err(str::to_owned)?,
         NodeData::Curve(points) => validate_curve_points(points)?,
         NodeData::CurveSet(entries) => {
             if entries.len() > CURVE_CHANNEL_COUNT {
@@ -967,6 +1040,21 @@ fn is_zero(v: &usize) -> bool {
     *v == 0
 }
 
+/// An exposed numeric parameter input. Image inputs are intensity maps, not
+/// collection inputs. Indices are stable slots, never reused after removal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExposedInput {
+    pub parameter: String,
+    pub ty: PortType,
+}
+
+/// An additional output alias, routed to an existing built-in output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExposedOutput {
+    pub label: String,
+    pub source_port: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub id: NodeId,
@@ -983,11 +1071,35 @@ pub struct Node {
     /// Structured data keyed by image identity; kept across mode switches like `individual`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     individual_data: BTreeMap<ImageId, NodeData>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exposed_inputs: Vec<Option<ExposedInput>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exposed_outputs: Vec<Option<ExposedOutput>>,
     /// Position in the graph editor.
     pub pos: [f32; 2],
 }
 
 impl Node {
+    pub fn exposed_inputs(&self) -> &[Option<ExposedInput>] { &self.exposed_inputs }
+    pub fn exposed_outputs(&self) -> &[Option<ExposedOutput>] { &self.exposed_outputs }
+
+    /// Resolves either a built-in or exposed input, preserving its collection role.
+    pub fn input_type(&self, port: usize) -> Option<PortType> {
+        if let Some(spec) = self.kind.inputs().get(port) { return Some(spec.ty); }
+        self.exposed_inputs.get(port.checked_sub(self.kind.inputs().len())?)?.as_ref().map(|p| p.ty)
+    }
+    pub fn output_type(&self, port: usize) -> Option<PortType> {
+        self.kind.outputs().get(self.resolve_output(port)?).map(|p| p.ty)
+    }
+    pub fn resolve_output(&self, port: usize) -> Option<usize> {
+        if port < self.kind.outputs().len() { return Some(port); }
+        let alias = self.exposed_outputs.get(port.checked_sub(self.kind.outputs().len())?)?.as_ref()?;
+        self.kind.outputs().get(alias.source_port).map(|_| alias.source_port)
+    }
+    pub fn is_collection_input(&self, port: usize) -> bool {
+        !(self.kind == NodeKind::Blur && port == 2)
+            && self.kind.inputs().get(port).is_some_and(|p| p.ty == PortType::Images)
+    }
     /// Effective value of a parameter for one image.
     pub fn param(&self, name: &str, image: ImageId) -> f32 {
         if self.mode == Mode::Individual {
@@ -1199,7 +1311,7 @@ const MAX_WALK: usize = 512;
 /// The folder a Source restricts its images to and whether subfolders count.
 fn source_folder(n: &Node) -> Option<(&str, bool)> {
     match n.all_data() {
-        Some(NodeData::Folder(f)) if !f.is_empty() => Some((f.as_str(), n.all_toggle("subfolders"))),
+        Some(NodeData::Folder(f)) => Some((f.as_str(), n.all_toggle("subfolders"))),
         _ => None,
     }
 }
@@ -1307,10 +1419,53 @@ impl Graph {
                 individual: BTreeMap::new(),
                 data: None,
                 individual_data: BTreeMap::new(),
+                exposed_inputs: Vec::new(),
+                exposed_outputs: Vec::new(),
                 pos,
             },
         );
         id
+    }
+
+    /// Parameters with implemented per-pixel evaluation.
+    pub fn supported_parameter_inputs(kind: NodeKind) -> &'static [&'static str] {
+        match kind { NodeKind::Develop => &["exposure", "contrast", "highlights", "shadows", "whites", "blacks"], NodeKind::Exposure => &["ev"], NodeKind::Blur => &["radius"], _ => &[] }
+    }
+
+    /// Expose a numeric parameter as an auxiliary mask or image-intensity input.
+    pub fn expose_parameter(&mut self, id: NodeId, parameter: &str, ty: PortType) -> Result<usize, GraphError> {
+        let node = self.nodes.get_mut(&id).ok_or(GraphError::UnknownNode(id))?;
+        if !(Self::supported_parameter_inputs(node.kind).contains(&parameter) && matches!(ty, PortType::Images | PortType::Mask))
+            || node.exposed_inputs.iter().flatten().any(|p| p.parameter == parameter) {
+            return Err(GraphError::Parse(format!("invalid or already exposed numeric parameter {parameter}")));
+        }
+        let port = node.kind.inputs().len() + node.exposed_inputs.len();
+        node.exposed_inputs.push(Some(ExposedInput { parameter: parameter.to_owned(), ty }));
+        Ok(port)
+    }
+
+    /// Expose an alias of a built-in output; aliases never point at aliases.
+    pub fn expose_output(&mut self, id: NodeId, source_port: usize, label: &str) -> Result<usize, GraphError> {
+        let node = self.nodes.get_mut(&id).ok_or(GraphError::UnknownNode(id))?;
+        if node.kind.outputs().get(source_port).is_none() { return Err(GraphError::NoSuchPort { node: id, port: source_port }); }
+        if label.trim().is_empty() || label.chars().count() > 128 || label.contains('\0') { return Err(GraphError::Parse("invalid output label".into())); }
+        let port = node.kind.outputs().len() + node.exposed_outputs.len();
+        node.exposed_outputs.push(Some(ExposedOutput { label: label.to_owned(), source_port }));
+        Ok(port)
+    }
+    pub fn remove_exposed_input(&mut self, id: NodeId, port: usize) -> bool {
+        let Some(node) = self.nodes.get_mut(&id) else { return false };
+        let Some(slot) = port.checked_sub(node.kind.inputs().len()).and_then(|i| node.exposed_inputs.get_mut(i)) else { return false };
+        if slot.take().is_none() { return false; }
+        self.edges.retain(|e| e.to != id || e.to_port != port);
+        true
+    }
+    pub fn remove_exposed_output(&mut self, id: NodeId, port: usize) -> bool {
+        let Some(node) = self.nodes.get_mut(&id) else { return false };
+        let Some(slot) = port.checked_sub(node.kind.outputs().len()).and_then(|i| node.exposed_outputs.get_mut(i)) else { return false };
+        if slot.take().is_none() { return false; }
+        self.edges.retain(|e| e.from != id || e.from_port != port);
+        true
     }
 
     pub fn remove_node(&mut self, id: NodeId) {
@@ -1349,6 +1504,11 @@ impl Graph {
         self.edges.iter().find(|e| e.to == node && e.to_port == port).map(|e| (e.from, e.from_port))
     }
 
+    /// All wires feeding an input, in graph insertion order.
+    pub fn input_edges(&self, node: NodeId, port: usize) -> impl Iterator<Item = &Edge> {
+        self.edges.iter().filter(move |e| e.to == node && e.to_port == port)
+    }
+
     /// Connects the first output of `from` to input `port` of `to`
     /// (see [`Graph::connect_ports`]).
     pub fn connect(&mut self, from: NodeId, to: NodeId, port: usize) -> Result<(), GraphError> {
@@ -1356,7 +1516,8 @@ impl Graph {
     }
 
     /// Connects output `from_port` of `from` to input `to_port` of `to`,
-    /// replacing any existing connection into that input. Rejects unknown
+    /// adding distinct wires for ordinary image inputs; Merge, Layer and masks
+    /// replace the existing input. Rejects unknown
     /// ports, type mismatches and cycles.
     pub fn connect_ports(
         &mut self,
@@ -1368,18 +1529,23 @@ impl Graph {
         let src = self.node(from).ok_or(GraphError::UnknownNode(from))?;
         let dst = self.node(to).ok_or(GraphError::UnknownNode(to))?;
         let outputs = src.kind.outputs();
-        if outputs.is_empty() {
+        if outputs.is_empty() && src.exposed_outputs.iter().all(Option::is_none) {
             return Err(GraphError::NoOutput(from));
         }
-        let found = outputs.get(from_port).ok_or(GraphError::NoSuchPort { node: from, port: from_port })?.ty;
-        let spec = dst.kind.inputs().get(to_port).ok_or(GraphError::NoSuchPort { node: to, port: to_port })?;
-        if spec.ty != found {
-            return Err(GraphError::TypeMismatch { expected: spec.ty, found });
+        let found = src.output_type(from_port).ok_or(GraphError::NoSuchPort { node: from, port: from_port })?;
+        let expected = dst.input_type(to_port).ok_or(GraphError::NoSuchPort { node: to, port: to_port })?;
+        if expected != found {
+            return Err(GraphError::TypeMismatch { expected, found });
         }
         if self.depends_on(from, to) {
             return Err(GraphError::WouldCycle);
         }
-        self.edges.retain(|e| !(e.to == to && e.to_port == to_port));
+        let multi = dst.is_collection_input(to_port) && !matches!(dst.kind, NodeKind::Merge | NodeKind::Layer);
+        if multi {
+            if self.edges.iter().any(|e| e.from == from && e.from_port == from_port && e.to == to && e.to_port == to_port) { return Ok(()); }
+        } else {
+            self.edges.retain(|e| !(e.to == to && e.to_port == to_port));
+        }
         self.edges.push(Edge { from, from_port, to, to_port });
         Ok(())
     }
@@ -1389,6 +1555,7 @@ impl Graph {
     /// Individual mode) and "Unmatched" for the last port. Empty for unknown ports.
     pub fn output_label(&self, node: NodeId, port: usize, image: ImageId) -> String {
         let Some(n) = self.node(node) else { return String::new() };
+        if let Some(Some(alias)) = port.checked_sub(n.kind.outputs().len()).and_then(|i| n.exposed_outputs.get(i)) { return alias.label.clone(); }
         let Some(spec) = n.kind.outputs().get(port) else { return String::new() };
         if n.kind == NodeKind::MetadataSplit && port < SPLIT_RANGES {
             if let Some(NodeData::Ranges(ranges)) = n.data(image) {
@@ -1402,6 +1569,16 @@ impl Graph {
 
     pub fn disconnect(&mut self, to: NodeId, port: usize) {
         self.edges.retain(|e| !(e.to == to && e.to_port == port));
+    }
+
+    /// Disconnect exactly one wire, leaving other wires on the input untouched.
+    pub fn disconnect_edge(&mut self, edge: Edge) -> bool {
+        if let Some(index) = self.edges.iter().position(|e| *e == edge) {
+            self.edges.remove(index);
+            true
+        } else {
+            false
+        }
     }
 
     /// Lists everything that keeps nodes from evaluating (missing required
@@ -1419,9 +1596,13 @@ impl Graph {
                 add(format!("{label}: no input is connected"));
             }
             for (port, spec) in node.kind.inputs().iter().enumerate() {
-                if spec.required && self.input_of(node.id, port).is_none() {
+                if spec.required && self.input_of(node.id, port).is_none() && !(node.kind == NodeKind::Generator && port == 0) {
                     add(format!("{label}: input \"{}\" is not connected", spec.label));
                 }
+            }
+            if node.kind == NodeKind::Normals {
+                let port = node.all_choice("mode");
+                if self.input_of(node.id, port).is_none() { add(format!("Normals: selected input is not connected (port {port})")); }
             }
             match node.kind {
                 NodeKind::Layer if node.all_choice("mode") == 1 => {
@@ -1649,12 +1830,13 @@ impl Graph {
     // ---- collection queries -------------------------------------------------
 
     fn input_contains_ctx(&self, ctx: &Ctx, node: NodeId, port: usize, image: ImageId) -> bool {
-        self.input_edge(node, port)
-            .is_some_and(|(up, up_port)| self.contains_output_ctx(ctx, up, up_port, image))
+        self.input_edges(node, port)
+            .any(|e| self.contains_output_ctx(ctx, e.from, e.from_port, image))
     }
 
     fn contains_output_ctx(&self, ctx: &Ctx, node: NodeId, port: usize, image: ImageId) -> bool {
         let Some(n) = self.node(node) else { return false };
+        let port = if n.kind.outputs().is_empty() && port == 0 { 0 } else { let Some(p) = n.resolve_output(port) else { return false }; p };
         if n.kind == NodeKind::MetadataSplit {
             return self.split_port_ctx(ctx, node, image) == Some(port);
         }
@@ -1672,6 +1854,9 @@ impl Graph {
 
     fn contains_ctx(&self, ctx: &Ctx, node: NodeId, image: ImageId) -> bool {
         let Some(n) = self.node(node) else { return false };
+        if n.kind == NodeKind::DepthEstimate {
+            return self.input_contains_ctx(ctx, node, 0, image);
+        }
         if n.kind.output() == Some(PortType::Mask) {
             return true;
         }
@@ -1679,9 +1864,11 @@ impl Graph {
             return false;
         }
         let result = match n.kind {
+            NodeKind::Generator if self.input_edges(node, 0).next().is_none() => image == ImageId(u64::MAX - node.0) && !ctx.catalog.images.contains(&image),
+            NodeKind::Normals => self.input_contains_ctx(ctx, node, n.choice("mode", image), image),
             NodeKind::Source => match source_folder(n) {
                 None => true,
-                Some((folder, recursive)) => ctx
+                Some((folder, recursive)) => !folder.is_empty() && ctx
                     .cap(image)
                     .is_some_and(|c| c.path.as_deref().is_some_and(|p| path_in_folder(p, folder, recursive))),
             },
@@ -1712,10 +1899,14 @@ impl Graph {
     }
 
     fn input_members(&self, ctx: &Ctx, node: NodeId, port: usize) -> Rc<Vec<ImageId>> {
-        match self.input_edge(node, port) {
-            Some((up, up_port)) => self.members_ctx(ctx, up, up_port),
-            None => Rc::new(Vec::new()),
+        let mut result = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for e in self.input_edges(node, port) {
+            for &image in self.members_ctx(ctx, e.from, e.from_port).iter() {
+                if seen.insert(image) { result.push(image); }
+            }
         }
+        Rc::new(result)
     }
 
     fn members_ctx(&self, ctx: &Ctx, node: NodeId, port: usize) -> Rc<Vec<ImageId>> {
@@ -1734,10 +1925,29 @@ impl Graph {
     fn compute_members(&self, ctx: &Ctx, node: NodeId, port: usize) -> Rc<Vec<ImageId>> {
         let none = || Rc::new(Vec::new());
         let Some(n) = self.node(node) else { return none() };
+        let port = if n.kind.outputs().is_empty() && port == 0 { 0 } else {
+            let Some(port) = n.resolve_output(port) else { return none() };
+            port
+        };
+        if n.kind == NodeKind::DepthEstimate {
+            return if port == 0 { self.input_members(ctx, node, 0) } else { none() };
+        }
         if n.kind.output() == Some(PortType::Mask) {
             return if port == 0 { Rc::new(ctx.catalog.images.to_vec()) } else { none() };
         }
         match n.kind {
+            NodeKind::Generator if port == 0 && self.input_edges(node, 0).next().is_none() => {
+                let image = ImageId(u64::MAX - node.0);
+                if ctx.catalog.images.contains(&image) { none() } else { Rc::new(vec![image]) }
+            }
+            NodeKind::Normals if port == 0 => {
+                let mut seen = std::collections::HashSet::new();
+                let candidates = (0..n.kind.inputs().len())
+                    .flat_map(|port| self.input_members(ctx, node, port).as_ref().clone())
+                    .filter(|&image| seen.insert(image) && self.input_contains_ctx(ctx, node, n.choice("mode", image), image))
+                    .collect();
+                Rc::new(candidates)
+            }
             NodeKind::MetadataSplit => {
                 if port >= n.kind.outputs().len() {
                     return none();
@@ -1757,6 +1967,7 @@ impl Graph {
             _ if port != 0 => none(),
             NodeKind::Source => match source_folder(n) {
                 None => Rc::new(ctx.catalog.images.to_vec()),
+                Some(("", _)) => none(),
                 Some((folder, recursive)) => Rc::new(
                     ctx.catalog
                         .images
@@ -1880,6 +2091,17 @@ impl Graph {
             if node.id.0 >= self.next_id {
                 return bad(format!("next_id {} is not greater than node id {}", self.next_id, node.id.0));
             }
+            let mut exposed = BTreeSet::new();
+            for input in node.exposed_inputs.iter().flatten() {
+                if !(Self::supported_parameter_inputs(node.kind).contains(&input.parameter.as_str()) && matches!(input.ty, PortType::Images | PortType::Mask)) || !exposed.insert(&input.parameter) {
+                    return bad(format!("node {}: invalid or duplicate exposed parameter", node.id.0));
+                }
+            }
+            for output in node.exposed_outputs.iter().flatten() {
+                if node.kind.outputs().get(output.source_port).is_none() || output.label.trim().is_empty() || output.label.chars().count() > 128 || output.label.contains('\0') {
+                    return bad(format!("node {}: invalid exposed output", node.id.0));
+                }
+            }
             let label = node.kind.label();
             let check_values = |values: &BTreeMap<String, f32>, scope: &str| -> Result<(), GraphError> {
                 for (name, value) in values {
@@ -1928,17 +2150,17 @@ impl Graph {
             if outputs.is_empty() {
                 return bad(format!("{what}: node {} ({}) has no output", e.from.0, src.kind.label()));
             }
-            let Some(out) = outputs.get(e.from_port) else {
+            let Some(found) = src.output_type(e.from_port) else {
                 return bad(format!("{what}: node {} ({}) has no output port {}", e.from.0, src.kind.label(), e.from_port));
             };
-            let found = out.ty;
-            let Some(spec) = dst.kind.inputs().get(e.to_port) else {
+            let Some(expected) = dst.input_type(e.to_port) else {
                 return bad(format!("{what}: node {} ({}) has no input {}", e.to.0, dst.kind.label(), e.to_port));
             };
-            if spec.ty != found {
-                return bad(format!("{what}: input expects {:?} but the source carries {found:?}", spec.ty));
+            if expected != found {
+                return bad(format!("{what}: input expects {:?} but the source carries {found:?}", expected));
             }
-            if !wired.insert((e.to, e.to_port)) {
+            let multi = dst.is_collection_input(e.to_port) && !matches!(dst.kind, NodeKind::Merge | NodeKind::Layer);
+            if (!multi && !wired.insert((e.to, e.to_port))) || self.edges.iter().take_while(|other| !std::ptr::eq(*other, e)).any(|other| other == e) {
                 return bad(format!("{what}: input {} of node {} is connected more than once", e.to_port, e.to.0));
             }
         }
@@ -1981,6 +2203,10 @@ struct SubNode {
     /// The All data only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     data: Option<NodeData>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exposed_inputs: Vec<Option<ExposedInput>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exposed_outputs: Vec<Option<ExposedOutput>>,
     pos: [f32; 2],
 }
 
@@ -2056,6 +2282,8 @@ impl Subgraph {
                     individual: BTreeMap::new(),
                     data: n.data.clone(),
                     individual_data: BTreeMap::new(),
+                    exposed_inputs: n.exposed_inputs.clone(),
+                    exposed_outputs: n.exposed_outputs.clone(),
                     pos: n.pos,
                 };
                 (id, node)
@@ -2093,7 +2321,7 @@ impl Graph {
             .iter()
             .map(|id| {
                 let n = &self.nodes[id];
-                SubNode { kind: n.kind, mode: n.mode, all: n.all.clone(), data: n.data.clone(), pos: n.pos }
+                SubNode { kind: n.kind, mode: n.mode, all: n.all.clone(), data: n.data.clone(), exposed_inputs: n.exposed_inputs.clone(), exposed_outputs: n.exposed_outputs.clone(), pos: n.pos }
             })
             .collect();
         let sub_edges = self
@@ -2116,6 +2344,8 @@ impl Graph {
             .map(|n| {
                 let id = self.add_node(n.kind, [n.pos[0] + offset[0], n.pos[1] + offset[1]]);
                 let node = self.nodes.get_mut(&id).expect("node was just added");
+                node.exposed_inputs = n.exposed_inputs.clone();
+                node.exposed_outputs = n.exposed_outputs.clone();
                 node.mode = n.mode;
                 node.all = n.all.iter().filter(|(k, _)| n.kind.param_spec(k).is_some()).map(|(k, v)| (k.clone(), *v)).collect();
                 node.data = n.data.clone().filter(|d| validate_data(n.kind, d).is_ok());
@@ -2167,15 +2397,33 @@ mod tests {
     }
 
     #[test]
-    fn connecting_replaces_the_existing_input() {
+    fn connecting_images_adds_distinct_inputs() {
         let mut g = Graph::new();
         let a = g.add_node(NodeKind::Source, [0.0, 0.0]);
         let b = g.add_node(NodeKind::Source, [0.0, 0.0]);
         let out = g.add_node(NodeKind::Output, [0.0, 0.0]);
         g.connect(a, out, 0).unwrap();
         g.connect(b, out, 0).unwrap();
-        assert_eq!(g.input_of(out, 0), Some(b));
-        assert_eq!(g.edges().len(), 1);
+        assert_eq!(g.input_of(out, 0), Some(a));
+        assert_eq!(g.edges().len(), 2);
+        g.connect(a, out, 0).unwrap();
+        assert_eq!(g.edges().len(), 2);
+    }
+
+    #[test]
+    fn exact_disconnect_preserves_other_wires_and_their_order() {
+        let mut g = Graph::new();
+        let a = g.add_node(NodeKind::Source, [0.0, 0.0]);
+        let b = g.add_node(NodeKind::Source, [0.0, 0.0]);
+        let out = g.add_node(NodeKind::Output, [0.0, 0.0]);
+        let first = Edge { from: a, from_port: 0, to: out, to_port: 0 };
+        let second = Edge { from: b, from_port: 0, to: out, to_port: 0 };
+        // Model a future fan-in without enabling it in connect or deserialization.
+        g.edges.extend([first, second]);
+        assert_eq!(g.input_edges(out, 0).copied().collect::<Vec<_>>(), vec![first, second]);
+        assert!(g.disconnect_edge(first));
+        assert!(!g.disconnect_edge(first));
+        assert_eq!(g.input_edges(out, 0).copied().collect::<Vec<_>>(), vec![second]);
     }
 
     #[test]
@@ -2361,7 +2609,8 @@ mod tests {
 
     #[test]
     fn load_rejects_two_edges_into_one_port() {
-        assert_rejected(load_edited(|v| push_edge(v, 1, 3, 0)), "connected more than once");
+        assert!(load_edited(|v| push_edge(v, 1, 3, 0)).is_ok());
+        assert_rejected(load_edited(|v| push_edge(v, 2, 3, 0)), "connected more than once");
     }
 
     #[test]
@@ -2438,14 +2687,16 @@ mod tests {
         assert!(NodeKind::Contrast.param_spec("pivot").unwrap().logarithmic);
         assert_eq!(NodeKind::MetadataFilter.param_spec("invert").unwrap().kind, ParamKind::Toggle);
 
-        // Everything that existed before is Continuous and linear.
+        assert_eq!(NodeKind::Blur.param_spec("radius").unwrap().kind, ParamKind::Continuous);
+        assert_eq!(NodeKind::Blur.param_spec("pass").unwrap().default, 0.0);
+        assert_eq!(NodeKind::Blur.param_spec("kernel").unwrap().default, 0.0);
+        // Legacy parameters remain continuous and linear.
         for kind in [
             NodeKind::CaptureEv,
             NodeKind::Exposure,
             NodeKind::WhiteBalance,
             NodeKind::Saturation,
             NodeKind::GradientMask,
-            NodeKind::Blur,
         ] {
             for spec in kind.params() {
                 assert_eq!((spec.kind, spec.logarithmic), (ParamKind::Continuous, false), "{}", spec.name);
@@ -2754,7 +3005,11 @@ mod tests {
             (NodeKind::WhiteBalance, "White Balance (relative)", "Colour"),
             (NodeKind::Saturation, "Saturation", "Colour"),
             (NodeKind::NoiseReduction, "Noise Reduction", "Detail"),
-            (NodeKind::Blur, "Blur", "Detail"),
+            (NodeKind::Blur, "Filter", "Detail"),
+            (NodeKind::PixelSort, "Pixel Sort", "Effects"),
+            (NodeKind::Normals, "Normals", "Effects"),
+            (NodeKind::Generator, "Generator", "Effects"),
+            (NodeKind::DepthEstimate, "Depth Estimate", "Mask"),
             (NodeKind::MetadataFilter, "Metadata Filter", "Collection"),
             (NodeKind::Merge, "Merge", "Collection"),
             (NodeKind::GradientMask, "Gradient Mask", "Mask"),
@@ -3269,8 +3524,8 @@ mod tests {
         assert_eq!(g.connect_ports(brush, 1, sharpen, 1), Err(GraphError::NoSuchPort { node: brush, port: 1 }));
         for port in 0..7 {
             assert_eq!(g.connect_ports(split, port, exp, 0), Ok(()), "port {port}");
-            assert_eq!(g.input_edge(exp, 0), Some((split, port)));
-            assert_eq!(g.edges().len(), 2, "re-connecting replaces the input edge");
+            assert_eq!(g.input_edges(exp, 0).last().map(|e| (e.from, e.from_port)), Some((split, port)));
+            assert_eq!(g.edges().len(), port + 2);
         }
         // Types across ports: split outputs are images, the brush mask is a mask.
         assert_eq!(
@@ -3345,6 +3600,7 @@ mod tests {
     fn data_kind_per_node_kind() {
         for kind in NodeKind::ALL {
             let expected = match kind {
+                NodeKind::Generator => Some(DataKind::GradientRamp),
                 NodeKind::PointCurve => Some(DataKind::Curve),
                 NodeKind::BrushMask => Some(DataKind::Strokes),
                 NodeKind::MetadataSplit => Some(DataKind::Ranges),
@@ -3387,7 +3643,7 @@ mod tests {
         assert_eq!(s.param_spec("missing").unwrap().kind, ParamKind::Choice(&["Unmatched", "Exclude"]));
         assert_eq!(s.params().len(), 2);
         assert!(NodeKind::ALL.contains(&c) && NodeKind::ALL.contains(&b) && NodeKind::ALL.contains(&s));
-        assert_eq!(NodeKind::ALL.len(), 33);
+        assert_eq!(NodeKind::ALL.len(), 37);
     }
 
     #[test]
@@ -4261,5 +4517,42 @@ mod tests {
             assert!(!g.contains(n, B, &iso));
         }
         assert!(!g.contains(loose, A, &iso), "unconnected required input");
+    }
+}
+
+#[cfg(test)]
+mod exposed_port_tests {
+    use super::*;
+    #[test]
+    fn exposed_ports_are_stable_validated_and_auxiliary() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let other = g.add_node(NodeKind::Source, [0.0; 2]);
+        let exp = g.add_node(NodeKind::Exposure, [0.0; 2]);
+        let mask = g.add_node(NodeKind::GradientMask, [0.0; 2]);
+        g.connect(src, exp, 0).unwrap();
+        let p = g.expose_parameter(exp, "ev", PortType::Images).unwrap();
+        g.connect(other, exp, p).unwrap();
+        assert!(matches!(g.connect(mask, exp, p), Err(GraphError::TypeMismatch { .. })));
+        let alias = g.expose_output(src, 0, "copy").unwrap();
+        let ids = [ImageId(1), ImageId(2)];
+        let catalog = Catalog { images: &ids, capture: &|_| None };
+        assert_eq!(g.members(src, alias, &catalog), g.members(src, 0, &catalog));
+        let sub = g.extract_subgraph(&[src, exp, other]);
+        let sub = Subgraph::from_json(&sub.to_json()).unwrap();
+        let mut copied = Graph::new();
+        copied.insert_subgraph(&sub, [0.0; 2]);
+        assert_eq!(Graph::from_json(&copied.to_json()), Ok(copied));
+        assert_eq!(Graph::from_json(&g.to_json()), Ok(g.clone()));
+        assert!(g.remove_exposed_input(exp, p));
+        assert!(g.input_of(exp, p).is_none());
+        let p2 = g.expose_parameter(exp, "ev", PortType::Mask).unwrap();
+        assert!(p2 > p);
+        assert!(matches!(g.connect(other, exp, p), Err(GraphError::NoSuchPort { .. })));
+        assert!(g.remove_exposed_output(src, alias));
+        assert!(g.expose_output(src, 0, "again").unwrap() > alias);
+        let mut json: serde_json::Value = serde_json::from_str(&g.to_json()).unwrap();
+        json["nodes"][exp.0.to_string()]["exposed_inputs"][p2 - g.node(exp).unwrap().kind.inputs().len()]["parameter"] = "not_a_parameter".into();
+        assert!(Graph::from_json(&json.to_string()).is_err());
     }
 }

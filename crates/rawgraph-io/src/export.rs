@@ -2,7 +2,7 @@
 //! write never leaves a truncated target and an existing file is only replaced on success.
 
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{BufWriter, Cursor, Write, Seek};
 use std::path::{Path, PathBuf};
 
 use image::codecs::jpeg::JpegEncoder;
@@ -99,39 +99,63 @@ fn write_rgb(
     ext: &str,
     options: &SaveOptions,
 ) -> Result<(), IoError> {
-    let srgb = options.space == OutputSpace::Srgb;
     write_atomic(path, options.overwrite, |tmp| {
-        let file = File::create(tmp).map_err(|e| io_err(tmp, e))?;
-        let mut w = BufWriter::new(file);
-        macro_rules! encode {
-            ($enc:expr, $exif:expr) => {{
-                let mut enc = $enc;
-                if options.embed_profile {
-                    enc.set_icc_profile(icc_profile(options.space).to_vec()).map_err(|e| io_err(tmp, e))?;
-                }
-                if $exif {
-                    if let Some(md) = &options.metadata {
-                        enc.set_exif_metadata(exif_blob(md, srgb)).map_err(|e| io_err(tmp, e))?;
-                    }
-                }
-                enc.write_image(bytes, width, height, color)
-            }};
-        }
-        match ext {
-            "png" => encode!(PngEncoder::new(&mut w), true),
-            "tif" | "tiff" => encode!(TiffEncoder::new(&mut w), false),
-            _ => encode!(JpegEncoder::new_with_quality(&mut w, options.jpeg_quality.clamp(1, 100)), true),
-        }
-        .map_err(|e| io_err(tmp, e))?;
-        std::io::Write::flush(&mut w).map_err(|e| io_err(tmp, e))?;
-        drop(w);
+        let mut writer = BufWriter::new(File::create(tmp).map_err(|e| io_err(tmp, e))?);
+        encode_rgb_to(&mut writer, width, height, bytes, color, ext, options)?;
+        writer.flush().map_err(|e| io_err(tmp, e))?;
+        drop(writer);
         if matches!(ext, "tif" | "tiff") {
             if let Some(md) = &options.metadata {
-                tiff_add_exif(tmp, md, srgb)?;
+                tiff_add_exif(tmp, md, options.space == OutputSpace::Srgb)?;
             }
         }
         Ok(())
     })
+}
+
+/// Encode RGB samples with the same image encoder as file export, entirely in memory.
+/// TIFF EXIF is appended by the file writer and is not included in these bytes.
+pub fn encode_rgb(
+    width: u32, height: u32, bytes: &[u8], color: ExtendedColorType,
+    ext: &str, options: &SaveOptions,
+) -> Result<Vec<u8>, IoError> {
+    let mut w = Cursor::new(Vec::new());
+    encode_rgb_to(&mut w, width, height, bytes, color, ext, options)?;
+    Ok(w.into_inner())
+}
+
+fn encode_rgb_to<W: Write + Seek>(mut w: W, width: u32, height: u32, bytes: &[u8], color: ExtendedColorType, ext: &str, options: &SaveOptions) -> Result<(), IoError> {
+    let bytes_per_sample = match color {
+        ExtendedColorType::Rgb8 => 1,
+        ExtendedColorType::Rgb16 => 2,
+        _ => return Err(IoError::Unsupported("expected RGB8 or RGB16".into())),
+    };
+    if bytes.len() % bytes_per_sample != 0 {
+        return Err(IoError::Io("invalid RGB sample bytes".into()));
+    }
+    check_size(width, height, bytes.len() / bytes_per_sample)?;
+    let srgb = options.space == OutputSpace::Srgb;
+    macro_rules! encode {
+        ($enc:expr, $exif:expr) => {{
+            let mut enc = $enc;
+            if options.embed_profile {
+                enc.set_icc_profile(icc_profile(options.space).to_vec()).map_err(|e| IoError::Io(format!("encoding {ext}: {e}")))?;
+            }
+            if $exif {
+                if let Some(md) = &options.metadata {
+                    enc.set_exif_metadata(exif_blob(md, srgb)).map_err(|e| IoError::Io(format!("encoding {ext}: {e}")))?;
+                }
+            }
+            enc.write_image(bytes, width, height, color).map_err(|e| IoError::Io(format!("encoding {ext}: {e}")))?;
+        }};
+    }
+    match ext {
+        "png" => encode!(PngEncoder::new(&mut w), true),
+        "tif" | "tiff" => encode!(TiffEncoder::new(&mut w), false),
+        "jpg" | "jpeg" if color == ExtendedColorType::Rgb8 => encode!(JpegEncoder::new_with_quality(&mut w, options.jpeg_quality.clamp(1, 100)), true),
+        _ => return Err(IoError::Unsupported(format!("cannot encode {color:?} as '{ext}'"))),
+    }
+    Ok(())
 }
 
 /// Writes 8-bit sRGB. `rgb8` is RGB, 3 bytes per pixel. The format follows the extension:
@@ -180,6 +204,25 @@ pub fn save_avif8(path: &Path, width: u32, height: u32, rgb8: &[u8], options: &S
         return Err(IoError::Exists(path.to_path_buf()));
     }
     let bytes = crate::avif::encode(width, height, rgb8, options)?;
+    write_atomic(path, options.overwrite, |tmp| fs::write(tmp, &bytes).map_err(|e| io_err(tmp, e)))
+}
+
+/// Writes RGBA WebP. Pixels are already encoded in the selected output space.
+/// EXIF is supported; ICC profiles are not yet embedded by this writer.
+pub fn save_webp8(path: &Path, width: u32, height: u32, rgba: &[u8], lossless: bool, options: &SaveOptions) -> Result<(), IoError> {
+    if width == 0 || height == 0 || width > 16383 || height > 16383 ||
+        (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(4)) != Some(rgba.len()) {
+        return Err(IoError::Io("invalid WebP dimensions or RGBA buffer".into()));
+    }
+    if !options.overwrite && path.exists() { return Err(IoError::Exists(path.to_path_buf())); }
+    let img = webp_rust::ImageBuffer { width: width as usize, height: height as usize, rgba: rgba.to_vec() };
+    let exif = options.metadata.as_ref().map(|m| exif_blob(m, options.space == OutputSpace::Srgb));
+    let bytes = if lossless {
+        webp_rust::encode_lossless_with_config(&img, &Default::default(), exif.as_deref())
+    } else {
+        let config = webp_rust::LossyEncodingConfig { quality: options.jpeg_quality.clamp(1, 100) as f32, ..Default::default() };
+        webp_rust::encode_lossy_with_config(&img, &config, exif.as_deref())
+    }.map_err(|e| io_err(path, e))?;
     write_atomic(path, options.overwrite, |tmp| fs::write(tmp, &bytes).map_err(|e| io_err(tmp, e)))
 }
 

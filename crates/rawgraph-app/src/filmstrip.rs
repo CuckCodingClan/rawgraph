@@ -49,6 +49,11 @@ pub struct Filmstrip {
     pub xmp_banner: Option<usize>,
 }
 
+pub(crate) fn gallery_keyboard_available(ctx: &egui::Context) -> bool {
+    !ctx.egui_wants_keyboard_input() && !ctx.memory(|m| m.focused()).is_some_and(|id|
+        ctx.data(|d| d.get_temp::<bool>(id.with("fine-slider")).unwrap_or(false)))
+}
+
 impl Filmstrip {
     pub fn with_thumbs(thumbs: ThumbLoader) -> Self {
         Self { thumbs, last_selected: None, last_range: 0..0, actions: Vec::new(), xmp_banner: None }
@@ -127,27 +132,43 @@ impl Filmstrip {
         session.filter != before
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, session: &mut Session) {
-        // Left/Right step through the filtered list unless a text field has focus.
-        if !ui.ctx().egui_wants_keyboard_input() {
-            let (left, right) = ui.ctx().input_mut(|i| {
-                (i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft), i.consume_key(egui::Modifiers::NONE, Key::ArrowRight))
-            });
-            if left {
-                session.step_image(-1);
-            }
-            if right {
-                session.step_image(1);
-            }
-        }
+    pub fn show(&mut self, ui: &mut egui::Ui, session: &mut Session, members: Option<&std::collections::HashSet<rawgraph_core::ImageId>>) {
         if Self::header(ui, session) {
             session.refresh_visible();
         }
-        let mut count = format!("{} of {}", session.visible().len(), session.total_images());
-        if let Some(k) = session.in_view_count() {
-            count.push_str(&format!("  |  {k} in view"));
+        let mut ids: Vec<_> = gallery_ids(session.visible(), members);
+        if let Some(members) = members {
+            let mut generated: Vec<_> = members.iter().copied().filter(|id| session.entry(*id).is_none()).collect();
+            generated.sort();
+            ids.extend(generated);
         }
-        ui.label(RichText::new(count).strong());
+        if members.is_some() && session.selected.is_none_or(|id| !ids.contains(&id)) {
+            session.selected = ids.first().copied();
+        }
+        ui.label(RichText::new(format!("{} images", ids.len())).strong());
+        if session.selected_node.is_none() {
+            ui.label("Select a node to see its images.");
+            self.thumbs.set_wanted(&[]);
+            return;
+        }
+        if members.is_none() {
+            ui.label("Loading node collection…");
+            self.thumbs.set_wanted(&[]);
+            return;
+        }
+        if ids.is_empty() {
+            ui.label("No images in this node match the filters.");
+            self.thumbs.set_wanted(&[]);
+            return;
+        }
+        if gallery_keyboard_available(ui.ctx()) {
+            let (left, right) = ui.ctx().input_mut(|i| (i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft), i.consume_key(egui::Modifiers::NONE, Key::ArrowRight)));
+            if left || right {
+                let index = session.selected.and_then(|id| ids.iter().position(|x| *x == id)).unwrap_or(0);
+                let next = if left { index.saturating_sub(1) } else { (index + 1).min(ids.len() - 1) };
+                session.selected = Some(ids[next]);
+            }
+        }
         if let Some(n) = self.xmp_banner {
             egui::Frame::group(ui.style()).fill(Color32::from_rgb(40, 52, 70)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -164,14 +185,16 @@ impl Filmstrip {
         }
         ui.add_space(2.0);
 
-        let rows = session.visible().len();
-        let width = (ui.available_width() - 6.0).max(80.0);
+        let available = (ui.available_width() - 6.0).max(100.0);
+        let columns = ((available + 4.0) / 124.0).floor().max(1.0) as usize;
+        let width = (available - (columns - 1) as f32 * 4.0) / columns as f32;
+        let rows = ids.len().div_ceil(columns);
         let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
-        // Keep the selection on screen when it changed through the keyboard.
         if session.selected != self.last_selected {
-            if let Some(i) = session.selected_index() {
-                if i < self.last_range.start + 1 || i + 2 > self.last_range.end {
-                    scroll = scroll.vertical_scroll_offset((i as f32 * ROW_H - ROW_H).max(0.0));
+            if let Some(i) = session.selected.and_then(|id| ids.iter().position(|x| *x == id)) {
+                let row = i / columns;
+                if row < self.last_range.start || row >= self.last_range.end {
+                    scroll = scroll.vertical_scroll_offset((row as f32 * ROW_H - ROW_H).max(0.0));
                 }
             }
             self.last_selected = session.selected;
@@ -179,53 +202,36 @@ impl Filmstrip {
         let mut clicked = None;
         let out = scroll.show_rows(ui, ROW_H, rows, |ui, range| {
             for row in range.clone() {
-                let Some(&id) = session.visible().get(row) else { continue };
-                let selected = session.selected == Some(id);
-                let entry = session.entry(id).cloned();
-                if let Some(entry) = entry {
-                    let tex = self.thumbs.texture(id);
-                    let failed = self.thumbs.has_failed(id);
-                    let dim = session.in_view(id) == Some(false);
-                    let resp = draw_row(ui, width, &entry, selected, tex.as_ref(), failed, dim);
-                    if resp.clicked() {
-                        clicked = Some(id);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for &id in ids.iter().skip(row * columns).take(columns) {
+                        if let Some(entry) = session.entry(id).cloned() {
+                            let tex = self.thumbs.texture(id);
+                            let resp = draw_row(ui, width, &entry, session.selected == Some(id), tex.as_ref(), self.thumbs.has_failed(id), false);
+                            if resp.clicked() { clicked = Some(id); }
+                            resp.context_menu(|ui| {
+                                if ui.button("Set as reference").clicked() { self.actions.push(FilmAction::SetReference(id)); ui.close(); }
+                                if entry.missing {
+                                    if ui.button("Locate file...").clicked() { self.actions.push(FilmAction::Locate(id)); ui.close(); }
+                                    if ui.button("Relink folder...").clicked() { self.actions.push(FilmAction::RelinkFolder(id)); ui.close(); }
+                                }
+                            });
+                        } else if ui.selectable_label(session.selected == Some(id), format!("Generated {}", id.0)).clicked() {
+                            clicked = Some(id);
+                        }
                     }
-                    resp.context_menu(|ui| {
-                        if ui.button("Set as reference").on_hover_text("Compare view: the left half shows this image").clicked() {
-                            self.actions.push(FilmAction::SetReference(id));
-                            ui.close();
-                        }
-                        if entry.missing {
-                            ui.separator();
-                            if ui.button("Locate file...").on_hover_text("Point this image at the file's new place").clicked() {
-                                self.actions.push(FilmAction::Locate(id));
-                                ui.close();
-                            }
-                            if ui.button("Relink folder...").on_hover_text("The whole folder moved: find all its files in the new place").clicked() {
-                                self.actions.push(FilmAction::RelinkFolder(id));
-                                ui.close();
-                            }
-                        }
-                    });
-                }
+                });
             }
             range
         });
         let range = out.inner;
         self.last_range = range.clone();
-        if let Some(id) = clicked {
-            session.select_id(id);
-        }
-
-        // Request thumbnails for the visible rows plus a margin, visible first.
+        if let Some(id) = clicked { session.selected = Some(id); }
         let (lo, hi) = (range.start.saturating_sub(MARGIN_ROWS), (range.end + MARGIN_ROWS).min(rows));
         let mut order: Vec<usize> = (range.start..range.end).collect();
         order.extend((range.end..hi).chain((lo..range.start).rev()));
-        let wanted: Vec<_> = order
-            .into_iter()
-            .filter_map(|r| session.visible().get(r).copied())
-            .filter_map(|id| session.entry(id).filter(|e| !e.missing).map(|e| Wanted { id, path: e.path.clone(), hash: e.content_hash.clone() }))
-            .collect();
+        let wanted: Vec<_> = order.into_iter().flat_map(|r| ids.iter().skip(r * columns).take(columns).copied())
+            .filter_map(|id| session.entry(id).filter(|e| !e.missing).map(|e| Wanted { id, path: e.path.clone(), hash: e.content_hash.clone() })).collect();
         self.thumbs.set_wanted(&wanted);
     }
 
@@ -240,6 +246,10 @@ impl Filmstrip {
         }
         crate::inspector::profile_line(ui, session);
     }
+}
+
+fn gallery_ids(visible: &[rawgraph_core::ImageId], members: Option<&std::collections::HashSet<rawgraph_core::ImageId>>) -> Vec<rawgraph_core::ImageId> {
+    members.map_or_else(Vec::new, |members| visible.iter().copied().filter(|id| members.contains(id)).collect())
 }
 
 fn draw_row(ui: &mut egui::Ui, width: f32, e: &ImageEntry, selected: bool, tex: Option<&egui::TextureHandle>, failed: bool, dim: bool) -> egui::Response {
@@ -381,6 +391,16 @@ pub(crate) fn draw_star(painter: &egui::Painter, c: Pos2, r: f32, filled: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gallery_never_falls_back_and_preserves_filtered_order() {
+        use rawgraph_core::ImageId;
+        let visible = [ImageId(3), ImageId(1), ImageId(2)];
+        assert!(gallery_ids(&visible, None).is_empty());
+        assert!(gallery_ids(&visible, Some(&Default::default())).is_empty());
+        let members = [ImageId(1), ImageId(3), ImageId(9)].into_iter().collect();
+        assert_eq!(gallery_ids(&visible, Some(&members)), vec![ImageId(3), ImageId(1)]);
+    }
 
     #[test]
     fn a_long_name_never_overlaps_the_note_or_the_edge() {

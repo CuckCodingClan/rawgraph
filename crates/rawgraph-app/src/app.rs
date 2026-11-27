@@ -103,6 +103,8 @@ struct Settings {
     scopes: AuxState,
     preview_size: u32,
     renderer: RendererMode,
+    click_zoom: f32,
+    wheel_navigates: bool,
 }
 
 impl Default for Settings {
@@ -115,6 +117,8 @@ impl Default for Settings {
             scopes: AuxState::default(),
             preview_size: DEFAULT_PREVIEW,
             renderer: RendererMode::Auto,
+            click_zoom: 2.0,
+            wheel_navigates: false,
         }
     }
 }
@@ -144,8 +148,7 @@ enum Command {
     ToggleClean,
     ToggleScopes,
     SetScopesPos(ScopesPos),
-    CleanFullscreen,
-    CleanNextMonitor,
+    CleanMonitor(usize),
     ResetLayout,
     Shortcuts,
     ScanReport,
@@ -219,8 +222,6 @@ fn shortcut_of(cmd: Command) -> Option<KeyboardShortcut> {
         Command::SetWorkspace(Workspace::Dual) => sc(cs, Key::D),
         Command::ToggleClean => sc(cs, Key::C),
         Command::ToggleScopes => sc(cs, Key::K),
-        Command::CleanFullscreen => sc(cs, Key::F),
-        Command::CleanNextMonitor => sc(cs, Key::M),
         Command::ToggleMaskOverlay => sc(Modifiers::NONE, Key::M),
         Command::Copy => sc(c, Key::C),
         Command::Cut => sc(c, Key::X),
@@ -233,14 +234,12 @@ fn shortcut_of(cmd: Command) -> Option<KeyboardShortcut> {
 }
 
 /// Commands bound to a key, most specific modifier combination first.
-const SHORTCUT_ORDER: [Command; 21] = [
+const SHORTCUT_ORDER: [Command; 18] = [
     Command::SaveAs,
     Command::OpenFolder,
     Command::SetWorkspace(Workspace::Dual),
     Command::ToggleClean,
     Command::ToggleScopes,
-    Command::CleanFullscreen,
-    Command::CleanNextMonitor,
     Command::NewProject,
     Command::OpenProject,
     Command::Save,
@@ -250,7 +249,6 @@ const SHORTCUT_ORDER: [Command; 21] = [
     Command::Redo,
     Command::Fit,
     Command::Actual,
-    Command::DeleteNode,
     Command::ViewNode,
     Command::FrameAll,
     Command::ScanReport,
@@ -259,7 +257,7 @@ const SHORTCUT_ORDER: [Command; 21] = [
 
 /// Everything that decides whether a new render is needed. Node positions are
 /// zeroed so that moving a node does not trigger an evaluation.
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct RequestKey {
     graph: Graph,
     node: NodeId,
@@ -282,6 +280,7 @@ struct RequestKey {
     mode: RendererMode,
     /// The compare view needs the CPU picture of the selected image.
     compare: bool,
+    timing: bool,
 }
 
 impl RequestKey {
@@ -304,7 +303,7 @@ impl RequestKey {
                 n.pos = [0.0, 0.0];
             }
         }
-        Self { graph, node, port, image, view: session.view, preview: session.provider.preview_size(), scopes, overlay, revision: session.provider.revision(image), overlay_frame: None, histogram: None, mode: RendererMode::Auto, compare: false }
+        Self { graph, node, port, image, view: session.view, preview: session.provider.preview_size(), scopes, overlay, revision: session.provider.revision(image), overlay_frame: None, histogram: None, mode: RendererMode::Auto, compare: false, timing: false }
     }
 }
 
@@ -391,6 +390,9 @@ pub struct App {
     renderer: Renderer,
     /// View > Renderer (or `--renderer`).
     renderer_mode: RendererMode,
+    timing_debug: bool,
+    node_timings: Option<Vec<rawgraph_engine::NodeTiming>>,
+    timing_gpu_tail: bool,
     /// Pixels of the last CPU frame, kept only for `--dump-frame`.
     last_cpu_pixels: Option<(u32, u32, Vec<u8>)>,
     /// `--bench`: when the exact scopes of the resting GPU picture arrived after the last frame.
@@ -433,6 +435,9 @@ pub struct App {
     title: String,
     submitted_at: Option<Instant>,
     bench: Option<Bench>,
+    gallery_collection: CollectionWorker,
+    gallery_key: Option<(Graph, Option<NodeId>, u64)>,
+    gallery_result: Option<crate::collection::CollectionResult>,
     collection: CollectionWorker,
     collection_key: Option<(Graph, Option<rawgraph_core::NodeId>, u64)>,
     /// Frame counter value when the last export finished (screenshots wait for the report to fade in).
@@ -472,11 +477,7 @@ pub struct App {
     crash_done: bool,
     compare: Compare,
     cmp_view: SharedView,
-    cmp_renderer: Option<Renderer>,
-    cmp_viewer: Viewer,
-    cmp_key: Option<RequestKey>,
-    cmp_image: Option<ImageId>,
-    cmp_error: Option<String>,
+    cmp_panes: [ext::PaneRender; 2],
     compare_started: Option<Instant>,
     compare_reported: bool,
     xmp_dialog: Option<XmpDialog>,
@@ -614,10 +615,13 @@ impl App {
         let workspace = cli.workspace.unwrap_or(settings.workspace);
         let mut viewer_state = settings.viewer;
         viewer_state.open = workspace == Workspace::Dual;
+        viewer_state.fullscreen = true;
         let mut scopes_state = settings.scopes;
         let scopes_pos = cli.scopes.unwrap_or(settings.scopes_pos);
         scopes_state.open = scopes_pos == ScopesPos::Window;
         let mut clean_state = settings.clean;
+        // A restored clean feed is always fullscreen.
+        clean_state.fullscreen = true;
         if cli.clean_feed {
             clean_state.open = true;
         }
@@ -659,10 +663,13 @@ impl App {
             status,
             renderer,
             renderer_mode,
+            timing_debug: false,
+            node_timings: None,
+            timing_gpu_tail: false,
             last_cpu_pixels: None,
             bench_refined: Vec::new(),
             last_frame_at: None,
-            viewer: Viewer::default(),
+            viewer: Viewer::with_preferences(settings.click_zoom, settings.wheel_navigates),
             filmstrip,
             editor,
             scope_panel: ScopePanel::new(),
@@ -697,6 +704,9 @@ impl App {
             title: String::new(),
             submitted_at: None,
             bench,
+            gallery_collection: CollectionWorker::new(cc.egui_ctx.clone()),
+            gallery_key: None,
+            gallery_result: None,
             collection: CollectionWorker::new(cc.egui_ctx.clone()),
             collection_key: None,
             export_done_frame: None,
@@ -726,11 +736,7 @@ impl App {
             crash_done: false,
             compare: Compare::default(),
             cmp_view: SharedView::default(),
-            cmp_renderer: None,
-            cmp_viewer: Viewer::default(),
-            cmp_key: None,
-            cmp_image: None,
-            cmp_error: None,
+            cmp_panes: [ext::PaneRender::default(), ext::PaneRender::default()],
             compare_started: None,
             compare_reported: false,
             xmp_dialog: None,
@@ -831,12 +837,13 @@ impl App {
             Command::ClearThumbCache => self.clear_cache_confirm = true,
             Command::ViewNode => {
                 if let Some(id) = self.session.selected_node {
-                    self.session.viewed_node = Some(id);
+                    self.session.viewed_node = None;
+                    self.session.selected_node = Some(id);
                 }
             }
             Command::FrameAll => self.editor.request_frame_all(),
-            Command::Fit => self.viewer.fit(),
-            Command::Actual => self.viewer.actual_size(ctx.pixels_per_point()),
+            Command::Fit => { if self.compare.active() { self.cmp_view = SharedView::default(); } else { self.viewer.fit(); } },
+            Command::Actual => { if self.compare.active() { self.cmp_view.mode = crate::viewer::ZoomMode::Custom(1.0 / ctx.pixels_per_point().max(0.1)); self.cmp_view.pan = egui::Vec2::ZERO; } else { self.viewer.actual_size(ctx.pixels_per_point()); } },
             Command::SetWorkspace(w) => self.set_workspace(w),
             Command::ToggleClean => {
                 if self.clean_win.is_open() {
@@ -851,18 +858,8 @@ impl App {
                 self.set_scopes_pos(next);
             }
             Command::SetScopesPos(p) => self.set_scopes_pos(p),
-            Command::CleanFullscreen => {
-                if !self.clean_win.is_open() {
-                    self.run(Command::ToggleClean, ctx);
-                }
-                self.clean_win.toggle_fullscreen(ctx, ViewportId::from_hash_of(CLEAN_ID));
-            }
-            Command::CleanNextMonitor => {
-                if self.clean_win.is_open() {
-                    self.clean_win.move_to_next(ctx, ViewportId::from_hash_of(CLEAN_ID), &self.monitors, 0.6);
-                } else {
-                    self.status.info("The clean feed window is not open");
-                }
+            Command::CleanMonitor(index) => {
+                self.clean_win.select_monitor(ctx, ViewportId::from_hash_of(CLEAN_ID), &self.monitors, index);
             }
             Command::ResetLayout => {
                 self.layout_epoch += 1;
@@ -951,7 +948,7 @@ impl App {
         self.frame_info = None;
         self.last_error = None;
         self.scope_panel.clear();
-        self.viewer = Viewer::default();
+        self.viewer = Viewer::with_preferences(self.viewer.click_zoom, self.viewer.wheel_navigates);
         self.scan_report = None;
         self.capture_job = None;
         self.scan_collection_at = None;
@@ -960,8 +957,7 @@ impl App {
         self.xmp_offer = None;
         self.xmp_probe = None;
         self.compare.forget();
-        self.cmp_key = None;
-        self.cmp_image = None;
+        self.cmp_panes = [ext::PaneRender::default(), ext::PaneRender::default()];
         self.relink = RelinkUi::None;
         self.node_export = None;
         self.run_nodes = None;
@@ -1137,7 +1133,7 @@ impl App {
             return;
         }
         let Some(node) = export::export_node(&self.session) else {
-            self.status.error("The graph has no Output node to export");
+            self.status.error("Select or pin an image node to export");
             return;
         };
         let items = self.export_ui.items(&self.session);
@@ -1148,12 +1144,12 @@ impl App {
                 return;
             }
         };
-        self.spawn_export(ctx, node, items, settings);
+        self.spawn_export(ctx, node, items, settings, export::catalog_items(&self.session));
     }
 
-    fn spawn_export(&mut self, ctx: &egui::Context, node: rawgraph_core::NodeId, items: Vec<rawgraph_batch::ExportItem>, settings: rawgraph_batch::ExportSettings) {
+    fn spawn_export(&mut self, ctx: &egui::Context, node: rawgraph_core::NodeId, items: Vec<rawgraph_batch::ExportItem>, settings: rawgraph_batch::ExportSettings, catalog: Vec<rawgraph_batch::ExportItem>) {
         self.status.info(format!("Exporting {} image(s) to {}", items.len(), settings.out_dir.display()));
-        self.export_job = Some(ExportJob::start(ctx.clone(), self.session.project.graph.clone(), node, items, settings));
+        self.export_job = Some(ExportJob::start(ctx.clone(), self.session.project.graph.clone(), node, items, settings, catalog));
         self.finished_export = None;
     }
 
@@ -1194,7 +1190,7 @@ impl App {
                     } else {
                         self.status.info(text);
                     }
-                    self.finished_export = Some(FinishedExport { report, items: job.items, settings: job.settings, node: job.node, node_run: job.node_run });
+                    self.finished_export = Some(FinishedExport { report, items: job.items, settings: job.settings, node: job.node, node_run: job.node_run, quick_catalog: job.quick_catalog });
                 }
                 Err(e) => {
                     eprintln!("export failed: {e}");
@@ -1208,7 +1204,7 @@ impl App {
         if self.show_export {
             let items = self.export_ui.items(&self.session);
             let counts = ExportState::scope_counts(&self.session);
-            let node_text = export::export_node(&self.session).map_or_else(|| "(no Output node)".to_owned(), |n| export::node_label(&self.session.project.graph, n));
+            let node_text = export::export_node(&self.session).map_or_else(|| "(no image node selected)".to_owned(), |n| export::node_label(&self.session.project.graph, n));
             match export::show_dialog(ctx, self.window_area, &mut self.export_ui, &self.session.view, &export::DialogInfo { counts, node_text: &node_text, items: &items, busy: self.export_job.is_some(), demo: self.session.demo }) {
                 DialogAction::PickFolder => self.open_dialog(DialogKind::ExportFolder),
                 DialogAction::Start => {
@@ -1223,7 +1219,7 @@ impl App {
         let mut close = false;
         if let Some(fin) = &self.finished_export {
             match export::show_report(ctx, self.window_area, fin) {
-                ReportAction::Retry => retry = Some((fin.node, fin.report.retry_items(&fin.items), fin.settings.clone(), fin.node_run.clone())),
+                ReportAction::Retry => retry = Some((fin.node, fin.report.retry_items(&fin.items), fin.settings.clone(), fin.node_run.clone(), fin.quick_catalog.clone())),
                 ReportAction::OpenFolder => export::open_folder(&fin.settings.out_dir),
                 ReportAction::Close => close = true,
                 ReportAction::None => {}
@@ -1232,14 +1228,14 @@ impl App {
         if close {
             self.finished_export = None;
         }
-        if let Some((node, items, settings, node_run)) = retry {
+        if let Some((node, items, settings, node_run, catalog)) = retry {
             match node_run {
                 Some(run) => {
                     self.status.info(format!("Exporting {} image(s) again through the Export node", items.len()));
                     self.export_job = Some(ExportJob::start_node(ctx.clone(), self.session.project.graph.clone(), node, items, run));
                     self.finished_export = None;
                 }
-                None => self.spawn_export(ctx, node, items, settings),
+                None => self.spawn_export(ctx, node, items, settings, catalog),
             }
         }
     }
@@ -1247,7 +1243,18 @@ impl App {
     // --------------------------------------------------------------- scanning
 
     fn start_scan(&mut self, ctx: &egui::Context, folder: PathBuf) {
+        if self.scan.is_some() {
+            self.status.error("A scan is already running");
+            return;
+        }
+        if self.session.demo {
+            self.session.new_project();
+            self.after_document_change();
+        }
         let recursive = !self.cli.no_recursive;
+        bind_open_folder(&mut self.session, &folder, recursive);
+        // This explicit scan handles the change; do not enqueue it a second time.
+        self.source_seen = node_ui::source_states(&self.session.project.graph);
         self.start_scan_with(ctx, folder, recursive);
     }
 
@@ -1390,7 +1397,7 @@ impl App {
 
     fn poll_renderer(&mut self, ctx: &egui::Context) {
         let reply = self.renderer.poll();
-        if let Some(r) = self.renderer.take_refined() {
+        if let Some(r) = self.renderer.take_refined().filter(|_| !self.compare.active()) {
             // The scopes of the resting GPU picture, now read at the full resolution.
             self.scope_panel.set_prepared(ctx, r.prepared);
             self.scope_worker_ms = r.scopes_ms;
@@ -1436,6 +1443,8 @@ impl App {
 
     fn apply_frame(&mut self, ctx: &egui::Context, f: &Frame) {
         let latency = self.submitted_at.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0);
+        self.node_timings = f.node_timings.clone();
+        self.timing_gpu_tail = f.gpu_tail;
         self.viewer.set_frame(ctx, f);
         self.last_error = None;
         self.last_frame_at = Some(Instant::now());
@@ -1445,7 +1454,7 @@ impl App {
         // Only a frame dump needs the CPU pixels; they are not kept otherwise.
         self.last_cpu_pixels = (self.cli.dump_frame.is_some() && f.gpu.is_none()).then(|| (f.width, f.height, f.rgba8.clone()));
         self.frame_info = Some(FrameInfo { width: f.width, height: f.height, eval_ms: f.eval_ms, display_ms: f.display_ms, hits: f.hits, misses: f.misses, path: f.path.clone(), scope_step: f.scope_step });
-        if let Some(prepared) = f.prepared.clone() {
+        if let Some(prepared) = f.prepared.clone().filter(|_| !self.compare.active()) {
             let t = Instant::now();
             self.scope_panel.set_prepared(ctx, prepared);
             self.scope_ms = t.elapsed().as_secs_f32() * 1000.0;
@@ -1531,15 +1540,31 @@ impl App {
         }
     }
 
+    fn refresh_gallery(&mut self) {
+        if let Some(result) = self.gallery_collection.poll() {
+            if !self.gallery_collection.pending() {
+                self.gallery_result = Some(result);
+            }
+        }
+        let node = self.session.selected_node.filter(|id| self.session.project.graph.node(*id).is_some());
+        let key = (self.neutral_graph(), node, self.session.images_gen);
+        if self.gallery_key.as_ref() != Some(&key) {
+            self.gallery_result = None;
+            if node.is_some() {
+                let (ids, caps) = self.session.id_captures();
+                self.gallery_collection.request(key.0.clone(), ids, caps, node);
+            }
+            self.gallery_key = Some(key);
+        }
+    }
+
     fn submit_if_needed(&mut self) {
         if self.session.selected.is_none() {
             return;
         }
         let Some((node, port)) = self.session.render_target() else {
-            if self.last_error.is_none() {
-                self.last_error = Some("The graph has no Output node to show".to_owned());
-                self.viewer.set_error("The graph has no Output node to show".to_owned());
-            }
+            self.last_key = None;
+            self.viewer = Viewer::with_preferences(self.viewer.click_zoom, self.viewer.wheel_navigates);
             return;
         };
         // The panels need a few frames to settle; asking before that would use
@@ -1547,7 +1572,7 @@ impl App {
         if self.frames < SETTLE_FRAMES {
             return;
         }
-        let scopes = (self.scopes_pos != ScopesPos::Hidden).then(|| self.scope_panel.prepare_settings());
+        let scopes = (!self.compare.active() && self.scopes_pos != ScopesPos::Hidden).then(|| self.scope_panel.prepare_settings());
         let overlay = crate::groups::overlay_request(self.show_mask_overlay, &self.session.project.graph, self.session.selected_node);
         // A brush mask is drawn in the frame of the node that uses it; one that cannot be shown right
         // on this picture is not drawn at all.
@@ -1564,6 +1589,7 @@ impl App {
         key.histogram = histogram;
         key.mode = self.renderer_mode;
         key.compare = self.compare.active();
+        key.timing = self.timing_debug;
         if self.last_key.as_ref() != Some(&key) {
             if self.last_key.as_ref().is_some_and(|k| k.preview != key.preview) {
                 self.prefetch.forget();
@@ -1575,7 +1601,11 @@ impl App {
             } else {
                 None
             };
-            let hints = GpuHints { cpu_reason, revision: key.revision, preview: key.preview, neighbours: self.session.neighbours(), histogram, overlay_frame };
+            let hints = GpuHints { timing: key.timing, cpu_reason, revision: key.revision, preview: key.preview, neighbours: self.session.neighbours(), histogram, overlay_frame };
+            // A notice belongs to the previous request, not the frame we are
+            // waiting for. Keep the last successful texture visible.
+            self.viewer.excluded = None;
+            self.viewer.error = None;
             self.renderer.submit_with(self.session.project.graph.clone(), node, port, self.session.current_image(), self.session.view, key.scopes.clone(), key.overlay, hints);
             self.submits += 1;
             self.submitted_at = Some(Instant::now());
@@ -2287,6 +2317,12 @@ impl App {
                 item(ui, cmds, "View selected node", Command::ViewNode, has_sel);
                 item(ui, cmds, "Frame all nodes", Command::FrameAll, true);
             });
+            ui.menu_button("Debug", |ui| {
+                if ui.checkbox(&mut self.timing_debug, "Per-node CPU timing").changed() {
+                    self.node_timings = None;
+                    self.timing_gpu_tail = false;
+                }
+            });
             ui.menu_button("View", |ui| {
                 ui.label(RichText::new("Workspace").weak());
                 if ui.radio(workspace == Workspace::Single, "Single").clicked() {
@@ -2298,6 +2334,13 @@ impl App {
                     cmds.push(Command::SetWorkspace(Workspace::Dual));
                     ui.close();
                 }
+                ui.separator();
+                ui.label(RichText::new("Viewer click zoom (relative to fit)").weak());
+                ui.radio_value(&mut self.viewer.click_zoom, 2.0, "2× fit");
+                ui.radio_value(&mut self.viewer.click_zoom, 3.0, "3× fit");
+                ui.label(RichText::new("Viewer wheel / swipe").weak());
+                ui.radio_value(&mut self.viewer.wheel_navigates, false, "Zoom");
+                ui.radio_value(&mut self.viewer.wheel_navigates, true, "Navigate images");
                 ui.separator();
                 ui.label(RichText::new("Preview size (long edge)").weak());
                 for n in PREVIEW_SIZES {
@@ -2318,8 +2361,19 @@ impl App {
                 ui.separator();
                 let clean_label = if clean_open { "Close clean feed" } else { "Clean feed" };
                 item(ui, cmds, clean_label, Command::ToggleClean, true);
-                item(ui, cmds, "Clean feed fullscreen", Command::CleanFullscreen, true);
-                item(ui, cmds, "Move clean feed to next monitor", Command::CleanNextMonitor, clean_open);
+                ui.menu_button("Clean feed display", |ui| {
+                    for (index, monitor) in self.monitors.iter().enumerate() {
+                        let name = monitor.id.split('|').next().unwrap_or("Display");
+                        let label = format!("{}: {} ({} × {} at {}, {}){}", index + 1, name,
+                            monitor.size[0], monitor.size[1], monitor.pos[0], monitor.pos[1],
+                            if monitor.primary { " — primary" } else { "" });
+                        if ui.radio(self.clean_win.state.monitor.as_deref() == Some(&monitor.id), label).clicked() {
+                            cmds.push(Command::CleanMonitor(index));
+                            ui.close();
+                        }
+                    }
+                    if self.monitors.is_empty() { ui.label("No displays available"); }
+                });
                 ui.menu_button("Scopes position", |ui| {
                     for p in ScopesPos::ALL {
                         if ui.radio(scopes_pos == p, p.label()).clicked() {
@@ -2508,7 +2562,7 @@ impl App {
         }
         let mut open = true;
         egui::Window::new("Keyboard shortcuts").open(&mut open).resizable(false).show(ctx, |ui| {
-            let rows: [(&str, &str); 36] = [
+            let rows = [
                 ("Shift/Ctrl+click, drag on empty space", "Add to the node selection, rubber band"),
                 ("Ctrl+A", "Select all nodes"),
                 ("Ctrl+C / X / V", "Copy / cut / paste nodes (as text)"),
@@ -2533,13 +2587,11 @@ impl App {
                 ("Scroll / Ctrl+scroll", "Pan / zoom the graph"),
                 ("Drag from a port", "Connect; drag off an input to disconnect"),
                 ("Double-click slider", "Reset to default"),
-                ("Viewer: wheel, drag", "Zoom around cursor, pan"),
+                ("Viewer: click, wheel, drag", "Toggle fit zoom, zoom/navigate, pan"),
                 ("Viewer: double-click", "Toggle fit / 100 %"),
                 ("Ctrl+0 / Ctrl+1", "Fit / 100 %"),
                 ("Ctrl+Shift+D", "Dual workspace"),
                 ("Ctrl+Shift+C", "Clean feed window"),
-                ("Ctrl+Shift+F / F11", "Clean feed fullscreen"),
-                ("Ctrl+Shift+M", "Clean feed to next monitor"),
                 ("Ctrl+Shift+K", "Scopes window"),
                 ("Right-click image", "Set as reference, locate a missing file"),
                 ("Right-click graph", "Paste here, Recipes"),
@@ -2615,25 +2667,30 @@ impl App {
     }
 
     fn viewer_area(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
-        if self.session.total_images() == 0 && self.scan.is_none() {
-            let rect = ui.available_rect_before_wrap();
-            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(14));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(egui::Rect::from_center_size(rect.center(), egui::vec2(380.0, 120.0))), |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Open a folder to begin").size(22.0).color(egui::Color32::from_gray(190)));
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("RAW, DNG, JPEG, PNG and TIFF files are added to the project; nothing is changed on disk.").weak());
-                    ui.add_space(10.0);
-                    if ui.button("Open folder...").clicked() {
-                        cmds.push(Command::OpenFolder);
-                    }
-                });
-            });
-            ui.advance_cursor_after_rect(rect);
-            return;
-        }
+        ui.horizontal(|ui| {
+            if ui.selectable_label(self.compare.active(), "Split").on_hover_text("Toggle split viewer (C)").clicked() { cmds.push(Command::Compare); }
+            if ui.button("Fit").clicked() { cmds.push(Command::Fit); }
+            if ui.button("100%").clicked() { cmds.push(Command::Actual); }
+            ui.separator();
+            let pinned = self.session.viewed_node.is_some();
+            if crate::icons::button(ui, if pinned { crate::icons::Icon::Unpin } else { crate::icons::Icon::Pin }, if pinned { "Unpin viewer" } else { "Pin viewer" }, pinned || self.session.target_node().is_some()).clicked() {
+                self.session.viewed_node = if pinned { None } else { self.session.target_node() };
+            }
+            ui.label(if pinned { "Pinned" } else { "Following selection" });
+            ui.separator();
+            let label = ui.add(egui::Label::new("Display exposure (EV)").sense(egui::Sense::click())).on_hover_text("Preview and scopes only. Double-click the slider or label to reset.");
+            crate::fine_slider::show(ui, &mut self.session.view.exposure_ev, -6.0..=6.0, 0.0, false, &label, 100.0, 2);
+        });
         if self.compare.active() {
             self.compare_area(ui);
+            return;
+        }
+        if self.session.total_images() == 0 && self.scan.is_none() {
+            ui.centered_and_justified(|ui| { ui.label("Choose a folder in a Source node to preview its images"); });
+            return;
+        }
+        if self.session.target_node().is_none() {
+            ui.centered_and_justified(|ui| { ui.label("Select a node to view it"); });
             return;
         }
         self.viewer.shows_mask = self
@@ -2641,7 +2698,7 @@ impl App {
             .render_target()
             .and_then(|(id, _)| self.session.project.graph.node(id))
             .is_some_and(|n| n.kind.output() == Some(rawgraph_core::PortType::Mask));
-        // Keep the previous frame dimmed while a proxy decodes.
+        // Keep the previous frame visible while a proxy decodes.
         self.viewer.busy = None;
         if self.renderer.pending() && self.session.selected.is_some_and(|id| !self.session.provider.is_cached(id)) {
             if let Some(e) = self.session.current_entry() {
@@ -2692,7 +2749,8 @@ impl App {
                 Filmstrip::capture_info(ui, &self.session);
                 ui.add_space(4.0);
             });
-            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.filmstrip.show(ui, &mut self.session));
+            let members = self.gallery_result.as_ref().filter(|r| r.view_node == self.session.selected_node).map(|r| &r.view_members);
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.filmstrip.show(ui, &mut self.session, members));
         });
     }
 
@@ -2708,7 +2766,7 @@ impl App {
         let viewer = &mut self.viewer;
         let (tools, session) = (&mut self.tools, &mut self.session);
         let mut tool_message = None;
-        let out = self.viewer_win.show(ctx, viewer_id, "RawGraph - Viewer", true, |ui| {
+        let out = self.viewer_win.show(ctx, viewer_id, "RawGraph - Viewer", false, &monitors, Some(true), |ui| {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| tool_message = show_viewer(viewer, tools, session, ui));
         });
         if let Some(m) = tool_message {
@@ -2719,15 +2777,38 @@ impl App {
             self.workspace = Workspace::Single;
         }
 
-        let (texture, size) = (self.viewer.texture_id(), self.viewer.frame_size);
-        self.clean_win.show(ctx, clean_id, "RawGraph - Clean feed", false, |ui| {
-            viewer::paint_clean(ui, texture, size);
+        let (texture, size) = if self.compare.active() {
+            self.primary_split_frame()
+        } else {
+            (self.viewer.texture_id(), self.viewer.frame_size)
+        };
+        let editor_focused = ctx.input(|i| {
+            i.focused || [viewer_id, clean_id, scopes_id].into_iter().any(|id| {
+                i.raw.viewports.get(&id).and_then(|v| v.focused) == Some(true)
+            })
         });
+        let focus_key = egui::Id::new("clean_feed_editor_was_focused");
+        let editor_refocused = ctx.data_mut(|data| {
+            let was_focused = data.get_temp::<bool>(focus_key).unwrap_or(false);
+            data.insert_temp(focus_key, editor_focused);
+            editor_focused && !was_focused
+        });
+        let clean_out = self.clean_win.show(ctx, clean_id, "RawGraph - Clean feed", false, &monitors, Some(editor_focused), |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                viewer::paint_clean(ui, texture, size);
+            });
+        });
+        if self.clean_win.state.open && !clean_out.close && editor_refocused {
+            // Raise without taking keyboard focus from the editor. Immediately
+            // restore normal stacking so the feed won't cover other apps later.
+            ctx.send_viewport_cmd_to(clean_id, egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+            ctx.send_viewport_cmd_to(clean_id, egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        }
 
         let panel = &mut self.scope_panel;
         let stale = self.scopes_stale;
         let step = self.frame_info.as_ref().filter(|f| f.path.is_gpu()).map(|f| f.scope_step);
-        self.scopes_win.show(ctx, scopes_id, "RawGraph - Scopes", true, |ui| {
+        self.scopes_win.show(ctx, scopes_id, "RawGraph - Scopes", true, &monitors, None, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 let area = ui.available_rect_before_wrap();
                 if let Some(step) = step {
@@ -2795,6 +2876,18 @@ impl eframe::App for App {
             self.prompt = Some(Pending::Quit);
         }
         self.poll_renderer(&ctx);
+        if self.timing_debug {
+            egui::Window::new("Per-node timing").show(&ctx, |ui| {
+                ui.label("Last preview: exclusive CPU wall time; cache hits are not timed.");
+                if self.timing_gpu_tail { ui.label("GPU tail is batched; per-node GPU timing unavailable. A GPU-resident base or Develop pre-tone base may not appear."); }
+                if let Some(rows) = &self.node_timings {
+                    for row in rows {
+                        let name = self.session.project.graph.node(row.node).map(|n| format!("{:?}", n.kind)).unwrap_or_default();
+                        ui.label(format!("{:?} {}: {:.3} ms ({} computed, {} cache hits)", row.node, name, row.cpu.as_secs_f64() * 1000.0, row.computed, row.cache_hits));
+                    }
+                } else { ui.label("Waiting for a profiled preview."); }
+            });
+        }
         self.filmstrip.poll(&ctx);
         self.poll_scan();
         self.poll_capture_refresh();
@@ -2831,6 +2924,7 @@ impl eframe::App for App {
         let status_top = egui::Panel::bottom("status").show_separator_line(true).show(ui, |ui| self.status_bar(ui)).response.rect.top();
         let content = ctx.content_rect();
         self.window_area = egui::Rect::from_min_max(egui::pos2(content.left(), menu_bottom + 2.0), egui::pos2(content.right(), (status_top - 2.0).max(menu_bottom + 40.0)));
+        self.refresh_gallery();
         match self.workspace {
             Workspace::Single => self.layout_single(ui, &mut cmds),
             Workspace::Dual => self.layout_dual(ui, &mut cmds),
@@ -2923,6 +3017,8 @@ impl eframe::App for App {
             scopes: self.scopes_win.state.clone(),
             scopes_pos: self.scopes_pos,
             preview_size: self.session.provider.preview_size(),
+            click_zoom: self.viewer.click_zoom,
+            wheel_navigates: self.viewer.wheel_navigates,
             // GPU-only is a test setting from the command line, never saved.
             renderer: if self.renderer_mode == RendererMode::Gpu { RendererMode::Auto } else { self.renderer_mode },
         };
@@ -2952,6 +3048,23 @@ fn ensure_extension(path: PathBuf, ext: &str, strip: Option<&str>) -> PathBuf {
     path.with_file_name(format!("{stem}{ext}"))
 }
 
+/// Bind an explicit open-folder action to a Source, never to the catalog alone.
+/// A selected Source is intentional; otherwise use an empty Source or add one.
+fn bind_open_folder(session: &mut Session, folder: &std::path::Path, recursive: bool) -> NodeId {
+    let graph = &mut session.project.graph;
+    let selected = session.selected_node.filter(|id| graph.node(*id).is_some_and(|n| n.kind == NodeKind::Source));
+    let empty = graph.nodes().find(|n| n.kind == NodeKind::Source && matches!(n.data(ImageId(0)), Some(rawgraph_core::NodeData::Folder(f)) if f.is_empty())).map(|n| n.id);
+    let id = selected.or(empty).unwrap_or_else(|| graph.add_node(NodeKind::Source, [0.0, 300.0]));
+    node_ui::set_source_folder(graph, id, Some(folder.to_string_lossy().into_owned()));
+    let node = graph.node_mut(id).unwrap();
+    let mode = node.mode;
+    node.mode = rawgraph_core::Mode::All;
+    node.set_param("subfolders", ImageId(0), if recursive { 1.0 } else { 0.0 });
+    node.mode = mode;
+    session.dirty = true;
+    id
+}
+
 /// True when the finished export's report goes to the application's own log; a
 /// `--run-export-node` run prints it once, on standard output, itself.
 pub fn report_on_stderr(cli: &Cli) -> bool {
@@ -2968,7 +3081,8 @@ pub fn apply_cli_state(session: &mut Session, cli: &Cli) {
     for (kind, pos) in &cli.add_node {
         let n = session.project.graph.nodes().count();
         let pos = pos.unwrap_or([(n % 7) as f32 * 240.0, 200.0 + (n / 7) as f32 * 160.0]);
-        session.project.graph.add_node(*kind, pos);
+        let id = session.project.graph.add_node(*kind, pos);
+        if *kind == NodeKind::Source { node_ui::set_source_folder(&mut session.project.graph, id, None); }
     }
     for &(node, x, y) in &cli.move_node {
         if let Some(n) = session.node_by_index(node).and_then(|id| session.project.graph.node_mut(id)) {
@@ -3170,8 +3284,11 @@ pub fn apply_cli_state(session: &mut Session, cli: &Cli) {
 /// Shows the viewer and lets the tool of the selected node work on top of it.
 pub fn show_viewer(viewer: &mut Viewer, tools: &mut Tools, session: &mut Session, ui: &mut egui::Ui) -> Option<String> {
     crate::tools::prepare_viewer(viewer, session);
-    let geom = viewer.show(ui)?;
-    tools.show(ui, &geom, session, viewer.frame_size)
+    let geom = viewer.show(ui);
+    let result = geom.as_ref().and_then(|geom| tools.show(ui, geom, session, viewer.frame_size));
+    let step = std::mem::take(&mut viewer.navigation_step);
+    if step != 0 { session.step_viewer_image(step); }
+    result
 }
 
 /// Index visited at step `i` of a stride walk over `n` images (no two
@@ -3240,6 +3357,8 @@ fn setup_style(ctx: &egui::Context) {
         style.text_styles.insert(TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace));
         style.spacing.item_spacing = egui::vec2(8.0, 5.0);
         style.spacing.button_padding = egui::vec2(8.0, 3.0);
+        style.spacing.slider_rail_height = 4.0;
+        style.visuals.slider_trailing_fill = true;
         style.visuals.panel_fill = egui::Color32::from_rgb(33, 35, 40);
         style.visuals.window_fill = egui::Color32::from_rgb(38, 40, 46);
         style.visuals.extreme_bg_color = egui::Color32::from_rgb(22, 24, 28);
@@ -3249,6 +3368,20 @@ fn setup_style(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn open_folder_binds_a_source_without_overwriting_other_sources() {
+        use super::*;
+        let mut s = Session::new(crate::session::fresh_project(), provider());
+        let first = bind_open_folder(&mut s, std::path::Path::new("/photos/a"), false);
+        assert_eq!(node_ui::source_folder(s.project.graph.node(first).unwrap()).as_deref(), Some("/photos/a"));
+        assert!(!node_ui::source_subfolders(s.project.graph.node(first).unwrap()));
+        let second = bind_open_folder(&mut s, std::path::Path::new("/photos/b"), true);
+        assert_ne!(first, second);
+        assert_eq!(node_ui::source_folder(s.project.graph.node(first).unwrap()).as_deref(), Some("/photos/a"));
+        s.selected_node = Some(first);
+        assert_eq!(bind_open_folder(&mut s, std::path::Path::new("/photos/c"), true), first);
+        assert_eq!(node_ui::source_folder(s.project.graph.node(second).unwrap()).as_deref(), Some("/photos/b"));
+    }
     use super::*;
     use crate::session::tests::{demo_session, png_project, provider};
     use crate::session::demo_graph;
@@ -3357,10 +3490,7 @@ mod tests {
     #[test]
     fn m_toggles_the_mask_overlay() {
         assert_eq!(shortcut_of(Command::ToggleMaskOverlay), Some(sc(Modifiers::NONE, Key::M)));
-        assert_eq!(shortcut_of(Command::CleanNextMonitor), Some(sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::M)));
-        let pos = |c: Command| SHORTCUT_ORDER.iter().position(|x| *x == c).unwrap();
-        assert!(pos(Command::CleanNextMonitor) < pos(Command::ToggleMaskOverlay), "the more specific shortcut is checked first");
-        assert_eq!(SHORTCUT_ORDER.len(), 21);
+        assert!(SHORTCUT_ORDER.contains(&Command::ToggleMaskOverlay));
     }
 }
 

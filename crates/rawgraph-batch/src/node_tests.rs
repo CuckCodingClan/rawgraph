@@ -721,6 +721,41 @@ fn export_node_to(g: &mut Graph, out: &Path, format: f32) -> NodeId {
     e
 }
 
+#[test]
+fn standalone_generator_normals_exports_without_source() {
+    let t = TempDir::new();
+    let mut g = Graph::new();
+    let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
+    let id = ImageId(u64::MAX - generator.0);
+    assert!(g.node_mut(generator).unwrap().set_param("width", id, 7.0));
+    assert!(g.node_mut(generator).unwrap().set_param("height", id, 5.0));
+    let normals = g.add_node(NodeKind::Normals, [0.0; 2]);
+    assert!(g.node_mut(normals).unwrap().set_param("mode", id, 1.0));
+    let e = export_node_to(&mut g, &t.path("out"), 1.0);
+    g.connect(generator, normals, 1).unwrap();
+    g.connect(normals, e, 0).unwrap();
+    let g = Graph::from_json(&g.to_json()).unwrap();
+    let report = export_node(&g, e, &[], &[id], DisplayTransform::default(), &CancelToken::new(), &mut |_| {}).unwrap();
+    assert_eq!(report.written(), 1, "{report:?}");
+    let image = image::open(written_of(&report.items[0].1)).unwrap();
+    assert_eq!((image.width(), image.height()), (7, 5));
+}
+
+#[test]
+fn standalone_generator_exports_without_source() {
+    let t = TempDir::new();
+    let mut g = Graph::new();
+    let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
+    let id = ImageId(u64::MAX - generator.0);
+    assert!(g.node_mut(generator).unwrap().set_param("width", id, 7.0));
+    assert!(g.node_mut(generator).unwrap().set_param("height", id, 5.0));
+    let e = export_node_to(&mut g, &t.path("out"), 1.0);
+    g.connect(generator, e, 0).unwrap();
+    let report = export_node(&g, e, &[], &[id], DisplayTransform::default(), &CancelToken::new(), &mut |_| {}).unwrap();
+    let image = image::open(written_of(&report.items[0].1)).unwrap();
+    assert_eq!((image.width(), image.height()), (7, 5));
+}
+
 fn run_node(g: &Graph, e: NodeId, f: &Folders) -> ExportReport {
     let ids: Vec<ImageId> = f.catalog.iter().map(|i| i.id).collect();
     export_node(g, e, &f.catalog, &ids, DisplayTransform::default(), &CancelToken::new(), &mut |_| {}).expect("export_node")
@@ -972,4 +1007,82 @@ fn write_grey_helper_is_used() {
     let t = TempDir::new();
     write_grey(&t.path("g.png"), 4, 4, 100);
     assert!(t.path("g.png").is_file());
+}
+
+#[test]
+fn data_map_png_stores_unmanaged_rgb_values() {
+    let mut rig = Rig::one(1, 1, [128, 128, 255]);
+    rig.p("format", 8.0);
+    let spec = export_spec(rig.g.node(rig.exp).unwrap(), A);
+    assert_eq!(spec.format, ExportFileFormat::Png16Data);
+    assert_eq!(settings_from_spec(&spec, DisplayTransform::default()).format, ExportFormat::Png16Data);
+    let image = ImageBuf::from_rgba(2, 1, vec![0.5, 0.0, 1.0, 0.2, -1.0, 0.25, 2.0, 1.0]).unwrap();
+    let path = rig.t.path("map.png");
+    let settings = ExportSettings { format: ExportFormat::Png16Data, embed_profile: true, ..Default::default() };
+    data_map_output(&image).write(&path, &settings, true, &None).unwrap();
+    let decoded = image::open(&path).unwrap().to_rgb16();
+    assert_eq!(decoded.into_raw(), vec![32768, 0, 65535, 0, 16384, 65535]);
+    assert!(icc_of(&path).is_none());
+    let bytes = fs::read(&path).unwrap();
+    let mut pos = 8;
+    while pos + 12 <= bytes.len() {
+        let n = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let kind = &bytes[pos + 4..pos + 8];
+        assert!(!matches!(kind, b"iCCP" | b"sRGB" | b"gAMA" | b"cHRM"));
+        pos += n + 12;
+    }
+    let source = rawgraph_io::load(&rig.catalog[0].source, None).unwrap().image;
+    let expected: Vec<u16> = source.data()[..3].iter().map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16).collect();
+    let report = rig.run();
+    assert_eq!(report.written(), 1);
+    let actual = written_of(&report.items[0].1);
+    assert_eq!(image::open(&actual).unwrap().to_rgb16().into_raw(), expected);
+    assert!(icc_of(&actual).is_none());
+    assert!(exif_of(&actual).is_none());
+}
+
+#[test]
+fn webp_node_maps_mode_and_writes_webp() {
+    let mut r = Rig::one(32, 24, [70, 120, 180]);
+    r.p("format", 9.0);
+    r.p("webp_lossless", 1.0);
+    let spec = export_spec(r.g.node(r.exp).unwrap(), A);
+    assert_eq!(spec.format, ExportFileFormat::Webp);
+    assert_eq!(settings_from_spec(&spec, DisplayTransform::default()).format, ExportFormat::Webp { quality: 92, lossless: true });
+    let path = r.first_path();
+    assert_eq!(path.extension().unwrap(), "webp");
+    let bytes = fs::read(path).unwrap();
+    assert_eq!(&bytes[..4], b"RIFF");
+    assert_eq!(&bytes[8..12], b"WEBP");
+}
+
+#[test]
+fn quick_export_selected_uses_full_catalog_for_layer_pairing() {
+    let f = folders(&[("a", &[("a1.png", [200, 100, 50]), ("a2.png", [60, 160, 220])]),
+                      ("b", &[("b1.png", [180, 220, 100]), ("b2.png", [90, 40, 200])])]);
+    let mut g = Graph::new();
+    let (a, b) = (source_for(&mut g, &f.t.path("a")), source_for(&mut g, &f.t.path("b")));
+    let layer = g.add_node(NodeKind::Layer, [0.0; 2]);
+    g.connect(a, layer, 0).unwrap();
+    g.connect(b, layer, 1).unwrap();
+    let mut settings = ExportSettings { out_dir: f.t.path("all"), format: ExportFormat::Png, ..Default::default() };
+    let all = export_catalog(&g, layer, &f.catalog, &f.catalog, &settings, &CancelToken::new(), &mut |_| {}).unwrap();
+    assert_eq!(all.written(), 2);
+    settings.out_dir = f.t.path("selected");
+    let selected = export_catalog(&g, layer, &f.catalog, &f.catalog[1..2], &settings, &CancelToken::new(), &mut |_| {}).unwrap();
+    assert_eq!(selected.written(), 1);
+    assert_eq!(rgb_of_file(&f.t.path("all/a2.png")), rgb_of_file(&f.t.path("selected/a2.png")));
+}
+
+#[test]
+fn quick_export_never_overwrites_unselected_original() {
+    let f = folders(&[("a", &[("one.png", [200, 100, 50]), ("two.png", [60, 160, 220])])]);
+    let mut g = Graph::new();
+    let source = source_for(&mut g, &f.t.path("a"));
+    let before = fs::read(&f.catalog[1].source).unwrap();
+    let settings = ExportSettings { out_dir: f.t.path("a"), format: ExportFormat::Png,
+        name_template: "two".into(), on_conflict: OnConflict::Overwrite, ..Default::default() };
+    let report = export_catalog(&g, source, &f.catalog, &f.catalog[..1], &settings, &CancelToken::new(), &mut |_| {}).unwrap();
+    assert_eq!(report.failed(), 1);
+    assert_eq!(fs::read(&f.catalog[1].source).unwrap(), before);
 }

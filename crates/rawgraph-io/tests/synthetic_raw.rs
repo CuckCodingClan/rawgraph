@@ -173,7 +173,7 @@ fn synthetic_dng_decodes_and_grey_stays_neutral_on_every_path() {
     let level = 0.18f32;
     let mosaic = vec![code(level); (w * h) as usize];
     let p = write(&t, "grey.dng", w, h, &mosaic, 1);
-    let expect = (code(level) as f32 - BLACK as f32) / (WHITE as f32 - BLACK as f32);
+    let expect = (code(level) as f32 - BLACK as f32) / (WHITE as f32 - BLACK as f32) * 2f32.powf(0.35 + 1.6);
 
     let info = read_capture_info(&p).unwrap();
     assert_eq!(info.make.as_deref(), Some("TestCam"));
@@ -379,4 +379,22 @@ fn dng_without_white_balance_data_reports_none() {
     let info = read_capture_info(&p).unwrap();
     assert_eq!(info.raw, Some(true));
     assert_eq!((info.as_shot_kelvin, info.as_shot_tint), (None, None));
+}
+
+#[test]
+fn raw_input_gain_uses_baseline_once_on_full_and_proxy() {
+    let t = Tmp::new("input-gain");
+    let (w, h) = (64, 64);
+    let mosaic = vec![code(0.1); (w * h) as usize];
+    let untagged = write(&t, "none.dng", w, h, &mosaic, 1);
+    let tagged = t.0.join("tagged.dng");
+    std::fs::write(&tagged, make_dng_with(w, h, &mosaic, 1, &Extras { baseline: Some(1.35), ..Default::default() })).unwrap();
+    for max_dim in [None, Some(32)] {
+        let a = load(&untagged, max_dim).unwrap();
+        let b = load(&tagged, max_dim).unwrap();
+        for (x, y) in a.image.data().chunks_exact(4).zip(b.image.data().chunks_exact(4)) {
+            for c in 0..3 { assert!((y[c] - 2.0*x[c]).abs() < 1e-4); }
+            assert_eq!((x[3], y[3]), (1.0, 1.0));
+        }
+    }
 }

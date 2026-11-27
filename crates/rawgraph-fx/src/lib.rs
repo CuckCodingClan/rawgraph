@@ -2,7 +2,7 @@
 //! geometry and mask generators.
 //!
 //! All functions work on scene-referred linear ACEScg `ImageBuf`s and `MaskBuf`s, never clamp
-//! the result to 0..1, leave alpha untouched and give bit-identical output for neutral
+//! the result to 0..1, preserve alpha (Pixel Sort moves it with its pixel) and give bit-identical output for neutral
 //! parameters (so the engine may skip the work).
 
 // Pixels are addressed as 4-float chunks of runtime-sized slices throughout.
@@ -17,6 +17,7 @@ mod lens;
 mod local;
 mod masked;
 mod masks;
+mod pixel_sort;
 mod sharpen;
 mod tone;
 mod util;
@@ -34,6 +35,7 @@ pub use masked::{contrast_masked, gain_masked, saturation_masked};
 pub use masks::{
     hue_mask, luminance_mask, mask_adjust, mask_combine, radial_mask, resize_mask, CombineMode,
 };
+pub use pixel_sort::{pixel_sort, SortMetric};
 pub use sharpen::sharpen;
 pub use tone::{black_white, hue_saturation, tone_curve, vignette, vibrance, whites_blacks};
 

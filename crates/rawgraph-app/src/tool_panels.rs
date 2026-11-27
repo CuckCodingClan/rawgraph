@@ -75,7 +75,7 @@ pub fn split_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
                         let speed = (v.abs() * 0.01).max(0.001);
                         ui.add(egui::DragValue::new(v).speed(speed).custom_formatter(|n, _| number_text(n as f32)).custom_parser(|t| t.trim().parse::<f64>().ok()));
                     }
-                    if ui.small_button("Remove").on_hover_text("Delete this range").clicked() {
+                    if crate::icons::button(ui, crate::icons::Icon::Delete, "Delete this range", true).clicked() {
                         remove = Some(i);
                     }
                     ui.end_row();

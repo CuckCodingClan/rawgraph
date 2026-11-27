@@ -66,6 +66,28 @@ fn set_collision(g: &mut Graph, merge: NodeId, option: f32) {
 // Paths and Source folders
 
 #[test]
+fn empty_source_is_distinct_from_legacy_catalog_and_round_trips() {
+    let lib = folder_lib();
+    let mut g = Graph::new();
+    let legacy = source_in(&mut g, None, true);
+    let empty = source_in(&mut g, Some(""), true);
+    let out = g.add_node(NodeKind::Output, [0.0, 0.0]);
+    g.connect(empty, out, 0).unwrap();
+    assert_eq!(lib.members(&g, legacy, 0).len(), lib.images.len());
+    for node in [empty, out] {
+        assert!(lib.members(&g, node, 0).is_empty());
+        assert!(!lib.contains(&g, node, 1));
+    }
+    let restored = Graph::from_json(&g.to_json()).unwrap();
+    assert_eq!(lib.members(&restored, legacy, 0).len(), lib.images.len());
+    assert!(lib.members(&restored, out, 0).is_empty());
+    assert!(g.node_mut(empty).unwrap().set_data(id(0), Some(NodeData::Folder("C:/Photos/Day1".into()))));
+    assert_eq!(lib.members(&g, out, 0), vec![1, 2, 3]);
+    assert!(g.node_mut(empty).unwrap().set_data(id(0), Some(NodeData::Folder(String::new()))));
+    assert!(lib.members(&g, out, 0).is_empty());
+}
+
+#[test]
 fn path_in_folder_rules() {
     // Separators are the same, case is ignored, trailing separators are ignored.
     assert!(path_in_folder("C:\\Photos\\2026\\a.CR3", "c:/photos/2026", false));
@@ -106,16 +128,13 @@ fn folder_lib() -> Lib {
 }
 
 #[test]
-fn source_without_folder_or_with_empty_folder_is_every_image() {
+fn legacy_source_without_folder_contains_every_image() {
     let lib = folder_lib();
     let mut g = Graph::new();
     let none = source_in(&mut g, None, true);
-    let empty = source_in(&mut g, Some(""), true);
-    for s in [none, empty] {
-        assert_eq!(lib.members(&g, s, 0), vec![1, 2, 3, 4, 5, 6]);
-        for i in 1..=6 {
-            assert!(lib.contains(&g, s, i));
-        }
+    assert_eq!(lib.members(&g, none, 0), vec![1, 2, 3, 4, 5, 6]);
+    for i in 1..=6 {
+        assert!(lib.contains(&g, none, i));
     }
     // The old API behaves the same with an empty image list.
     let cap = |_: ImageId| -> Option<CaptureInfo> { None };
@@ -792,7 +811,8 @@ fn develop_tone_table_and_defaults() {
             "saturation",
             "baseline",
             "baseline_default",
-            "brightness"
+            "brightness",
+            "tone_version"
         ]
     );
     let labels: Vec<&str> = d.params().iter().take(11).map(|s| s.label).collect();
@@ -1160,6 +1180,7 @@ fn export_node_shape() {
         [
             "format",
             "quality",
+            "webp_lossless",
             "size",
             "long_edge",
             "percent",
@@ -1176,7 +1197,7 @@ fn export_node_shape() {
     );
     assert_eq!(
         k.param_spec("format").unwrap().kind,
-        ParamKind::Choice(&["JPEG", "PNG", "PNG 16-bit", "TIFF", "TIFF 16-bit", "EXR", "AVIF"])
+        ParamKind::Choice(&["JPEG", "PNG", "PNG 16-bit", "TIFF", "TIFF 16-bit", "EXR", "AVIF", "Adobe XMP sidecar", "PNG 16-bit data map", "WebP"])
     );
     let q = k.param_spec("quality").unwrap();
     assert_eq!((q.min, q.max, q.default), (1.0, 100.0, 92.0));
@@ -1221,6 +1242,7 @@ fn export_spec_defaults() {
         ExportSpec {
             format: ExportFileFormat::Jpeg,
             quality: 92,
+            webp_lossless: false,
             size: ExportSize::Original,
             space: OutputSpace::Srgb,
             embed_profile: true,
@@ -1250,6 +1272,8 @@ fn export_spec_reads_every_param() {
         assert_eq!(export_spec(n, id(1)).format, *f);
         assert_eq!(f.label(), EXPORT_FORMATS[i]);
     }
+    assert_eq!(ExportFileFormat::from_index(9), ExportFileFormat::Webp);
+    assert_eq!(ExportFileFormat::from_index(10), ExportFileFormat::Jpeg);
     assert_eq!(ExportFileFormat::from_index(99), ExportFileFormat::Jpeg);
     for (v, expect) in [(1.0, 1u8), (92.4, 92), (92.6, 93), (100.0, 100)] {
         n.set_param("quality", id(1), v);
@@ -1292,7 +1316,7 @@ fn export_spec_reads_every_param() {
     n.mode = Mode::Individual;
     n.set_param("format", id(7), 5.0);
     assert_eq!(export_spec(n, id(7)).format, ExportFileFormat::Exr);
-    assert_eq!(export_spec(n, id(8)).format, ExportFileFormat::Avif, "inherits the All value (last loop value)");
+    assert_eq!(export_spec(n, id(8)).format, ExportFileFormat::Webp, "inherits the All value (last loop value)");
 }
 
 #[test]
@@ -1695,7 +1719,7 @@ fn loading_rejects_invalid_new_data() {
     );
     // Bad parameter values of the new parameters.
     parse_err(load(&|v| v["nodes"]["2"]["all"]["quality"] = serde_json::json!(101)), "outside 1..100");
-    parse_err(load(&|v| v["nodes"]["2"]["all"]["format"] = serde_json::json!(7)), "outside 0..6");
+    parse_err(load(&|v| v["nodes"]["2"]["all"]["format"] = serde_json::json!(10)), "outside 0..9");
     parse_err(load(&|v| v["nodes"]["2"]["all"]["long_edge"] = serde_json::json!(15)), "outside 16..32000");
     parse_err(load(&|v| v["nodes"]["2"]["all"]["percent"] = serde_json::json!(0)), "outside 1..100");
     parse_err(load(&|v| v["nodes"]["1"]["all"]["subfolders"] = serde_json::json!(2)), "outside 0..1");
@@ -1707,7 +1731,7 @@ fn new_kinds_are_in_every_list_and_round_trip() {
     for kind in [NodeKind::Layer, NodeKind::Export] {
         assert!(NodeKind::ALL.contains(&kind));
     }
-    assert_eq!(NodeKind::ALL.len(), 33);
+    assert_eq!(NodeKind::ALL.len(), 37);
     let mut seen = std::collections::HashSet::new();
     for kind in NodeKind::ALL {
         assert!(seen.insert(kind), "{kind:?} listed twice");

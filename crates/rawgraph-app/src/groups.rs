@@ -130,9 +130,9 @@ pub fn param_groups(kind: NodeKind) -> (Vec<ParamGroup>, Vec<&'static str>) {
         NodeKind::Develop => {
             let pick = |names: &[&str]| -> Vec<&'static str> { names.iter().filter_map(|n| all.iter().copied().find(|a| a == n)).collect() };
             for (title, names) in [
-                ("Tone", pick(&["exposure", "contrast", "highlights", "shadows", "whites", "blacks"])),
+                ("Tone", pick(&["tone_version", "exposure", "contrast", "highlights", "shadows", "whites", "blacks"])),
                 ("Colour", pick(&["wb", "temperature", "tint", "vibrance", "saturation"])),
-                ("RAW", pick(&["baseline", "baseline_default", "brightness"])),
+
             ] {
                 if !names.is_empty() {
                     groups.push(ParamGroup { title: title.to_owned(), names, swatch: None });
@@ -141,7 +141,7 @@ pub fn param_groups(kind: NodeKind) -> (Vec<ParamGroup>, Vec<&'static str>) {
         }
         _ => {}
     }
-    let rest: Vec<&'static str> = all.iter().copied().filter(|n| !groups.iter().any(|g| g.names.contains(n))).collect();
+    let rest: Vec<&'static str> = all.iter().copied().filter(|n| !(kind == NodeKind::Develop && ["baseline", "baseline_default", "brightness"].contains(n)) && !groups.iter().any(|g| g.names.contains(n))).collect();
     (groups, rest)
 }
 
@@ -180,6 +180,7 @@ pub fn all_rows(node: &Node, image: ImageId) -> Vec<Row> {
     node.kind
         .params()
         .iter()
+        .filter(|spec| !(node.kind == NodeKind::Develop && ["baseline", "baseline_default", "brightness"].contains(&spec.name)))
         .map(|spec| {
             let v = node.param(spec.name, image);
             let value = match spec.kind {
@@ -380,13 +381,12 @@ mod tests {
     #[test]
     fn develop_groups_and_plain_kinds() {
         let (groups, rest) = param_groups(NodeKind::Develop);
-        assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Tone", "Colour", "RAW"]);
-        assert_eq!(groups[0].names, vec!["exposure", "contrast", "highlights", "shadows", "whites", "blacks"]);
+        assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Tone", "Colour"]);
+        assert_eq!(groups[0].names, vec!["tone_version", "exposure", "contrast", "highlights", "shadows", "whites", "blacks"]);
         assert_eq!(groups[1].names, vec!["wb", "temperature", "tint", "vibrance", "saturation"]);
-        assert_eq!(groups[2].names, vec!["baseline", "baseline_default", "brightness"]);
         assert!(rest.is_empty(), "every Develop parameter is in a group");
         let total: usize = groups.iter().map(|g| g.names.len()).sum();
-        assert_eq!(total, NodeKind::Develop.params().len());
+        assert_eq!(total + 3, NodeKind::Develop.params().len());
         let (g, r) = param_groups(NodeKind::Exposure);
         assert!(g.is_empty());
         assert_eq!(r, vec!["ev"]);

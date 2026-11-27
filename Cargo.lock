@@ -533,6 +533,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bin-rs"
+version = "0.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23f756521115a60a84bc45722261eaf03aa6a59d886c9c3b41d08ac1c39e3e24"
+
+[[package]]
 name = "bit-set"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3301,7 +3307,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-app"
-version = "0.1.0"
+version = "26.11.1"
 dependencies = [
  "arboard",
  "eframe",
@@ -3319,11 +3325,12 @@ dependencies = [
  "rfd",
  "serde",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "rawgraph-batch"
-version = "0.1.0"
+version = "26.11.1"
 dependencies = [
  "exr",
  "image",
@@ -3337,7 +3344,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-core"
-version = "0.1.0"
+version = "26.11.1"
 dependencies = [
  "rawgraph-io",
  "rawgraph-scopes",
@@ -3348,7 +3355,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-engine"
-version = "0.1.0"
+version = "26.11.1"
 dependencies = [
  "rawgraph-core",
  "rawgraph-fx",
@@ -3356,7 +3363,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-fx"
-version = "0.1.0"
+version = "26.11.1"
 dependencies = [
  "rawgraph-core",
  "rawgraph-io",
@@ -3365,7 +3372,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-gpu"
-version = "0.1.0"
+version = "26.11.1"
 dependencies = [
  "bytemuck",
  "pollster",
@@ -3377,7 +3384,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-io"
-version = "0.1.0"
+version = "26.11.1"
 dependencies = [
  "avif-serialize",
  "exr",
@@ -3387,11 +3394,12 @@ dependencies = [
  "rawgraph-core",
  "rawler",
  "rayon",
+ "webp-rust",
 ]
 
 [[package]]
 name = "rawgraph-project"
-version = "0.1.0"
+version = "26.11.1"
 dependencies = [
  "blake3",
  "quick-xml",
@@ -3403,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-scope-views"
-version = "0.1.0"
+version = "26.11.1"
 dependencies = [
  "eframe",
  "egui",
@@ -3413,7 +3421,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-scopes"
-version = "0.1.0"
+version = "26.11.1"
 dependencies = [
  "rawgraph-core",
  "rayon",
@@ -4452,6 +4460,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webp-rust"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9c8776fe97ff9083d2c7ebb62dd98f643124c2ce94cb50a7bbf1dfea5deb5a0"
+dependencies = [
+ "bin-rs",
 ]
 
 [[package]]

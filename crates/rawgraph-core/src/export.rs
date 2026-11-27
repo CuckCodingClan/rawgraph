@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::color::OutputSpace;
 use crate::graph::{ImageId, Node, NodeData, NodeKind};
 
-pub const EXPORT_FORMATS: [&str; 7] = ["JPEG", "PNG", "PNG 16-bit", "TIFF", "TIFF 16-bit", "EXR", "AVIF"];
+pub const EXPORT_FORMATS: [&str; 10] = ["JPEG", "PNG", "PNG 16-bit", "TIFF", "TIFF 16-bit", "EXR", "AVIF", "Adobe XMP sidecar", "PNG 16-bit data map", "WebP"];
 pub const EXPORT_SIZES: [&str; 3] = ["Original", "Long edge", "Percent"];
 pub const EXPORT_COLLISIONS: [&str; 3] = ["Skip", "Overwrite", "Rename"];
 
@@ -52,10 +52,13 @@ pub enum ExportFileFormat {
     Tiff16,
     Exr,
     Avif,
+    Xmp,
+    Png16Data,
+    Webp,
 }
 
 impl ExportFileFormat {
-    pub const ALL: [ExportFileFormat; 7] = [
+    pub const ALL: [ExportFileFormat; 10] = [
         ExportFileFormat::Jpeg,
         ExportFileFormat::Png,
         ExportFileFormat::Png16,
@@ -63,6 +66,9 @@ impl ExportFileFormat {
         ExportFileFormat::Tiff16,
         ExportFileFormat::Exr,
         ExportFileFormat::Avif,
+        ExportFileFormat::Xmp,
+        ExportFileFormat::Png16Data,
+        ExportFileFormat::Webp,
     ];
 
     /// Format with this index in [`EXPORT_FORMATS`]; out of range gives JPEG.
@@ -114,6 +120,7 @@ pub struct ExportSpec {
     pub format: ExportFileFormat,
     /// 1..=100 (lossy formats).
     pub quality: u8,
+    pub webp_lossless: bool,
     pub size: ExportSize,
     pub space: OutputSpace,
     pub embed_profile: bool,
@@ -128,6 +135,7 @@ impl Default for ExportSpec {
         ExportSpec {
             format: ExportFileFormat::Jpeg,
             quality: 92,
+            webp_lossless: false,
             size: ExportSize::Original,
             space: OutputSpace::Srgb,
             embed_profile: true,
@@ -166,6 +174,7 @@ pub fn export_spec(node: &Node, image: ImageId) -> ExportSpec {
     ExportSpec {
         format: ExportFileFormat::from_index(node.choice("format", image)),
         quality: finite("quality", 92.0).round().clamp(1.0, 100.0) as u8,
+        webp_lossless: node.toggle("webp_lossless", image),
         size,
         space: OutputSpace::from_index(node.choice("color_space", image)),
         embed_profile: node.toggle("profile", image),

@@ -59,19 +59,9 @@ pub fn develop_settings(node: &Node, image: ImageId, capture: Option<&CaptureInf
         (as_shot, None)
     };
 
-    let (baseline_ev, baseline_source) = if !node.toggle("baseline", image) {
-        (0.0, BaselineSource::Off)
-    } else if capture.and_then(|c| c.raw) != Some(true) {
-        (0.0, BaselineSource::NotRaw)
-    } else if let Some(v) = capture.and_then(|c| c.baseline_exposure).filter(|v| v.is_finite()) {
-        (v, BaselineSource::File)
-    } else {
-        (node.param("baseline_default", image), BaselineSource::Default)
-    };
-
-    let is_raw = capture.and_then(|c| c.raw) == Some(true);
-    let brightness_ev = if is_raw { node.param("brightness", image) } else { 0.0 };
-    let gain_ev = baseline_ev + brightness_ev;
+    // Legacy fields remain parseable but no longer affect pixels. RAW gain is
+    // applied by the decoder exactly once, even without a Develop node.
+    let (baseline_ev, brightness_ev, gain_ev, baseline_source) = (0.0, 0.0, 0.0, BaselineSource::Off);
 
     DevelopSettings { matrix, gain_ev, baseline_ev, brightness_ev, as_shot, effective, baseline_source }
 }
@@ -227,31 +217,24 @@ mod tests {
     }
 
     #[test]
-    fn baseline_and_brightness_parts() {
-        let n = develop_node(|_| {}); // baseline on, default 0.35, brightness 1.6
-        let s = develop_settings(&n, A, Some(&raw(None, None, Some(0.5))));
-        assert_eq!(parts(&s), (BaselineSource::File, 0.5, 1.6, 2.1));
-        let s = develop_settings(&n, A, Some(&raw(None, None, None)));
-        assert_eq!(parts(&s), (BaselineSource::Default, 0.35, 1.6, 0.35 + 1.6));
-
-        let off = develop_node(|n| {
-            n.set_param("baseline", A, 0.0);
-        });
-        let s = develop_settings(&off, A, Some(&raw(None, None, Some(0.5))));
-        assert_eq!(parts(&s), (BaselineSource::Off, 0.0, 1.6, 1.6), "brightness ignores the toggle");
-
-        let rendered = CaptureInfo { raw: Some(false), baseline_exposure: Some(0.5), ..Default::default() };
-        let unknown = CaptureInfo { baseline_exposure: Some(0.5), ..Default::default() };
-        for cap in [Some(&rendered), Some(&unknown), None] {
-            assert_eq!(parts(&develop_settings(&n, A, cap)), (BaselineSource::NotRaw, 0.0, 0.0, 0.0));
-            assert_eq!(parts(&develop_settings(&off, A, cap)), (BaselineSource::Off, 0.0, 0.0, 0.0));
+    fn legacy_baseline_values_do_not_add_node_gain() {
+        let n = develop_node(|n| { n.set_param("baseline", A, 0.0); n.set_param("baseline_default", A, 1.0); n.set_param("brightness", A, 2.0); });
+        for cap in [Some(raw(Some(5200.0), None, Some(0.5))), Some(CaptureInfo { raw: Some(false), ..Default::default() }), None] {
+            assert_eq!(develop_settings(&n, A, cap.as_ref()).gain_ev, 0.0);
         }
+    }
 
-        let custom = develop_node(|n| {
-            n.set_param("baseline_default", A, -0.5);
-            n.set_param("brightness", A, -1.0);
-        });
-        let s = develop_settings(&custom, A, Some(&raw(None, None, None)));
-        assert_eq!(parts(&s), (BaselineSource::Default, -0.5, -1.0, -1.5));
+    #[test]
+    fn baseline_and_brightness_parts() {
+        let n = develop_node(|_| {});
+        let off = develop_node(|n| { n.set_param("baseline", A, 0.0); n.set_param("baseline_default", A, -0.5); n.set_param("brightness", A, -1.0); });
+        let tagged = raw(None, None, Some(0.5));
+        let untagged = raw(None, None, None);
+        let rendered = CaptureInfo { raw: Some(false), baseline_exposure: Some(0.5), ..Default::default() };
+        for node in [&n, &off] {
+            for cap in [Some(&tagged), Some(&untagged), Some(&rendered), None] {
+                assert_eq!(parts(&develop_settings(node, A, cap)), (BaselineSource::Off, 0.0, 0.0, 0.0));
+            }
+        }
     }
 }

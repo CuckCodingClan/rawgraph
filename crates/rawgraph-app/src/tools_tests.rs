@@ -52,6 +52,8 @@ impl View {
             display: Arc::new(rawgraph_scopes::DisplayTransform::default().apply(&img)),
             prepared: None,
             scopes_ms: 0.0,
+            node_timings: None,
+            gpu_tail: false,
             eval_ms: 0.0,
             display_ms: 0.0,
             hits: 0,
@@ -415,6 +417,7 @@ fn brush_behind(v: &mut View, after: &[NodeKind]) -> (NodeId, Vec<NodeId>) {
 fn a_stroke_painted_behind_a_crop_is_stored_in_the_frame_of_the_node_that_uses_the_mask() {
     let mut v = View::new(NodeKind::BrushMask);
     let (exp, crops) = brush_behind(&mut v, &[NodeKind::Transform]);
+    v.s.viewed_node = Some(crops[0]);
     let img = v.s.current_image();
     {
         let n = v.s.project.graph.node_mut(crops[0]).unwrap();
@@ -443,6 +446,7 @@ fn a_stroke_painted_behind_a_crop_is_stored_in_the_frame_of_the_node_that_uses_t
 fn a_stroke_behind_a_quarter_turn_and_a_fine_rotation_lands_where_the_oracle_says() {
     let mut v = View::new(NodeKind::BrushMask);
     let (_, crops) = brush_behind(&mut v, &[NodeKind::Transform, NodeKind::Transform]);
+    v.s.viewed_node = Some(crops[1]);
     let img = v.s.current_image();
     v.s.project.graph.node_mut(crops[0]).unwrap().set_param("rotate", img, 1.0);
     v.s.project.graph.node_mut(crops[1]).unwrap().set_param("angle", img, 6.0);

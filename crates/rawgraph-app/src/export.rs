@@ -28,14 +28,16 @@ pub enum Fmt {
     Exr,
     Png16,
     Tiff16,
+    Webp,
 }
 
 impl Fmt {
-    pub const ALL: [Fmt; 6] = [Fmt::Jpeg, Fmt::Png, Fmt::Png16, Fmt::Tiff, Fmt::Tiff16, Fmt::Exr];
+    pub const ALL: [Fmt; 7] = [Fmt::Jpeg, Fmt::Png, Fmt::Png16, Fmt::Tiff, Fmt::Tiff16, Fmt::Exr, Fmt::Webp];
 
     pub fn label(self) -> &'static str {
         match self {
             Fmt::Jpeg => "JPEG",
+            Fmt::Webp => "WebP",
             Fmt::Png => "PNG",
             Fmt::Tiff => "TIFF",
             Fmt::Exr => "EXR (linear)",
@@ -57,6 +59,7 @@ pub struct ExportState {
     pub scope: Scope,
     pub format: Fmt,
     pub quality: u8,
+    pub webp_lossless: bool,
     pub full_size: bool,
     pub long_edge: u32,
     /// Empty until the user picks one: the default is never a source folder.
@@ -76,6 +79,7 @@ impl Default for ExportState {
             scope: Scope::Selected,
             format: Fmt::Jpeg,
             quality: 92,
+            webp_lossless: false,
             full_size: true,
             long_edge: 2048,
             out_dir: String::new(),
@@ -88,11 +92,10 @@ impl Default for ExportState {
     }
 }
 
-/// Node that gets exported: the viewed node if it produces images, else Output.
+/// Quick Export requires an explicit viewed image node (legacy Output is supported).
 pub fn export_node(session: &Session) -> Option<NodeId> {
     let g = &session.project.graph;
-    let viewed = session.viewed_node.and_then(|id| g.node(id)).filter(|n| n.kind != NodeKind::Output && n.kind.output() == Some(PortType::Images));
-    viewed.map(|n| n.id).or_else(|| session.output_node())
+    session.target_node().and_then(|id| g.node(id)).filter(|n| n.kind == NodeKind::Output || n.kind.output() == Some(PortType::Images)).map(|n| n.id)
 }
 
 pub fn node_label(graph: &Graph, node: NodeId) -> String {
@@ -107,12 +110,27 @@ impl ExportState {
             Scope::Filtered => session.visible().to_vec(),
             Scope::All => session.project.images().iter().map(|e| e.id).collect(),
         };
-        ids.into_iter().filter_map(|id| session.entry(id)).map(|e| ExportItem { id: e.id, source: e.path.clone() }).collect()
+
+        let mut ids = ids;
+        if self.scope != Scope::Selected {
+            ids.extend(Self::generated_items(session));
+        }
+        ids.into_iter().map(|id| ExportItem { id, source: session.entry(id).map(|e| e.path.clone()).unwrap_or_default() }).collect()
+    }
+
+    fn generated_items(session: &Session) -> Vec<ImageId> {
+        let Some(node) = export_node(session) else { return Vec::new(); };
+        let ids: Vec<_> = session.project.images().iter().map(|entry| entry.id).collect();
+        let capture = |id| session.entry(id).map(crate::session::capture_with_path);
+        let catalog = rawgraph_core::Catalog { images: &ids, capture: &capture };
+        session.project.graph.members(node, 0, &catalog).into_iter()
+            .filter(|id| session.entry(*id).is_none()).collect()
     }
 
     /// Image counts for the three scopes: (selected, filtered, all).
     pub fn scope_counts(session: &Session) -> (usize, usize, usize) {
-        (usize::from(session.selected.is_some()), session.visible().len(), session.total_images())
+        let generated = Self::generated_items(session).len();
+        (usize::from(session.selected.is_some()), session.visible().len() + generated, session.total_images() + generated)
     }
 
     /// The display transform used for the export. The viewing exposure is a
@@ -132,6 +150,7 @@ impl ExportState {
             out_dir: PathBuf::from(self.out_dir.trim()),
             format: match self.format {
                 Fmt::Jpeg => ExportFormat::Jpeg { quality: self.quality.clamp(1, 100) },
+                Fmt::Webp => ExportFormat::Webp { quality: self.quality.clamp(1, 100), lossless: self.webp_lossless },
                 Fmt::Png => ExportFormat::Png,
                 Fmt::Tiff => ExportFormat::Tiff,
                 Fmt::Exr => ExportFormat::Exr,
@@ -186,6 +205,8 @@ pub enum ExportMsg {
 pub struct NodeRun {
     pub catalog: Vec<ExportItem>,
     pub display: DisplayTransform,
+    pub members: Vec<ImageId>,
+    pub culling: std::collections::HashMap<ImageId, (u8, rawgraph_project::Flag, Option<rawgraph_project::ColorLabel>)>,
 }
 
 /// A running export. The graph is cloned, so the app stays fully usable.
@@ -200,18 +221,19 @@ pub struct ExportJob {
     pub started: std::time::Instant,
     /// Set for an export through an Export node (the settings then come from the node).
     pub node_run: Option<NodeRun>,
+    pub quick_catalog: Vec<ExportItem>,
 }
 
 impl ExportJob {
-    pub fn start(ctx: egui::Context, graph: Graph, node: NodeId, items: Vec<ExportItem>, settings: ExportSettings) -> Self {
+    pub fn start(ctx: egui::Context, graph: Graph, node: NodeId, items: Vec<ExportItem>, settings: ExportSettings, catalog: Vec<ExportItem>) -> Self {
         let (tx, rx) = channel();
         let cancel = CancelToken::new();
-        let (c2, i2, s2) = (cancel.clone(), items.clone(), settings.clone());
+        let (c2, i2, s2, catalog2) = (cancel.clone(), items.clone(), settings.clone(), catalog.clone());
         let total = items.len();
         let spawned = std::thread::Builder::new().name("rawgraph-export".into()).spawn(move || {
             let tx_p = tx.clone();
             let ctx_p = ctx.clone();
-            let result = rawgraph_batch::export(&graph, node, &i2, &s2, &c2, &mut |p| {
+            let result = rawgraph_batch::export_catalog(&graph, node, &catalog2, &i2, &s2, &c2, &mut |p| {
                 let _ = tx_p.send(ExportMsg::Progress { done: p.done, total: p.total });
                 ctx_p.request_repaint();
             });
@@ -219,7 +241,7 @@ impl ExportJob {
             ctx.request_repaint();
         });
         drop(spawned);
-        Self { rx, cancel, done: 0, total, items, settings, node, started: std::time::Instant::now(), node_run: None }
+        Self { rx, cancel, done: 0, total, items, settings, node, started: std::time::Instant::now(), node_run: None, quick_catalog: catalog }
     }
 
     /// Runs the Export node `node`: writes `items` (a subset of the run's catalog) with the node's
@@ -234,15 +256,21 @@ impl ExportJob {
         let spawned = std::thread::Builder::new().name("rawgraph-export".into()).spawn(move || {
             let tx_p = tx.clone();
             let ctx_p = ctx.clone();
-            let result = rawgraph_batch::export_node(&graph, node, &run2.catalog, &selection, run2.display, &c2, &mut |p| {
+            let is_xmp = graph.node(node).is_some_and(|n| selection.iter().any(|id| rawgraph_core::export_spec(n, *id).format == rawgraph_core::ExportFileFormat::Xmp));
+            let result = if is_xmp {
+                Ok(crate::xmp_export::run(&graph, node, &run2, &selection, &c2, &mut |done, total| {
+                    let _ = tx_p.send(ExportMsg::Progress { done, total });
+                    ctx_p.request_repaint();
+                }))
+            } else { rawgraph_batch::export_node(&graph, node, &run2.catalog, &selection, run2.display, &c2, &mut |p| {
                 let _ = tx_p.send(ExportMsg::Progress { done: p.done, total: p.total });
                 ctx_p.request_repaint();
-            });
+            }) };
             let _ = tx.send(ExportMsg::Done(result));
             ctx.request_repaint();
         });
         drop(spawned);
-        Self { rx, cancel, done: 0, total, items, settings, node, started: std::time::Instant::now(), node_run: Some(run) }
+        Self { rx, cancel, done: 0, total, items, settings, node, started: std::time::Instant::now(), node_run: Some(run), quick_catalog: Vec::new() }
     }
 
     pub fn cancel(&self) {
@@ -265,6 +293,7 @@ pub struct FinishedExport {
     pub settings: ExportSettings,
     pub node: NodeId,
     pub node_run: Option<NodeRun>,
+    pub quick_catalog: Vec<ExportItem>,
 }
 
 /// The display transform of an export through an Export node: the same one the export dialog
@@ -318,7 +347,9 @@ pub fn node_selection(session: &mut Session, node: NodeId, scope: Scope) -> Vec<
         Scope::Selected => session.selected.filter(|id| members.contains(id)).into_iter().collect(),
         Scope::Filtered => {
             let set: std::collections::HashSet<ImageId> = members.iter().copied().collect();
-            session.visible().iter().copied().filter(|id| set.contains(id)).collect()
+            let mut ids: Vec<_> = session.visible().iter().copied().filter(|id| set.contains(id)).collect();
+            ids.extend(members.iter().copied().filter(|id| session.entry(*id).is_none()));
+            ids
         }
         Scope::All => members,
     }
@@ -337,9 +368,11 @@ pub fn node_plan(session: &mut Session, node: NodeId, scope: Scope) -> (Vec<Expo
     let catalog = catalog_items(session);
     let selection = node_selection(session, node, scope);
     let by_id: std::collections::HashMap<ImageId, &ExportItem> = catalog.iter().map(|i| (i.id, i)).collect();
-    let items: Vec<ExportItem> = selection.iter().filter_map(|id| by_id.get(id).map(|i| (*i).clone())).collect();
+    let items: Vec<ExportItem> = selection.iter().map(|id| by_id.get(id).map(|i| (*i).clone()).unwrap_or_else(|| ExportItem { id: *id, source: Default::default() })).collect();
     let display = node_display(&session.view);
-    (items, NodeRun { catalog, display })
+    let members = node_members(session, node);
+    let culling = session.project.images().iter().map(|e| (e.id, (e.rating, e.flag, e.color_label))).collect();
+    (items, NodeRun { catalog, display, members, culling })
 }
 
 /// Whether `out_dir` is the folder of any source photo of `catalog`: an export never writes there.
@@ -534,7 +567,8 @@ pub fn show_dialog(ctx: &egui::Context, area: egui::Rect, st: &mut ExportState, 
                         ui.selectable_value(&mut st.format, f, f.label());
                     }
                 });
-                if st.format == Fmt::Jpeg {
+                if st.format == Fmt::Webp { ui.checkbox(&mut st.webp_lossless, "Lossless WebP"); ui.label("WebP ICC profile embedding is not supported."); }
+                if st.format == Fmt::Jpeg || (st.format == Fmt::Webp && !st.webp_lossless) {
                     ui.add(egui::Slider::new(&mut st.quality, 1..=100).text("quality"));
                 }
                 if matches!(st.format, Fmt::Png16 | Fmt::Tiff16) {
@@ -575,7 +609,7 @@ pub fn show_dialog(ctx: &egui::Context, area: egui::Rect, st: &mut ExportState, 
             ui.label("Files");
             ui.vertical(|ui| {
                 ui.add_enabled_ui(st.format.has_profile_options(), |ui| {
-                    ui.checkbox(&mut st.embed_profile, "Embed sRGB profile");
+                    ui.add_enabled(st.format != Fmt::Webp, egui::Checkbox::new(&mut st.embed_profile, "Embed sRGB profile"));
                     ui.checkbox(&mut st.copy_metadata, "Copy capture metadata (camera, lens, exposure, date, copyright)");
                 });
                 if !st.format.has_profile_options() {
@@ -757,6 +791,17 @@ mod tests {
     }
 
     #[test]
+    fn empty_source_never_exports_the_catalog() {
+        let (_dir, mut s) = session(2);
+        let src = s.project.graph.add_node(rawgraph_core::NodeKind::Source, [0.0, 0.0]);
+        let out = s.project.graph.add_node(rawgraph_core::NodeKind::Export, [0.0, 0.0]);
+        s.project.graph.connect(src, out, 0).unwrap();
+        assert!(crate::node_ui::set_source_folder(&mut s.project.graph, src, None));
+        assert!(node_members(&mut s, out).is_empty());
+        assert!(node_selection(&mut s, out, Scope::All).is_empty());
+    }
+
+    #[test]
     fn long_paths_are_elided_in_the_middle() {
         let long = r"\\nas\photos\2026\Kunde Mustermann\Hochzeit Garten und Schloss\ROH\Auswahl final";
         let e = elide_middle(long, 40);
@@ -807,7 +852,8 @@ mod tests {
         st.copy_metadata = false;
         let s = st.settings(&view).unwrap();
         assert!(!s.embed_profile && !s.copy_metadata);
-        assert_eq!(Fmt::ALL.len(), 6);
+        assert!(Fmt::ALL.contains(&Fmt::Webp));
+        assert_eq!(Fmt::ALL.len(), 7);
         assert_eq!((Fmt::Png16.label(), Fmt::Tiff16.label()), ("PNG 16-bit", "TIFF 16-bit"));
         assert!(Fmt::Png16.has_profile_options() && !Fmt::Exr.has_profile_options());
         // The file name keeps the format's extension.
@@ -865,10 +911,10 @@ mod tests {
     }
 
     #[test]
-    fn export_node_is_the_viewed_image_node_or_output() {
+    fn export_node_requires_an_explicit_image_view() {
         let (_d, mut s) = session(1);
-        let out = s.output_node().unwrap();
-        assert_eq!(export_node(&s), Some(out));
+        assert_eq!(export_node(&s), None);
+        let out = s.project.graph.add_node(NodeKind::Output, [0.0, 0.0]);
         let src = s.node_by_index(0).unwrap();
         s.viewed_node = Some(src);
         assert_eq!(export_node(&s), Some(src));
