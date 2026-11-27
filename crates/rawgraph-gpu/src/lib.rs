@@ -22,7 +22,7 @@ mod readback;
 
 pub use context::GpuContext;
 pub use display::{
-    display_into, display_rgba8, display_samples, display_texture, render_into, DisplayTarget, GpuToneMap,
+    display_into, display_rgba8, display_samples, display_texture, read_display_batch, render_into, DisplayTarget, GpuToneMap,
 };
 pub use error::GpuError;
 pub use image::GpuImage;

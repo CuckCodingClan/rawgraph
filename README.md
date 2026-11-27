@@ -31,6 +31,17 @@ on-disk thumbnail cache and the camera's embedded preview on a background worker
 and clears the badge. Edits to the current photo retain the last frame and show the
 badge only after 150 ms. Scopes wait for the graph result; Clean Feed can show the preview.
 
+Gallery edits use a separate, lower-priority worker and 512-pixel linear image
+bases, not the viewer's large proxies. Visible rows are scheduled first, nearby
+rows next. Slider drags schedule at most ten updates per second, with a final pass
+on release. This is a scheduling cap, not a frame-rate guarantee. The gallery
+worker uses half the CPU cores (2 to 8) at below-normal priority. Run the synthetic
+CPU and available GPU benchmark with:
+
+```text
+cargo test -p rawgraph-app gallery_benchmark -- --ignored --nocapture
+```
+
 Measure RAW decode stages and embedded preview extraction on your own files:
 
 ```text
@@ -139,6 +150,21 @@ The Windows GUI starts without creating a console and shows a small startup spla
 Click a node to preview its result. Pin the viewer to keep that stage visible while editing another node. With no selected or pinned node, there is no preview. New graphs no longer include an Output node; old graphs can still be opened. Use an Export node to save files or Quick Export to write from the stage you are viewing.
 
 The gallery, scopes, and Clean Feed follow the single viewer or the right **Primary** pane in Split Viewer, not the inspector’s selected node. The gallery lists the primary node’s collection and highlights the primary image. Both split panes have independent image and node pins; unpinned dimensions follow selection (an image-only pin can retain its last compatible node). The left **Reference** pane does not drive the gallery, scopes, or Clean Feed. Wheel and arrow navigation and gallery clicks stay in the primary collection; unpin the primary image to step through it. The single viewer uses fit-relative click zoom (2× or 3×), and the View menu switches wheel behavior between zooming and stepping images. Drag a connection from a port to blank canvas to add and wire a compatible node. You can delete any node, including the last Source, and undo the deletion. An empty graph has a blank viewer and an empty gallery.
+
+### Gallery thumbnails
+
+Each tile uses the Primary viewer's stage and display settings, but renders its
+own photo even when the Primary viewer pins a different photo. Group edits update
+all affected photos; Individual edits only update the affected photo. Camera JPEGs
+are provisional until the editable render is ready. The tile retains its last
+picture while rendering. Depth Map, Pixel Sort and stages measured as slow defer
+updates during a drag; a small amber dot means the picture is stale.
+
+**View → Editable thumbnail cache** controls the persistent disk budget (default
+**8 GiB**, oldest access evicted first). Set it to zero to keep editable bases in
+memory only. These small scene-linear bases are separate from embedded JPEGs and
+are reused when you change nodes or settings. Reduced-resolution effects can
+look different from a full viewer proxy or export.
 
 ### Export node preview
 

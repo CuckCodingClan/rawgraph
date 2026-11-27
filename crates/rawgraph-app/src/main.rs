@@ -17,6 +17,7 @@ mod develop;
 mod dialogs;
 mod export;
 mod filmstrip;
+mod live_thumbs;
 mod fine_slider;
 mod filter;
 mod frames;

@@ -105,6 +105,7 @@ struct Settings {
     renderer: RendererMode,
     click_zoom: f32,
     wheel_navigates: bool,
+    editable_thumb_gib: u32,
 }
 
 impl Default for Settings {
@@ -119,6 +120,7 @@ impl Default for Settings {
             renderer: RendererMode::Auto,
             click_zoom: 2.0,
             wheel_navigates: false,
+            editable_thumb_gib: crate::live_thumbs::DEFAULT_GIB,
         }
     }
 }
@@ -607,7 +609,9 @@ impl App {
         );
         let dirs = DataDirs::from_option(cli.data_dir.as_deref());
         let thumb_cache = rawgraph_project::ThumbCache::new(&dirs.thumbs(), CACHE_BUDGET).map_err(|e| eprintln!("thumbnail cache: {e}")).ok().map(Arc::new);
-        let filmstrip = Filmstrip::with_thumbs(ThumbLoader::with_cache(cc.egui_ctx.clone(), provider.clone(), thumb_cache.clone()));
+        let mut live = crate::live_thumbs::LiveThumbs::new(cc.egui_ctx.clone(), provider.clone(), dirs.thumbs().join("linear"), settings.editable_thumb_gib);
+        live.allow_gpu(cc.wgpu_render_state.is_some());
+        let filmstrip = Filmstrip::with_thumbs(ThumbLoader::with_cache(cc.egui_ctx.clone(), provider.clone(), thumb_cache.clone()), live);
         let session_key = format!("{}-{}", std::process::id(), crate::clock::now_unix_ms());
         let lock = SessionLock::create(&dirs.recovery(), &session_key).map_err(|e| eprintln!("recovery lock: {e}")).ok();
         let startup_scan = Some(Self::spawn_startup_scan(&cc.egui_ctx, dirs.recovery(), lock.as_ref().and_then(SessionLock::file_name).unwrap_or_default()));
@@ -950,6 +954,7 @@ impl App {
     fn after_document_change(&mut self) {
         self.history.reset(&self.session.project.graph);
         self.filmstrip.thumbs.clear();
+        self.filmstrip.live.reset();
         self.editor.request_frame_all();
         self.last_key = None;
         self.frame_info = None;
@@ -2334,6 +2339,7 @@ impl App {
         let has_report = self.scan_report.is_some();
         let show_overlay = self.show_mask_overlay;
         let mut new_preview = None;
+        let mut thumb_budget = self.filmstrip.live.budget();
         let renderer_mode = self.renderer_mode;
         let mut new_renderer = None;
         let item_tip = |ui: &mut egui::Ui, cmds: &mut Vec<Command>, label: &str, cmd: Command, enabled: bool, tip: &str| {
@@ -2425,8 +2431,12 @@ impl App {
                     }
                 }
                 ui.separator();
+                ui.menu_button("Editable thumbnail cache", |ui| {
+                    ui.add(egui::DragValue::new(&mut thumb_budget).range(0..=128).suffix(" GiB"));
+                    ui.label("0 keeps editable bases in memory only.");
+                });
                 ui.label(RichText::new("Renderer").weak());
-                let tip = "Automatic runs the last pointwise nodes and the display transform on the GPU and falls back to the CPU when that is not possible.\nExport, thumbnails, collection counts and the compare view's reference image always use the CPU.";
+                let tip = "Automatic runs the last pointwise nodes and the display transform on the GPU and falls back to the CPU when that is not possible.\nExport, collection counts and the compare view's reference image always use the CPU.";
                 for m in [RendererMode::Auto, RendererMode::Cpu] {
                     if ui.radio(renderer_mode == m, m.label()).on_hover_text(tip).clicked() {
                         new_renderer = Some(m);
@@ -2494,6 +2504,7 @@ impl App {
                 item(ui, cmds, "Open demo images", Command::OpenDemo, true);
             });
         });
+        if thumb_budget != self.filmstrip.live.budget() { self.filmstrip.live.set_budget(thumb_budget); }
         if let Some(n) = new_preview {
             self.session.provider.set_preview_size(n);
         }
@@ -2961,7 +2972,6 @@ impl eframe::App for App {
                 } else { ui.label("Waiting for a profiled preview."); }
             });
         }
-        self.filmstrip.poll(&ctx);
         self.poll_scan();
         self.poll_capture_refresh();
         self.poll_export();
@@ -3036,6 +3046,9 @@ impl eframe::App for App {
         self.update_selection_preview(&ctx);
         self.compare_step(&ctx);
         self.submit_if_needed();
+        let target = self.primary_target();
+        self.filmstrip.request_live(&ctx, &mut self.session, target, self.renderer_mode != RendererMode::Cpu && !self.cli.capture());
+        self.filmstrip.poll(&ctx);
         self.crash_step();
         self.report_fill_time();
         self.screenshot_step(&ctx);
@@ -3096,6 +3109,7 @@ impl eframe::App for App {
             preview_size: self.session.provider.preview_size(),
             click_zoom: self.viewer.click_zoom,
             wheel_navigates: self.viewer.wheel_navigates,
+            editable_thumb_gib: self.filmstrip.live.budget(),
             // GPU-only is a test setting from the command line, never saved.
             renderer: if self.renderer_mode == RendererMode::Gpu { RendererMode::Auto } else { self.renderer_mode },
         };
@@ -3590,6 +3604,27 @@ mod tests {
         app.compare.panes[1].image = None;
         app.resolve_compare_pins();
         assert_eq!(app.primary_target().node, Some(generator));
+        app.shutdown();
+    }
+
+    #[test]
+    fn editable_thumbnail_budget_is_persisted_and_legacy_settings_default_to_eight() {
+        #[derive(Default)]
+        struct Storage(std::collections::HashMap<String, String>);
+        impl eframe::Storage for Storage {
+            fn get_string(&self, key: &str) -> Option<String> { self.0.get(key).cloned() }
+            fn set_string(&mut self, key: &str, value: String) { self.0.insert(key.to_owned(), value); }
+            fn remove_string(&mut self, key: &str) { self.0.remove(key); }
+            fn flush(&mut self) {}
+        }
+        let mut storage = Storage::default();
+        storage.0.insert(SETTINGS_KEY.to_owned(), "()".to_owned());
+        assert_eq!(eframe::get_value::<Settings>(&storage, SETTINGS_KEY).unwrap().editable_thumb_gib, 8);
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.filmstrip.live.set_budget(23);
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(eframe::get_value::<Settings>(&storage, SETTINGS_KEY).unwrap().editable_thumb_gib, 23);
         app.shutdown();
     }
 

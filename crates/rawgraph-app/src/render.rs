@@ -936,7 +936,7 @@ fn run_cpu(evaluator: &mut Evaluator, req: &Request, provider: &dyn ImageProvide
 }
 
 /// Roundtrip the same rendered samples and codec settings as batch export, without filesystem I/O.
-fn codec_preview(buf: &ImageBuf, spec: &rawgraph_core::ExportSpec, transform: rawgraph_scopes::DisplayTransform) -> Result<Option<DisplayImage>, String> {
+pub(crate) fn codec_preview(buf: &ImageBuf, spec: &rawgraph_core::ExportSpec, transform: rawgraph_scopes::DisplayTransform) -> Result<Option<DisplayImage>, String> {
     use rawgraph_core::color::{invert, rec709_to_output, mul_vec, srgb_eotf, srgb_oetf, Transfer};
     let ext = match spec.format { ExportFileFormat::Jpeg => "jpg", ExportFileFormat::Png => "png", _ => return Ok(None) };
     let settings = rawgraph_batch::settings_from_spec(spec, transform);

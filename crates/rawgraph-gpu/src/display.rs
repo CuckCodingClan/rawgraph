@@ -351,6 +351,45 @@ impl DisplayTarget {
     }
 }
 
+/// Read several small display targets with one submission and one mapping wait.
+pub fn read_display_batch(ctx: &GpuContext, targets: &[&DisplayTarget]) -> Result<Vec<Vec<u8>>, GpuError> {
+    if targets.is_empty() { return Ok(Vec::new()); }
+    let mut total = 0;
+    let layout: Vec<_> = targets.iter().map(|t| {
+        let pitch = (t.width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let offset = total;
+        total += u64::from(pitch) * u64::from(t.height);
+        (offset, pitch)
+    }).collect();
+    if total > MAX_STAGING_BYTES.min(ctx.device.limits().max_buffer_size) {
+        return targets.iter().map(|t| t.read_rgba8(ctx)).collect();
+    }
+    let staging = ctx.create_buffer("gallery readback", total, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST)?;
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    for (t, &(offset, pitch)) in targets.iter().zip(&layout) {
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: t.texture(), mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &staging, layout: wgpu::TexelCopyBufferLayout { offset, bytes_per_row: Some(pitch), rows_per_image: Some(t.height) } },
+            wgpu::Extent3d { width: t.width, height: t.height, depth_or_array_layers: 1 },
+        );
+    }
+    let submission = ctx.queue.submit([encoder.finish()]);
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+    ctx.device.poll(wgpu::PollType::Wait { submission_index: Some(submission), timeout: None }).map_err(|e| GpuError::Readback(e.to_string()))?;
+    rx.recv().map_err(|e| GpuError::Readback(e.to_string()))?.map_err(|e| GpuError::Readback(e.to_string()))?;
+    let mapped = slice.get_mapped_range().map_err(|e| GpuError::Readback(e.to_string()))?;
+    Ok(targets.iter().zip(layout).map(|(t, (offset, pitch))| {
+        let mut bytes = Vec::with_capacity((t.width * t.height * 4) as usize);
+        for row in 0..t.height {
+            let start = offset as usize + (row * pitch) as usize;
+            bytes.extend_from_slice(&mapped[start..start + (t.width * 4) as usize]);
+        }
+        bytes
+    }).collect())
+}
+
 /// Ops + display in one call into reusable targets; allocates no GPU memory (see
 /// [`GpuContext::allocations_created`]). `scratch` receives the float result of the ops and must
 /// be a different image of the size of `base`; `target` receives the display-encoded picture.

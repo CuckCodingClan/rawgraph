@@ -200,6 +200,13 @@ impl Evaluator {
         Self::default()
     }
 
+    /// Pixel-free cache identity for a node and one image, using the same inputs as evaluation.
+    pub fn fingerprint(&self, graph: &Graph, node: NodeId, image: ImageId, provider: &dyn ImageProvider) -> Result<u64, EvalError> {
+        let images = provider.images();
+        let env = Env { provider, images: &images, view_tone: self.view_tone, control: false };
+        node_fingerprint(graph, node, image, &env, &mut FingerprintMemo::new(), &mut Vec::new())
+    }
+
     /// Evaluates output port 0 of `node`. For a Metadata Split node this means viewing
     /// the node: every image of its input collection is passed through unchanged.
     pub fn eval(

@@ -41,6 +41,9 @@ pub enum FilmAction {
 
 pub struct Filmstrip {
     pub thumbs: ThumbLoader,
+    pub(crate) live: crate::live_thumbs::LiveThumbs,
+    live_wanted: Vec<rawgraph_core::ImageId>,
+    live_visible: usize,
     last_selected: Option<rawgraph_core::ImageId>,
     last_range: Range<usize>,
     /// Filled while drawing; the app drains it every frame.
@@ -55,12 +58,13 @@ pub(crate) fn gallery_keyboard_available(ctx: &egui::Context) -> bool {
 }
 
 impl Filmstrip {
-    pub fn with_thumbs(thumbs: ThumbLoader) -> Self {
-        Self { thumbs, last_selected: None, last_range: 0..0, actions: Vec::new(), xmp_banner: None }
+    pub fn with_thumbs(thumbs: ThumbLoader, live: crate::live_thumbs::LiveThumbs) -> Self {
+        Self { thumbs, live, live_wanted: Vec::new(), live_visible: 0, last_selected: None, last_range: 0..0, actions: Vec::new(), xmp_banner: None }
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
         self.thumbs.poll(ctx);
+        self.live.poll(ctx);
     }
 
     /// True when the thumbnails that are visible or about to be are in memory.
@@ -145,16 +149,19 @@ impl Filmstrip {
         if target.node.is_none() {
             ui.label("Select a node to see its images.");
             self.thumbs.set_wanted(&[]);
+            self.live_wanted.clear();
             return;
         }
         if members.is_none() {
             ui.label("Loading node collection…");
             self.thumbs.set_wanted(&[]);
+            self.live_wanted.clear();
             return;
         }
         if ids.is_empty() {
             ui.label("No images in this node match the filters.");
             self.thumbs.set_wanted(&[]);
+            self.live_wanted.clear();
             return;
         }
         if !target.image_pinned && gallery_keyboard_available(ui.ctx()) {
@@ -201,8 +208,11 @@ impl Filmstrip {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     for &id in ids.iter().skip(row * columns).take(columns) {
                         if let Some(entry) = session.entry(id).cloned() {
-                            let tex = self.thumbs.texture(id);
+                            let tex = self.live.texture(id).or_else(|| self.thumbs.texture(id));
                             let resp = draw_row(ui, width, &entry, target.image == Some(id), tex.as_ref(), self.thumbs.has_failed(id), false);
+                            if self.live.stale(id) {
+                                ui.painter().circle_filled(resp.rect.right_top() + egui::vec2(-8.0, 8.0), 2.5, Color32::from_rgb(255, 184, 77));
+                            }
                             if resp.clicked() { clicked = Some(id); }
                             resp.context_menu(|ui| {
                                 if ui.button("Set as reference").clicked() { self.actions.push(FilmAction::SetReference(id)); ui.close(); }
@@ -211,8 +221,18 @@ impl Filmstrip {
                                     if ui.button("Relink folder...").clicked() { self.actions.push(FilmAction::RelinkFolder(id)); ui.close(); }
                                 }
                             });
-                        } else if ui.selectable_label(target.image == Some(id), format!("Generated {}", id.0)).clicked() {
-                            clicked = Some(id);
+                        } else {
+                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, ROW_H - 4.0), Sense::click());
+                            if let Some(tex) = self.live.texture(id) {
+                                let size = tex.size_vec2();
+                                let fitted = size * (rect.width() / size.x).min(rect.height() / size.y);
+                                ui.painter().image(tex.id(), Rect::from_center_size(rect.center(), fitted), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                            } else {
+                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, format!("Generated {}", id.0), NAME_FONT, Color32::GRAY);
+                            }
+                            if target.image == Some(id) { ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, Color32::LIGHT_BLUE), egui::StrokeKind::Inside); }
+                            if self.live.stale(id) { ui.painter().circle_filled(rect.right_top() + egui::vec2(-8.0, 8.0), 2.5, Color32::from_rgb(255, 184, 77)); }
+                            if resp.clicked() { clicked = Some(id); }
                         }
                     }
                 });
@@ -225,9 +245,16 @@ impl Filmstrip {
         let (lo, hi) = (range.start.saturating_sub(MARGIN_ROWS), (range.end + MARGIN_ROWS).min(rows));
         let mut order: Vec<usize> = (range.start..range.end).collect();
         order.extend((range.end..hi).chain((lo..range.start).rev()));
-        let wanted: Vec<_> = order.into_iter().flat_map(|r| ids.iter().skip(r * columns).take(columns).copied())
-            .filter_map(|id| session.entry(id).filter(|e| !e.missing).map(|e| Wanted { id, path: e.path.clone(), hash: e.content_hash.clone() })).collect();
+        let ordered: Vec<_> = order.into_iter().flat_map(|r| ids.iter().skip(r * columns).take(columns).copied()).collect();
+        let wanted: Vec<_> = ordered.iter().copied().filter_map(|id| session.entry(id).filter(|e| !e.missing).map(|e| Wanted { id, path: e.path.clone(), hash: e.content_hash.clone() })).collect();
         self.thumbs.set_wanted(&wanted);
+        self.live_wanted = ordered;
+        self.live_visible = ((range.end - range.start) * columns).min(self.live_wanted.len());
+    }
+
+    pub(crate) fn request_live(&mut self, ctx: &egui::Context, session: &mut Session, target: ViewerTarget, gpu: bool) {
+        if self.live_wanted.is_empty() { self.live.suspend(); }
+        else { self.live.request(ctx, session, target, (&self.live_wanted, self.live_visible), gpu); }
     }
 
     /// Details of the selected image, shown under the list.
