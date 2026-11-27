@@ -9,7 +9,7 @@ use rawgraph_project::{ColorLabel, Flag, ImageEntry};
 
 use crate::filter::{sort_label, SORT_KEYS};
 use crate::inspector::capture_summary;
-use crate::session::Session;
+use crate::session::{Session, ViewerTarget};
 use crate::testimages::display_name;
 use crate::textfit::{fit_start, text_width};
 use crate::thumbs::{ThumbLoader, Wanted};
@@ -132,21 +132,17 @@ impl Filmstrip {
         session.filter != before
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, session: &mut Session, members: Option<&std::collections::HashSet<rawgraph_core::ImageId>>) {
+    pub fn show(&mut self, ui: &mut egui::Ui, session: &mut Session, mut target: ViewerTarget, members: Option<&std::collections::HashSet<rawgraph_core::ImageId>>) {
         if Self::header(ui, session) {
             session.refresh_visible();
         }
-        let mut ids: Vec<_> = gallery_ids(session.visible(), members);
-        if let Some(members) = members {
-            let mut generated: Vec<_> = members.iter().copied().filter(|id| session.entry(*id).is_none()).collect();
-            generated.sort();
-            ids.extend(generated);
-        }
-        if members.is_some() && session.selected.is_none_or(|id| !ids.contains(&id)) {
+        let ids = members.map_or_else(Vec::new, |members| session.gallery_images(members));
+        if members.is_some() && !target.image_pinned && target.image.is_none_or(|id| !ids.contains(&id)) {
             session.selected = ids.first().copied();
+            target.image = session.selected;
         }
         ui.label(RichText::new(format!("{} images", ids.len())).strong());
-        if session.selected_node.is_none() {
+        if target.node.is_none() {
             ui.label("Select a node to see its images.");
             self.thumbs.set_wanted(&[]);
             return;
@@ -161,12 +157,11 @@ impl Filmstrip {
             self.thumbs.set_wanted(&[]);
             return;
         }
-        if gallery_keyboard_available(ui.ctx()) {
+        if !target.image_pinned && gallery_keyboard_available(ui.ctx()) {
             let (left, right) = ui.ctx().input_mut(|i| (i.consume_key(egui::Modifiers::NONE, Key::ArrowLeft), i.consume_key(egui::Modifiers::NONE, Key::ArrowRight)));
             if left || right {
-                let index = session.selected.and_then(|id| ids.iter().position(|x| *x == id)).unwrap_or(0);
-                let next = if left { index.saturating_sub(1) } else { (index + 1).min(ids.len() - 1) };
-                session.selected = Some(ids[next]);
+                session.step_gallery(target, &ids, if left { -1 } else { 1 });
+                target.image = session.selected;
             }
         }
         if let Some(n) = self.xmp_banner {
@@ -190,14 +185,14 @@ impl Filmstrip {
         let width = (available - (columns - 1) as f32 * 4.0) / columns as f32;
         let rows = ids.len().div_ceil(columns);
         let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
-        if session.selected != self.last_selected {
-            if let Some(i) = session.selected.and_then(|id| ids.iter().position(|x| *x == id)) {
+        if target.image != self.last_selected {
+            if let Some(i) = target.image.and_then(|id| ids.iter().position(|x| *x == id)) {
                 let row = i / columns;
                 if row < self.last_range.start || row >= self.last_range.end {
                     scroll = scroll.vertical_scroll_offset((row as f32 * ROW_H - ROW_H).max(0.0));
                 }
             }
-            self.last_selected = session.selected;
+            self.last_selected = target.image;
         }
         let mut clicked = None;
         let out = scroll.show_rows(ui, ROW_H, rows, |ui, range| {
@@ -207,7 +202,7 @@ impl Filmstrip {
                     for &id in ids.iter().skip(row * columns).take(columns) {
                         if let Some(entry) = session.entry(id).cloned() {
                             let tex = self.thumbs.texture(id);
-                            let resp = draw_row(ui, width, &entry, session.selected == Some(id), tex.as_ref(), self.thumbs.has_failed(id), false);
+                            let resp = draw_row(ui, width, &entry, target.image == Some(id), tex.as_ref(), self.thumbs.has_failed(id), false);
                             if resp.clicked() { clicked = Some(id); }
                             resp.context_menu(|ui| {
                                 if ui.button("Set as reference").clicked() { self.actions.push(FilmAction::SetReference(id)); ui.close(); }
@@ -216,7 +211,7 @@ impl Filmstrip {
                                     if ui.button("Relink folder...").clicked() { self.actions.push(FilmAction::RelinkFolder(id)); ui.close(); }
                                 }
                             });
-                        } else if ui.selectable_label(session.selected == Some(id), format!("Generated {}", id.0)).clicked() {
+                        } else if ui.selectable_label(target.image == Some(id), format!("Generated {}", id.0)).clicked() {
                             clicked = Some(id);
                         }
                     }
@@ -226,7 +221,7 @@ impl Filmstrip {
         });
         let range = out.inner;
         self.last_range = range.clone();
-        if let Some(id) = clicked { session.selected = Some(id); }
+        if let Some(id) = clicked.filter(|_| !target.image_pinned) { session.selected = Some(id); }
         let (lo, hi) = (range.start.saturating_sub(MARGIN_ROWS), (range.end + MARGIN_ROWS).min(rows));
         let mut order: Vec<usize> = (range.start..range.end).collect();
         order.extend((range.end..hi).chain((lo..range.start).rev()));
@@ -236,20 +231,21 @@ impl Filmstrip {
     }
 
     /// Details of the selected image, shown under the list.
-    pub fn capture_info(ui: &mut egui::Ui, session: &Session) {
-        let Some(e) = session.current_entry() else { return };
+    pub fn capture_info(ui: &mut egui::Ui, session: &Session, image: Option<rawgraph_core::ImageId>) {
+        let Some(e) = image.and_then(|id| session.entry(id)) else { return };
         ui.label(RichText::new(display_name(e)).strong());
         ui.label(capture_summary(&e.capture));
         ui.label(e.capture.ev100().map_or("EV100 unknown".to_owned(), |v| format!("EV100 {v:+.2}")));
         if e.capture.flash_fired == Some(true) {
             ui.label("Flash fired");
         }
-        crate::inspector::profile_line(ui, session);
+        let profile = (rawgraph_io::source_kind(&e.path) == Some(SourceKind::Rendered)).then(|| session.provider.profile_of(e.id)).flatten();
+        if let Some(profile) = profile {
+            let (text, warn) = crate::inspector::profile_text(&profile);
+            let text = RichText::new(text);
+            ui.label(if warn { text.color(Color32::from_rgb(255, 170, 90)) } else { text.weak() });
+        }
     }
-}
-
-fn gallery_ids(visible: &[rawgraph_core::ImageId], members: Option<&std::collections::HashSet<rawgraph_core::ImageId>>) -> Vec<rawgraph_core::ImageId> {
-    members.map_or_else(Vec::new, |members| visible.iter().copied().filter(|id| members.contains(id)).collect())
 }
 
 fn draw_row(ui: &mut egui::Ui, width: f32, e: &ImageEntry, selected: bool, tex: Option<&egui::TextureHandle>, failed: bool, dim: bool) -> egui::Response {
@@ -391,16 +387,6 @@ pub(crate) fn draw_star(painter: &egui::Painter, c: Pos2, r: f32, filled: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn gallery_never_falls_back_and_preserves_filtered_order() {
-        use rawgraph_core::ImageId;
-        let visible = [ImageId(3), ImageId(1), ImageId(2)];
-        assert!(gallery_ids(&visible, None).is_empty());
-        assert!(gallery_ids(&visible, Some(&Default::default())).is_empty());
-        let members = [ImageId(1), ImageId(3), ImageId(9)].into_iter().collect();
-        assert_eq!(gallery_ids(&visible, Some(&members)), vec![ImageId(3), ImageId(1)]);
-    }
 
     #[test]
     fn a_long_name_never_overlaps_the_note_or_the_edge() {

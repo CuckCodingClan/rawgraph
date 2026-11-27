@@ -117,7 +117,7 @@ The Windows GUI starts without creating a console and shows a small startup spla
 
 Click a node to preview its result. Pin the viewer to keep that stage visible while editing another node. With no selected or pinned node, there is no preview. New graphs no longer include an Output node; old graphs can still be opened. Use an Export node to save files or Quick Export to write from the stage you are viewing.
 
-The gallery on the left shows only images that pass through the selected node. Split Viewer has independent image and node pins for both panes; whichever dimension is unpinned follows the current selection. The single viewer uses fit-relative click zoom (2× or 3×), and the View menu switches wheel behavior between zooming and stepping images. Drag a connection from a port to blank canvas to add and wire a compatible node.
+The gallery, scopes, and Clean Feed follow the single viewer or the right **Primary** pane in Split Viewer, not the inspector’s selected node. The gallery lists the primary node’s collection and highlights the primary image. Both split panes have independent image and node pins; unpinned dimensions follow selection (an image-only pin can retain its last compatible node). The left **Reference** pane does not drive the gallery, scopes, or Clean Feed. Wheel and arrow navigation and gallery clicks stay in the primary collection; unpin the primary image to step through it. The single viewer uses fit-relative click zoom (2× or 3×), and the View menu switches wheel behavior between zooming and stepping images. Drag a connection from a port to blank canvas to add and wire a compatible node.
 
 ### Export node preview
 

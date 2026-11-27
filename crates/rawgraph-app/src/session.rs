@@ -202,6 +202,14 @@ pub struct Session {
     baseline: Baseline,
 }
 
+/// The node collection and image shown together by a viewer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewerTarget {
+    pub node: Option<NodeId>,
+    pub image: Option<ImageId>,
+    pub image_pinned: bool,
+}
+
 impl Session {
     pub fn new(project: Project, provider: Arc<FileProvider>) -> Self {
         let baseline = Baseline::of(&project);
@@ -366,16 +374,34 @@ impl Session {
         self.selected = Some(self.visible[next]);
     }
 
-    /// Navigate only the current selected-node collection, never cached membership.
+    /// Catalog members in filmstrip order, followed by generated images.
+    pub fn gallery_images(&self, members: &HashSet<ImageId>) -> Vec<ImageId> {
+        let mut images: Vec<_> = self.visible.iter().copied().filter(|id| members.contains(id)).collect();
+        let mut generated: Vec<_> = members.iter().copied().filter(|id| self.entry(*id).is_none()).collect();
+        generated.sort();
+        images.extend(generated);
+        images
+    }
+
+    /// Navigate only the viewer's current collection, never stale membership.
     pub fn step_viewer_image(&mut self, delta: i32) {
-        let Some(node) = self.selected_node.filter(|id| self.project.graph.node(*id).is_some()) else { return };
+        self.step_viewer_target(self.viewer_target(None, self.viewed_node), delta);
+    }
+
+    pub fn step_viewer_target(&mut self, target: ViewerTarget, delta: i32) {
+        if target.image_pinned || delta == 0 { return; }
+        let Some(node) = target.node else { return };
         let (ids, captures) = self.id_captures();
-        let result = crate::collection::compute(&self.project.graph, &ids, &captures, Some(node));
-        let members: Vec<_> = self.visible.iter().copied().filter(|id| result.view_members.contains(id)).collect();
-        if members.is_empty() || delta == 0 { return; }
-        let index = self.selected.and_then(|id| members.iter().position(|x| *x == id));
-        let next = match index { Some(i) => (i as i64 + i64::from(delta)).clamp(0, members.len() as i64 - 1) as usize, None if delta > 0 => 0, None => members.len() - 1 };
-        self.selected = Some(members[next]);
+        let members = crate::collection::view_members(&self.project.graph, &ids, &captures, node);
+        let images = self.gallery_images(&members);
+        self.step_gallery(target, &images, delta);
+    }
+
+    pub fn step_gallery(&mut self, target: ViewerTarget, images: &[ImageId], delta: i32) {
+        if target.image_pinned || images.is_empty() || delta == 0 { return; }
+        let index = target.image.and_then(|id| images.iter().position(|x| *x == id));
+        let next = match index { Some(i) => (i as i64 + i64::from(delta)).clamp(0, images.len() as i64 - 1) as usize, None if delta > 0 => 0, None => images.len() - 1 };
+        self.selected = Some(images[next]);
     }
 
     /// Neighbours of the selection in the filtered order, for prefetching.
@@ -715,7 +741,13 @@ impl Session {
 
     /// Node the viewer renders: pinned target, otherwise the primary selection.
     pub fn target_node(&self) -> Option<NodeId> {
-        [self.viewed_node, self.selected_node].into_iter().flatten().find(|id| self.project.graph.node(*id).is_some())
+        self.viewer_target(None, self.viewed_node).node
+    }
+
+    pub fn viewer_target(&self, image_pin: Option<ImageId>, node_pin: Option<NodeId>) -> ViewerTarget {
+        let (image, node) = crate::compare::Pane { image: image_pin, node: node_pin.filter(|id| self.project.graph.node(*id).is_some()) }
+            .target(self.selected, self.selected_node.filter(|id| self.project.graph.node(*id).is_some()));
+        ViewerTarget { node, image: node.and(image), image_pinned: image_pin.is_some() }
     }
 
     /// The interactive tool the viewer offers for the selected node.
@@ -732,11 +764,15 @@ impl Session {
     /// wanted, that port. While the crop tool is active this is the picture
     /// that enters the Crop / Rotate node.
     pub fn render_target(&self) -> Option<(NodeId, Option<usize>)> {
+        self.render_viewer_target(self.viewer_target(None, self.viewed_node))
+    }
+
+    pub fn render_viewer_target(&self, target: ViewerTarget) -> Option<(NodeId, Option<usize>)> {
         if let ToolMode::Crop(id) = self.tool_mode() {
             let graph = &self.project.graph;
             let mut inputs = graph.input_edges(id, 0);
             if let Some(first) = inputs.next() {
-                let image = self.current_image();
+                let image = target.image?;
                 let evaluator = rawgraph_engine::Evaluator::new();
                 let edge = std::iter::once(first).chain(inputs)
                     .find(|e| evaluator.contains_output(graph, e.from, e.from_port, image, self.provider.as_ref()))
@@ -747,11 +783,11 @@ impl Session {
         // Painting a brush mask whose picture cannot be shown right behind later geometry:
         // show the picture as it leaves the node that uses the mask.
         if let ToolMode::Brush(id) = self.tool_mode() {
-            if let crate::frames::BrushPlan::ShowConsumer { consumer } = crate::frames::brush_plan(&self.project.graph, id, self.target_node()) {
+            if let crate::frames::BrushPlan::ShowConsumer { consumer } = crate::frames::brush_plan(&self.project.graph, id, target.node) {
                 return Some((consumer, None));
             }
         }
-        self.target_node().map(|n| (n, None))
+        target.node.map(|n| (n, None))
     }
 
     /// How the brush tool of `brush` paints on the picture that is shown.
@@ -1037,6 +1073,38 @@ pub mod tests {
         s.filter.descending = true;
         s.refresh_visible();
         assert_eq!(s.visible(), &[ids[4], ids[1]]);
+    }
+
+    #[test]
+    fn viewer_wheel_stays_in_the_pinned_nodes_filtered_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let mut project = png_project(&a, 3);
+        std::fs::copy(a.join("img_000.png"), b.join("other.png")).unwrap();
+        project.scan_folder(&b, false, &rawgraph_io::is_supported, &|_| None);
+        let mut s = Session::new(project, provider());
+        let source = s.project.graph.add_node(NodeKind::Source, [0.0; 2]);
+        crate::node_ui::set_source_folder(&mut s.project.graph, source, Some(a.to_str().unwrap().to_owned()));
+        let generator = s.project.graph.add_node(NodeKind::Generator, [0.0; 2]);
+        s.selected_node = Some(generator);
+        s.viewed_node = Some(source);
+        let (ids, captures) = s.id_captures();
+        let members = crate::collection::view_members(&s.project.graph, &ids, &captures, source);
+        let order = s.gallery_images(&members);
+        assert_eq!(order.len(), 3);
+        s.selected = s.visible().iter().copied().find(|id| !members.contains(id));
+        assert!(s.selected.is_some());
+        s.step_viewer_image(1);
+        assert_eq!(s.selected, Some(order[0]));
+        s.step_viewer_image(1);
+        assert_eq!(s.selected, Some(order[1]));
+        s.step_viewer_image(10);
+        assert_eq!(s.selected, Some(order[2]));
+        s.step_viewer_image(1);
+        assert_eq!(s.selected, Some(order[2]));
     }
 
     #[test]

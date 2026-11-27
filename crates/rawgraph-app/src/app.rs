@@ -39,7 +39,7 @@ use crate::gpu_path::{RenderPath, RendererMode};
 use crate::gpu_real::GpuSetup;
 use crate::render::{Frame, GpuConfig, GpuHints, Renderer, Reply};
 use crate::scan::{summarize, ScanJob, ScanMsg};
-use crate::session::{ViewSettings, Session};
+use crate::session::{Session, ViewerTarget, ViewSettings};
 use crate::shot::{report, save_png};
 use crate::status::Status;
 use crate::testimages::display_name;
@@ -286,11 +286,7 @@ struct RequestKey {
 impl RequestKey {
     #[cfg(test)]
     fn new(session: &Session, node: NodeId, scopes: Option<PrepareSettings>, overlay: Option<NodeId>) -> Self {
-        Self::for_target(session, node, None, scopes, overlay)
-    }
-
-    fn for_target(session: &Session, node: NodeId, port: Option<usize>, scopes: Option<PrepareSettings>, overlay: Option<NodeId>) -> Self {
-        Self::for_image(session, session.current_image(), node, port, scopes, overlay)
+        Self::for_image(session, session.current_image(), node, None, scopes, overlay)
     }
 
     /// The request for a given image (the compare view renders the reference image this way).
@@ -436,7 +432,7 @@ pub struct App {
     submitted_at: Option<Instant>,
     bench: Option<Bench>,
     gallery_collection: CollectionWorker,
-    gallery_key: Option<(Graph, Option<NodeId>, u64)>,
+    gallery_key: Option<(Graph, Option<NodeId>, u64, usize)>,
     gallery_result: Option<crate::collection::CollectionResult>,
     collection: CollectionWorker,
     collection_key: Option<(Graph, Option<rawgraph_core::NodeId>, u64)>,
@@ -960,6 +956,8 @@ impl App {
         self.xmp_probe = None;
         self.compare.forget();
         self.cmp_panes = [ext::PaneRender::default(), ext::PaneRender::default()];
+        self.gallery_key = None;
+        self.gallery_result = None;
         self.relink = RelinkUi::None;
         self.node_export = None;
         self.run_nodes = None;
@@ -1399,6 +1397,11 @@ impl App {
 
     fn poll_renderer(&mut self, ctx: &egui::Context) {
         let reply = self.renderer.poll();
+        if self.last_key.is_none() {
+            self.renderer.take_refined();
+            self.renderer.take_histogram();
+            return;
+        }
         if let Some(r) = self.renderer.take_refined().filter(|_| !self.compare.active()) {
             // The scopes of the resting GPU picture, now read at the full resolution.
             self.scope_panel.set_prepared(ctx, r.prepared);
@@ -1419,7 +1422,7 @@ impl App {
             }
             match reply {
                 Reply::Frame(f) => {
-                    self.scopes_stale = false;
+                    if !self.compare.active() { self.scopes_stale = false; }
                     self.apply_frame(ctx, &f);
                 }
                 Reply::Refined(_) | Reply::Dumped { .. } | Reply::Histogram(_) => {}
@@ -1432,12 +1435,12 @@ impl App {
                     }
                     self.last_error = Some(message.clone());
                     self.viewer.set_error(message);
-                    self.scopes_stale = true;
+                    if !self.compare.active() { self.scopes_stale = true; }
                 }
                 Reply::Excluded { message, .. } => {
                     self.last_error = None;
                     self.viewer.set_excluded(message);
-                    self.scopes_stale = true;
+                    if !self.compare.active() { self.scopes_stale = true; }
                 }
             }
         }
@@ -1544,12 +1547,12 @@ impl App {
 
     fn refresh_gallery(&mut self) {
         if let Some(result) = self.gallery_collection.poll() {
-            if !self.gallery_collection.pending() {
+            if !self.gallery_collection.pending() && self.gallery_key.as_ref().is_some_and(|key| key.1 == result.view_node) {
                 self.gallery_result = Some(result);
             }
         }
-        let node = self.session.selected_node.filter(|id| self.session.project.graph.node(*id).is_some());
-        let key = (self.neutral_graph(), node, self.session.images_gen);
+        let node = self.primary_target().node;
+        let key = (self.neutral_graph(), node, self.session.images_gen, self.session.scan_found());
         if self.gallery_key.as_ref() != Some(&key) {
             self.gallery_result = None;
             if node.is_some() {
@@ -1560,18 +1563,33 @@ impl App {
         }
     }
 
+    fn gallery_members(result: Option<&crate::collection::CollectionResult>, target: ViewerTarget) -> Option<&std::collections::HashSet<ImageId>> {
+        result.filter(|r| r.view_node.is_some() && r.view_node == target.node).map(|r| &r.view_members)
+    }
+
+    fn single_viewer_request(&self) -> Option<(ImageId, NodeId, Option<usize>)> {
+        let target = if self.compare.active() { self.session.viewer_target(None, self.session.viewed_node) } else { self.primary_target() };
+        let image = target.image?;
+        let (node, port) = self.session.render_viewer_target(target)?;
+        Some((image, node, port))
+    }
+
     fn submit_if_needed(&mut self) {
-        if self.session.selected.is_none() {
-            return;
-        }
-        let Some((node, port)) = self.session.render_target() else {
-            self.last_key = None;
-            self.viewer = Viewer::with_preferences(self.viewer.click_zoom, self.viewer.wheel_navigates);
+        let Some((image, node, port)) = self.single_viewer_request() else {
+            if self.last_key.take().is_some() {
+                self.viewer = Viewer::with_preferences(self.viewer.click_zoom, self.viewer.wheel_navigates);
+                self.frame_info = None;
+                self.last_error = None;
+                if !self.compare.active() {
+                    self.scope_panel.clear();
+                    self.scopes_stale = false;
+                }
+            }
             return;
         };
         // The panels need a few frames to settle; asking before that would use
         // default scope settings and cost a second render.
-        if self.frames < SETTLE_FRAMES {
+        if self.frames < SETTLE_FRAMES || (!self.compare.active() && Self::gallery_members(self.gallery_result.as_ref(), self.primary_target()).is_none()) {
             return;
         }
         let scopes = (!self.compare.active() && self.scopes_pos != ScopesPos::Hidden).then(|| self.scope_panel.prepare_settings());
@@ -1586,7 +1604,7 @@ impl App {
             .filter(|n| n.kind == NodeKind::PointCurve && self.session.project.graph.input_edge(n.id, 0).is_some())
             .map(|n| n.id)
             .filter(|_| port.is_none());
-        let mut key = RequestKey::for_target(&self.session, node, port, scopes, overlay);
+        let mut key = RequestKey::for_image(&self.session, image, node, port, scopes, overlay);
         key.overlay_frame = overlay_frame.clone();
         key.histogram = histogram;
         key.mode = self.renderer_mode;
@@ -1608,7 +1626,7 @@ impl App {
             // waiting for. Keep the last successful texture visible.
             self.viewer.excluded = None;
             self.viewer.error = None;
-            self.renderer.submit_with(self.session.project.graph.clone(), node, port, self.session.current_image(), self.session.view, key.scopes.clone(), key.overlay, hints);
+            self.renderer.submit_with(self.session.project.graph.clone(), node, port, key.image, self.session.view, key.scopes.clone(), key.overlay, hints);
             self.submits += 1;
             self.submitted_at = Some(Instant::now());
             self.last_key = Some(key);
@@ -1665,7 +1683,7 @@ impl App {
     }
 
     fn shot_ready(&self, shot: &Shot) -> bool {
-        let replied = !self.session.demo || true;
+        let expects_frame = self.single_viewer_request().is_some();
         self.frames >= MIN_FRAMES_BEFORE_SHOT
             && self.cli_applied
             && self.scan.is_none()
@@ -1684,12 +1702,11 @@ impl App {
             && (!self.compare.active() || self.cmp_ready())
             && self.export_done_frame.is_none_or(|f| self.frames >= f + 25)
             && !self.collection.pending()
-            && replied
-            && (self.session.selected.is_none() || shot.reply_at.is_some_and(|at| self.frames >= at + 4))
+            && (!expects_frame || shot.reply_at.is_some_and(|at| self.frames >= at + 4))
             && !self.renderer.pending()
             && self.filmstrip.all_loaded()
             && (self.late_disconnect_done || self.cli.late_disconnect.is_empty())
-            && self.last_key.is_some() == self.session.selected.is_some()
+            && self.last_key.is_some() == expects_frame
             && self.curve_hist_ready()
     }
 
@@ -2530,7 +2547,7 @@ impl App {
     fn scopes_ui(&mut self, ui: &mut egui::Ui) {
         let stale = self.scopes_stale;
         let area = ui.available_rect_before_wrap();
-        let step = self.frame_info.as_ref().filter(|f| f.path.is_gpu()).map(|f| f.scope_step);
+        let step = self.frame_info.as_ref().filter(|f| !self.compare.active() && f.path.is_gpu()).map(|f| f.scope_step);
         egui::Frame::NONE.inner_margin(6.0).show(ui, |ui| {
             if let Some(step) = step {
                 scope_step_label(ui, step);
@@ -2687,14 +2704,15 @@ impl App {
             self.compare_area(ui);
             return;
         }
-        if self.session.total_images() == 0 && self.scan.is_none() {
+        if self.primary_target().image.is_none() && self.session.total_images() == 0 && self.scan.is_none() {
             ui.centered_and_justified(|ui| { ui.label("Choose a folder in a Source node to preview its images"); });
             return;
         }
-        if self.session.target_node().is_none() {
+        if self.primary_target().node.is_none() {
             ui.centered_and_justified(|ui| { ui.label("Select a node to view it"); });
             return;
         }
+        if self.primary_target().image.is_none() { return; }
         self.viewer.shows_mask = self
             .session
             .render_target()
@@ -2746,14 +2764,23 @@ impl App {
 
     fn filmstrip_panel(&mut self, ui: &mut egui::Ui, epoch: u32) {
         egui::Panel::left(("filmstrip", epoch)).resizable(true).default_size(232.0).size_range(170.0..=420.0).show(ui, |ui| {
+            let target = self.primary_target();
             egui::Panel::bottom(("filmstrip-info", epoch)).resizable(false).show_separator_line(true).show(ui, |ui| {
                 ui.add_space(4.0);
-                Filmstrip::capture_info(ui, &self.session);
+                Filmstrip::capture_info(ui, &self.session, target.image);
                 ui.add_space(4.0);
             });
-            let members = self.gallery_result.as_ref().filter(|r| r.view_node == self.session.selected_node).map(|r| &r.view_members);
-            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.filmstrip.show(ui, &mut self.session, members));
+            let members = Self::gallery_members(self.gallery_result.as_ref(), target);
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.filmstrip.show(ui, &mut self.session, target, members));
         });
+    }
+
+    fn primary_frame(&self) -> (Option<egui::TextureId>, [u32; 2]) {
+        if self.compare.active() {
+            self.primary_split_frame()
+        } else {
+            (self.single_viewer_request().and_then(|_| self.viewer.texture_id()), self.viewer.frame_size)
+        }
     }
 
     fn secondary_windows(&mut self, ctx: &egui::Context) {
@@ -2765,25 +2792,23 @@ impl App {
         self.clean_win.ensure_monitor_exists(ctx, clean_id, &monitors, 0.6);
         self.scopes_win.ensure_monitor_exists(ctx, scopes_id, &monitors, 0.5);
 
-        let viewer = &mut self.viewer;
-        let (tools, session) = (&mut self.tools, &mut self.session);
-        let mut tool_message = None;
-        let out = self.viewer_win.show(ctx, viewer_id, "RawGraph - Viewer", false, &monitors, Some(true), |ui| {
-            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| tool_message = show_viewer(viewer, tools, session, ui));
+        let mut viewer_win = std::mem::take(&mut self.viewer_win);
+        let out = viewer_win.show(ctx, viewer_id, "RawGraph - Viewer", false, &monitors, Some(true), |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                if self.compare.active() {
+                    self.compare_area(ui);
+                } else if let Some(message) = self.single_viewer_request().and_then(|_| show_viewer(&mut self.viewer, &mut self.tools, &mut self.session, ui)) {
+                    self.status.error(message);
+                }
+            });
         });
-        if let Some(m) = tool_message {
-            self.status.error(m);
-        }
+        self.viewer_win = viewer_win;
         if out.close && self.workspace == Workspace::Dual {
             // Closing the detached viewer returns to the single workspace.
             self.workspace = Workspace::Single;
         }
 
-        let (texture, size) = if self.compare.active() {
-            self.primary_split_frame()
-        } else {
-            (self.viewer.texture_id(), self.viewer.frame_size)
-        };
+        let (texture, size) = self.primary_frame();
         let editor_focused = ctx.input(|i| {
             i.focused || [viewer_id, clean_id, scopes_id].into_iter().any(|id| {
                 i.raw.viewports.get(&id).and_then(|v| v.focused) == Some(true)
@@ -2809,7 +2834,7 @@ impl App {
 
         let panel = &mut self.scope_panel;
         let stale = self.scopes_stale;
-        let step = self.frame_info.as_ref().filter(|f| f.path.is_gpu()).map(|f| f.scope_step);
+        let step = self.frame_info.as_ref().filter(|f| !self.compare.active() && f.path.is_gpu()).map(|f| f.scope_step);
         self.scopes_win.show(ctx, scopes_id, "RawGraph - Scopes", true, &monitors, None, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 let area = ui.available_rect_before_wrap();
@@ -2927,6 +2952,7 @@ impl eframe::App for App {
         let status_top = egui::Panel::bottom("status").show_separator_line(true).show(ui, |ui| self.status_bar(ui)).response.rect.top();
         let content = ctx.content_rect();
         self.window_area = egui::Rect::from_min_max(egui::pos2(content.left(), menu_bottom + 2.0), egui::pos2(content.right(), (status_top - 2.0).max(menu_bottom + 40.0)));
+        self.resolve_compare_pins();
         self.refresh_gallery();
         match self.workspace {
             Workspace::Single => self.layout_single(ui, &mut cmds),
@@ -3388,6 +3414,103 @@ mod tests {
     use super::*;
     use crate::session::tests::{demo_session, png_project, provider};
     use crate::session::demo_graph;
+
+    fn headless_app(dir: &std::path::Path) -> App {
+        let ctx = egui::Context::default();
+        App::new(&eframe::CreationContext::_new_kittest(ctx), Cli { demo: true, data_dir: Some(dir.to_owned()), ..Default::default() })
+    }
+
+    fn load_gallery(app: &mut App) {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.refresh_gallery();
+            if App::gallery_members(app.gallery_result.as_ref(), app.primary_target()).is_some() { return; }
+            assert!(Instant::now() < until, "gallery worker did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn single_viewer_pins_gallery_and_scope_request_until_unpinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        let develop = app.session.node_by_index(1).unwrap();
+        let generator = app.session.project.graph.add_node(NodeKind::Generator, [0.0; 2]);
+        app.session.selected_node = Some(generator);
+        app.session.viewed_node = Some(develop);
+        app.frames = SETTLE_FRAMES;
+        app.scopes_pos = ScopesPos::RightColumn;
+        load_gallery(&mut app);
+        let members = App::gallery_members(app.gallery_result.as_ref(), app.primary_target()).unwrap();
+        assert_eq!(app.session.gallery_images(members), app.session.visible());
+        app.submit_if_needed();
+        let key = app.last_key.as_ref().unwrap();
+        assert_eq!(key.node, develop);
+        assert!(key.scopes.is_some());
+        assert_eq!(app.session.selected_node, Some(generator), "inspector selection is independent");
+
+        app.session.viewed_node = None;
+        assert!(App::gallery_members(app.gallery_result.as_ref(), app.primary_target()).is_none(), "discard stale membership");
+        load_gallery(&mut app);
+        let members = App::gallery_members(app.gallery_result.as_ref(), app.primary_target()).unwrap().clone();
+        assert_eq!(members.len(), 1);
+        app.session.step_viewer_image(1);
+        app.submit_if_needed();
+        let key = app.last_key.as_ref().unwrap();
+        assert_eq!(key.node, generator);
+        assert!(members.contains(&key.image));
+        assert!(key.scopes.is_some());
+        app.shutdown();
+    }
+
+    #[test]
+    fn split_gallery_scopes_and_clean_feed_follow_right_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        let develop = app.session.node_by_index(1).unwrap();
+        let generator = app.session.project.graph.add_node(NodeKind::Generator, [0.0; 2]);
+        let ctx = egui::Context::default();
+        app.toggle_compare();
+        app.frames = SETTLE_FRAMES;
+        app.scopes_pos = ScopesPos::RightColumn;
+        let image = app.session.visible()[1];
+        app.compare.panes[1].node = Some(develop);
+        app.compare.panes[1].image = Some(image);
+        app.compare.panes[0].node = Some(generator);
+        app.session.selected_node = Some(generator);
+        let (ids, captures) = app.session.id_captures();
+        let generator_image = *crate::collection::view_members(&app.session.project.graph, &ids, &captures, generator).iter().next().unwrap();
+        app.compare.panes[0].image = Some(generator_image);
+        load_gallery(&mut app);
+        let target = app.primary_target();
+        assert_eq!((target.node, target.image), (Some(develop), Some(image)));
+        let members = App::gallery_members(app.gallery_result.as_ref(), target).unwrap();
+        assert!(members.contains(&image) && !members.contains(&generator_image));
+        let selection = app.session.selected;
+        app.session.step_viewer_target(target, 1);
+        assert_eq!(app.session.selected, selection, "stepping cannot move the image pin");
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            ctx.run_ui(egui::RawInput::default(), |_| app.compare_step(&ctx)).drop_without_applying_deltas();
+            // The CPU renderer publishes its picture before the asynchronous scopes.
+            if app.cmp_ready() && !app.scope_panel.needs_refresh() { break; }
+            assert!(Instant::now() < until, "compare frames or primary scopes did not arrive");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.pane_key(1).map(|key| (key.node, key.image)), Some((develop, image)));
+        assert!(app.primary_frame().0.is_some(), "right render supplies the Clean Feed texture");
+        let frame = app.primary_frame();
+        app.compare.panes[0] = Default::default();
+        assert_eq!(app.primary_target(), target);
+        assert_eq!(app.primary_frame(), frame);
+        app.compare.panes[1].node = None;
+        app.resolve_compare_pins();
+        assert_eq!(app.primary_target(), target, "image-only pin retains its last compatible stage");
+        app.compare.panes[1].image = None;
+        app.resolve_compare_pins();
+        assert_eq!(app.primary_target().node, Some(generator));
+        app.shutdown();
+    }
 
     #[test]
     fn extensions_are_enforced() {

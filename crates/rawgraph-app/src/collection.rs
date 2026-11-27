@@ -98,6 +98,18 @@ fn input_members(graph: &Graph, catalog: &Catalog, node: NodeId, port: usize) ->
         .collect()
 }
 
+/// Membership used by the viewer and gallery. A Split shows its input
+/// collection, regardless of which output port each image leaves through.
+fn node_members(graph: &Graph, catalog: &Catalog, node: NodeId, kind: NodeKind) -> Vec<ImageId> {
+    if kind == NodeKind::MetadataSplit { input_members(graph, catalog, node, 0) } else { graph.members(node, 0, catalog) }
+}
+
+pub fn view_members(graph: &Graph, ids: &[ImageId], captures: &Captures, view_node: NodeId) -> HashSet<ImageId> {
+    let capture = |i: ImageId| captures.get(&i).cloned();
+    let catalog = Catalog { images: ids, capture: &capture };
+    graph.node(view_node).into_iter().flat_map(|node| node_members(graph, &catalog, node.id, node.kind)).collect()
+}
+
 /// Pure computation of everything above. Every collection is listed once per node with
 /// `Graph::members` (the catalog-based query), never asked image by image.
 pub fn compute(graph: &Graph, ids: &[ImageId], captures: &Captures, view_node: Option<NodeId>) -> CollectionResult {
@@ -106,8 +118,7 @@ pub fn compute(graph: &Graph, ids: &[ImageId], captures: &Captures, view_node: O
     let catalog = Catalog { images: ids, capture: &capture };
     let mut r = CollectionResult { view_node, ..Default::default() };
     for node in graph.nodes() {
-        // A Split "contains" what reaches it (any port); every other node what leaves it.
-        let own = if node.kind == NodeKind::MetadataSplit { input_members(graph, &catalog, node.id, 0) } else { graph.members(node.id, 0, &catalog) };
+        let own = node_members(graph, &catalog, node.id, node.kind);
         let n = own.len();
         r.counts.insert(node.id, n);
         if view_node == Some(node.id) {
