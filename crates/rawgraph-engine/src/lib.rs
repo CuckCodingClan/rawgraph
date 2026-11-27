@@ -2140,7 +2140,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_generator_radius_mask_image_and_luma() {
+    fn standalone_generator_radius_control_accepts_luma_alias() {
         let mut g = Graph::new();
         let src = g.add_node(NodeKind::Source, [0.0; 2]);
         let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
@@ -2151,9 +2151,10 @@ mod tests {
         *p.catalog.lock().unwrap() = vec![A];
         let mut ev = Evaluator::new();
         let plain = run(&g, blur, A, &p, &mut ev);
+        let radius = g.expose_parameter(blur, "radius", PortType::Images).unwrap();
         let luma = g.expose_output(generator, 0, "Luma").unwrap();
         for port in [0, luma] {
-            g.connect_ports(generator, port, blur, 1).unwrap();
+            g.connect_ports(generator, port, blur, radius).unwrap();
             let mapped = run(&g, blur, A, &p, &mut ev);
             assert_ne!(*plain, *mapped);
             assert!(Graph::from_json(&g.to_json()).is_ok());
@@ -3519,24 +3520,27 @@ mod tests {
         for kind in [NodeKind::Contrast, NodeKind::Saturation, NodeKind::Sharpen] {
             let (mut g, _, effect) = one(kind);
             let map = add(&mut g, NodeKind::Generator);
-            set(&mut g, map, "width", A, 64.0);
+            let width = if kind == NodeKind::Sharpen { 512 } else { 64 };
+            set(&mut g, map, "width", A, width as f32);
             set(&mut g, map, "height", A, 64.0);
             set(&mut g, map, "gradient_scale", A, 50.0);
             if kind == NodeKind::Sharpen { set(&mut g, effect, "radius", A, 2.0); }
             let p = TestProvider::default();
+            *p.dims.lock().unwrap() = Some((width, 64));
+            p.texture.store(true, Ordering::Relaxed);
             let mut ev = Evaluator::new();
             let spec = kind.param_spec("amount").unwrap();
             set(&mut g, effect, "amount", A, spec.min);
             let black = run(&g, effect, A, &p, &mut ev);
             set(&mut g, effect, "amount", A, spec.max);
             let white = run(&g, effect, A, &p, &mut ev);
-            assert_ne!(black, white, "{kind:?}");
+            assert!(black != white, "{kind:?}");
             let port = g.expose_parameter(effect, "amount", PortType::Images).unwrap();
             g.connect(map, effect, port).unwrap();
             let spatial = run(&g, effect, A, &p, &mut ev);
             for y in 0..64 {
-                for x in 0..12 { assert_eq!(spatial.pixel(x, y), black.pixel(x, y), "{kind:?}"); }
-                for x in 52..64 { assert_eq!(spatial.pixel(x, y), white.pixel(x, y), "{kind:?}"); }
+                for x in 0..width / 5 { assert_eq!(spatial.pixel(x, y), black.pixel(x, y), "{kind:?}"); }
+                for x in (width - width / 5)..width { assert_eq!(spatial.pixel(x, y), white.pixel(x, y), "{kind:?}"); }
             }
             assert_ne!(spatial, black);
             assert_ne!(spatial, white);

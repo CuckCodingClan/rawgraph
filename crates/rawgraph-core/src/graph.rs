@@ -3486,6 +3486,10 @@ mod tests {
         assert!(n.data(A).is_some(), "painted for A");
         assert!(n.data(B).is_none(), "B is untouched");
         let capture = |_: ImageId| None;
+        assert!(!g.contains(brush, B, &capture));
+        assert!(g.contains(brush, ImageId(u64::MAX - brush.0), &capture));
+        let source = g.add_node(NodeKind::Source, [0.0; 2]);
+        g.connect(source, brush, 0).unwrap();
         assert!(g.contains(brush, B, &capture));
         assert_eq!(Graph::from_json(&g.to_json()), Ok(g));
     }
