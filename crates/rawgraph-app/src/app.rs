@@ -401,6 +401,8 @@ pub struct App {
     last_frame_at: Option<Instant>,
     viewer: Viewer,
     filmstrip: Filmstrip,
+    quick_preview: crate::quick_preview::QuickPreview,
+    quick_generation: u64,
     editor: GraphEditor,
     scope_panel: ScopePanel,
     /// UI-thread time of the last scope upload (`set_prepared`) in ms.
@@ -674,6 +676,8 @@ impl App {
             last_frame_at: None,
             viewer: Viewer::with_preferences(settings.click_zoom, settings.wheel_navigates),
             filmstrip,
+            quick_preview: crate::quick_preview::QuickPreview::new(cc.egui_ctx.clone(), thumb_cache.clone()),
+            quick_generation: 0,
             editor,
             scope_panel: ScopePanel::new(),
             scope_ms: 0.0,
@@ -1407,7 +1411,8 @@ impl App {
             self.renderer.take_histogram();
             return;
         }
-        if let Some(r) = self.renderer.take_refined().filter(|_| !self.compare.active()) {
+        let matches_selection = !self.viewer.awaiting_final() || self.last_key.as_ref().map(|k| k.image) == self.viewer.preview_image;
+        if let Some(r) = self.renderer.take_refined().filter(|_| matches_selection && !self.compare.active()) {
             // The scopes of the resting GPU picture, now read at the full resolution.
             self.scope_panel.set_prepared(ctx, r.prepared);
             self.scope_worker_ms = r.scopes_ms;
@@ -1422,6 +1427,7 @@ impl App {
             self.session.curve_hist = Some(crate::session::CurveHist { node: h.node, image: h.image, bins: h.bins });
         }
         if let Some(reply) = reply {
+            if !matches_selection { return; }
             if let Some(s) = &mut self.shot {
                 s.reply_at = Some(self.frames);
             }
@@ -1581,6 +1587,47 @@ impl App {
         Some((image, node, port))
     }
 
+    fn update_selection_preview(&mut self, ctx: &egui::Context) {
+        let target = if self.compare.active() {
+            let target = self.primary_target();
+            target.image.zip(target.node)
+        } else {
+            self.single_viewer_request().map(|(image, node, _)| (image, node))
+        };
+        let viewer = if self.compare.active() { &mut self.cmp_panes[1].viewer } else { &mut self.viewer };
+        let Some((image, node)) = target else {
+            if viewer.preview_image.is_some() { *viewer = Viewer::with_preferences(viewer.click_zoom, viewer.wheel_navigates); }
+            return;
+        };
+        if viewer.preview_image != Some(image) {
+            self.quick_generation = self.quick_generation.wrapping_add(1);
+            viewer.select(image, self.quick_generation);
+            self.prefetch.forget();
+            self.scopes_stale = true;
+            let provider = &self.session.provider;
+            if let Some(proxy) = provider.cached_proxy(image) {
+                let size = (proxy.width(), proxy.height());
+                let tex = crate::quick_preview::proxy_texture(ctx, &proxy, self.session.view.transform());
+                viewer.set_placeholder(self.quick_generation, tex, crate::quick_preview::geometry(&self.session, node, image, size));
+            } else if let Some(tex) = self.filmstrip.thumbs.texture(image) {
+                let [w, h] = tex.size();
+                let size = crate::quick_preview::estimate_proxy_size(provider, image, (w as u32, h as u32));
+                viewer.set_placeholder(self.quick_generation, tex, crate::quick_preview::geometry(&self.session, node, image, size));
+            } else if let Some(path) = provider.path_of(image) {
+                let hash = self.session.entry(image).map_or_else(String::new, |e| e.content_hash.clone());
+                self.quick_preview.request(crate::quick_preview::Job { generation: self.quick_generation, path, hash });
+            }
+            ctx.request_repaint();
+        }
+        for (generation, pixels) in self.quick_preview.poll() {
+            if generation != self.quick_generation || !viewer.awaiting_final() { continue; }
+            let [w, h] = pixels.size;
+            let size = crate::quick_preview::estimate_proxy_size(&self.session.provider, image, (w as u32, h as u32));
+            let tex = ctx.load_texture("embedded selection preview", pixels, egui::TextureOptions::LINEAR);
+            viewer.set_placeholder(generation, tex, crate::quick_preview::geometry(&self.session, node, image, size));
+        }
+    }
+
     fn submit_if_needed(&mut self) {
         let Some((image, node, port)) = self.single_viewer_request() else {
             if self.last_key.take().is_some() {
@@ -1633,6 +1680,7 @@ impl App {
             // waiting for. Keep the last successful texture visible.
             self.viewer.excluded = None;
             self.viewer.error = None;
+            self.viewer.rendering();
             self.renderer.submit_with(self.session.project.graph.clone(), node, port, key.image, self.session.view, key.scopes.clone(), key.overlay, hints);
             self.submits += 1;
             self.submitted_at = Some(Instant::now());
@@ -2721,13 +2769,6 @@ impl App {
             return;
         }
         if self.primary_target().image.is_none() { return; }
-        // Keep the previous frame visible while a proxy decodes.
-        self.viewer.busy = None;
-        if self.renderer.pending() && self.session.selected.is_some_and(|id| !self.session.provider.is_cached(id)) {
-            if let Some(e) = self.session.current_entry() {
-                self.viewer.busy = Some(format!("Decoding {}...", display_name(e)));
-            }
-        }
         if let Some(message) = show_viewer(&mut self.viewer, &mut self.tools, &mut self.session, ui) {
             self.status.error(message);
         }
@@ -2812,6 +2853,7 @@ impl App {
         }
 
         let (texture, size) = self.primary_frame();
+        let uv = if self.compare.active() { self.cmp_panes[1].viewer.preview_uv } else { self.viewer.preview_uv };
         let editor_focused = ctx.input(|i| {
             i.focused || [viewer_id, clean_id, scopes_id].into_iter().any(|id| {
                 i.raw.viewports.get(&id).and_then(|v| v.focused) == Some(true)
@@ -2825,7 +2867,7 @@ impl App {
         });
         let clean_out = self.clean_win.show(ctx, clean_id, "RawGraph - Clean feed", false, &monitors, Some(editor_focused), |ui| {
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-                viewer::paint_clean(ui, texture, size);
+                viewer::paint_clean(ui, texture, size, uv);
             });
         });
         if self.clean_win.state.open && !clean_out.close && editor_refocused {
@@ -2957,11 +2999,13 @@ impl eframe::App for App {
         self.window_area = egui::Rect::from_min_max(egui::pos2(content.left(), menu_bottom + 2.0), egui::pos2(content.right(), (status_top - 2.0).max(menu_bottom + 40.0)));
         self.resolve_compare_pins();
         self.refresh_gallery();
+        self.update_selection_preview(&ctx);
         match self.workspace {
             Workspace::Single => self.layout_single(ui, &mut cmds),
             Workspace::Dual => self.layout_dual(ui, &mut cmds),
         }
         self.handle_ui_requests(&ctx);
+        self.update_selection_preview(&ctx);
         self.shortcuts_window(&ctx);
         self.report_window(&ctx);
         self.prompt_window(&ctx);
@@ -2989,6 +3033,7 @@ impl eframe::App for App {
         self.autosave_step(&ctx);
         self.refresh_collection();
         self.tool_bench_step(&ctx);
+        self.update_selection_preview(&ctx);
         self.compare_step(&ctx);
         self.submit_if_needed();
         self.crash_step();
@@ -3318,7 +3363,7 @@ pub fn apply_cli_state(session: &mut Session, cli: &Cli) {
 pub fn show_viewer(viewer: &mut Viewer, tools: &mut Tools, session: &mut Session, ui: &mut egui::Ui) -> Option<String> {
     crate::tools::prepare_viewer(viewer, session);
     let geom = viewer.show(ui);
-    let result = geom.as_ref().and_then(|geom| tools.show(ui, geom, session, viewer.frame_size));
+    let result = if viewer.awaiting_final() { None } else { geom.as_ref().and_then(|geom| tools.show(ui, geom, session, viewer.frame_size)) };
     let step = std::mem::take(&mut viewer.navigation_step);
     if step != 0 { session.step_viewer_image(step); }
     result
@@ -3432,6 +3477,38 @@ mod tests {
             assert!(Instant::now() < until, "gallery worker did not finish");
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn gallery_selection_displays_cached_pixels_before_the_worker_reply() {
+        use rawgraph_engine::ImageProvider;
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        let ctx = egui::Context::default();
+        app.session.selected_node = app.session.node_by_index(0);
+        app.frames = SETTLE_FRAMES;
+        load_gallery(&mut app);
+        let before = app.single_viewer_request().unwrap().0;
+        app.session.select_index(1);
+        let after = app.single_viewer_request().unwrap().0;
+        assert_ne!(before, after);
+        app.session.provider.image(after).unwrap();
+        ctx.run_ui(egui::RawInput::default(), |_| app.update_selection_preview(&ctx)).drop_without_applying_deltas();
+        assert_eq!(app.viewer.preview_image, Some(after));
+        let placeholder = app.viewer.texture_id().expect("available in the selection update");
+        assert_eq!(app.viewer.badge(&ctx, Instant::now()), Some("Preview"));
+        assert!(app.scopes_stale);
+        app.submit_if_needed();
+        let until = Instant::now() + Duration::from_secs(10);
+        while app.viewer.awaiting_final() {
+            ctx.run_ui(egui::RawInput::default(), |_| app.poll_renderer(&ctx)).drop_without_applying_deltas();
+            assert!(Instant::now() < until, "render did not complete");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_ne!(app.viewer.texture_id().unwrap(), placeholder);
+        assert_eq!(app.viewer.badge(&ctx, Instant::now()), None);
+        assert!(!app.scopes_stale);
+        app.shutdown();
     }
 
     #[test]

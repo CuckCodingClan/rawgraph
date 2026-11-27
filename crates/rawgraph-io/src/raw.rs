@@ -879,7 +879,7 @@ fn mat_mul(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
 }
 
 /// Full resolution: white balance + clip handling + colour matrix in one pass. Output RGBA f32.
-fn convert_full(dev: &Developed, x: &ColourXform, neutralize: bool) -> (usize, usize, Vec<f32>) {
+fn convert_full(dev: &Developed, x: &ColourXform, neutralize: bool, gain: f32) -> (usize, usize, Vec<f32>) {
     let (cw, ch) = (dev.crop.d.w, dev.crop.d.h);
     let stride = dev.rgb.width;
     let px = dev.rgb.pixels();
@@ -888,7 +888,7 @@ fn convert_full(dev: &Developed, x: &ColourXform, neutralize: bool) -> (usize, u
         let base = (dev.crop.p.y + y) * stride + dev.crop.p.x;
         for (o, p) in row.as_chunks_mut::<4>().0.iter_mut().zip(&px[base..base + cw]) {
             let c = mat_mul(&x.m, white_balance_pixel(p, &x.wb, neutralize));
-            *o = [c[0], c[1], c[2], 1.0];
+            *o = [c[0] * gain, c[1] * gain, c[2] * gain, 1.0];
         }
     });
     (cw, ch, out)
@@ -1011,16 +1011,15 @@ type FastPlan = (([f32; 4], [f32; 4]), [usize; 4], Rect, usize);
 fn load_inner(path: &Path, options: &LoadOptions, mode: Mode) -> Result<(Loaded, Stages), IoError> {
     let mut st = Stages::default();
     let neutralize = options.neutralize_clipped_highlights;
-    let (decoder, src) = st.time("container", || {
-        let src = open_source(path)?;
-        let decoder = rawler::get_decoder(&src).map_err(rawler_err)?;
-        Ok::<_, IoError>((decoder, src))
-    })?;
+    let src = st.time("file read", || open_source(path))?;
+    let decoder = st.time("container", || rawler::get_decoder(&src).map_err(rawler_err))?;
     let params = RawDecodeParams::default();
     let md = decoder.raw_metadata(&src, &params).map_err(rawler_err)?;
     let raw = st.time("decompress", || decoder.raw_image(&src, &params, false).map_err(rawler_err))?;
     let capture = capture_from(&md, || Some(WbSource::of(&raw)), path);
     let orientation = orientation_of(&md);
+    // Multiply after the matrix exactly as in the former separate baseline pass.
+    let gain = 2.0f32.powf(capture.baseline_exposure.filter(|v| v.is_finite()).unwrap_or(0.35) + 1.6);
 
     if raw.fuji_rotation_width.is_some() {
         return Err(IoError::Unsupported("Fuji rotated (SuperCCD) sensors".into()));
@@ -1063,7 +1062,7 @@ fn load_inner(path: &Path, options: &LoadOptions, mode: Mode) -> Result<(Loaded,
         let (cw0, ch0) = (dev.crop.d.w, dev.crop.d.h);
         let f = factor_for(cw0, ch0);
         if f == 1 {
-            let (w, h, data) = st.time("white balance + clip + matrix", || convert_full(&dev, &xform, neutralize));
+            let (w, h, data) = st.time("white balance + clip + matrix + baseline", || convert_full(&dev, &xform, neutralize, gain));
             drop(dev);
             return finish(st, w, h, data, orientation, capture, (cw0, ch0));
         }
@@ -1071,11 +1070,11 @@ fn load_inner(path: &Path, options: &LoadOptions, mode: Mode) -> Result<(Loaded,
         (cw, ch, ow, oh, small) = (cw0, ch0, a, b, v);
     }
 
-    let data = st.time("colour matrix", || {
+    let data = st.time("colour matrix + baseline", || {
         let mut out = vec![0.0f32; ow * oh * 4];
         out.par_chunks_mut(4).zip(small.par_iter()).for_each(|(o, p)| {
             let c = mat_mul(&xform.m, *p);
-            o.copy_from_slice(&[c[0], c[1], c[2], 1.0]);
+            o.copy_from_slice(&[c[0] * gain, c[1] * gain, c[2] * gain, 1.0]);
         });
         out
     });
@@ -1091,12 +1090,6 @@ fn finish(
     capture: CaptureInfo,
     crop_size: (usize, usize),
 ) -> Result<(Loaded, Stages), IoError> {
-    // Apply the RAW input rendering gain once, independent of the graph. Both full
-    // and proxy decoders converge here; never apply it to rendered files.
-    let ev = capture.baseline_exposure.filter(|v| v.is_finite()).unwrap_or(0.35) + 1.6;
-    let gain = 2.0f32.powf(ev);
-    let mut data = data;
-    data.par_chunks_mut(4).for_each(|p| { for c in &mut p[..3] { *c *= gain; } });
     let (w, h, data) = st.time("orientation", || orient_rgba(w as u32, h as u32, data, orientation));
     let image = ImageBuf::from_rgba(w, h, data).ok_or_else(|| IoError::Decode("internal buffer size mismatch".into()))?;
     let full_size = oriented_size(crop_size.0 as u32, crop_size.1 as u32, orientation);
@@ -1116,15 +1109,22 @@ fn upright_embedded(img: image::DynamicImage, orientation: u16) -> image::Dynami
     img
 }
 
-pub fn load_thumbnail(path: &Path, max_dim: u32) -> Result<(u32, u32, Vec<u8>), IoError> {
-    let embedded = guard("raw", || {
+/// Extracts a camera preview without falling back to sensor decode.
+pub fn load_embedded_preview(path: &Path, max_dim: u32) -> Result<Option<PreviewPixels>, IoError> {
+    embedded_preview(path, max_dim.max(1), 1)
+}
+
+type PreviewPixels = (u32, u32, Vec<u8>);
+
+fn embedded_preview(path: &Path, max_dim: u32, min_dim: u32) -> Result<Option<PreviewPixels>, IoError> {
+    guard("raw", || {
         let src = open_source(path)?;
         let decoder = rawler::get_decoder(&src).map_err(rawler_err)?;
         let params = RawDecodeParams::default();
         let md = decoder.raw_metadata(&src, &params).map_err(rawler_err)?;
         let orientation = orientation_of(&md);
         // Accept an embedded image only if it is not much smaller than requested.
-        let good = |i: &image::DynamicImage| i.width().max(i.height()) >= max_dim / 2;
+        let good = |i: &image::DynamicImage| i.width().max(i.height()) >= min_dim;
         if let Ok(Some(img)) = decoder.preview_image(&src, &params) {
             if good(&img) {
                 return Ok(Some(upright_embedded(img, orientation)));
@@ -1136,9 +1136,12 @@ pub fn load_thumbnail(path: &Path, max_dim: u32) -> Result<(u32, u32, Vec<u8>), 
             }
         }
         Ok(None)
-    });
-    if let Ok(Some(img)) = embedded {
-        return Ok(crate::dynamic_to_thumb(img, max_dim));
+    }).map(|img| img.map(|img| crate::dynamic_to_thumb(img, max_dim)))
+}
+
+pub fn load_thumbnail(path: &Path, max_dim: u32) -> Result<PreviewPixels, IoError> {
+    if let Ok(Some(img)) = embedded_preview(path, max_dim, max_dim / 2) {
+        return Ok(img);
     }
     // No (usable) embedded preview: decode a proxy and encode it as sRGB.
     let loaded = load(path, &LoadOptions { max_dim: Some(max_dim), ..Default::default() })?;

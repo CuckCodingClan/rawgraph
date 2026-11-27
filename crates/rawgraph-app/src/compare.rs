@@ -56,6 +56,8 @@ impl Default for SharedView {
 pub struct Half<'a> {
     pub texture: Option<egui::TextureId>,
     pub size: [u32; 2],
+    pub uv: Option<[Pos2; 4]>,
+    pub badge: Option<&'static str>,
     pub label: String,
     pub entry: Option<&'a ImageEntry>,
     /// Message instead of the picture (error, still loading).
@@ -130,18 +132,21 @@ pub fn show(ui: &mut egui::Ui, view: &mut SharedView, viewer: &mut crate::viewer
         match (half.texture, size_of(half)) {
             (Some(t), Some(sz)) => {
                 let img = Rect::from_center_size(area.center() + view.pan, sz * scale);
-                p.image(t, img, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                if let Some(uv) = half.uv { crate::quick_preview::paint(&p, t, img, uv, Color32::WHITE); }
+                else { p.image(t, img, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE); }
                 if let Some(note) = &half.note {
                     let pos = area.right_bottom() - Vec2::new(10.0, 10.0);
                     p.text(pos, egui::Align2::RIGHT_BOTTOM, note, egui::FontId::proportional(12.0), Color32::WHITE);
                 }
             }
-            _ => {
+            _ if half.note.is_some() || half.badge.is_none() => {
                 let text = half.note.clone().unwrap_or_else(|| "Rendering...".to_owned());
                 p.text(area.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(15.0), Color32::from_gray(170));
             }
+            _ => {}
         }
         paint_label(&p, area, half);
+        if let Some(badge) = half.badge { crate::viewer::paint_progress(&p, area, badge); }
     }
     painter.rect_filled(Rect::from_min_max(Pos2::new(rect.center().x - 1.0, rect.min.y), Pos2::new(rect.center().x + 1.0, rect.max.y)), 0.0, Color32::from_gray(60));
     scale

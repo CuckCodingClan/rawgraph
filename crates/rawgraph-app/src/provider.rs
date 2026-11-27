@@ -286,6 +286,31 @@ impl FileProvider {
         self.paths.read().ok()?.get(&id).cloned()
     }
 
+    pub fn cached_proxy(&self, id: ImageId) -> Option<Arc<ImageBuf>> {
+        self.cache.lock().ok()?.lru.get(&(id, self.preview_size()))
+    }
+
+    /// Speculative work never claims a foreground inflight slot. If a worker
+    /// needs the same uncached image, it can start immediately on its own thread.
+    pub fn prefetch(&self, id: ImageId) {
+        self.prefetch_with(id, |path, preview| self.decode(id, path, preview));
+    }
+
+    fn prefetch_with(&self, id: ImageId, decode: impl FnOnce(&Path, u32) -> Result<Arc<ImageBuf>, String>) {
+        let Some(path) = self.path_of(id) else { return };
+        let preview = self.preview_size();
+        let key = (id, preview);
+        if self.cache.lock().is_ok_and(|c| c.lru.contains(&key) || c.inflight.contains(&key)) { return; }
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        if let Ok(img) = decode(&path, preview) {
+            if let Ok(mut c) = self.cache.lock() {
+                if self.epoch.load(Ordering::Relaxed) == epoch && !c.lru.contains(&key) {
+                    c.lru.insert(key, img);
+                }
+            }
+        }
+    }
+
     /// True if a proxy for `id` at the current preview size is in memory.
     pub fn is_cached(&self, id: ImageId) -> bool {
         let key = (id, self.preview_size());
@@ -348,7 +373,7 @@ impl ImageProvider for FileProvider {
                     return Ok(hit);
                 }
                 if c.inflight.contains(&key) {
-                    // Another thread (prefetch or worker) is decoding the same image.
+                    // Another foreground worker is decoding the same image.
                     c = self.done.wait(c).map_err(|_| "image cache is unavailable".to_owned())?;
                     continue;
                 }
@@ -400,6 +425,31 @@ mod tests {
 
     fn img(w: u32, h: u32) -> Arc<ImageBuf> {
         Arc::new(ImageBuf::new(w, h))
+    }
+
+    #[test]
+    fn foreground_does_not_wait_for_speculation_of_same_image() {
+        let provider = Arc::new(FileProvider::new(32 << 20));
+        let id = ImageId(1);
+        provider.set_paths([(id, PathBuf::from("demo:1"))]);
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let p = provider.clone();
+        let background = std::thread::spawn(move || p.prefetch_with(id, |_, _| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(img(1, 1))
+        }));
+        started.recv().unwrap();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let p = provider.clone();
+        let foreground = std::thread::spawn(move || done_tx.send(p.image(id)).unwrap());
+        let result = done.recv_timeout(std::time::Duration::from_secs(5));
+        release.send(()).unwrap();
+        background.join().unwrap();
+        foreground.join().unwrap();
+        assert!(result.unwrap().unwrap().width() > 1);
+        assert!(provider.cached_proxy(id).unwrap().width() > 1);
     }
 
     #[test]
