@@ -126,7 +126,7 @@ cargo run --release -p rawgraph-app -- --open-folder <folder with RAW files>
 cargo test --workspace
 ```
 
-For quick testing on Windows, double-click `RawGraph Dev.cmd` in the repository root. It builds and runs the current source checkout in release mode, with build output in `..\rawgraph-target-windows`. Later runs rebuild only what changed. If the build fails, the window stays open to show the error.
+For quick testing on Windows, double-click `RawGraph Dev.cmd` in the repository root (or press Ctrl+Shift+B in VS Code). It builds and runs the current source checkout with the `iter` profile: release optimisation without link-time optimisation and with incremental compilation, so a rebuild after a small change takes seconds instead of minutes. Build output goes to the local disk (`%LOCALAPPDATA%\rawgraph-target`; set `RAWGRAPH_TARGET` to change it), because compiling into a network share is much slower. Shipped preview builds still use `--release`. If the build fails, the window stays open to show the error.
 
 CI (`.github/workflows/ci.yml`): Linux clippy + tests on every push to `main` and every pull request, Windows tests on pull requests, macOS only when started manually.
 
