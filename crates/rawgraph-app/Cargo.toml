@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "accesskit", "persistence", "default_fonts", "wayland", "x11"] }
+half = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rawgraph-batch = { version = "26.11.1", path = "../rawgraph-batch" }
 rawgraph-core.workspace = true
@@ -22,7 +23,7 @@ rfd = "0.18.0"
 serde = { workspace = true, features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

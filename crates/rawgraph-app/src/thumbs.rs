@@ -107,12 +107,13 @@ pub fn fetch_thumb(cache: Option<&ThumbCache>, hash: &str, size: u32, decode: im
 }
 
 struct Shared {
-    wanted: Mutex<VecDeque<Wanted>>,
+    wanted: Mutex<VecDeque<(u64, Wanted)>>,
     wake: Condvar,
     shutdown: AtomicBool,
 }
 
 struct Done {
+    ticket: u64,
     id: ImageId,
     result: Result<(u32, u32, Vec<u8>), String>,
 }
@@ -122,7 +123,8 @@ pub struct ThumbLoader {
     rx: Receiver<Done>,
     textures: HashMap<ImageId, (TextureHandle, u64)>,
     failed: HashSet<ImageId>,
-    in_flight: HashSet<ImageId>,
+    in_flight: HashMap<ImageId, u64>,
+    ticket: u64,
     tick: u64,
     last_wanted: Vec<ImageId>,
     pub stats: Arc<CacheStats>,
@@ -153,7 +155,7 @@ impl ThumbLoader {
                         };
                     }
                 };
-                let Wanted { id, path, hash } = job;
+                let (ticket, Wanted { id, path, hash }) = job;
                 let result = if path.to_string_lossy().starts_with(DEMO_PREFIX) {
                     provider.demo_thumbnail(id, THUMB_SIZE)
                 } else {
@@ -161,13 +163,13 @@ impl ThumbLoader {
                     stats.note(event);
                     r
                 };
-                if tx.send(Done { id, result }).is_err() {
+                if tx.send(Done { ticket, id, result }).is_err() {
                     return;
                 }
                 ctx.request_repaint();
             });
         }
-        Self { shared, rx, textures: HashMap::new(), failed: HashSet::new(), in_flight: HashSet::new(), tick: 0, last_wanted: Vec::new(), stats, first_request: None }
+        Self { shared, rx, textures: HashMap::new(), failed: HashSet::new(), in_flight: HashMap::new(), ticket: 0, tick: 0, last_wanted: Vec::new(), stats, first_request: None }
     }
 
     /// Tells the loader which images are needed now (most important first).
@@ -183,18 +185,17 @@ impl ThumbLoader {
         }
         if let Ok(mut q) = self.shared.wanted.lock() {
             // Requests that never started are forgotten, then the new list is queued.
-            for w in q.iter() {
-                self.in_flight.remove(&w.id);
+            for (ticket, w) in q.iter() {
+                if self.in_flight.get(&w.id) == Some(ticket) { self.in_flight.remove(&w.id); }
             }
-            let queue: VecDeque<Wanted> = items
+            let mut queue: VecDeque<_> = items
                 .iter()
-                .filter(|w| !self.textures.contains_key(&w.id) && !self.failed.contains(&w.id) && !self.in_flight.contains(&w.id))
+                .filter(|w| !self.textures.contains_key(&w.id) && !self.failed.contains(&w.id) && !self.in_flight.contains_key(&w.id))
                 .cloned()
                 .collect();
-            for w in &queue {
-                self.in_flight.insert(w.id);
-            }
-            *q = queue;
+            self.ticket += 1;
+            for w in &queue { self.in_flight.insert(w.id, self.ticket); }
+            *q = queue.drain(..).map(|w| (self.ticket, w)).collect();
         }
         self.shared.wake.notify_all();
     }
@@ -218,6 +219,7 @@ impl ThumbLoader {
         while uploaded < UPLOADS_PER_FRAME {
             let Ok(done) = self.rx.try_recv() else { break };
             uploaded += 1;
+            if self.in_flight.get(&done.id) != Some(&done.ticket) { continue; }
             self.in_flight.remove(&done.id);
             match done.result {
                 Ok((w, h, rgba)) if rgba.len() == w as usize * h as usize * 4 => {
@@ -374,8 +376,14 @@ mod tests {
             let _ = fetch_thumb(Some(&cache), h, 256, || Ok(gradient(32, 32)));
         }
         assert!(cache.total_bytes() > 0);
-        let freed = ThumbCache::new(dir.path(), 0).unwrap().evict();
-        assert!(freed > 0);
+        let before = cache.total_bytes();
+        assert_eq!(cache.clear(), before);
+        assert_eq!(cache.total_bytes(), 0);
+        // Clearing keeps the budget: later thumbnails are cached again.
+        let _ = fetch_thumb(Some(&cache), "dd", 256, || Ok(gradient(32, 32)));
+        assert!(cache.total_bytes() > 0);
+        // Opening with a zero budget also empties the cache.
+        ThumbCache::new(dir.path(), 0).unwrap();
         assert_eq!(cache.total_bytes(), 0);
     }
 

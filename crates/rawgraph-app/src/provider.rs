@@ -336,6 +336,15 @@ impl FileProvider {
         Ok((display.width, display.height, display.to_rgba8()))
     }
 
+    /// Independent thumbnail decode: never takes the viewer proxy's in-flight lock.
+    pub(crate) fn thumbnail_base(&self, id: ImageId, path: &Path, size: u32) -> Result<(Arc<ImageBuf>, (u32, u32)), String> {
+        if path.to_string_lossy().starts_with(DEMO_PREFIX) {
+            let full = self.demo.image(id)?;
+            return Ok((Arc::new(full.downscale_box(size)), (full.width(), full.height())));
+        }
+        rawgraph_io::load(path, Some(size)).map(|l| (Arc::new(l.image), l.full_size)).map_err(|e| e.to_string())
+    }
+
     fn decode(&self, id: ImageId, path: &Path, preview: u32) -> Result<Arc<ImageBuf>, String> {
         if path.to_string_lossy().starts_with(DEMO_PREFIX) {
             let full = self.demo.image(id)?;

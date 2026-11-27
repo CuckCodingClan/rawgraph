@@ -577,6 +577,7 @@ impl App {
         } else {
             self.filmstrip.thumbs.invalidate(ids);
         }
+        self.filmstrip.live.reset();
         self.last_key = None;
         self.prefetch.forget();
         self.collection_key = None;
@@ -656,14 +657,9 @@ impl App {
             Some(false) => self.clear_cache_confirm = false,
             Some(true) => {
                 self.clear_cache_confirm = false;
-                // `ThumbCache` has no "remove all"; a zero budget evicts every entry.
-                match rawgraph_project::ThumbCache::new(&self.dirs.thumbs(), 0) {
-                    Ok(empty) => {
-                        let freed = empty.evict();
-                        self.status.info(format!("Thumbnail cache cleared ({:.1} MB freed)", freed as f64 / 1_048_576.0));
-                    }
-                    Err(e) => self.status.error(format!("Cannot clear the thumbnail cache: {e}")),
-                }
+                self.filmstrip.live.clear_disk();
+                let freed = self.thumb_cache.as_ref().map_or(0, |cache| cache.clear());
+                self.status.info(format!("Thumbnail caches cleared ({:.1} MB of camera previews freed)", freed as f64 / 1_048_576.0));
             }
         }
     }

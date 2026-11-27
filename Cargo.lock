@@ -3311,6 +3311,7 @@ version = "26.11.1"
 dependencies = [
  "arboard",
  "eframe",
+ "half",
  "image",
  "rawgraph-batch",
  "rawgraph-core",
