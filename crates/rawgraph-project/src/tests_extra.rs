@@ -446,8 +446,9 @@ fn thumb_cache_evicts_least_recently_used() {
     assert!(c.get("a1", 128).is_some()); // refresh a1: b2 is now the oldest
     std::thread::sleep(Duration::from_millis(40));
     assert_eq!(c.evict(), 0);
+    // Opening with a smaller budget trims oldest-first immediately.
     let small = ThumbCache::new(&dir, 200).unwrap();
-    assert_eq!(small.evict(), 100);
+    assert_eq!(small.evict(), 0);
     assert!(small.get("b2", 128).is_none());
     assert!(small.get("a1", 128).is_some());
     assert!(small.get("c3", 128).is_some());
