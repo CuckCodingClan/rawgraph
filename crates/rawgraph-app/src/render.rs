@@ -632,6 +632,7 @@ fn run_request<B: Backend>(
     env: &Env<'_>,
     resting: &mut Option<RestingScopes>,
 ) -> Option<Reply> {
+    evaluator.set_view_tone(req.view.tone.tone_map());
     evaluator.set_timing_enabled(req.hints.timing);
     evaluator.retain_image(req.image);
     let started = Instant::now();

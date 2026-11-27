@@ -76,6 +76,8 @@ pub struct ExportSettings {
     pub on_conflict: OnConflict,
     /// Applied for Jpeg/Png/Tiff/Png16/Tiff16/Avif. Ignored for Exr.
     pub display: DisplayTransform,
+    /// Viewer tone used to evaluate Display-mode generators, independent of export tone mapping.
+    pub generator_view_tone: rawgraph_scopes::ToneMap,
     /// Embed the ICC profile of `space` in Jpeg/Png/Tiff/Png16/Tiff16/Avif files. Exr is unchanged:
     /// linear ACEScg with chromaticities.
     pub embed_profile: bool,
@@ -110,6 +112,7 @@ impl Default for ExportSettings {
             long_edge: None,
             on_conflict: OnConflict::Skip,
             display: DisplayTransform::default(),
+            generator_view_tone: rawgraph_scopes::ToneMap::AcesFit,
             embed_profile: true,
             copy_metadata: true,
             space: OutputSpace::Srgb,
@@ -159,6 +162,7 @@ pub fn settings_from_spec(spec: &ExportSpec, display: DisplayTransform) -> Expor
         long_edge,
         on_conflict,
         display,
+        generator_view_tone: display.tone_map,
         embed_profile: spec.embed_profile,
         copy_metadata: m.camera || m.exposure || m.date || m.gps || m.author || m.software || description.is_some(),
         space: spec.space,
@@ -646,6 +650,7 @@ fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job
         return ItemStatus::SkippedExisting(planned.to_path_buf());
     }
 
+    ev.set_view_tone(settings.generator_view_tone);
     let evaluated = ev.eval_image(ctx.graph, ctx.node, item.id, provider, ctx.cancel);
     ev.clear();
     provider.release_pixels();

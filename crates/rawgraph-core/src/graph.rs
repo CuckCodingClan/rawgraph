@@ -287,6 +287,7 @@ const GENERATOR_PARAMS: &[ParamSpec] = &[
     p("seed", "Noise seed", "", 0.0, 65535.0, 0.0),
     p("cell_size", "Pattern cell size", "px", 1.0, 1024.0, 32.0),
     toggle("invert", "Invert pattern", false),
+    choice("output", "Output", &["Display", "Data"], 0),
 ];
 const CAPTURE_EV_PARAMS: &[ParamSpec] = &[p("delta", "EV change", "EV", -6.0, 6.0, 0.0)];
 const EXPOSURE_PARAMS: &[ParamSpec] = &[p("ev", "Exposure", "stops", -6.0, 6.0, 0.0)];

@@ -19,6 +19,7 @@ use rawgraph_core::{
     MAX_LAYERS,
 };
 use rawgraph_fx as fx;
+use rawgraph_scopes::{InverseDisplayTransform, ToneMap};
 
 /// Supplies base pixels for Source nodes. Called from a worker thread.
 pub trait ImageProvider: Send + Sync {
@@ -108,7 +109,7 @@ impl CancelToken {
 }
 
 /// Cache key: node, image and the frame size a mask was evaluated for ((0, 0) for images).
-type Key = (NodeId, ImageId, (u32, u32));
+type Key = (NodeId, ImageId, (u32, u32), bool);
 
 struct Entry {
     fingerprint: u64,
@@ -127,10 +128,11 @@ pub struct NodeTiming {
 /// Caching graph evaluator.
 pub struct Evaluator {
     cache: HashMap<Key, Entry>,
+    view_tone: ToneMap,
     /// Output of a Develop node before its tone part, one entry per (node, image). It is
     /// what [`Evaluator::eval_base`] returns for a plan with `base_before_tone`, and what
     /// the Develop node itself builds on, so moving a tone slider never redoes the base.
-    pre_tone: HashMap<(NodeId, ImageId), Entry>,
+    pre_tone: HashMap<(NodeId, ImageId, bool), Entry>,
     hits: u64,
     misses: u64,
     keep_intermediates: bool,
@@ -141,7 +143,7 @@ pub struct Evaluator {
 
 impl Default for Evaluator {
     fn default() -> Self {
-        Self { cache: HashMap::new(), pre_tone: HashMap::new(), hits: 0, misses: 0, keep_intermediates: true, timings: None, timing_children: Vec::new(), timing_hit: Vec::new() }
+        Self { cache: HashMap::new(), view_tone: ToneMap::AcesFit, pre_tone: HashMap::new(), hits: 0, misses: 0, keep_intermediates: true, timings: None, timing_children: Vec::new(), timing_hit: Vec::new() }
     }
 }
 
@@ -151,9 +153,13 @@ impl Default for Evaluator {
 struct Env<'a> {
     provider: &'a dyn ImageProvider,
     images: &'a [ImageId],
+    view_tone: ToneMap,
+    control: bool,
 }
 
 impl Env<'_> {
+    fn control(self, control: bool) -> Self { Self { control: self.control || control, ..self } }
+
     /// Runs `f` with the catalog of this environment.
     fn cat<R>(&self, f: impl FnOnce(&Catalog) -> R) -> R {
         let capture = |i: ImageId| self.provider.capture(i);
@@ -200,7 +206,7 @@ impl Evaluator {
         cancel: &CancelToken,
     ) -> Result<Value, EvalError> {
         let images = provider.images();
-        self.eval_env(graph, node, image, &Env { provider, images: &images }, cancel)
+        self.eval_env(graph, node, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false }, cancel)
     }
 
     fn eval_env(&mut self, graph: &Graph, node: NodeId, image: ImageId, env: &Env, cancel: &CancelToken) -> Result<Value, EvalError> {
@@ -220,7 +226,7 @@ impl Evaluator {
         cancel: &CancelToken,
     ) -> Result<Value, EvalError> {
         let images = provider.images();
-        self.eval_output_env(graph, node, port, image, &Env { provider, images: &images }, cancel)
+        self.eval_output_env(graph, node, port, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false }, cancel)
     }
 
     fn eval_output_env(
@@ -252,8 +258,8 @@ impl Evaluator {
         let mut memo = FingerprintMemo::new();
         let result = self.eval_node(graph, node, image, None, env, cancel, &mut visiting, &mut memo).map(|(_, v)| v);
         if !self.keep_intermediates {
-            self.cache.retain(|(n, im, _), _| *im != image || *n == node);
-            self.pre_tone.retain(|(_, im), _| *im != image);
+            self.cache.retain(|(n, im, _, _), _| *im != image || *n == node);
+            self.pre_tone.retain(|(_, im, _), _| *im != image);
         }
         result
     }
@@ -290,7 +296,7 @@ impl Evaluator {
     /// the base, so it changes exactly when `eval_base` would recompute.
     pub fn plan_tail(&self, graph: &Graph, node: NodeId, image: ImageId, provider: &dyn ImageProvider) -> Result<TailPlan, EvalError> {
         let images = provider.images();
-        let env = Env { provider, images: &images };
+        let env = Env { provider, images: &images, view_tone: self.view_tone, control: false };
         if !env.viewing_member(graph, node, image) {
             return Err(not_a_member_error(graph, node));
         }
@@ -301,7 +307,7 @@ impl Evaluator {
 
         let target = graph.node(node).ok_or(EvalError::UnknownNode(node))?;
         if target.kind.output() == Some(PortType::Mask) {
-            let base_fingerprint = memo.get(&node).copied().unwrap_or_default();
+            let base_fingerprint = memo.get(&(node, false)).copied().unwrap_or_default();
             return Ok(TailPlan { base: node, base_port: 0, ops: Vec::new(), base_fingerprint, base_before_tone: false });
         }
 
@@ -338,7 +344,7 @@ impl Evaluator {
             let develop = graph.node(cur).ok_or(EvalError::UnknownNode(cur))?;
             pre_tone_fingerprint(graph, develop, image, &env, &mut memo)?
         } else {
-            match memo.get(&cur) {
+            match memo.get(&(cur, false)) {
                 Some(&fp) => fp,
                 None => node_fingerprint(graph, cur, image, &env, &mut memo, &mut Vec::new())?,
             }
@@ -359,15 +365,15 @@ impl Evaluator {
         cancel: &CancelToken,
     ) -> Result<Arc<ImageBuf>, EvalError> {
         let images = provider.images();
-        let env = Env { provider, images: &images };
+        let env = Env { provider, images: &images, view_tone: self.view_tone, control: false };
         if plan.base_before_tone {
             if !env.contains_output(graph, plan.base, plan.base_port, image) {
                 return Err(not_a_member_error(graph, plan.base));
             }
             let result = self.eval_develop_pre(graph, plan.base, image, &env, cancel);
             if !self.keep_intermediates {
-                self.cache.retain(|(_, im, _), _| *im != image);
-                self.pre_tone.retain(|(n, im), _| *im != image || *n == plan.base);
+                self.cache.retain(|(_, im, _, _), _| *im != image);
+                self.pre_tone.retain(|(n, im, _), _| *im != image || *n == plan.base);
             }
             return result;
         }
@@ -380,13 +386,13 @@ impl Evaluator {
     /// True if `image` leaves output `port` of `node` (metadata only).
     pub fn contains_output(&self, graph: &Graph, node: NodeId, port: usize, image: ImageId, provider: &dyn ImageProvider) -> bool {
         let images = provider.images();
-        Env { provider, images: &images }.contains_output(graph, node, port, image)
+        Env { provider, images: &images, view_tone: self.view_tone, control: false }.contains_output(graph, node, port, image)
     }
 
     /// True if `image` is part of the collection `node` outputs (metadata only).
     pub fn contains(&self, graph: &Graph, node: NodeId, image: ImageId, provider: &dyn ImageProvider) -> bool {
         let images = provider.images();
-        Env { provider, images: &images }.cat(|c| graph.contains_in(node, image, c))
+        Env { provider, images: &images, view_tone: self.view_tone, control: false }.cat(|c| graph.contains_in(node, image, c))
     }
 
     /// The ordered collection leaving output `port` of `node` (metadata only): every image
@@ -394,7 +400,7 @@ impl Evaluator {
     /// order for a Source, the driver's order for a Layer, port order for a Merge).
     pub fn members(&self, graph: &Graph, node: NodeId, port: usize, provider: &dyn ImageProvider) -> Vec<ImageId> {
         let images = provider.images();
-        Env { provider, images: &images }.cat(|c| graph.members(node, port, c))
+        Env { provider, images: &images, view_tone: self.view_tone, control: false }.cat(|c| graph.members(node, port, c))
     }
 
     /// When `false`, only the requested node's result stays cached after `eval`
@@ -402,6 +408,9 @@ impl Evaluator {
     pub fn set_keep_intermediates(&mut self, keep: bool) {
         self.keep_intermediates = keep;
     }
+
+    /// Set the viewer tone used by Display-mode generators; exposure is intentionally excluded.
+    pub fn set_view_tone(&mut self, tone: ToneMap) { self.view_tone = tone; }
 
     /// Like `eval` but requires an image result.
     pub fn eval_image(
@@ -413,7 +422,7 @@ impl Evaluator {
         cancel: &CancelToken,
     ) -> Result<Arc<ImageBuf>, EvalError> {
         let images = provider.images();
-        self.eval_image_env(graph, node, image, &Env { provider, images: &images }, cancel)
+        self.eval_image_env(graph, node, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false }, cancel)
     }
 
     fn eval_image_env(&mut self, graph: &Graph, node: NodeId, image: ImageId, env: &Env, cancel: &CancelToken) -> Result<Arc<ImageBuf>, EvalError> {
@@ -434,7 +443,7 @@ impl Evaluator {
         progress: &mut dyn FnMut(usize, usize),
     ) -> Vec<(ImageId, Result<Arc<ImageBuf>, EvalError>)> {
         let catalog = provider.images();
-        let env = Env { provider, images: &catalog };
+        let env = Env { provider, images: &catalog, view_tone: self.view_tone, control: false };
         let listed: HashSet<ImageId> = images.iter().copied().collect();
         let total = images.len();
         let mut out = Vec::with_capacity(total);
@@ -444,12 +453,12 @@ impl Evaluator {
             } else {
                 self.eval_image_env(graph, node, img, &env, cancel)
             };
-            self.cache.retain(|(_, im, _), _| *im != img);
-            self.pre_tone.retain(|(_, im), _| *im != img);
+            self.cache.retain(|(_, im, _, _), _| *im != img);
+            self.pre_tone.retain(|(_, im, _), _| *im != img);
             if !self.keep_intermediates {
                 // A Layer node evaluates other images of the project; do not let them pile up.
-                self.cache.retain(|(_, im, _), _| listed.contains(im));
-                self.pre_tone.retain(|(_, im), _| listed.contains(im));
+                self.cache.retain(|(_, im, _, _), _| listed.contains(im));
+                self.pre_tone.retain(|(_, im, _), _| listed.contains(im));
             }
             out.push((img, result));
             progress(i + 1, total);
@@ -459,8 +468,8 @@ impl Evaluator {
 
     /// Drops cached results of every image except `image`.
     pub fn retain_image(&mut self, image: ImageId) {
-        self.cache.retain(|(_, im, _), _| *im == image);
-        self.pre_tone.retain(|(_, im), _| *im == image);
+        self.cache.retain(|(_, im, _, _), _| *im == image);
+        self.pre_tone.retain(|(_, im, _), _| *im == image);
     }
 
     pub fn clear(&mut self) {
@@ -599,7 +608,7 @@ impl Evaluator {
                 match env.input_edge(graph, id, port, image) {
                     Some((up, up_port)) => {
                         used.push(up);
-                        let (_, value) = self.eval_node(graph, up, image, up_size, env, cancel, visiting, memo)?;
+                        let (_, value) = self.eval_node(graph, up, image, up_size, &env.control(spec.ty == PortType::Mask), cancel, visiting, memo)?;
                         let value = output_value(graph, up, up_port, value);
                         let ty = match value {
                             Value::Images(_) => PortType::Images,
@@ -622,12 +631,12 @@ impl Evaluator {
             if let Some((up, up_port)) = env.input_edge(graph, id, port, image) {
                 used.push(up);
                 let target = inputs.iter().flatten().find_map(|v| match v { Value::Images(img) => Some((img.width(), img.height())), _ => None });
-                let (_, v) = self.eval_node(graph, up, image, if exposed.ty == PortType::Mask { target } else { None }, env, cancel, visiting, memo)?;
+                let (_, v) = self.eval_node(graph, up, image, if exposed.ty == PortType::Mask { target } else { None }, &env.control(true), cancel, visiting, memo)?;
                 inputs[port] = Some(output_value(graph, up, up_port, v));
             }
         }
 
-        let key: Key = (id, image, size.unwrap_or((0, 0)));
+        let key: Key = (id, image, size.unwrap_or((0, 0)), env.control);
         if let Some(entry) = self.cache.get(&key) {
             if entry.fingerprint == fingerprint {
                 self.hits += 1;
@@ -644,7 +653,7 @@ impl Evaluator {
             self.compute_develop(graph, node, image, &inputs, env, memo)?
         } else {
             let lens = if node.kind == NodeKind::LensManual { lens_profile_for(graph, node, image, provider) } else { None };
-            compute(node, image, size, &inputs, provider, lens.as_ref())?
+            compute(node, image, size, &inputs, provider, lens.as_ref(), env)?
         };
         self.misses += 1;
         self.cache.insert(key, Entry { fingerprint, value: value.clone() });
@@ -682,7 +691,7 @@ impl Evaluator {
         }
         if !mapped.is_empty() {
             let fp_pre = pre_tone_fingerprint(graph, node, image, env, memo)?;
-            let pre = self.develop_pre_from(node, image, src, fp_pre, env.provider);
+            let pre = self.develop_pre_from(node, image, src, fp_pre, env.provider, env.control);
             let get = |name| mapped.get(name).map(Vec::as_slice);
             let maps = ops::DevelopControlMaps { exposure: get("exposure"), contrast: get("contrast"), highlights: get("highlights"), shadows: get("shadows"), whites: get("whites"), blacks: get("blacks") };
             return Ok(modified(&pre, |img| {
@@ -702,7 +711,7 @@ impl Evaluator {
             return Ok(Value::Images(develop_base(node, image, src, env.provider)));
         }
         let fp_pre = pre_tone_fingerprint(graph, node, image, env, memo)?;
-        let pre = self.develop_pre_from(node, image, src, fp_pre, env.provider);
+        let pre = self.develop_pre_from(node, image, src, fp_pre, env.provider, env.control);
         Ok(modified(&pre, |img| {
             if local {
                 if values.exposure != 0.0 { ops::apply_gain(img, 2f32.powf(values.exposure)); }
@@ -725,12 +734,13 @@ impl Evaluator {
         src: Arc<ImageBuf>,
         fp_pre: u64,
         provider: &dyn ImageProvider,
+        control: bool,
     ) -> Arc<ImageBuf> {
         let capture = provider.capture(image);
         if develop_base_is_neutral(&develop_settings(node, image, capture.as_ref())) {
             return src;
         }
-        let key = (node.id, image);
+        let key = (node.id, image, control);
         if let Some(entry) = self.pre_tone.get(&key) {
             if entry.fingerprint == fp_pre {
                 if let Value::Images(img) = &entry.value {
@@ -761,7 +771,7 @@ impl Evaluator {
         let mut memo = FingerprintMemo::new();
         node_fingerprint(graph, id, image, env, &mut memo, &mut Vec::new())?;
         let fp_pre = pre_tone_fingerprint(graph, node, image, env, &mut memo)?;
-        if let Some(entry) = self.pre_tone.get(&(id, image)) {
+        if let Some(entry) = self.pre_tone.get(&(id, image, env.control)) {
             if entry.fingerprint == fp_pre {
                 if let Value::Images(img) = &entry.value {
                     self.hits += 1;
@@ -778,7 +788,7 @@ impl Evaluator {
         let Value::Images(src) = value else {
             return Err(EvalError::WrongType { node: id, port: 0 });
         };
-        let out = self.develop_pre_from(node, image, src, fp_pre, env.provider);
+        let out = self.develop_pre_from(node, image, src, fp_pre, env.provider, env.control);
         self.release(&[up], image);
         Ok(out)
     }
@@ -796,7 +806,7 @@ impl Evaluator {
         cancel: &CancelToken,
         visiting: &mut Vec<NodeId>,
     ) -> Result<(u64, Value), EvalError> {
-        let key: Key = (node.id, image, (0, 0));
+        let key: Key = (node.id, image, (0, 0), env.control);
         if let Some(entry) = self.cache.get(&key) {
             if entry.fingerprint == fingerprint {
                 self.hits += 1;
@@ -883,7 +893,7 @@ impl Evaluator {
     /// In lean mode, drops the cached results of nodes whose consumer is done.
     fn release(&mut self, nodes: &[NodeId], image: ImageId) {
         if !self.keep_intermediates {
-            self.cache.retain(|(n, im, _), _| *im != image || !nodes.contains(n));
+            self.cache.retain(|(n, im, _, _), _| *im != image || !nodes.contains(n));
         }
     }
 }
@@ -1055,7 +1065,7 @@ fn hash_lens_profile(profile: Option<&LensProfile>, hasher: &mut DefaultHasher) 
 }
 
 /// Fingerprints computed during one evaluation (the image is fixed, so a node has one).
-type FingerprintMemo = HashMap<NodeId, u64>;
+type FingerprintMemo = HashMap<(NodeId, bool), u64>;
 
 /// Parameters of the Develop tone part; they are left out of the pre-tone fingerprint.
 const TONE_PARAMS: [&str; 8] = ["exposure", "contrast", "highlights", "shadows", "whites", "blacks", "vibrance", "saturation"];
@@ -1077,7 +1087,7 @@ fn node_fingerprint(
     memo: &mut FingerprintMemo,
     visiting: &mut Vec<NodeId>,
 ) -> Result<u64, EvalError> {
-    if let Some(&fp) = memo.get(&id) {
+    if let Some(&fp) = memo.get(&(id, env.control)) {
         return Ok(fp);
     }
     let node = graph.node(id).ok_or(EvalError::UnknownNode(id))?;
@@ -1089,7 +1099,7 @@ fn node_fingerprint(
     let result = node_fingerprint_inner(graph, node, image, env, memo, visiting, false);
     visiting.pop();
     if let Ok(fp) = result {
-        memo.insert(id, fp);
+        memo.insert((id, env.control), fp);
     }
     result
 }
@@ -1119,6 +1129,10 @@ fn node_fingerprint_inner(
     let provider = env.provider;
     let mut hasher = DefaultHasher::new();
     node.kind.hash(&mut hasher);
+    env.control.hash(&mut hasher);
+    if node.kind == NodeKind::Generator && node.choice("output", image) == 0 && !env.control {
+        (env.view_tone as u8).hash(&mut hasher);
+    }
     if node.kind == NodeKind::DepthEstimate {
         std::env::var_os("RAWGRAPH_DEPTH_WORKER").hash(&mut hasher);
         std::env::var_os("RAWGRAPH_DEPTH_SCRIPT").hash(&mut hasher);
@@ -1207,7 +1221,7 @@ fn node_fingerprint_inner(
                         // The port decision of the split this input hangs on.
                         env.cat(|c| graph.split_port_in(up, image, c)).hash(&mut hasher);
                     }
-                    let fp = node_fingerprint(graph, up, image, env, memo, visiting)?;
+                    let fp = node_fingerprint(graph, up, image, &env.control(spec.ty == PortType::Mask), memo, visiting)?;
                     if graph.node(up).and_then(|u| u.kind.output()) != Some(spec.ty) {
                         return Err(EvalError::WrongType { node: id, port });
                     }
@@ -1226,7 +1240,7 @@ fn node_fingerprint_inner(
         if let Some((up, up_port)) = env.input_edge(graph, id, port, image) {
             up_port.hash(&mut hasher);
             output_channel(graph.node(up).unwrap(), up_port).hash(&mut hasher);
-            node_fingerprint(graph, up, image, env, memo, visiting)?.hash(&mut hasher);
+            node_fingerprint(graph, up, image, &env.control(true), memo, visiting)?.hash(&mut hasher);
         } else { u64::MAX.hash(&mut hasher); }
     }
     Ok(hasher.finish())
@@ -1692,6 +1706,7 @@ fn compute(
     inputs: &[Option<Value>],
     provider: &dyn ImageProvider,
     lens: Option<&LensProfile>,
+    env: &Env,
 ) -> Result<Value, EvalError> {
     let id = node.id;
     let param = |name: &str| node.param(name, image);
@@ -1702,7 +1717,15 @@ fn compute(
                 Some(Value::Images(src)) => (src.width(), src.height()),
                 _ => (param("width").round().clamp(1.0, 8192.0) as u32, param("height").round().clamp(1.0, 8192.0) as u32),
             };
-            render_generator(node, image, width, height).map(Value::Images)
+            let generated = render_generator(node, image, width, height)?;
+            if node.choice("output", image) != 0 || env.control { return Ok(Value::Images(generated)); }
+            let inverse = InverseDisplayTransform::new(env.view_tone);
+            Ok(modified(&generated, |out| {
+                for px in out.data_mut().as_chunks_mut::<4>().0.iter_mut() {
+                    let rgb = inverse.apply([px[0], px[1], px[2]]);
+                    px[..3].copy_from_slice(&rgb);
+                }
+            }))
         }
         NodeKind::Normals => {
             let (w, h, values) = if node.choice("mode", image) == 0 {
@@ -2275,10 +2298,51 @@ mod tests {
     }
 
     #[test]
+    fn display_generator_waveform_cache_and_control_context() {
+        use rawgraph_scopes::DisplayTransform;
+        let mut g = Graph::new();
+        let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
+        let id = ImageId(u64::MAX - generator.0);
+        set(&mut g, generator, "width", id, 1024.0);
+        set(&mut g, generator, "height", id, 1.0);
+        let p = TestProvider::default();
+        let mut ev = Evaluator::new();
+        let cancel = CancelToken::new();
+        let mut previous = None;
+        for tone in [ToneMap::Clip, ToneMap::SoftHighlights, ToneMap::AcesFit] {
+            ev.set_view_tone(tone);
+            let plan = ev.plan_tail(&g, generator, id, &p).unwrap();
+            assert_eq!(plan.base, generator);
+            if let Some(fp) = previous { assert_ne!(fp, plan.base_fingerprint); }
+            previous = Some(plan.base_fingerprint);
+            let frame = ev.eval_image(&g, generator, id, &p, &cancel).unwrap();
+            let display = DisplayTransform { exposure_ev: 0.0, tone_map: tone }.apply(&frame);
+            for (x, rgb) in display.rgb.as_chunks::<3>().0.iter().enumerate() {
+                for value in rgb { assert!((value * 1023.0 - x as f32).abs() <= 1.0, "{tone:?} x={x} value={value}"); }
+            }
+            assert_eq!((display.rgb[0]*1023.0).round() as u32, 0);
+            assert_eq!((display.rgb[3069]*1023.0).round() as u32, 1023);
+            let env = Env { provider: &p, images: &[], view_tone: tone, control: true };
+            let (_, value) = ev.eval_node(&g, generator, id, None, &env, &cancel, &mut vec![], &mut FingerprintMemo::new()).unwrap();
+            let Value::Images(control) = value else { panic!() };
+            for x in 0..1024 { assert!((control.pixel(x, 0)[0] - x as f32/1023.0).abs() < 1e-6); }
+        }
+        set(&mut g, generator, "output", id, 1.0);
+        let raw = render_generator(g.node(generator).unwrap(), id, 1024, 1).unwrap();
+        let first = ev.eval_image(&g, generator, id, &p, &cancel).unwrap();
+        assert_eq!(*raw, *first);
+        let fp = ev.plan_tail(&g, generator, id, &p).unwrap().base_fingerprint;
+        ev.set_view_tone(ToneMap::Clip);
+        assert_eq!(fp, ev.plan_tail(&g, generator, id, &p).unwrap().base_fingerprint);
+        assert!(Arc::ptr_eq(&first, &ev.eval_image(&g, generator, id, &p, &cancel).unwrap()));
+    }
+
+    #[test]
     fn generator_graph_pixels_serialization_and_cache() {
         let mut g = Graph::new();
         let src = g.add_node(NodeKind::Source, [0.0; 2]);
         let gen = g.add_node(NodeKind::Generator, [0.0; 2]);
+        set(&mut g, gen, "output", A, 1.0);
         let out = g.add_node(NodeKind::Output, [0.0; 2]);
         g.connect(src, gen, 0).unwrap();
         g.connect(gen, out, 0).unwrap();
@@ -2310,6 +2374,7 @@ mod tests {
         let mut g = Graph::new();
         let src = g.add_node(NodeKind::Source, [0.0; 2]);
         let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
+        set(&mut g, generator, "output", A, 1.0);
         let out = g.add_node(NodeKind::Output, [0.0; 2]);
         g.connect(src, generator, 0).unwrap(); g.connect(generator, out, 0).unwrap();
         let p = TestProvider::default(); *p.dims.lock().unwrap() = Some((9, 1));
@@ -2348,6 +2413,7 @@ mod tests {
         let mut g = Graph::new();
         let src = g.add_node(NodeKind::Source, [0.0; 2]);
         let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
+        set(&mut g, generator, "output", A, 1.0);
         let out = g.add_node(NodeKind::Output, [0.0; 2]);
         g.connect(src, generator, 0).unwrap(); g.connect(generator, out, 0).unwrap();
         let p = TestProvider::default(); *p.dims.lock().unwrap() = Some((9, 1));
@@ -2379,6 +2445,7 @@ mod tests {
         let mut g = Graph::new();
         let src = g.add_node(NodeKind::Source, [0.0; 2]);
         let generator = g.add_node(NodeKind::Generator, [0.0; 2]);
+        set(&mut g, generator, "output", A, 1.0);
         let out = g.add_node(NodeKind::Output, [0.0; 2]);
         g.connect(src, generator, 0).unwrap();
         g.connect(generator, out, 0).unwrap();
@@ -2452,7 +2519,7 @@ mod tests {
         *p.catalog.lock().unwrap() = vec![A, B];
         p.paths.lock().unwrap().insert(A.0, "/a/yes.jpg".into());
         p.paths.lock().unwrap().insert(B.0, "/b/no.jpg".into());
-        let env = Env { provider: &p, images: &[A, B] };
+        let env = Env { provider: &p, images: &[A, B], view_tone: ToneMap::AcesFit, control: false };
         assert_eq!(env.cat(|c| g.members(depth, 0, c)), vec![A]);
         assert!(env.contains_output(&g, depth, 0, A));
         assert!(!env.contains_output(&g, depth, 0, B));
@@ -2514,7 +2581,7 @@ mod tests {
         *p.catalog.lock().unwrap() = vec![A, B];
         p.paths.lock().unwrap().insert(A.0, "/a/b/one.jpg".into());
         p.paths.lock().unwrap().insert(B.0, "/a/two.jpg".into());
-        let env = Env { provider: &p, images: &[A, B] };
+        let env = Env { provider: &p, images: &[A, B], view_tone: ToneMap::AcesFit, control: false };
         assert_eq!(env.cat(|c| g.members(out, 0, c)), vec![A, B]);
         assert_eq!(env.input_edge(&g, out, 0, A), Some((first, 0)));
         assert_eq!(env.input_edge(&g, out, 0, B), Some((second, 0)));
@@ -2572,7 +2639,7 @@ mod tests {
 
     fn fingerprint_of(g: &Graph, n: NodeId, img: ImageId, p: &dyn ImageProvider) -> u64 {
         let images = p.images();
-        node_fingerprint(g, n, img, &Env { provider: p, images: &images }, &mut FingerprintMemo::new(), &mut Vec::new()).unwrap()
+        node_fingerprint(g, n, img, &Env { provider: p, images: &images, view_tone: ToneMap::AcesFit, control: false }, &mut FingerprintMemo::new(), &mut Vec::new()).unwrap()
     }
 
     fn set(g: &mut Graph, n: NodeId, name: &str, img: ImageId, v: f32) {
@@ -3606,7 +3673,7 @@ mod tests {
         let mut ev = Evaluator::new();
         let a1 = run(&g, full, A, &p, &mut ev);
         let b1 = run(&g, cropped_exp, A, &p, &mut ev);
-        let sizes: Vec<(u32, u32)> = ev.cache.keys().filter(|(n, _, _)| *n == mask).map(|k| k.2).collect();
+        let sizes: Vec<(u32, u32)> = ev.cache.keys().filter(|(n, _, _, _)| *n == mask).map(|k| k.2).collect();
         assert_eq!(sizes.len(), 2, "one mask entry per requested size: {sizes:?}");
         let misses = ev.misses();
         let a2 = run(&g, full, A, &p, &mut ev);
@@ -4352,7 +4419,7 @@ mod tests {
         let tp = ev.plan_tail(&g, out, A, &p).unwrap();
         assert_eq!(tp.base, blur);
         let first = ev.eval_base(&g, &tp, A, &p, &c).unwrap();
-        assert_eq!(ev.cache.get(&(blur, A, (0, 0))).unwrap().fingerprint, tp.base_fingerprint);
+        assert_eq!(ev.cache.get(&(blur, A, (0, 0), false)).unwrap().fingerprint, tp.base_fingerprint);
         // eval_base uses the cache.
         let misses = ev.misses();
         let again = ev.eval_base(&g, &tp, A, &p, &c).unwrap();
@@ -4370,7 +4437,7 @@ mod tests {
         assert_ne!(tp3.base_fingerprint, tp.base_fingerprint);
         ev.eval_base(&g, &tp3, A, &p, &c).unwrap();
         assert_eq!(ev.misses(), misses + 1);
-        assert_eq!(ev.cache.get(&(blur, A, (0, 0))).unwrap().fingerprint, tp3.base_fingerprint);
+        assert_eq!(ev.cache.get(&(blur, A, (0, 0), false)).unwrap().fingerprint, tp3.base_fingerprint);
         // A revision bump recomputes the whole base chain, and the plan sees it.
         p.revision.store(7, Ordering::Relaxed);
         let tp4 = ev.plan_tail(&g, out, A, &p).unwrap();

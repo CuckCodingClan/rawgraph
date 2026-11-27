@@ -299,7 +299,7 @@ The inspector displays radius as a percentage of the long edge; the graph stores
 
 ### Generator (`Generator`)
 
-Image input is optional in practice: it supplies dimensions and collection membership when connected; otherwise Generator produces a standalone image. Gradient has separate draggable colour and opacity ramps, each with 2–256 stops. Select a stop to edit its position, value or midpoint to the next stop, or to delete it. The structured setting is `GradientRamp`; old scalar ramp values are fallback data. Noise remains a separate mode.
+Image input is optional in practice: it supplies dimensions and collection membership when connected; otherwise Generator produces a standalone image. Gradient has separate draggable colour and opacity ramps, each with 2–256 stops. Select a stop to edit its position, value or midpoint to the next stop, or to delete it. The structured setting is `GradientRamp`; old scalar ramp values are fallback data. Noise remains a separate mode. Display values are inverse-view transformed with the current session tone map (excluding preview exposure); Data preserves numeric values. Control-input evaluation uses data values. Export evaluation uses the session view tone. Saturated ACES-fit colours outside the invertible gamut are projected and can change hue.
 
 - **Inputs:** Images: Images (required)
 - **Outputs:** Images: Images
@@ -326,6 +326,7 @@ Image input is optional in practice: it supplies dimensions and collection membe
 | Noise seed | `seed` | 0 | 0 to 65535 |
 | Pattern cell size | `cell_size` | 32 | 1 to 1024 px |
 | Invert pattern | `invert` | Off | Off / On |
+| Output | `output` | Display | Display / Data |
 
 ## Geometry
 

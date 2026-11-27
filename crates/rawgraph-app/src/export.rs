@@ -161,6 +161,7 @@ impl ExportState {
             long_edge: (!self.full_size).then_some(self.long_edge.max(1)),
             on_conflict: self.on_conflict,
             display: self.display(view),
+            generator_view_tone: view.tone.tone_map(),
             embed_profile: self.embed_profile,
             copy_metadata: self.copy_metadata,
             ..Default::default()

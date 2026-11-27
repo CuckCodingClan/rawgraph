@@ -3359,6 +3359,7 @@ version = "26.11.1"
 dependencies = [
  "rawgraph-core",
  "rawgraph-fx",
+ "rawgraph-scopes",
 ]
 
 [[package]]

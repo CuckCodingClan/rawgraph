@@ -40,6 +40,7 @@ fn add_stop(r: &mut GradientRamp, lane: usize, t: f32, smooth: f32) -> Option<us
 }
 pub fn show(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
     let image = session.current_image(); let Some(node) = session.project.graph.node(id) else { return };
+    let display_output = node.choice("output", image) == 0;
     let mut ramp = ramp_of(node, image); let before = ramp.clone();
     let smooth = if node.choice("ramp_interpolation", image) == 1 { node.param("ramp_smoothness", image)/100. } else { 0. };
     let mut state: State = ui.data_mut(|d| d.get_temp(key(id,"state"))).unwrap_or_default();
@@ -56,7 +57,7 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
     if state.dragging && down { if let (Some(i),Some(p)) = (state.selected,pos) { move_stop(&mut ramp,state.lane,i,((p.x-rect.left())/rect.width()).clamp(0.,1.)); }} else if !down { state.dragging=false; }
     for lane in 0..2 { let y = if lane == 1 { rect.top()-9. } else { rect.bottom()+9. }; for (i,t) in positions(&ramp,lane).iter().enumerate() { let p=Pos2::new(rect.left()+t*rect.width(),y); painter.circle_filled(p,6.,if state.lane==lane && state.selected==Some(i) { Color32::YELLOW } else { Color32::WHITE }); painter.circle_stroke(p,6.,Stroke::new(1.,Color32::BLACK)); }}
     if let Some(i) = state.selected.filter(|i| *i < positions(&ramp,state.lane).len()) {
-        ui.label(if state.lane == 0 { "Colour stop (scene-linear RGB)" } else { "Opacity stop" });
+        ui.label(if state.lane != 0 { "Opacity stop" } else if display_output { "Colour stop (display RGB)" } else { "Colour stop (data RGB)" });
         let mut pos = positions(&ramp,state.lane)[i]; if ui.add(egui::Slider::new(&mut pos,0.0..=1.0).text("Position")).changed() { move_stop(&mut ramp,state.lane,i,pos); }
         if state.lane == 0 { ui.horizontal(|ui| { for (c,label) in ramp.colors[i].color.iter_mut().zip(["R", "G", "B"]) { ui.add(egui::DragValue::new(c).speed(0.01).prefix(label)); } }); } else { ui.add(egui::Slider::new(&mut ramp.opacities[i].opacity,0.0..=1.0).text("Opacity")); }
         let len=positions(&ramp,state.lane).len(); if i+1<len { let m=if state.lane==0 { &mut ramp.colors[i].midpoint } else { &mut ramp.opacities[i].midpoint }; ui.add(egui::Slider::new(m,0.01..=0.99).text("Midpoint to next stop")); }
