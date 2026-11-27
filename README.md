@@ -20,6 +20,14 @@ Local-first RAW photo analysis, organization, and non-destructive editing throug
 
 ## Roadmap
 
+### Performance is a standing priority
+
+RawGraph should feel snappy on the first view of a RAW, not just after it is cached. A wait of over two seconds for the first visible frame from an unedited Source is unacceptable. Treat responsiveness as a requirement for new features, and prioritize measured performance improvements when no feature requests are queued.
+
+- [ ] Benchmark selection-to-first-visible-frame on Windows with representative RAWs on both local SSD and NAS. Record median and p95 separately for uncached and cached views, along with camera format, preview size, and hardware. Use the baseline to set explicit regression budgets.
+- [ ] Profile the uncached path first: file I/O, decompression, proxy generation, display conversion, and upload. Remove redundant pixel passes, publish a useful preview before scopes or other secondary work, and make prefetch yield to the selected image.
+- [ ] Compare before/after timings for changes to preview hot paths. Preserve colour accuracy and full-resolution export fidelity; don't use fast cache hits to hide slow first draws.
+
 ### 1. Define and benchmark
 - [ ] Set target cameras/formats, minimum hardware, display/GPU expectations, and project/license requirements; support Windows, macOS, and Linux.
 - [ ] Build a permitted reference RAW corpus covering cameras, ISO, skin, saturated colors, highlights, fine detail, and difficult lighting.
@@ -97,7 +105,116 @@ cargo run --release -p rawgraph-app -- --open-folder <folder with RAW files>
 cargo test --workspace
 ```
 
+For quick testing on Windows, double-click `RawGraph Dev.cmd` in the repository root. It builds and runs the current source checkout in release mode, with build output in `..\rawgraph-target-windows`. Later runs rebuild only what changed. If the build fails, the window stays open to show the error.
+
 CI (`.github/workflows/ci.yml`): Linux clippy + tests on every push to `main` and every pull request, Windows tests on pull requests, macOS only when started manually.
+
+### Graph workspace
+
+Click a node to preview its result. Pin the viewer to keep that stage visible while editing another node. With no selected or pinned node, there is no preview. New graphs no longer include an Output node; old graphs can still be opened. Use an Export node to save files or Quick Export to write from the stage you are viewing.
+
+The gallery on the left shows only images that pass through the selected node. Split Viewer has independent image and node pins for both panes; whichever dimension is unpinned follows the current selection. The single viewer uses fit-relative click zoom (2× or 3×), and the View menu switches wheel behavior between zooming and stepping images. Drag a connection from a port to blank canvas to add and wire a compatible node.
+
+### Export node preview
+
+Viewing an Export node set to JPEG or 8-bit PNG automatically shows the result of encoding and decoding the viewer image with the node’s settings. It writes no files. The preview can use a reduced-resolution image, so compression artifacts may differ from a full-resolution export. XMP has no image output; other formats do not yet support this preview. For PNG and TIFF, select 8 or 16 bits per channel separately from the format.
+
+### Data-map export
+
+Choose **PNG 16-bit data map** on an Export node for RGB normal maps or other
+encoded data. RGB values reaching the node are clamped to 0–1 and rounded to
+16-bit directly, without display transform, colour-space conversion, or ICC
+profile or EXIF metadata. Alpha is discarded. Use Original size: resizing averages values and
+does not renormalize normals. This does not undo transforms applied upstream.
+The normal PNG 16-bit option and photo export defaults remain colour-managed.
+
+### Adobe XMP sidecars
+
+Select **Adobe XMP sidecar** on an Export node. This metadata-only export writes
+`<RAW stem>.xmp` into the chosen output folder for proprietary RAW files in the
+node collection. DNG and rendered images are not supported. Move the sidecar
+beside its matching RAW for Adobe to discover it. The output folder must not be
+a source-photo folder. Existing sidecars are always skipped, regardless of the
+node collision setting; output names ignore the filename template. Nothing is
+rendered and originals are not modified. Duplicate stems share a sidecar name;
+the first wins and subsequent entries are skipped.
+
+Only the project star rating and colour-label text are written. Reject maps to
+Adobe rating -1 (so an accompanying star rating cannot also be represented);
+pick is not exported. Colour names use English label text and may not match
+custom Adobe label sets. Graph edits, including tone and colour adjustments, are
+not exported: Adobe processing is not equivalent to RawGraph. Other export
+settings (size, colour space, profile and metadata groups) do not apply. A run
+with mixed per-image XMP and rendered formats reports rendered items as failed;
+run those separately. Quick Export remains a rendered-image export.
+
+### Per-node timing
+
+Enable **Debug → Per-node CPU timing** to profile the next preview in a floating window.
+Rows report exclusive CPU wall time (upstream node evaluation excluded), number of
+computations, and result-cache hits for that preview. Cache hits are reported separately,
+not as operation timings. Times include evaluation overhead and are diagnostic, not a
+benchmark. The GPU tail is batched and has no per-node GPU timings; a GPU-resident
+base or Develop pre-tone base may not appear. Turning the option off disables the
+per-node timing clocks. Overlay, histogram, and scope work is not included.
+
+### Clean feed
+
+Open **View → Clean feed** for a fullscreen, image-only output. It shows
+the current preview aspect-fitted on black and hides when RawGraph loses focus.
+The Dual Screen viewer stays fullscreen and does not hide on focus loss.
+Neither output adds a Windows taskbar entry. Press
+**Escape** (or F11) while the feed has focus to close it; the editor stays open.
+Choose a display under **View → Clean feed display**, before or while it is open. Placement depends on the
+OS/window manager; verify it on your display setup, especially on Wayland.
+
+Drop a folder onto the graph to create a Source there and scan that folder. Viewer pinning, resets, and delete actions use icons with descriptive tooltips.
+
+### Multiple image inputs
+
+Connect multiple Sources or edit branches to the same ordinary image input. The node processes their combined collection; if an image arrives more than once, the first connected branch carrying it supplies its pixels. Use Merge for explicit filename collision rules. Mask ports and the individual Merge and Layer ports still accept one wire each.
+
+### RAW input exposure
+
+RAW decoding applies DNG BaselineExposure when present (otherwise +0.35 EV),
+plus the existing +1.6 EV rendering offset, once at input for both preview and
+export. Rendered inputs receive neither gain. White balance remains separate.
+Develop exposure is an additional editable adjustment; a neutral Develop does
+not add input gain again. Older projects still load, but their per-Develop
+baseline toggle, default and brightness overrides are ignored, including
+individual-image overrides. Projects using non-default values or multiple
+Develop nodes can therefore render differently; use visible Develop exposure
+adjustments to recreate any desired compensation.
+
+### Source nodes
+
+A new Source, including the starter Source, supplies no images until you choose a folder. Clearing the folder makes it empty again. **File → Open folder** assigns the path to a Source before scanning; it does not create an input shared by all nodes. Older saved Sources with no folder setting retain their catalog-wide behavior so saved graphs keep their inputs.
+
+Right-click a Develop node and choose **Add Input** to expose Exposure, Contrast, Highlights, Shadows, Whites, or Blacks as an image-intensity or mask input. A connected map replaces that slider per pixel: 0–1 maps linearly across the slider's full range, with values outside 0–1 clamped. Image inputs use linear ACEScg luminance; use an exposed image channel if you need a particular channel. Both Legacy and Local v1 tone processing support these inputs. An unconnected input leaves the slider in control.
+
+Right-click a Filter node and choose **Add Input → Radius** to drive radius per pixel from image luminance. Values 0–1 replace the radius slider across its full range; the built-in Radius mask, if connected, additionally scales that radius. Gaussian and Box use the existing multi-level radius approximation; other kernels use the existing bounded spatial sampler. Unsupported controls are not listed.
+
+The **Filter** node offers low pass and high pass with Gaussian (the original three-box approximation), Box (average), Lens Disk, Motion, Radial Zoom, Radial Spin, Diamond, Median, and Bilateral. High pass shows the signed detail around a neutral midpoint; it is not a sharpening operation. Older Blur nodes load as Gaussian low pass. **Preview Exposure** lives in the viewer toolbar and affects only the preview and display scopes, not exports.
+
+### Adobe XMP export
+
+Choose **Adobe XMP** in an Export node to write ratings and colour labels for the proprietary RAW images that reach it. It writes sidecars to the chosen output folder without rendering or modifying the originals, and skips existing sidecars. Put each sidecar beside its matching RAW before reading metadata in Lightroom Classic or Bridge. Develop adjustments are not exported by this mode.
+
+### Depth and normals
+
+**Depth Estimate** outputs a relative-depth mask (black near, white far). It requires the opt-in CPU model and worker described in [Depth Estimate setup](docs/depth-estimate.md). Use Mask Adjust to remap or invert it. **Normals** converts a depth mask or an explicitly selected luminance height map to RGB normals, with strength, smoothing, and Flip Y. Export via **PNG 16-bit data map** at Original size to preserve the encoded channels without photo color transforms.
+
+### Generator
+
+Generator uses an optional input's dimensions and collection, or produces a standalone image at the configured dimensions. It offers Gradient, seeded Noise, and checker Pattern. Gradient supports Linear, Radial, Angle, Reflected, and Diamond styles, with angle, scale, reverse, interpolation, smoothness, and optional dithering. Click in either ramp lane to add a colour or opacity stop, drag it to move it, or select it to edit its value, position, midpoint to the next stop, or delete it. The default ramp has exact black and white data endpoints; Reverse does not move stored stops. Noise is a separate Generator mode. Viewer tone mapping can make data values look different on screen.
+
+Preview filenames, the window title, and `--version` use `YYMM.###` (three-digit monthly build number, starting at `001`). Cargo stores the equivalent unpadded SemVer, such as `26.11.1` for `2611.001`.
+
+### Pixel Sort
+
+Pixel Sort stably sorts all complete RGBA pixels across the image, filling each column top-to-bottom from left to right. Brightness is linear ACEScg luminance; saturation is RGB chroma (max minus min) divided by the largest absolute RGB component, or zero for black; hue is the ACEScg RGB chroma-vector angle (neutral hue zero). These metrics accept signed and HDR values without clamping. Ties retain source row-major order; reverse changes the key direction without reversing ties. Pixels with non-finite RGB sort last in either direction. Alpha travels unchanged with its pixel and does not affect its key.
+
+Preview sorts the available proxy image, so its pattern can differ from the full-resolution export: downsampling and sorting do not commute. This global sort uses memory proportional to the number of pixels.
 
 ### Sample photos
 
@@ -139,3 +256,27 @@ Update this section as implementation files are added.
 - 2026-11-15 — Waves 4 and 5: Develop stage, effects crate, masks, split node, curve, brush, crop, 16-bit export, GPU prototype (see Structure).
 - 2026-11-13 — First working prototype: eight workspace crates, real RAW files in the application (see Structure).
 - 2026-11-13 — Added persistent per-image Individual-node settings and RAW/JPEG parity of controls, including absolute/relative white-balance requirements.
+
+### Develop local tone v1
+
+Develop offers an opt-in **Local v1** tone processing choice; existing graphs default
+to Legacy and the standalone Highlights / Shadows node is unchanged. Local v1 uses
+an edge-aware luminance neighborhood for highlight/shadow gains, preserving RGB
+detail and unclipped HDR values; Whites and Blacks separately affect endpoints.
+This is a first Camera Raw-inspired approximation, not Adobe’s algorithm or a
+parity claim. Preview uses the CPU result at this boundary. Compare representative
+reference photos and exports against Camera Raw before drawing quality conclusions;
+proxy resolution, halos, fine detail, color and performance need evaluation.
+
+### Filter motion direction
+
+The Filter node’s optional Direction normal (RGB) image input overrides Motion angle.
+It reads scene-linear R and G directly as X and Y, decoded by `2 * channel - 1`,
+then normalizes XY; B and map alpha are ignored. Neutral (0.5, 0.5), near-zero
+or non-finite XY leaves the pixel unblurred. Without a map for an image, Motion
+angle applies. Maps are nearest-neighbour scaled; positive Y points down. Motion
+blur preserves the source alpha. Other kernels ignore the direction map.
+
+### WebP export
+
+Export nodes and Quick Export support 8-bit WebP with alpha. Choose lossless or lossy compression; quality affects only lossy encoding. Pixels use the chosen display transform and output colour space. EXIF metadata is supported, but ICC profiles are not embedded in WebP; use sRGB for maximum interoperability.
