@@ -48,6 +48,7 @@ struct Extras {
     second_matrix: Option<[f64; 9]>,
     /// Leave out ColorMatrix1 and AsShotNeutral (a file without usable white-balance data).
     no_wb: bool,
+    preview: bool,
 }
 
 fn rational_bytes(v: &[(i64, i64)], signed: bool) -> Vec<u8> {
@@ -111,6 +112,7 @@ fn make_dng_with(w: u32, h: u32, mosaic: &[u16], orientation: u16, extras: &Extr
     if extras.no_wb {
         e.retain(|t| t.0 != 50721 && t.0 != 50722 && t.0 != 50728);
     }
+    if extras.preview { e.push((330, 4, 1, le32(&[0]))); }
     e.sort_by_key(|t| t.0);
     let ifd_len = 2 + 12 * e.len() + 4;
     let mut blob_off = 8 + ifd_len;
@@ -132,6 +134,8 @@ fn make_dng_with(w: u32, h: u32, mosaic: &[u16], orientation: u16, extras: &Extr
     for (tag, _, _, d) in e.iter_mut() {
         if *tag == 273 {
             *d = le32(&[strip_offset]);
+        } else if *tag == 330 {
+            *d = le32(&[strip_offset + pixels.len() as u32]);
         }
     }
     let mut out = vec![b'I', b'I', 42, 0, 8, 0, 0, 0];
@@ -152,6 +156,22 @@ fn make_dng_with(w: u32, h: u32, mosaic: &[u16], orientation: u16, extras: &Extr
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&blobs);
     out.extend_from_slice(&pixels);
+    if extras.preview {
+        let (w, h) = (640, 400);
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg).encode(&[170, 80, 40].repeat(w * h), w as u32, h as u32, image::ExtendedColorType::Rgb8).unwrap();
+        let entries = [(254, 4, 1), (256, 4, w as u32), (257, 4, h as u32), (258, 3, 8),
+            (259, 3, 34892), (262, 3, 2), (273, 4, 0), (277, 3, 3), (278, 4, h as u32),
+            (279, 4, jpeg.len() as u32), (284, 3, 1)];
+        let jpeg_offset = (out.len() + 2 + entries.len() * 12 + 4) as u32;
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, kind, value) in entries {
+            out.extend_from_slice(&le16(&[tag, kind]));
+            out.extend_from_slice(&le32(&[1, if tag == 273 { jpeg_offset } else { value }]));
+        }
+        out.extend_from_slice(&le32(&[0]));
+        out.extend_from_slice(&jpeg);
+    }
     out
 }
 
@@ -397,4 +417,34 @@ fn raw_input_gain_uses_baseline_once_on_full_and_proxy() {
             assert_eq!((x[3], y[3]), (1.0, 1.0));
         }
     }
+}
+
+#[test]
+#[ignore = "diagnostic timing, run explicitly with --ignored --nocapture"]
+fn synthetic_first_draw() {
+    let dir = Tmp::new("first-draw");
+    let path = dir.0.join("synthetic.dng");
+    std::fs::write(&path, make_dng(6000, 4000, &vec![350; 24_000_000], 6)).unwrap();
+    let preview_path = dir.0.join("preview.dng");
+    std::fs::write(&preview_path, make_dng_with(6000, 4000, &vec![350; 24_000_000], 6, &Extras { preview: true, ..Default::default() })).unwrap();
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        let (_, stages) = load_with_mode(&path, &LoadOptions { max_dim: Some(2560), ..Default::default() }, Mode::Auto).unwrap();
+        let total = t.elapsed().as_secs_f64() * 1000.0;
+        let t = std::time::Instant::now();
+        let preview = raw::load_embedded_preview(&preview_path, 1280).unwrap().expect("embedded JPEG");
+        println!("total {total:.3} ms; {stages:?}; embedded {}×{} {:.3} ms", preview.0, preview.1, t.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+#[test]
+fn embedded_preview_exists_only_for_the_dng_with_a_preview_and_is_upright() {
+    let dir = Tmp::new("embedded");
+    let path = dir.0.join("embedded.dng");
+    std::fs::write(&path, make_dng(32, 24, &[350; 32 * 24], 6)).unwrap();
+    assert!(raw::load_embedded_preview(&path, 1280).unwrap().is_none());
+    std::fs::write(&path, make_dng_with(32, 24, &[350; 32 * 24], 6, &Extras { preview: true, ..Default::default() })).unwrap();
+    let (w, h, pixels) = raw::load_embedded_preview(&path, 1280).unwrap().expect("embedded JPEG");
+    assert_eq!((w, h), (400, 640));
+    assert!(pixels[0].abs_diff(170) <= 3, "{pixels:?}");
 }
