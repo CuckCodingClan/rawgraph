@@ -2,7 +2,7 @@
 //! inspector, which ones fit into a node box, and the text that describes the
 //! mask input of a node. No UI code, so everything here is unit-testable.
 
-use rawgraph_core::{Graph, ImageId, Node, NodeId, NodeKind, ParamKind, PortType};
+use rawgraph_core::{Graph, ImageId, Node, NodeId, NodeKind, ParamKind, ParamSpec, PortType};
 
 /// Most parameters a node box shows; the rest is summarised as "... +n".
 pub const MAX_BOX_ROWS: usize = 4;
@@ -71,7 +71,7 @@ pub fn wheels_rows(node: &Node, image: ImageId) -> Vec<Row> {
             parts.extend(ch);
             let changed = !parts.is_empty();
             let value = if changed { parts.join(" ") } else { "-".to_owned() };
-            Row { label: (*title).to_owned(), value, changed }
+            Row { key: None, label: (*title).to_owned(), value, changed }
         })
         .collect()
 }
@@ -153,6 +153,7 @@ pub fn is_changed(node: &Node, image: ImageId, name: &str) -> bool {
 /// One row of a node box.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
+    pub key: Option<&'static str>,
     pub label: String,
     pub value: String,
     pub changed: bool,
@@ -175,21 +176,23 @@ fn format_value(v: f32, unit: &str) -> String {
     }
 }
 
-/// Every parameter of a node as a row (no limit).
+pub fn parameter_row(node: &Node, image: ImageId, spec: &ParamSpec) -> Row {
+    let v = node.param(spec.name, image);
+    let value = match spec.kind {
+        ParamKind::Choice(opts) => opts.get(v.max(0.0).round() as usize).copied().unwrap_or("?").to_owned(),
+        ParamKind::Toggle => if v >= 0.5 { "on" } else { "off" }.to_owned(),
+        ParamKind::Continuous => format_value(v, spec.unit),
+    };
+    Row { key: Some(spec.name), label: spec.label.to_owned(), value, changed: is_changed(node, image, spec.name) }
+}
+
+/// Every visible parameter of a node as a row (no limit).
 pub fn all_rows(node: &Node, image: ImageId) -> Vec<Row> {
     node.kind
         .params()
         .iter()
         .filter(|spec| !(node.kind == NodeKind::Develop && ["baseline", "baseline_default", "brightness"].contains(&spec.name)))
-        .map(|spec| {
-            let v = node.param(spec.name, image);
-            let value = match spec.kind {
-                ParamKind::Choice(opts) => opts.get(v.max(0.0).round() as usize).copied().unwrap_or("?").to_owned(),
-                ParamKind::Toggle => if v >= 0.5 { "on" } else { "off" }.to_owned(),
-                ParamKind::Continuous => format_value(v, spec.unit),
-            };
-            Row { label: spec.label.to_owned(), value, changed: is_changed(node, image, spec.name) }
-        })
+        .map(|spec| parameter_row(node, image, spec))
         .collect()
 }
 
@@ -219,7 +222,7 @@ pub fn limit_rows(rows: Vec<Row>, max: usize) -> Vec<Row> {
     }
     let hidden = rows.len() - max;
     let mut out: Vec<Row> = rows.into_iter().zip(keep).filter(|(_, k)| *k).map(|(r, _)| r).collect();
-    out.push(Row { label: format!("\u{2026} +{hidden}"), value: String::new(), changed: false });
+    out.push(Row { key: None, label: format!("\u{2026} +{hidden}"), value: String::new(), changed: false });
     out
 }
 
@@ -414,7 +417,7 @@ mod tests {
 
     #[test]
     fn limit_keeps_the_order_of_the_chosen_rows() {
-        let row = |l: &str, c: bool| Row { label: l.to_owned(), value: String::new(), changed: c };
+        let row = |l: &str, c: bool| Row { key: None, label: l.to_owned(), value: String::new(), changed: c };
         let rows = vec![row("a", false), row("b", false), row("c", true), row("d", false), row("e", true), row("f", false)];
         let out = limit_rows(rows, 4);
         let labels: Vec<&str> = out.iter().map(|r| r.label.as_str()).collect();

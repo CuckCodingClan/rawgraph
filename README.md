@@ -190,17 +190,17 @@ individual-image overrides. Projects using non-default values or multiple
 Develop nodes can therefore render differently; use visible Develop exposure
 adjustments to recreate any desired compensation.
 
-The blue top-left and red top-right title-bar squares add supported input maps and output channel aliases. Added ports appear as labelled edge rows; right-click one to remove it. These edits support undo.
+The inset blue **+** tab at the left of the title bar adds supported input maps. Each added input appears on the left edge beside its parameter name and value, even when the value is at its default. The inset red **+** tab at the far right, beyond the A/I badge, adds output channel aliases as labelled rows on the right edge. Right-click an added port to remove it. These edits support undo.
 
 ### Source nodes
 
 A new Source, including the starter Source, supplies no images until you choose a folder. Clearing the folder makes it empty again. **File → Open folder** assigns the path to a Source before scanning; it does not create an input shared by all nodes. Older saved Sources with no folder setting retain their catalog-wide behavior so saved graphs keep their inputs.
 
-Click the blue top-left square on a Develop node and choose a parameter to expose Exposure, Contrast, Highlights, Shadows, Whites, or Blacks as an image-intensity or mask input. A connected map replaces that slider per pixel: 0–1 maps linearly across the slider's full range, with values outside 0–1 clamped. Image inputs use linear ACEScg luminance; use an exposed image channel if you need a particular channel. Both Legacy and Local v1 tone processing support these inputs. An unconnected input leaves the slider in control.
+Click the blue title-bar **+** tab on a Develop node and choose a parameter to expose Exposure, Contrast, Highlights, Shadows, Whites, or Blacks as an image-intensity or mask input. A connected map replaces that slider per pixel: 0–1 maps linearly across the slider's full range, with values outside 0–1 clamped. Image inputs use linear ACEScg luminance; use an exposed image channel if you need a particular channel. Both Legacy and Local v1 tone processing support these inputs. An unconnected input leaves the slider in control.
 
 Fixed parameter mask ports also accept images or exposed channels. Images are read as clamped linear luminance and resized to the photo; fixed masks scale between the parameter minimum and the slider value (white gives the full slider value). A control uses the matching photo when present, otherwise a single-image output such as a standalone Generator applies to every photo. A disjoint multi-image output is ignored. Control images do not enter the main gallery.
 
-Click the blue top-left square on a Filter node and choose **Radius** to drive radius per pixel from image luminance. Values 0–1 replace the radius slider across its full range; the built-in Radius mask, if connected, additionally scales that radius. Gaussian and Box use the existing multi-level radius approximation; other kernels use the existing bounded spatial sampler. Unsupported controls are not listed.
+Click the blue title-bar **+** tab on a Filter node and choose **Radius** to drive radius per pixel from image luminance. Values 0–1 replace the radius slider across its full range; the built-in Radius mask, if connected, additionally scales that radius. Gaussian and Box use the existing multi-level radius approximation; other kernels use the existing bounded spatial sampler. Unsupported controls are not listed.
 
 The **Filter** node offers low pass and high pass with Gaussian (the original three-box approximation), Box (average), Lens Disk, Motion, Radial Zoom, Radial Spin, Diamond, Median, and Bilateral. High pass shows the signed detail around a neutral midpoint; it is not a sharpening operation. Older Blur nodes load as Gaussian low pass. **Preview Exposure** lives in the viewer toolbar and affects only the preview and display scopes, not exports.
 

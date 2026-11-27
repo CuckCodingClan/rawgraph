@@ -10,9 +10,9 @@ use eframe::egui::{
     self, epaint::CubicBezierShape, Align2, Color32, CornerRadius, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke,
     StrokeKind, Vec2,
 };
-use rawgraph_core::{Graph, ImageId, Mode, NodeId, NodeKind, PortType};
+use rawgraph_core::{Graph, ImageId, Mode, Node, NodeId, NodeKind, PortType};
 
-use crate::groups::{all_rows, box_row_count, limit_rows, MAX_BOX_ROWS};
+use crate::groups::{all_rows, box_row_count, limit_rows, parameter_row, MAX_BOX_ROWS};
 use crate::selection::{band_hits, NodeSelection};
 use crate::session::Session;
 use crate::status::Status;
@@ -28,6 +28,11 @@ const ROW_H: f32 = 21.0;
 const PARAM_H: f32 = 16.0;
 const PAD: f32 = 8.0;
 const PORT_R: f32 = 5.5;
+const TAB_SIZE: f32 = 16.0;
+const TAB_INSET: f32 = 6.0;
+const TITLE_GAP: f32 = 4.0;
+const TAB_INPUT: Color32 = Color32::from_rgb(58, 120, 190);
+const TAB_OUTPUT: Color32 = Color32::from_rgb(180, 70, 74);
 
 pub const COLOR_IMAGES: Color32 = Color32::from_rgb(92, 165, 240);
 pub const COLOR_MASK: Color32 = Color32::from_rgb(240, 165, 62);
@@ -141,8 +146,17 @@ pub fn summary_rows(node: &rawgraph_core::Node, image: ImageId) -> Vec<(String, 
     if node.kind == NodeKind::ColorWheels {
         return crate::groups::wheels_rows(node, image).into_iter().filter(|r| r.changed).map(|r| (r.label, r.value)).collect();
     }
-    limit_rows(all_rows(node, image).into_iter().filter(|row| row.changed).collect(), MAX_BOX_ROWS)
-        .into_iter().map(|r| (r.label, r.value)).collect()
+    // Exposed parameters always occupy the first summary rows, in stable port
+    // order, regardless of the current image or which slider values changed.
+    let mut rows: Vec<_> = node.exposed_inputs().iter().flatten()
+        .map(|input| parameter_row(node, image, node.kind.param_spec(&input.parameter).unwrap()))
+        .collect();
+    let max = MAX_BOX_ROWS.saturating_sub(rows.len());
+    let other = all_rows(node, image).into_iter()
+        .filter(|row| row.changed && !rows.iter().any(|exposed| exposed.key == row.key))
+        .collect();
+    rows.extend(limit_rows(other, max));
+    rows.into_iter().map(|r| (r.label, r.value)).collect()
 }
 
 /// The rows of a node box: like [`summary_rows`], but a Source shows its folder, a Layer a compact
@@ -172,13 +186,12 @@ pub fn port_rows(kind: NodeKind) -> usize {
 }
 
 fn node_port_rows(node: &rawgraph_core::Node) -> usize {
-    (node.kind.inputs().len() + node.exposed_inputs().len())
-        .max(node.kind.outputs().len() + node.exposed_outputs().len()).max(1)
+    node.kind.inputs().len().max(node.kind.outputs().len() + node.exposed_outputs().len()).max(1)
 }
 
 #[cfg(test)]
-fn record_port_control(response: &egui::Response, name: &'static str) {
-    response.ctx.data_mut(|data| data.insert_temp(egui::Id::unique(("port_control", name)), response.rect));
+fn record_port_control(response: &egui::Response, id: NodeId, name: &'static str) {
+    response.ctx.data_mut(|data| data.insert_temp(egui::Id::unique(("port_control", id, name)), response.rect));
 }
 
 fn input_menu(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions: &mut Vec<Action>) {
@@ -186,7 +199,7 @@ fn input_menu(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions
         if node.exposed_inputs().iter().flatten().any(|p| p.parameter == parameter) { continue; }
         let label = node.kind.param_spec(parameter).unwrap().label;
         let response = ui.button(label).on_hover_text("Map luminance linearly to the parameter's full range (replaces its slider value)");
-        #[cfg(test)] record_port_control(&response, "input_item");
+        #[cfg(test)] record_port_control(&response, id, "input_item");
         if response.clicked() { actions.push(Action::ExposeInput(id, parameter)); ui.close(); }
     }
 }
@@ -196,33 +209,98 @@ fn output_menu(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, action
         for label in ["Luma", "R", "G", "B", "A"] {
             if node.exposed_outputs().iter().flatten().any(|p| p.label == label) { continue; }
             let response = ui.button(label);
-            #[cfg(test)] if label == "Luma" { record_port_control(&response, "output_item"); }
+            #[cfg(test)] if label == "Luma" { record_port_control(&response, id, "output_item"); }
             if response.clicked() { actions.push(Action::ExposeOutput(id, source, label)); ui.close(); }
         }
     }
 }
 
+fn has_input_tab(kind: NodeKind) -> bool {
+    !Graph::supported_parameter_inputs(kind).is_empty()
+}
+
+fn has_output_tab(kind: NodeKind) -> bool {
+    kind.outputs().iter().any(|p| p.ty == PortType::Images)
+}
+
 fn exposed_port_menus(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions: &mut Vec<Action>) {
-    if !Graph::supported_parameter_inputs(node.kind).is_empty() {
+    if has_input_tab(node.kind) {
         ui.menu_button("Add Input", |ui| input_menu(ui, node, id, actions));
     }
-    if node.kind.outputs().iter().any(|p| p.ty == PortType::Images) {
+    if has_output_tab(node.kind) {
         ui.menu_button("Add Output", |ui| output_menu(ui, node, id, actions));
     }
 }
 
-fn actual_node_size(node: &rawgraph_core::Node) -> Vec2 {
-    node_size(node.kind) + Vec2::new(0.0, (node_port_rows(node) - port_rows(node.kind)) as f32 * ROW_H)
+fn actual_node_size(node: &Node) -> Vec2 {
+    let extra_port_rows = node_port_rows(node) - port_rows(node.kind);
+    let extra_param_rows = node.exposed_inputs().iter().flatten().count().saturating_sub(MAX_BOX_ROWS);
+    node_size(node.kind) + Vec2::new(0.0, extra_port_rows as f32 * ROW_H + extra_param_rows as f32 * PARAM_H)
 }
 
-/// Centre of input port `port`, in graph units.
-pub fn input_port(pos: [f32; 2], port: usize) -> Pos2 {
+fn parameter_row_y(node: &Node, row: usize) -> f32 {
+    TITLE_H + 6.0 + node_port_rows(node) as f32 * ROW_H + 4.0 + (row as f32 + 0.5) * PARAM_H
+}
+
+fn builtin_input_port(pos: [f32; 2], port: usize) -> Pos2 {
     Pos2::new(pos[0], pos[1] + TITLE_H + 6.0 + port as f32 * ROW_H + ROW_H / 2.0)
+}
+
+/// Centre of an input in graph units, including parameter inputs on summary rows.
+fn input_port(node: &Node, port: usize) -> Pos2 {
+    if let Some(i) = port.checked_sub(node.kind.inputs().len()) {
+        // Removed inputs leave holes in their port indices, not in the layout.
+        let row = node.exposed_inputs()[..i].iter().flatten().count();
+        Pos2::new(node.pos[0], node.pos[1] + parameter_row_y(node, row))
+    } else {
+        builtin_input_port(node.pos, port)
+    }
 }
 
 /// Centre of output port `port`, in graph units.
 pub fn output_port(pos: [f32; 2], port: usize) -> Pos2 {
     Pos2::new(pos[0] + NODE_W, pos[1] + TITLE_H + 6.0 + port as f32 * ROW_H + ROW_H / 2.0)
+}
+
+struct TitleBar {
+    rect: Rect,
+    input: Option<Rect>,
+    output: Option<Rect>,
+    mode: Option<Rect>,
+    count: Option<Rect>,
+    warning: Option<Rect>,
+    text: Rect,
+}
+
+impl TitleBar {
+    fn new(node: &Node, node_rect: Rect, zoom: f32, has_warning: bool) -> Self {
+        let rect = Rect::from_min_size(node_rect.min, Vec2::new(node_rect.width(), TITLE_H * zoom));
+        let cy = rect.center().y;
+        let side = TAB_SIZE * zoom;
+        let gap = TITLE_GAP * zoom;
+        let left = rect.left() + TAB_INSET * zoom;
+        let mut right = rect.right() - TAB_INSET * zoom;
+        let input = has_input_tab(node.kind)
+            .then(|| Rect::from_min_size(Pos2::new(left, cy - side / 2.0), Vec2::splat(side)));
+        let mut reserve = |width: f32| {
+            let badge = Rect::from_min_size(Pos2::new(right - width, cy - side / 2.0), Vec2::new(width, side));
+            right = badge.left() - gap;
+            badge
+        };
+        let output = has_output_tab(node.kind).then(|| reserve(side));
+        let show_mode = zoom >= 0.5 && !node.kind.params().is_empty();
+        let mode = show_mode.then(|| reserve(side));
+        let count = (show_mode && node.mode == Mode::Individual).then(|| {
+            let digits = node.individual_count().to_string().len() as f32;
+            reserve((10.0 + 6.5 * digits) * zoom)
+        });
+        let warning = (zoom >= 0.5 && has_warning).then(|| reserve(side));
+        let text = Rect::from_min_max(
+            Pos2::new(input.map_or(left, |tab| tab.right() + gap), rect.top()),
+            Pos2::new(right, rect.bottom()),
+        );
+        Self { rect, input, output, mode, count, warning, text }
+    }
 }
 
 /// Graph <-> screen mapping: `screen = origin + pan + graph * zoom`.
@@ -575,7 +653,7 @@ impl GraphEditor {
         for e in session.project.graph.edges() {
             let (Some(from), Some(to)) = (session.project.graph.node(e.from), session.project.graph.node(e.to)) else { continue };
             let color = from.output_type(e.from_port).map_or(Color32::GRAY, port_color);
-            draw_wire(&painter, xf.to_screen(output_port(from.pos, e.from_port)), xf.to_screen(input_port(to.pos, e.to_port)), color, self.zoom);
+            draw_wire(&painter, xf.to_screen(output_port(from.pos, e.from_port)), xf.to_screen(input_port(to, e.to_port)), color, self.zoom);
         }
 
         // Port screen positions for the drop test, filled while drawing.
@@ -605,10 +683,34 @@ impl GraphEditor {
             let resp = ui.interact(node_rect.intersect(rect), ui.scope_id().with(("node", id.0)), sense);
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Node {}", kind.label())));
 
-            self.paint_node(&painter, session, id, node_rect, selected, viewed, image);
+            let issue = issues.get(&id).map(String::as_str);
+            let title = TitleBar::new(&node, node_rect, self.zoom, issue.is_some());
+            self.paint_node(&painter, session, id, node_rect, &title, image);
+            self.badges(ui, &painter, &node, &title, issue);
 
-            // Badges and their tooltips.
-            self.badges(ui, &painter, session, id, node_rect, issues.get(&id).map(String::as_str), image);
+            // Register tabs after the node so even a drag that starts on a tab
+            // belongs to the tab, not to the node underneath it.
+            for (input, tab) in [(true, title.input), (false, title.output)] {
+                let Some(tab) = tab else { continue };
+                let label = if input { "Add input port" } else { "Add output port" };
+                let response = ui.interact(tab.intersect(rect), ui.scope_id().with(("port_tab", id.0, input)),
+                    if space { Sense::hover() } else { Sense::click_and_drag() });
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, !space, label));
+                let response = response.on_hover_text(label);
+                let fill = if input { TAB_INPUT } else { TAB_OUTPUT };
+                let fill = if response.hovered() { fill.gamma_multiply(1.15) } else { fill };
+                painter.rect_filled(tab, (4.0 * self.zoom).round() as u8, fill);
+                painter.text(tab.center(), Align2::CENTER_CENTER, "+", FontId::proportional(13.0 * self.zoom),
+                    Color32::from_white_alpha(217));
+                #[cfg(test)] record_port_control(&response, id, if input { "input" } else { "output" });
+                if !space {
+                    egui::Popup::menu(&response).show(|ui| {
+                        if input { input_menu(ui, &node, id, &mut actions); } else { output_menu(ui, &node, id, &mut actions); }
+                    });
+                }
+            }
+            // Keep the selection outline above the tabs, even at minimum zoom.
+            self.paint_outline(&painter, node_rect, selected, viewed);
 
             // Ports.
             if self.zoom > 0.0 {
@@ -616,11 +718,12 @@ impl GraphEditor {
                     let Some(ty) = node.input_type(i) else { continue };
                     let builtin = kind.inputs().get(i);
                     let label = builtin.map(|s| s.label).unwrap_or_else(|| kind.param_spec(&node.exposed_inputs()[i - kind.inputs().len()].as_ref().unwrap().parameter).unwrap().label);
-                    let c = xf.to_screen(input_port(pos, i));
+                    let c = xf.to_screen(input_port(&node, i));
                     let connected = session.project.graph.input_of(id, i).is_some();
                     inputs.push((id, i, c, ty));
                     let hover_rect = Rect::from_center_size(c, Vec2::splat((PORT_R * 2.6 * self.zoom).max(14.0)));
                     let pr = ui.interact(hover_rect, ui.scope_id().with(("in", id.0, i)), if space { Sense::hover() } else { Sense::click_and_drag() });
+                    #[cfg(test)] if builtin.is_none() { record_port_control(&pr, id, "parameter_port"); }
                     pr.widget_info(|| {
                         egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{} input {}", kind.label(), label))
                     });
@@ -659,23 +762,6 @@ impl GraphEditor {
                     }
                     let connected = session.project.graph.edges().iter().any(|e| e.from == id && e.from_port == port);
                     draw_port(&painter, c, ty, connected, pr.hovered() || pr.dragged(), self.zoom);
-                }
-            }
-
-            // Corner controls are registered after the node so they own their clicks.
-            if !space {
-                for (input, enabled) in [(true, !Graph::supported_parameter_inputs(kind).is_empty()), (false, kind.outputs().iter().any(|p| p.ty == PortType::Images))] {
-                    if !enabled { continue; }
-                    let side = 12.0 * self.zoom;
-                    let x = if input { node_rect.left() } else { node_rect.right() - side };
-                    let square = Rect::from_min_size(Pos2::new(x, node_rect.top()), Vec2::splat(side));
-                    let response = ui.interact(square, ui.scope_id().with(("corner", id.0, input)), Sense::click())
-                        .on_hover_text(if input { "Add input port" } else { "Add output port" });
-                    painter.rect_filled(square, 0, if input { Color32::from_rgb(48, 140, 230) } else { Color32::from_rgb(220, 65, 70) });
-                    #[cfg(test)] record_port_control(&response, if input { "input" } else { "output" });
-                    egui::Popup::menu(&response).show(|ui| {
-                        if input { input_menu(ui, &node, id, &mut actions); } else { output_menu(ui, &node, id, &mut actions); }
-                    });
                 }
             }
 
@@ -834,7 +920,7 @@ impl GraphEditor {
                     ConnDrag::FromInput { node, port } => {
                         if let Some(n) = session.project.graph.node(*node) {
                             let ty = n.input_type(*port).unwrap_or(PortType::Images);
-                            draw_wire(&painter, p, xf.to_screen(input_port(n.pos, *port)), port_color(ty), self.zoom);
+                            draw_wire(&painter, p, xf.to_screen(input_port(n, *port)), port_color(ty), self.zoom);
                             let target = nearest_output(&outputs, p, self.zoom, Some(ty));
                             if let Some((_, _, c, _)) = target {
                                 painter.circle_stroke(c, 9.0 * self.zoom.max(0.8), Stroke::new(2.0, Color32::from_rgb(120, 230, 140)));
@@ -905,24 +991,7 @@ impl GraphEditor {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn paint_node(
-        &self,
-        painter: &egui::Painter,
-        session: &Session,
-        id: NodeId,
-        node_rect: Rect,
-        selected: Sel,
-        viewed: bool,
-        image: ImageId,
-    ) {
-        let Some(node) = session.project.graph.node(id) else { return };
-        let z = self.zoom;
-        let r = (7.0 * z).round().clamp(2.0, 20.0) as u8;
-        painter.rect_filled(node_rect.translate(Vec2::new(2.0, 3.0) * z), r, Color32::from_black_alpha(70));
-        painter.rect_filled(node_rect, r, Color32::from_rgb(44, 47, 54));
-        let title = Rect::from_min_size(node_rect.min, Vec2::new(node_rect.width(), TITLE_H * z));
-        painter.rect_filled(title, CornerRadius { nw: r, ne: r, sw: 0, se: 0 }, title_color(node.kind));
+    fn paint_outline(&self, painter: &egui::Painter, node_rect: Rect, selected: Sel, viewed: bool) {
         let outline = if selected == Sel::Primary {
             Stroke::new(2.5, COLOR_SELECTED)
         } else if selected == Sel::Member {
@@ -932,32 +1001,48 @@ impl GraphEditor {
         } else {
             Stroke::new(1.0, Color32::from_rgb(84, 89, 99))
         };
-        painter.rect_stroke(node_rect, r, outline, StrokeKind::Inside);
+        painter.rect_stroke(node_rect, self.node_radius(), outline, StrokeKind::Inside);
+    }
+
+    fn node_radius(&self) -> u8 {
+        (7.0 * self.zoom).round().clamp(2.0, 20.0) as u8
+    }
+
+    fn paint_node(
+        &self,
+        painter: &egui::Painter,
+        session: &Session,
+        id: NodeId,
+        node_rect: Rect,
+        title: &TitleBar,
+        image: ImageId,
+    ) {
+        let Some(node) = session.project.graph.node(id) else { return };
+        let z = self.zoom;
+        let r = self.node_radius();
+        painter.rect_filled(node_rect.translate(Vec2::new(2.0, 3.0) * z), r, Color32::from_black_alpha(70));
+        painter.rect_filled(node_rect, r, Color32::from_rgb(44, 47, 54));
+        painter.rect_filled(title.rect, CornerRadius { nw: r, ne: r, sw: 0, se: 0 }, title_color(node.kind));
 
         if z < 0.35 {
             return;
         }
-        painter.text(
-            node_rect.min + Vec2::new(NODE_W / 2.0, TITLE_H / 2.0) * z,
-            Align2::CENTER_CENTER,
-            node.kind.label(),
-            FontId::proportional(13.0 * z),
-            Color32::from_gray(240),
-        );
+        let color = Color32::from_gray(240);
+        let mut job = egui::text::LayoutJob::simple_singleline(node.kind.label().to_owned(), FontId::proportional(13.0 * z), color);
+        job.wrap.max_width = title.text.width();
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = painter.layout_job(job);
+        let text_rect = Align2::CENTER_CENTER.anchor_size(title.text.center(), galley.size());
+        painter.with_clip_rect(title.text).galley(text_rect.min, galley, color);
         if z < 0.5 {
             return;
         }
         let label_font = FontId::proportional(11.5 * z);
         let label_color = Color32::from_gray(176);
         for (i, spec) in node.kind.inputs().iter().enumerate() {
-            let p = node_rect.min + (input_port([0.0, 0.0], i).to_vec2()) * z;
+            let p = node_rect.min + (builtin_input_port([0.0, 0.0], i).to_vec2()) * z;
             painter.text(p + Vec2::new(11.0 * z, 0.0), Align2::LEFT_CENTER, spec.label, label_font.clone(), label_color);
-        }
-        for (i, input) in node.exposed_inputs().iter().enumerate() {
-            if let Some(input) = input {
-                let p = node_rect.min + input_port([0.0, 0.0], node.kind.inputs().len() + i).to_vec2() * z;
-                painter.text(p + Vec2::new(11.0 * z, 0.0), Align2::LEFT_CENTER, node.kind.param_spec(&input.parameter).unwrap().label, label_font.clone(), label_color);
-            }
         }
         for (i, output) in node.exposed_outputs().iter().enumerate() {
             if let Some(output) = output {
@@ -990,14 +1075,15 @@ impl GraphEditor {
             painter.text(p - Vec2::new(54.0 * z, 0.0), Align2::RIGHT_CENTER, name, label_font.clone(), name_color);
         }
         // Parameter summary for the selected image.
-        let rows = node_port_rows(node) as f32;
-        let mut y = TITLE_H + 6.0 + rows * ROW_H + 4.0;
         let own = node.mode == Mode::Individual && node.has_individual(image);
         let color = if own { Color32::from_rgb(255, 196, 120) } else { Color32::from_gray(150) };
-        for (label, value) in box_rows(&session.project.graph, node, image) {
-            painter.text(node_rect.min + Vec2::new(10.0, y + PARAM_H / 2.0) * z, Align2::LEFT_CENTER, label, FontId::proportional(11.0 * z), Color32::from_gray(130));
-            painter.text(node_rect.min + Vec2::new(NODE_W - 10.0, y + PARAM_H / 2.0) * z, Align2::RIGHT_CENTER, value, FontId::monospace(11.0 * z), color);
-            y += PARAM_H;
+        for (i, (label, value)) in box_rows(&session.project.graph, node, image).into_iter().enumerate() {
+            let y = parameter_row_y(node, i);
+            #[cfg(test)] if i == 0 && node.exposed_inputs().iter().any(Option::is_some) {
+                painter.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(("parameter_row", id)), node_rect.top() + y * z));
+            }
+            painter.text(node_rect.min + Vec2::new(10.0, y) * z, Align2::LEFT_CENTER, label, FontId::proportional(11.0 * z), Color32::from_gray(130));
+            painter.text(node_rect.min + Vec2::new(NODE_W - 10.0, y) * z, Align2::RIGHT_CENTER, value, FontId::monospace(11.0 * z), color);
         }
         if has_count(node.kind) {
             let text = match session.collection.counts.get(&id) {
@@ -1009,29 +1095,10 @@ impl GraphEditor {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn badges(
-        &self,
-        ui: &mut egui::Ui,
-        painter: &egui::Painter,
-        session: &Session,
-        id: NodeId,
-        node_rect: Rect,
-        issue: Option<&str>,
-        _image: ImageId,
-    ) {
-        let Some(node) = session.project.graph.node(id) else { return };
+    fn badges(&self, ui: &mut egui::Ui, painter: &egui::Painter, node: &Node, title: &TitleBar, issue: Option<&str>) {
+        let id = node.id;
         let z = self.zoom;
-        if z < 0.5 {
-            return;
-        }
-        let h = 16.0 * z;
-        let mut x = node_rect.max.x - 6.0 * z;
-        let cy = node_rect.min.y + TITLE_H * z / 2.0;
-
-
-        if let Some(msg) = issue {
-            let rect = Rect::from_center_size(Pos2::new(x - 8.0 * z, cy), Vec2::new(16.0 * z, h));
+        if let (Some(rect), Some(msg)) = (title.warning, issue) {
             let c = rect.center();
             let tri = vec![
                 Pos2::new(c.x, c.y - 7.5 * z),
@@ -1041,30 +1108,23 @@ impl GraphEditor {
             painter.add(egui::Shape::convex_polygon(tri, COLOR_WARN, Stroke::new(1.0, Color32::from_rgb(90, 50, 0))));
             painter.text(Pos2::new(c.x, c.y + 1.5 * z), Align2::CENTER_CENTER, "!", FontId::proportional(11.0 * z), Color32::BLACK);
             ui.interact(rect, ui.scope_id().with(("warn", id.0)), Sense::hover()).on_hover_text(msg);
-            x -= 20.0 * z;
         }
-        if node.kind.params().is_empty() {
-            return;
-        }
-        if node.mode == Mode::Individual {
+        if let Some(rect) = title.count {
             let n = node.individual_count();
-            let text = n.to_string();
-            let w = (10.0 + 6.5 * text.len() as f32) * z;
-            let rect = Rect::from_center_size(Pos2::new(x - w / 2.0, cy), Vec2::new(w, h));
             painter.rect_filled(rect, (4.0 * z).round() as u8, Color32::from_rgb(30, 32, 38));
-            painter.text(rect.center(), Align2::CENTER_CENTER, &text, FontId::monospace(11.0 * z), Color32::from_rgb(255, 205, 140));
+            painter.text(rect.center(), Align2::CENTER_CENTER, n.to_string(), FontId::monospace(11.0 * z), Color32::from_rgb(255, 205, 140));
             ui.interact(rect, ui.scope_id().with(("count", id.0)), Sense::hover())
                 .on_hover_text(format!("{n} image(s) have their own values on this node"));
-            x -= w + 3.0 * z;
         }
-        let rect = Rect::from_center_size(Pos2::new(x - 8.0 * z, cy), Vec2::new(16.0 * z, h));
+        let Some(rect) = title.mode else { return };
         let (letter, fill, tip) = match node.mode {
             Mode::All => ("A", Color32::from_rgb(70, 76, 90), "Mode All: the same values for every image"),
             Mode::Individual => ("I", Color32::from_rgb(214, 128, 40), "Mode Individual: values per image"),
         };
         painter.rect_filled(rect, (4.0 * z).round() as u8, fill);
         painter.text(rect.center(), Align2::CENTER_CENTER, letter, FontId::proportional(11.5 * z), Color32::WHITE);
-        ui.interact(rect, ui.scope_id().with(("mode", id.0)), Sense::hover()).on_hover_text(tip);
+        let _badge = ui.interact(rect, ui.scope_id().with(("mode", id.0)), Sense::hover()).on_hover_text(tip);
+        #[cfg(test)] record_port_control(&_badge, id, "mode");
     }
 
     fn apply(&mut self, actions: Vec<Action>, session: &mut Session, status: &mut Status) {
@@ -1262,7 +1322,7 @@ fn nearest_wire(graph: &Graph, xf: &Xform, p: Pos2) -> Option<rawgraph_core::gra
     let mut hit = None;
     for edge in graph.edges() {
         let (Some(from), Some(to)) = (graph.node(edge.from), graph.node(edge.to)) else { continue };
-        let pts = wire_points(xf.to_screen(output_port(from.pos, edge.from_port)), xf.to_screen(input_port(to.pos, edge.to_port)), xf.zoom);
+        let pts = wire_points(xf.to_screen(output_port(from.pos, edge.from_port)), xf.to_screen(input_port(to, edge.to_port)), xf.zoom);
         let mut prev = pts[0];
         for i in 1..=64 {
             let t = i as f32 / 64.0;
@@ -1361,8 +1421,8 @@ mod tests {
         let output = g.expose_output(src, 0, "Luma").unwrap();
         g.connect_ports(src, output, exp, input).unwrap();
         let n = g.node(exp).unwrap();
-        assert!(input_port(n.pos, input).y < n.pos[1] + actual_node_size(n).y);
-        let p = input_port(n.pos, input);
+        assert!(input_port(n, input).y < n.pos[1] + actual_node_size(n).y);
+        let p = input_port(n, input);
         assert_eq!(nearest_input(&[(exp, input, p, PortType::Images)], p, 1.0, Some(PortType::Images)).unwrap().1, input);
         assert_eq!(compatible_port(&g, ConnDrag::FromOutput(src, output, None), NodeKind::Exposure), Some(0));
         assert!(g.remove_exposed_input(exp, input));
@@ -1372,26 +1432,97 @@ mod tests {
         assert!(g.node(exp).unwrap().input_type(input).is_none());
     }
 
+    fn port_control(h: &Harness, id: NodeId, name: &'static str) -> Rect {
+        h.ctx.data(|d| d.get_temp(egui::Id::unique(("port_control", id, name))).expect(name))
+    }
+
     #[test]
-    fn visible_port_buttons_open_menus_and_create_ports() {
-        let mut graph = Graph::new();
-        let id = graph.add_node(NodeKind::Exposure, [100.0, 100.0]);
+    fn inset_port_tabs_open_menus_without_selecting_or_dragging_the_node() {
+        let (graph, src, id, _) = loose_graph();
         let mut h = Harness::new(graph);
-        h.click(h.node_title_pos(id));
-        let control = |h: &Harness, name: &'static str| h.ctx.data(|d| d.get_temp::<Rect>(egui::Id::unique(("port_control", name))).expect(name)).center();
+        h.click(h.node_title_pos(src));
         let original = h.s.project.graph.node(id).unwrap().pos;
-        h.click(control(&h, "input"));
-        h.click(control(&h, "input_item"));
-        assert_eq!(h.s.project.graph.node(id).unwrap().exposed_inputs().iter().flatten().next().unwrap().parameter, "ev");
-        h.click(control(&h, "output"));
-        h.click(control(&h, "output_item"));
-        assert_eq!(h.s.project.graph.node(id).unwrap().exposed_outputs().iter().flatten().next().unwrap().label, "Luma");
+        let xf = h.xf();
+        let node_rect = Rect::from_min_size(xf.to_screen(Pos2::from(original)), node_size(NodeKind::Exposure) * xf.zoom);
+        let title_rect = Rect::from_min_size(node_rect.min, Vec2::new(node_rect.width(), TITLE_H * xf.zoom));
+        let input = port_control(&h, id, "input");
+        let output = port_control(&h, id, "output");
+        let mode = port_control(&h, id, "mode");
+        for tab in [input, output] {
+            assert!(title_rect.contains_rect(tab));
+            assert!(node_rect.shrink(4.0 * xf.zoom).contains_rect(tab));
+            assert!((tab.width() - TAB_SIZE * xf.zoom).abs() < 1e-4);
+            assert!((tab.center().y - title_rect.center().y).abs() < 1e-4);
+        }
+        assert!((input.left() - node_rect.left() - TAB_INSET * xf.zoom).abs() < 1e-4);
+        assert!((node_rect.right() - output.right() - TAB_INSET * xf.zoom).abs() < 1e-4);
+        assert!(output.left() - mode.right() >= TITLE_GAP * xf.zoom - 1e-4);
+
+        h.drag(input.center(), input.center() + Vec2::new(65.0, 20.0));
+        assert_eq!(h.s.selected_node, Some(src));
         assert_eq!(h.s.project.graph.node(id).unwrap().pos, original);
+        h.click(input.center());
+        assert_eq!(h.s.selected_node, Some(src));
+        h.click(port_control(&h, id, "input_item").center());
+        let node = h.s.project.graph.node(id).unwrap();
+        let port = node.kind.inputs().len();
+        assert_eq!(node.exposed_inputs()[0].as_ref().unwrap().parameter, "ev");
+        assert_eq!(summary_rows(node, h.s.current_image()), vec![("Exposure".into(), "0.00 EV".into())]);
+        let row_y = h.ctx.data(|d| d.get_temp::<f32>(egui::Id::unique(("parameter_row", id))).unwrap());
+        assert!((port_control(&h, id, "parameter_port").center().y - row_y).abs() < 1e-4);
+        assert!((h.in_port(id, port).y - row_y).abs() < 1e-4);
+
+        h.click(output.center());
+        assert_eq!(h.s.selected_node, Some(src));
+        h.click(port_control(&h, id, "output_item").center());
+        let node = h.s.project.graph.node(id).unwrap();
+        assert_eq!(node.exposed_outputs()[0].as_ref().unwrap().label, "Luma");
+        assert_eq!(node.pos, original);
         let undo_output = h.hist.undo().unwrap();
         assert!(undo_output.node(id).unwrap().exposed_outputs().iter().flatten().next().is_none());
-        assert_eq!(undo_output.node(id).unwrap().exposed_inputs().iter().flatten().next().unwrap().parameter, "ev");
+        assert_eq!(undo_output.node(id).unwrap().exposed_inputs()[0].as_ref().unwrap().parameter, "ev");
         let undo_input = h.hist.undo().unwrap();
         assert!(undo_input.node(id).unwrap().exposed_inputs().iter().flatten().next().is_none());
+    }
+
+    #[test]
+    fn dragging_a_wire_to_and_from_an_inline_parameter_port() {
+        let (mut graph, src, id, _) = loose_graph();
+        let port = graph.expose_parameter(id, "ev", PortType::Images).unwrap();
+        let mut h = Harness::new(graph);
+        let image = h.s.current_image();
+        h.s.project.graph.node_mut(id).unwrap().set_param("ev", image, 1.51);
+        h.settle();
+        assert_eq!(summary_rows(h.s.project.graph.node(id).unwrap(), image), vec![("Exposure".into(), "1.51 EV".into())]);
+        let source = h.out_port(src);
+        let parameter = port_control(&h, id, "parameter_port").center();
+        h.drag(source, parameter);
+        assert_eq!(h.s.project.graph.input_edge(id, port), Some((src, 0)));
+        h.drag(parameter, h.in_port(id, 0));
+        assert_eq!(h.s.project.graph.input_edge(id, port), None);
+        assert_eq!(h.s.project.graph.input_edge(id, 0), Some((src, 0)));
+    }
+
+    #[test]
+    fn all_exposed_develop_parameters_fit_and_removed_slots_leave_no_gap() {
+        let mut graph = Graph::new();
+        let id = graph.add_node(NodeKind::Develop, [0.0, 0.0]);
+        let keys = Graph::supported_parameter_inputs(NodeKind::Develop);
+        let ports: Vec<_> = keys.iter().map(|key| graph.expose_parameter(id, key, PortType::Images).unwrap()).collect();
+        let image = ImageId(1);
+        let node = graph.node_mut(id).unwrap();
+        node.set_param("saturation", image, 0.25);
+        let rows = summary_rows(node, image);
+        assert_eq!(rows.len(), 7); // Six exposed parameters and the overflow note.
+        assert!(rows[6].0.contains("+1"));
+        for (i, (&port, key)) in ports.iter().zip(keys).enumerate() {
+            assert_eq!(rows[i].0, node.kind.param_spec(key).unwrap().label);
+            assert_eq!(input_port(node, port).y, parameter_row_y(node, i));
+        }
+        assert!(parameter_row_y(node, 6) < actual_node_size(node).y - COUNT_H);
+        assert!(graph.remove_exposed_input(id, ports[0]));
+        let node = graph.node(id).unwrap();
+        assert_eq!(input_port(node, ports[1]).y, parameter_row_y(node, 0));
     }
 
     #[test]
@@ -1400,7 +1531,7 @@ mod tests {
             let size = node_size(kind);
             let origin = [0.0, 0.0];
             for i in 0..kind.inputs().len() {
-                let p = input_port(origin, i);
+                let p = builtin_input_port(origin, i);
                 assert_eq!(p.x, 0.0);
                 assert!(p.y > TITLE_H && p.y < size.y, "{kind:?} input {i} inside node");
             }
@@ -1581,7 +1712,7 @@ mod tests {
         }
 
         fn in_port(&self, id: NodeId, port: usize) -> Pos2 {
-            self.xf().to_screen(input_port(self.s.project.graph.node(id).unwrap().pos, port))
+            self.xf().to_screen(input_port(self.s.project.graph.node(id).unwrap(), port))
         }
     }
 
@@ -1782,7 +1913,7 @@ mod tests {
     fn merge_has_four_input_ports_in_the_box() {
         let size = node_size(NodeKind::Merge);
         for i in 0..4 {
-            assert!(input_port([0.0, 0.0], i).y < size.y);
+            assert!(builtin_input_port([0.0, 0.0], i).y < size.y);
         }
         assert!(node_size(NodeKind::MetadataFilter).y > node_size(NodeKind::CaptureEv).y);
     }
@@ -2041,7 +2172,7 @@ mod tests {
         g.connect(b, c, 0).unwrap();
         let mut h = Harness::new(g);
         let from = h.out_port(a);
-        let to = h.xf().to_screen(input_port(h.s.project.graph.node(b).unwrap().pos, 0));
+        let to = h.xf().to_screen(input_port(h.s.project.graph.node(b).unwrap(), 0));
         let p = from + (to - from) * 0.5;
         let steps = h.undo_steps();
         h.move_to(p);
