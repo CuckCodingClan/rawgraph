@@ -34,6 +34,7 @@ mod icons;
 mod missing_check;
 mod node_ui;
 mod prefetch;
+mod quick_preview;
 mod provider;
 mod ranges_logic;
 mod recipes;

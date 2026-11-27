@@ -63,8 +63,10 @@ pub struct Viewer {
     pan: Vec2,
     /// Last evaluation error; the last good frame stays visible, dimmed.
     pub error: Option<String>,
-    /// Progress note while a proxy decodes (the previous frame stays, dimmed).
-    pub busy: Option<String>,
+    pub preview_image: Option<rawgraph_core::ImageId>,
+    preview_generation: Option<u64>,
+    pub preview_uv: Option<[Pos2; 4]>,
+    rendering: Option<std::time::Instant>,
     /// Neutral message: the image is not part of the viewed collection.
     pub excluded: Option<String>,
     /// Zoom in points per image pixel as last painted, for the status bar.
@@ -94,7 +96,10 @@ impl Default for Viewer {
             mode: ZoomMode::Fit,
             pan: Vec2::ZERO,
             error: None,
-            busy: None,
+            preview_image: None,
+            preview_generation: None,
+            preview_uv: None,
+            rendering: None,
             excluded: None,
             last_scale: 1.0,
             overlay: None,
@@ -116,11 +121,54 @@ impl Viewer {
         self.gpu_tex.or_else(|| self.texture.as_ref().map(|t| t.id()))
     }
 
+    pub fn select(&mut self, image: rawgraph_core::ImageId, generation: u64) {
+        self.preview_image = Some(image);
+        self.preview_generation = Some(generation);
+        self.preview_uv = None;
+        self.texture = None;
+        self.gpu_tex = None;
+        self.overlay = None;
+        self.error = None;
+        self.excluded = None;
+        self.frame_size = [0, 0];
+        self.fit();
+        self.rendering = Some(std::time::Instant::now());
+    }
+
+    pub fn set_placeholder(&mut self, generation: u64, texture: TextureHandle, geometry: crate::quick_preview::Geometry) {
+        if self.preview_generation != Some(generation) { return; }
+        self.texture = Some(texture);
+        self.frame_size = geometry.size;
+        self.preview_uv = Some(geometry.uv);
+    }
+
+    pub fn rendering(&mut self) {
+        self.rendering.get_or_insert_with(std::time::Instant::now);
+    }
+
+    pub fn awaiting_final(&self) -> bool { self.preview_generation.is_some() }
+
+    fn finish_render(&mut self) {
+        self.preview_generation = None;
+        self.preview_uv = None;
+        self.rendering = None;
+    }
+
+    pub fn badge(&self, ctx: &egui::Context, now: std::time::Instant) -> Option<&'static str> {
+        if self.preview_uv.is_some() && self.error.is_none() { return Some("Preview"); }
+        let since = self.rendering?;
+        let remaining = std::time::Duration::from_millis(150).saturating_sub(now.saturating_duration_since(since));
+        if self.awaiting_final() || remaining.is_zero() { return Some("Rendering…"); }
+        ctx.request_repaint_after(remaining);
+        None
+    }
+
     pub fn set_frame(&mut self, ctx: &egui::Context, frame: &Frame) {
         if let Some(pic) = frame.gpu {
             if pic.width == 0 || pic.height == 0 {
                 return;
             }
+            self.finish_render();
             // The picture stays on the GPU; the CPU texture is not needed any more.
             self.gpu_tex = Some(pic.texture);
             self.texture = None;
@@ -134,6 +182,8 @@ impl Viewer {
         if size[0] == 0 || size[1] == 0 || frame.rgba8.len() != size[0] * size[1] * 4 {
             return;
         }
+        if self.preview_uv.is_some() { self.texture = None; } // Do not overwrite a shared filmstrip texture.
+        self.finish_render();
         let image = ColorImage::from_rgba_unmultiplied(size, &frame.rgba8);
         // Pixels are shown crisp when magnified, smooth when reduced.
         let options = TextureOptions {
@@ -168,11 +218,15 @@ impl Viewer {
 
 
     pub fn set_error(&mut self, message: String) {
+        if self.awaiting_final() { self.texture = None; }
+        self.finish_render();
         self.error = Some(message);
         self.excluded = None;
     }
 
     pub fn set_excluded(&mut self, message: String) {
+        if self.awaiting_final() { self.texture = None; }
+        self.finish_render();
         self.excluded = Some(message);
         self.error = None;
     }
@@ -222,15 +276,12 @@ impl Viewer {
             return None;
         }
         let Some(texture_id) = self.texture_id() else {
-            match (&self.error, &self.busy) {
-                (Some(err), _) => paint_notice(&painter, rect, err, true),
-                (None, Some(msg)) => paint_notice(&painter, rect, msg, false),
-                (None, None) => {}
-            }
+            if let Some(err) = &self.error { paint_notice(&painter, rect, err, true); }
+            if let Some(badge) = self.badge(ui.ctx(), std::time::Instant::now()) { paint_progress(&painter, rect, badge); }
             return None;
         };
         let mut image_size = Vec2::new(self.frame_size[0] as f32, self.frame_size[1] as f32);
-        if self.orient.is_some_and(|o| o.quarter_turns % 2 == 1) {
+        if self.preview_uv.is_none() && self.orient.is_some_and(|o| o.quarter_turns % 2 == 1) {
             image_size = Vec2::new(image_size.y, image_size.x);
         }
         let ppp = ui.ctx().pixels_per_point();
@@ -289,9 +340,10 @@ impl Viewer {
         let size = image_size * scale;
         let image_rect = Rect::from_center_size(rect.center() + self.pan, size);
         let tint = if self.error.is_some() { Color32::from_gray(70) } else { Color32::WHITE };
-        match self.orient {
-            Some(o) => paint_oriented(&painter, texture_id, image_rect, o, tint),
-            None => {
+        match (self.preview_uv, self.orient) {
+            (Some(uv), _) => crate::quick_preview::paint(&painter, texture_id, image_rect, uv, tint),
+            (None, Some(o)) => paint_oriented(&painter, texture_id, image_rect, o, tint),
+            (None, None) => {
                 painter.image(texture_id, image_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), tint);
                 if let Some(overlay) = &self.overlay {
                     painter.image(overlay.id(), image_rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), tint);
@@ -308,6 +360,7 @@ impl Viewer {
         if let Some(err) = &self.error {
             paint_notice(&painter, rect, err, true);
         }
+        if let Some(badge) = self.badge(ui.ctx(), std::time::Instant::now()) { paint_progress(&painter, rect, badge); }
         Some(Geometry { viewport: rect, image_rect, scale, response })
     }
 }
@@ -344,6 +397,20 @@ fn paint_tag(painter: &egui::Painter, rect: Rect, text: &str, color: Color32) {
     painter.galley(tag.min + Vec2::new(7.0, 4.0), galley, color);
 }
 
+pub fn paint_progress(painter: &egui::Painter, rect: Rect, text: &str) {
+    let color = Color32::from_gray(228);
+    let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(12.0), color);
+    let size = galley.size() + Vec2::new(34.0, 10.0);
+    let tag = Rect::from_min_size(rect.right_bottom() - size - Vec2::splat(10.0), size);
+    painter.rect_filled(tag, 8.0, Color32::from_rgba_unmultiplied(12, 14, 18, 230));
+    let center = tag.left_center() + Vec2::new(12.0, 0.0);
+    let phase = painter.ctx().input(|i| i.time as f32) * 6.0;
+    let points: Vec<_> = (0..10).map(|i| center + 4.0 * Vec2::angled(phase + i as f32 * 0.4)).collect();
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.2, color)));
+    painter.galley(tag.left_top() + Vec2::new(23.0, 5.0), galley, color);
+    painter.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+}
+
 /// Readable message box in the middle of the viewer (error or progress).
 fn paint_notice(painter: &egui::Painter, rect: Rect, text: &str, error: bool) {
     let font = egui::FontId::proportional(17.0);
@@ -360,7 +427,7 @@ fn paint_notice(painter: &egui::Painter, rect: Rect, text: &str, error: bool) {
 }
 
 /// Fits the texture centred on black, with no chrome at all (clean feed).
-pub fn paint_clean(ui: &mut egui::Ui, texture: Option<egui::TextureId>, size: [u32; 2]) {
+pub fn paint_clean(ui: &mut egui::Ui, texture: Option<egui::TextureId>, size: [u32; 2], uv: Option<[Pos2; 4]>) {
     let rect = ui.max_rect();
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Color32::BLACK);
@@ -368,13 +435,42 @@ pub fn paint_clean(ui: &mut egui::Ui, texture: Option<egui::TextureId>, size: [u
         let image = Vec2::new(size[0] as f32, size[1] as f32);
         let scale = fit_scale(rect.size(), image);
         let r = Rect::from_center_size(rect.center(), image * scale);
-        painter.image(t, r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        if let Some(uv) = uv { crate::quick_preview::paint(&painter, t, r, uv, Color32::WHITE); }
+        else { painter.image(t, r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE); }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_shows_only_its_preview_until_the_final_render_and_edits_do_not_flash() {
+        let ctx = egui::Context::default();
+        let mut viewer = Viewer::default();
+        let geom = |size| crate::quick_preview::Geometry { size, uv: [Pos2::ZERO; 4] };
+        let texture = || ctx.load_texture("test placeholder", ColorImage::filled([32, 48], Color32::GRAY), TextureOptions::LINEAR);
+        viewer.select(rawgraph_core::ImageId(1), 1);
+        assert_eq!(viewer.badge(&ctx, std::time::Instant::now()), Some("Rendering…"));
+        viewer.set_placeholder(1, texture(), geom([4000, 6000]));
+        assert_eq!(viewer.badge(&ctx, std::time::Instant::now()), Some("Preview"));
+        assert_eq!(viewer.frame_size, [4000, 6000]);
+        viewer.select(rawgraph_core::ImageId(2), 2);
+        assert!(viewer.texture_id().is_none());
+        viewer.set_placeholder(1, texture(), geom([4000, 6000]));
+        assert!(viewer.texture_id().is_none());
+        viewer.set_placeholder(2, texture(), geom([6000, 4000]));
+        viewer.finish_render();
+        assert_eq!(viewer.badge(&ctx, std::time::Instant::now()), None);
+        viewer.set_placeholder(2, texture(), geom([1, 1]));
+        assert_eq!(viewer.frame_size, [6000, 4000]);
+        viewer.rendering();
+        let now = viewer.rendering.unwrap();
+        assert_eq!(viewer.badge(&ctx, now), None);
+        assert_eq!(viewer.badge(&ctx, now + std::time::Duration::from_millis(150)), Some("Rendering…"));
+        viewer.finish_render();
+        assert_eq!(viewer.badge(&ctx, now + std::time::Duration::from_secs(1)), None);
+    }
 
     #[test]
     fn fit_scale_uses_the_tighter_axis() {

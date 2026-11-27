@@ -20,7 +20,7 @@ type MembershipKey = (rawgraph_core::Graph, u64, usize, ImageId, NodeId);
 #[derive(Default)]
 pub(super) struct PaneRender {
     renderer: Option<Renderer>,
-    viewer: Viewer,
+    pub(super) viewer: Viewer,
     key: Option<RequestKey>,
     scopes: Option<rawgraph_scope_views::PrepareSettings>,
     image: Option<ImageId>,
@@ -317,6 +317,7 @@ impl App {
                         self.scopes_stale = false;
                     }
                     pane.key = None;
+                    pane.viewer.preview_image = None;
                     pane.image = None;
                     pane.error = None;
                     continue;
@@ -329,6 +330,7 @@ impl App {
             }
             if pane.key.as_ref() != Some(&key) || pane.scopes != scopes {
                 pane.renderer.as_mut().unwrap().submit(self.session.project.graph.clone(), key.node, key.port, key.image, self.session.view, scopes.clone(), None);
+                pane.viewer.rendering();
                 pane.scopes = scopes;
                 pane.key = Some(key.clone());
                 pane.image = None;
@@ -341,6 +343,7 @@ impl App {
                         pane.image = Some(f.image);
                         pane.error = None;
                         if index == 1 {
+                            self.scopes_stale = false;
                             if let Some(prepared) = f.prepared.clone() {
                                 self.scope_panel.set_prepared(ctx, prepared);
                                 self.scope_worker_ms = f.scopes_ms;
@@ -349,6 +352,7 @@ impl App {
                         }
                     }
                     Reply::Error { message, .. } | Reply::Excluded { message, .. } => {
+                        pane.viewer.set_error(message.clone());
                         pane.error = Some(message);
                         pane.image = Some(key.image);
                         if index == 1 { self.scopes_stale = true; }
@@ -382,7 +386,8 @@ impl App {
 
     pub(super) fn primary_split_frame(&self) -> (Option<egui::TextureId>, [u32; 2]) {
         let pane = &self.cmp_panes[1];
-        let has_target = self.primary_target().image.is_some();
+        let target = self.primary_target().image;
+        let has_target = target.is_some() && (target == pane.viewer.preview_image || target == pane.image);
         (if has_target && pane.error.is_none() { pane.viewer.texture_id() } else { None }, pane.viewer.frame_size)
     }
 
@@ -400,6 +405,7 @@ impl App {
         });
         self.resolve_compare_pins();
         let session = &self.session;
+        let ctx = ui.ctx().clone();
         let panes = &self.cmp_panes;
         let make_half = |i: usize| {
             let pane = &panes[i];
@@ -409,9 +415,9 @@ impl App {
             let node_label = node.map(|id| session.project.graph.node(id).map(|n| format!("{} #{}", n.kind.label(), id.0)).unwrap_or_else(|| format!("Missing node #{}", id.0))).unwrap_or_else(|| "No node".into());
             let desired = self.pane_key(i);
             let valid = desired.as_ref().is_some_and(|key| pane.key.as_ref() == Some(key) && pane.image == Some(key.image) && pane.renderer.as_ref().is_some_and(|r| !r.pending()));
-            let texture = if desired.is_some() && (!valid || pane.error.is_none()) { pane.viewer.texture_id() } else { None };
-            let note = if desired.is_none() { Some(if node.is_none() { "No node selected" } else { "No image selected" }.into()) } else if valid { pane.error.clone() } else { Some("Rendering…".into()) };
-            Half { texture, size: pane.viewer.frame_size, label: format!("{} — {}{}", image_label, node_label, if pane.resolved == node && node.is_some() { " (last compatible; selected node excludes image)" } else { "" }), entry, note, tag: if i == 0 { "LEFT" } else { "RIGHT" } }
+            let texture = if (i == 0 || desired.as_ref().map(|k| k.image) == pane.viewer.preview_image) && desired.is_some() && (!valid || pane.error.is_none()) { pane.viewer.texture_id() } else { None };
+            let note = if desired.is_none() { Some(if node.is_none() { "No node selected" } else { "No image selected" }.into()) } else if valid { pane.error.clone() } else if i == 0 { Some("Rendering…".into()) } else { None };
+            Half { texture, size: pane.viewer.frame_size, uv: pane.viewer.preview_uv, badge: (i == 1 && desired.is_some()).then(|| pane.viewer.badge(&ctx, Instant::now())).flatten(), label: format!("{} — {}{}", image_label, node_label, if pane.resolved == node && node.is_some() { " (last compatible; selected node excludes image)" } else { "" }), entry, note, tag: if i == 0 { "LEFT" } else { "RIGHT" } }
         };
         let left = make_half(0);
         let right = make_half(1);

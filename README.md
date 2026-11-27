@@ -24,6 +24,27 @@ Local-first RAW photo analysis, organization, and non-destructive editing throug
 
 RawGraph should feel snappy on the first view of a RAW, not just after it is cached. A wait of over two seconds for the first visible frame from an unedited Source is unacceptable. Treat responsiveness as a requirement for new features, and prioritize measured performance improvements when no feature requests are queued.
 
+When you select a photo, the viewer replaces the old picture with a cached proxy or
+filmstrip thumbnail if one is ready. Otherwise it shows **Rendering…** and tries the
+on-disk thumbnail cache and the camera's embedded preview on a background worker.
+**Preview** means the displayed picture is provisional; the graph render replaces it
+and clears the badge. Edits to the current photo retain the last frame and show the
+badge only after 150 ms. Scopes wait for the graph result; Clean Feed can show the preview.
+
+Measure RAW decode stages and embedded preview extraction on your own files:
+
+```text
+cargo run --release -p rawgraph-io --example first_draw -- <RAW-folder>
+```
+
+The example times the 2560-pixel proxy and embedded preview separately; it does not
+flush OS caches or measure click-to-display. Baseline gain is timed with the matrix
+because it is applied in the same pixel loop. To run the generated DNG fixture:
+
+```text
+cargo test -p rawgraph-io --test synthetic_raw synthetic_first_draw -- --ignored --nocapture
+```
+
 - [ ] Benchmark selection-to-first-visible-frame on Windows with representative RAWs on both local SSD and NAS. Record median and p95 separately for uncached and cached views, along with camera format, preview size, and hardware. Use the baseline to set explicit regression budgets.
 - [ ] Profile the uncached path first: file I/O, decompression, proxy generation, display conversion, and upload. Remove redundant pixel passes, publish a useful preview before scopes or other secondary work, and make prefetch yield to the selected image.
 - [ ] Compare before/after timings for changes to preview hot paths. Preserve colour accuracy and full-resolution export fidelity; don't use fast cache hits to hide slow first draws.
