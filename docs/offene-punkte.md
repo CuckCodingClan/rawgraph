@@ -1,6 +1,6 @@
 # RawGraph – Fragen und offene Punkte
 
-Stand: 15.11.2026, nach Welle 8 (Nodes aus `node_structure.md`, eingefärbte Scopes, Projektformat 2). Grundlage sind `README.md` (Anforderungen und Fahrplan) und `node_structure.md` (Node-Liste).
+Stand: 28.11.2026, Version 26.11.3 (nach Welle 8 und dem Auftrag vom 28.11.: Masken-Migration, GPU-Ausbau, Export-Vorschau/WebP-ICC, HEIC, Depth-Worker, Altmängel, LUT, Gruppen und Makros, HDR Merge, Panorama, HDR-Panorama, Stichwörter, Benennung aus der Beschriftungs-Excel, Stapel-Umbenennung, Arbeitsbereiche). Grundlage sind `README.md` (Anforderungen und Fahrplan) und `node_structure.md` (Node-Liste).
 
 Antworten bitte mit der Nummer. Wo ein Vorschlag steht, reicht „Vorschlag“.
 
@@ -19,7 +19,6 @@ Antworten bitte mit der Nummer. Wo ein Vorschlag steht, reicht „Vorschlag“.
 | 21 | macOS und Linux stehen jetzt als Pflicht in den Anforderungen. Ich kann hier nur Windows prüfen. Auf welchem Gerät lässt sich das prüfen, und bis wann? | Sobald ein Mac oder Linux-Rechner mit Rust bereitsteht. |
 | 22 | Lizenz: Die RAW-Bibliothek `rawler` steht unter LGPL-2.1 und ist fest in die exe gelinkt. Bei Weitergabe entstehen Pflichten; das Paket beantwortet sie nur mit einem Quelltext-Angebot. Bleiben wir dabei? | Vorerst ja; vor einem Verkauf neu entscheiden. |
 | 23 | Die Standard-Helligkeit für RAW ist an deinen zwölf Beispielen gemessen (+1,6 Blenden, dazu der Wert aus der Datei). Canon liegt rund 0,2 Blenden über Sony. Soll es einen Wert je Kamera geben? | Ja, sobald mehr Beispiele je Kamera vorliegen. |
-| 26 | HEIC steht in der Node-Liste. Dafür gibt es keinen Encoder mit verträglicher Lizenz (HEVC ist patentbelastet, die freien Encoder stehen unter GPL). Möglich wäre der Windows-eigene Encoder, der nur unter Windows und nur mit installierter HEVC-Erweiterung läuft. Reicht AVIF? | AVIF reicht; HEIC weglassen. |
 | 27 | Lens Correction „Auto“ nutzt die Korrekturdaten in der Datei. Die gibt es nur bei Sony-DNG (Farbsäume, minimale Verzeichnung, keine Vignette). Canon-DNG und ARW haben keine. Soll eine Objektivdatenbank dazu (Lensfun: Programmteil LGPL-3, Daten CC-BY-SA)? | Ja, als eigene Welle. |
 | 28 | Layer-Modus „All“ (jede Kombination): Wie sollen die Ergebnisse heißen und im Filmstreifen erscheinen? | Jede Kombination als eigener Eintrag „A × B“, Export-Name aus beiden Dateinamen. |
 | 29 | Zusammenarbeit: Projektdatei im geteilten Ordner mit Revisionsprüfung (jetzt gebaut) oder später ein Datenbank-Server? Die Abwägung steht in `docs/project-format.md`. | Vorerst geteilter Ordner; Server erst bei echtem Mehrbenutzer-Bedarf. |
@@ -96,27 +95,26 @@ Reihenfolge nach meinem Vorschlag.
 
 1. **Layer-Modus „All“** und zusammengesetzte Bild-Identitäten (Frage 28).
 2. **ACES-Ausgabe und HDR:** echte Output-Transforms, HDR-Vorschau, HDR-Export, Scopes mit Nits-Skala (Fragen 7 und 19).
-3. **Objektivdatenbank** für Verzeichnung und Vignette (Frage 27); Farbsäume aus dem Bild schätzen; Kameraprofile.
-4. **GPU-Rechenweg ausbauen:** Masken, Layer (Platzieren und Mischen), Rauschminderung (Guided Filter), Lens Correction (Verzeichnung, Vignette), Geometrie, Scopes auf der GPU; Filter mit Radius-Karte. Weichzeichner, Schärfen und die lokalen Tonwerte laufen bereits dort.
+3. **Objektivdatenbank** für Verzeichnung und Vignette (Frage 27); Farbsäume aus dem Bild schätzen; Kameraprofile. Für Panoramen mit starkem Weitwinkel wichtig (Verzeichnung wird beim Zusammensetzen nicht korrigiert).
+4. **GPU-Rechenweg ausbauen:** Masken, Layer (Platzieren und Mischen), Rauschminderung (Guided Filter), Lens Correction, Geometrie, Scopes auf der GPU; Filter mit Radius-Karte. Develop Lichter/Schatten/Weiß/Schwarz, Filter (Gauß/Box) und Schärfen laufen bereits dort.
 5. **Lokale Werkzeuge:** Dunst entfernen, Fleckenentfernung, Lichter/Schatten mit lokaler Anpassung.
-6. **Graph-Bedienung:** Gruppen und Makros, Kommentare, Ausrichten.
-7. **Weitere Nodes:** Körnung, LUT; Masken aus KI (Motiv, Himmel), Tiefe, importiertes Bild.
-8. **Mehrbild-Funktionen:** HDR-Zusammenführung ist als Node „HDR Merge“ gebaut (Bildgruppen, Ausrichtung nur per Verschiebung, Geisterbilder, Stapel-Marke im Filmstreifen; noch nicht mit echten Reihen von Hand getestet, nur mit Prüfbildern); offen: Panorama, Fokus-Stapel, Drehung/Subpixel-Ausrichtung beim HDR, Gruppen von Hand bilden per Auswahl im Filmstreifen (heute: Zahl „Group number“ je Bild im Inspektor).
-9. **Bibliothek:** Stichwörter, Stapel, XMP schreiben, Benennung aus der Beschriftungs-Excel, Analyse-Filter (Helligkeit).
+6. **Graph-Bedienung:** Kommentare, Ausrichten. (Gruppen und Makros sind gebaut.)
+7. **Weitere Nodes:** Körnung; Masken aus KI (Motiv, Himmel), importiertes Bild. (LUT ist gebaut.)
+8. **Mehrbild-Funktionen:** Fokus-Stapel; HDR-Ausrichtung mit Drehung/Subpixel; Gruppen von Hand per Auswahl im Filmstreifen bilden (heute: „Group number“ je Bild). HDR Merge, Panorama und HDR-Panorama sind gebaut, aber nur mit Prüfbildern getestet, nicht mit echten Reihen von Hand.
+9. **Bibliothek:** Stapel, Analyse-Filter (Helligkeit); Stichwörter in HEIC-Dateien. (Stichwörter, XMP schreiben, Benennung aus der Beschriftungs-Excel und Stapel-Umbenennung sind gebaut.)
 10. **Zusammenarbeit:** Zusammenführen gleichzeitiger Änderungen, Sperren, Rechte, geteilter Speicher (Frage 29).
 11. **Scopes:** HDR-Skalen, CIE-Farbtafel, Vergleich mit Resolve an Testbildern.
-12. **Arbeitsbereiche:** gespeicherte Layouts wie in Resolve, Scopes und Clean Feed auf drittem und viertem Monitor.
-13. **Betrieb:** Installer, Signatur, Handbuch, macOS und Linux.
+12. **Arbeitsbereiche:** Scopes und Clean Feed auf drittem und viertem Monitor. (Gespeicherte Layouts für mehrere Monitore sind gebaut.)
+13. **Betrieb:** Installer, Signatur, Handbuch, macOS und Linux (HEIC dort ohne Encoder).
 
 ## 5. Was steht
 
-- Elf Pakete, 1.112 Tests grün, Clippy ohne Warnungen, lokale Commits ohne Push.
-- GPU-Vorschau: CPU- und GPU-Bild weichen um höchstens eine von 255 Stufen ab (bei unter 0,1 % der Pixel); bei jedem GPU-Fehler fällt die Vorschau auf die CPU zurück. Ein Develop-Regler braucht rund 12 ms bis zum Bild (CPU: rund 45 ms).
-- Geladen und geprüft: Sony A7 IV (ARW, DNG), Canon EOS R5 und R6 (DNG), JPEG, PNG, TIFF.
-- 33 Nodes. Aus `node_structure.md`: Source (Ordner, Unterordner), Metadata Filter, Merge (Namensregel), Layer (Match), Develop (Exposure, Contrast, Lights, Shadows, White, Black, Weißabgleich, Tint, Dynamic, Saturation), Curves (Lum×Lum, Sat×Sat, Hue×Hue, Hue×Sat, dazu Rot/Grün/Blau), Lens Correction (Manual/Auto, Vignette, Farbsäume), Export (Format, Größe, Farbraum, Metadaten, Zielordner, Kollisionsregel). Dazu wie bisher: Capture EV, Exposure, Contrast, Highlights/Shadows, Tone Curve, White Balance, Saturation, Hue/Saturation, Lift/Gamma/Gain, Black & White, Noise Reduction, Sharpen, Clarity, Blur, Crop/Rotate, Vignette, Split by Metadata, sieben Masken-Nodes, Output.
-- Scopes eingefärbt (abschaltbar): Wellenform in den Bildfarben, RGB-Überlagerung additiv, Vektorskop nach Farbton, Histogramm in Kanalfarben.
-- Projektdatei Format 2 mit Verlauf, Wiederherstellen eines früheren Graphen und Konfliktabfrage; beschrieben in `docs/project-format.md`.
-- Export: JPEG, PNG, TIFF (8 und 16 Bit), EXR, AVIF; vier Farbräume; Metadaten wählbar samt GPS, Autor, Copyright, Beschreibung.
-- Weitergabe-Paket: `packaging\package.ps1` baut Ordner und zip (exe ohne Microsoft-C++-Laufzeit, Lizenztexte aller Bausteine) nach `%LOCALAPPDATA%\rawgraph\dist\`.
-- Starten: `%LOCALAPPDATA%\rawgraph\dist\RawGraph-0.1.0-windows-x64\RawGraph.exe` (optional mit `--open-folder <Ordner>`).
-- Aufgeräumt am 15.11.2026: Bau-Ordner, Bildschirmfotos und Testdaten sind gelöscht. Geblieben sind der Code, die Doku, das Paket in `dist` und die Beispielfotos in `samples`. Der nächste Bau übersetzt alles neu (einige Minuten).
+- Zwölf Pakete (dazu `rawgraph-rename`), rund 1.800 Tests grün (ohne die GPU-Tests auf echter Grafikkarte), Clippy ohne Warnungen. Quelltext auf GitHub (`CuckCodingClan/rawgraph`, privat); jede Änderung als Pull Request mit Prüfung unter Linux und Windows.
+- GPU-Vorschau: CPU- und GPU-Bild weichen um höchstens eine von 255 Stufen ab; bei jedem GPU-Fehler fällt die Vorschau auf die CPU zurück.
+- Geladen und geprüft: Sony A7 IV (ARW, DNG), Canon EOS R5 und R6 (DNG), JPEG, PNG, TIFF. Bildwahl bis Bild vom NAS: erstes Bild 43 ms, fertiges Bild 0,66 s (Median, 33 DNG).
+- 34 Nodes, neu seit 15.11.: LUT (`.cube`), HDR Merge, Panorama, Depth Map mit eigenem Arbeitsprozess; dazu Gruppen (Strg+G) und Makros.
+- Graph-Format 6 (Masken-Migration aus Format 1/2, Develop-Ton, Stichwörter, Gruppen); ältere Dateien werden beim Laden umgeschrieben, neuere klar abgelehnt. Projektdatei Schema 3 mit Verlauf, Speichern während eines Scans, Wiederherstellung nach Absturz; beschrieben in `docs/project-format.md`.
+- Export: JPEG, PNG, TIFF (8 und 16 Bit), EXR, AVIF, WebP (mit ICC), HEIC (Windows-Encoder); Stichwörter als XMP eingebettet und als Begleitdatei; Vorschau des Codecs im Viewer.
+- Bibliothek: Stichwörter (Panel, Filter, Lightroom-XMP), Benennung aus der Beschriftungs-Excel (`{sheet_name}`, `{caption}`, `{no}`), Stapel-Umbenennung auch der RAW-Originale mit Vorschau, Blockprüfung, Rückgängig-Protokoll und Wiederherstellung nach Abbruch.
+- Arbeitsbereiche für mehrere Monitore (Primary, Dual Screen, Scopes, Clean Feed), gespeichert und wiederherstellbar.
+- Weitergabe-Paket: `packaging\package.ps1` baut Ordner und zip nach `%LOCALAPPDATA%\rawgraph\dist\`.
