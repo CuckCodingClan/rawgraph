@@ -282,7 +282,7 @@ original identity.
 
 ### Per-pixel image controls
 
-Click the blue title-bar **+** tab to add a control input. Develop exposes Exposure, Contrast, Lights, Shadows, White and Black; Exposure is available on the standalone Exposure node; Contrast, Saturation and Sharpen each expose their amount; Filter exposes Radius and Direction (RGB). A connected map scales that slider's effect per pixel: black gives no effect (the parameter's neutral value), white gives the slider value, and values in between interpolate linearly; values outside 0–1 are clamped. The slider still sets the strength. Image inputs use linear ACEScg luminance; use an exposed image channel if you need a particular channel. Both Legacy and Local v1 tone processing support these inputs. An unconnected input leaves the slider in control.
+Click the blue title-bar **+** tab to add a control input. Develop exposes Exposure, Contrast, Lights, Shadows, White and Black; Exposure is available on the standalone Exposure node; Contrast, Saturation and Sharpen each expose their amount; Filter exposes Radius and Direction (RGB). A connected map scales that slider's effect per pixel: black gives no effect (the parameter's neutral value), white gives the slider value, and values in between interpolate linearly; values outside 0–1 are clamped. The slider still sets the strength. Image inputs use linear ACEScg luminance; use an exposed image channel if you need a particular channel. Both the local tone processing and Legacy tone support these inputs. An unconnected input leaves the slider in control.
 
 Intensity maps are resized to the photo. A control uses the matching photo when present; otherwise a single-image output such as a standalone Generator or Draw applies to every photo. A disjoint multi-image output is ignored. Control images do not enter the main gallery. **View → Show mask overlay** (M) tints the first connected intensity control red without affecting the render, scopes or export.
 
@@ -357,16 +357,16 @@ Update this section as implementation files are added.
 - 2026-11-13 — First working prototype: eight workspace crates, real RAW files in the application (see Structure).
 - 2026-11-13 — Added persistent per-image Individual-node settings and RAW/JPEG parity of controls, including absolute/relative white-balance requirements.
 
-### Develop local tone v1
+### Develop local tone
 
-Develop offers an opt-in **Local v1** tone processing choice; existing graphs default
-to Legacy and the standalone Highlights / Shadows node is unchanged. Local v1 uses
-an edge-aware luminance neighborhood for highlight/shadow gains, preserving RGB
-detail and unclipped HDR values; Whites and Blacks separately affect endpoints.
-This is a first Camera Raw-inspired approximation, not Adobe’s algorithm or a
-parity claim. Preview uses the CPU result at this boundary. Compare representative
-reference photos and exports against Camera Raw before drawing quality conclusions;
-proxy resolution, halos, fine detail, color and performance need evaluation.
+Develop's Lights, Shadows, White and Black use local tone processing by default:
+an edge-aware luminance neighborhood drives highlight/shadow gains, preserving RGB
+detail and unclipped HDR values; White and Black separately affect the endpoints.
+The **Legacy tone** toggle at the bottom of the Develop controls switches back to
+the older pointwise curves. The standalone Highlights / Shadows node is unchanged.
+This is a Camera Raw-inspired approximation, not Adobe's algorithm or a parity
+claim. Preview uses the CPU result at this boundary. Compare representative
+reference photos and exports against Camera Raw before drawing quality conclusions.
 
 ### Filter motion direction
 
