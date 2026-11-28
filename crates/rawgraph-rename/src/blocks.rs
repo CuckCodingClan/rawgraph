@@ -41,12 +41,18 @@ pub struct BlockReport {
     pub unknown_numbers: Vec<(u64, usize)>,
     /// Files without a number in the name.
     pub no_number: Vec<usize>,
+    /// Numbers of the sheet below the lowest or above the highest number of the folder (a missing head or tail).
+    pub outside_range: Vec<u64>,
+    /// Everything the user must look at before renaming, in plain sentences (also shown in the main window).
+    pub warnings: Vec<String>,
 }
 
 impl BlockReport {
     /// Anything the user should look at before running.
     pub fn has_warnings(&self) -> bool {
-        !self.missing_numbers.is_empty() || !self.duplicate_numbers.is_empty() || !self.unknown_numbers.is_empty() || !self.no_number.is_empty()
+        !self.warnings.is_empty()
+            || !self.outside_range.is_empty()
+            || !self.missing_numbers.is_empty() || !self.duplicate_numbers.is_empty() || !self.unknown_numbers.is_empty() || !self.no_number.is_empty()
     }
 }
 
@@ -75,6 +81,7 @@ pub fn check_blocks(plan: &Plan, sheet: &CaptionSheet) -> BlockReport {
     }
     if let (Some(&lo), Some(&hi)) = (by_number.keys().next(), by_number.keys().next_back()) {
         report.missing_numbers = known.range(lo..=hi).copied().filter(|n| !by_number.contains_key(n)).collect();
+        report.outside_range = known.iter().copied().filter(|n| (*n < lo || *n > hi) && !by_number.contains_key(n)).collect();
     }
     for b in sheet.blocks() {
         let inside: Vec<(&u64, &Vec<usize>)> = by_number.range(b.first_no..=b.last_no).collect();
@@ -82,12 +89,61 @@ pub fn check_blocks(plan: &Plan, sheet: &CaptionSheet) -> BlockReport {
             caption: b.caption,
             first_no: b.first_no,
             last_no: b.last_no,
-            in_folder: inside.iter().map(|(_, v)| v.len()).sum(),
+            in_folder: inside.iter().map(|(_, v)| v.iter().map(|&i| shot_id(plan, i)).collect::<BTreeSet<_>>().len()).sum(),
             first: inside.first().map(|(_, v)| v[0]),
             last: inside.last().map(|(_, v)| v[0]),
         });
     }
+    report.warnings = warnings(plan, sheet, &report, &by_number);
     report
+}
+
+fn list(title: &str, items: &[u64]) -> String {
+    let shown: Vec<String> = items.iter().take(12).map(u64::to_string).collect();
+    let more = if items.len() > 12 { format!(" ... and {} more", items.len() - 12) } else { String::new() };
+    format!("{title}: {}{more}", shown.join(", "))
+}
+
+/// The sentences for the main window: the checks that would have caught a shifted rename.
+fn warnings(plan: &Plan, sheet: &CaptionSheet, r: &BlockReport, _by_number: &BTreeMap<u64, Vec<usize>>) -> Vec<String> {
+    let mut w = Vec::new();
+    let shots: BTreeSet<(String, String)> = plan.entries.iter().enumerate().filter(|(_, e)| e.kind == EntryKind::Main).map(|(i, _)| shot_id(plan, i)).collect();
+    if shots.len() != sheet.len() {
+        w.push(format!("The folder has {} photo(s) but the sheet has {} row(s).", shots.len(), sheet.len()));
+    }
+    if !r.outside_range.is_empty() {
+        w.push(list("Numbers of the sheet outside the range of the folder have no file (a missing head or tail?)", &r.outside_range));
+    }
+    if !r.missing_numbers.is_empty() {
+        w.push(list("Numbers of the sheet inside the range have no file", &r.missing_numbers));
+    }
+    if !r.duplicate_numbers.is_empty() {
+        w.push(list("Numbers carried by several different files", &r.duplicate_numbers.iter().map(|d| d.0).collect::<Vec<_>>()));
+    }
+    if !r.unknown_numbers.is_empty() {
+        w.push(list("Files whose number is not in the sheet", &r.unknown_numbers.iter().map(|d| d.0).collect::<Vec<_>>()));
+    }
+    if !r.no_number.is_empty() {
+        w.push(format!("{} file(s) have no usable photo number in the name.", r.no_number.len()));
+    }
+    let off: Vec<&BlockView> = r.blocks.iter().filter(|b| b.in_folder as u64 != b.expected()).collect();
+    if !off.is_empty() {
+        let b = off[0];
+        w.push(format!("{} block(s) do not have the number of photos the sheet expects (first: \"{}\", No. {}-{}: {} of {}).", off.len(), b.caption, b.first_no, b.last_no, b.in_folder, b.expected()));
+    }
+    let offset = sheet.offset_rows();
+    if !offset.is_empty() {
+        let (row, n, lead) = offset[0];
+        w.push(format!("{} sheet row(s) have a number in the name column that differs from the number column (row {row}: {n} against {lead}); the sheet itself may be shifted.", offset.len()));
+    }
+    // Capture time must grow with the photo number.
+    let mut timed: Vec<(u64, i64)> = plan.entries.iter().filter(|e| e.kind == EntryKind::Main).filter_map(|e| Some((e.number?, e.capture_ms?))).collect();
+    timed.sort();
+    let inversions = timed.windows(2).filter(|p| p[1].1 < p[0].1).count();
+    if inversions > 0 {
+        w.push(format!("{inversions} photo(s) were taken before the photo with the next lower number; the numbering may not follow the shooting order."));
+    }
+    w
 }
 
 fn shot_id(plan: &Plan, i: usize) -> (String, String) {
@@ -131,14 +187,14 @@ mod tests {
 
     #[test]
     fn gaps_duplicates_and_unknown_numbers_are_reported() {
-        // 3 is missing, 2 exists twice (two different shots), 9 is not in the sheet, "x" has no number.
-        let (_t, plan) = plan_of(&["J-1.jpg", "J-2.jpg", "K-2.jpg", "J-4.jpg", "J-9.jpg", "x.jpg"]);
+        // 3 is missing, 2 exists twice (two different shots), 9 is not in the sheet.
+        let (_t, plan) = plan_of(&["J-1.jpg", "J-2.jpg", "J-02.jpg", "J-4.jpg", "J-9.jpg"]);
         let r = check_blocks(&plan, &sheet());
         assert_eq!(r.missing_numbers, vec![3, 5, 6], "the range is the folder's (1..9)");
         assert_eq!(r.duplicate_numbers.len(), 1);
         assert_eq!(r.duplicate_numbers[0].0, 2);
         assert_eq!(r.unknown_numbers.iter().map(|u| u.0).collect::<Vec<_>>(), vec![9]);
-        assert_eq!(r.no_number.len(), 1);
+        assert!(r.no_number.is_empty());
         assert!(r.has_warnings());
         // block A: numbers 1,2,2 present -> 3 files, first = 1, last = a number 2 file
         assert_eq!(r.blocks[0].in_folder, 3);
@@ -150,6 +206,40 @@ mod tests {
         let (_t, plan) = plan_of(&["J-1.CR2", "J-1.jpg", "J-2.CR2"]);
         let r = check_blocks(&plan, &sheet());
         assert!(r.duplicate_numbers.is_empty());
+    }
+
+    #[test]
+    fn a_missing_tail_is_a_warning_in_the_main_window() {
+        // The past incident: sheet 1..6, folder 1..5 (the last photos are missing): every folder number has a row,
+        // no gap inside the range, but the counts differ and the last block is short.
+        let (_t, plan) = plan_of(&["J-1.jpg", "J-2.jpg", "J-3.jpg", "J-4.jpg", "J-5.jpg"]);
+        let r = check_blocks(&plan, &sheet());
+        assert_eq!(r.outside_range, vec![6]);
+        assert!(r.has_warnings());
+        let all = r.warnings.join(" | ");
+        assert!(all.contains("5 photo(s) but the sheet has 6"), "{all}");
+        assert!(all.contains("outside the range") && all.contains('6'), "{all}");
+        assert!(all.contains("do not have the number of photos"), "{all}");
+        // a clean folder has no warning at all
+        let (_t, plan) = plan_of(&["J-1.jpg", "J-2.jpg", "J-3.jpg", "J-4.jpg", "J-5.jpg", "J-6.jpg"]);
+        assert!(check_blocks(&plan, &sheet()).warnings.is_empty());
+    }
+
+    #[test]
+    fn an_offset_inside_the_sheet_and_a_capture_time_that_runs_backwards_are_warned_about() {
+        // Column B says 003 in the row of photo 2.
+        let rows: Vec<Vec<String>> = [(1, "001_A"), (2, "003_A"), (3, "003_A")].iter().map(|(n, name)| vec![n.to_string(), name.to_string(), "A".to_owned()]).collect();
+        let shifted = CaptionSheet::from_cells(&rows, &SheetColumns::default()).unwrap();
+        assert_eq!(shifted.offset_rows(), vec![(2, 2, 3)]);
+        let t = tempfile::tempdir().unwrap();
+        let mut files: Vec<_> = (1..=3u64).map(|n| src(&touch(t.path(), &format!("J-{n}.jpg"), "x"), n)).collect();
+        files[0].capture_unix_ms = Some(3000);
+        files[1].capture_unix_ms = Some(2000);
+        files[2].capture_unix_ms = Some(4000);
+        let plan = build(&files, &RenameRules { template: "{sheet_name}".into(), ..Default::default() }, Some(&shifted), &PlanOptions::default()).unwrap();
+        let w = check_blocks(&plan, &shifted).warnings.join(" | ");
+        assert!(w.contains("differs from the number column") && w.contains("row 2"), "{w}");
+        assert!(w.contains("1 photo(s) were taken before"), "{w}");
     }
 
     #[test]

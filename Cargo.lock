@@ -3538,10 +3538,12 @@ name = "rawgraph-rename"
 version = "26.11.2"
 dependencies = [
  "calamine",
+ "libc",
  "regex",
  "serde",
  "serde_json",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

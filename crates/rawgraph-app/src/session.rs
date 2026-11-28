@@ -191,6 +191,8 @@ pub struct Session {
     pub export_busy: bool,
     /// The caption sheet loaded for renaming and export names (session only, not saved).
     pub caption_sheet: Option<Arc<rawgraph_batch::SheetBinding>>,
+    /// Summary for the next saved revision instead of the generated one (set after a batch rename).
+    pub next_summary: Option<String>,
     /// `--inspector-scroll`: keeps the inspector scrolled to this offset (screenshots).
     pub inspector_scroll: Option<f32>,
     demo_entries: Vec<ImageEntry>,
@@ -243,6 +245,7 @@ impl Session {
             ui_requests: Vec::new(),
             export_busy: false,
             caption_sheet: None,
+            next_summary: None,
             inspector_scroll: None,
             demo_entries: Vec::new(),
             visible: Vec::new(),
@@ -789,9 +792,10 @@ impl Session {
             self.project = copy;
             revision
         } else {
-            let summary = self.baseline.summarize(&self.project);
+            let summary = self.next_summary.clone().unwrap_or_else(|| self.baseline.summarize(&self.project));
             if overwrite { self.project.commit_overwrite(path, &summary)? } else { self.project.commit(path, &summary)? }
         };
+        self.next_summary = None;
         self.project_path = Some(path.to_path_buf());
         self.dirty = false;
         self.baseline = Baseline::of(&self.project);

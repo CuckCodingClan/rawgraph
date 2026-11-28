@@ -474,28 +474,43 @@ Safety rules (all enforced by the program, each with tests):
 
 - Nothing happens before a full preview (old name -> new name for every file) has no conflict. Conflicts are shown red and
   block the run: two files with the same new name, an existing file that is not part of the rename, an invalid name
-  (`< > : " / \ | ? *`, control characters), a Windows reserved name (`CON`, `NUL`, ...), a name ending in a dot or a
-  space, a name longer than 255 characters, a missing source, a photo without a sheet row. Name comparison ignores case
-  on Windows and macOS.
+  (`< > : " / \ | ? *`, control and text-direction characters), a Windows reserved name (`CON`, `NUL`, `COM0`, `CONIN$`, ...),
+  a name ending in a dot or a space, a name longer than 255 characters, a missing source, a photo without a sheet row, a
+  file name with more after the photo number (`IMG_1234-2`, `Job-076_v2`, `Smith-346 (1)` are not mapped to their last group of
+  digits), files of different name schemes, and a sidecar that belongs to a RAW that is not part of the run. Name comparison
+  ignores case on Windows and macOS.
+- Warnings in the main window (a sheet rename needs the box "I checked the first and last photo of every block" ticked):
+  the folder and the sheet have a different number of photos; sheet numbers have no file, inside or outside the range of
+  the folder (a missing head or tail); a block has fewer or more photos than the sheet expects; the number in column B differs
+  from column A (a shifted sheet); capture times run backwards against the numbers; files from several folders are mixed;
+  paths longer than 259 characters on Windows. The Block check window shows the first and last photo of every block with
+  thumbnails.
 - The rename is two-phase: every file first gets a unique temporary name in its own folder, then its final name. Chains
-  (a -> b, b -> c) and swaps (a <-> b) therefore work. Files are renamed inside their own folder only; they never change
-  folder or volume, and an existing file is never overwritten.
-- The `.xmp` / `.XMP` sidecar with the same stem is renamed with its file. Optionally files with the same stem (RAW + JPEG)
-  are renamed as one unit.
+  (a -> b, b -> c) and swaps (a <-> b) therefore work. Every single rename is atomic and never replaces: a file that
+  appears at a target after the check (a sync client, an export, a second program) makes the rename fail and roll back, it is
+  never overwritten (`MoveFileExW` without replace on Windows, `renameat2(RENAME_NOREPLACE)` on Linux, hard link + unlink
+  elsewhere). Files are renamed inside their own folder only and never leave the volume.
+- The `.xmp` sidecar with the same stem is renamed with its file, but belongs to the RAW when a RAW of that stem exists (if only
+  the JPEG is chosen, the entry is blocked instead). `<name>.<ext>.xmp` (darktable), `.pp3` and `.dop` follow their file.
+  Optionally files with the same stem (RAW + JPEG) are renamed as one unit.
 - Every renamed file that is an image of the open project keeps its image id, content hash, rating, flag, label and edits;
-  only its path changes, and the project is marked changed. If the project cannot follow, the files are renamed back.
-- Afterwards every new file is checked: it exists, has the size it had before, the old names are gone and no temporary file
-  is left. A failure in either phase or in this check puts every file back (best effort; whatever could not be put back is
-  listed with its current name).
-- Before the first file is touched the run is written to an undo log, `<project>.rename-log.json` next to the project file
-  (in the application data folder `rename\` while the project is not saved). "Undo last rename" (Library menu and the
-  window) reverses the last finished run with the same two-phase method and the same checks; it refuses when a file changed
-  or a name is taken. A run that a crash interrupted can be put back with "Recover" in the window.
-- The tool refuses to run while a folder scan, an export, an XMP import or another job that reads the files is running.
-- Block check (sheet-based renames): for every block of consecutive numbers with the same caption, the first and the last
-  photo of the folder with their thumbnails, old and new name, plus the numbers of the sheet that have no file, numbers
-  carried by several different files (a RAW + JPEG of one shot does not count), files whose number is not in the sheet and
-  files without a number. A shift by one inside a block does not show in the captions; only the number and the picture do.
+  only its path changes, and the project is marked changed and, when it has a file, saved at once as a revision "Renamed N
+  files". If the project cannot follow, the files are renamed back. A project without a file must be saved to keep the new names.
+- Afterwards every new file is checked: it exists, has the size it had before (sidecars may change size), the old names are
+  gone and no temporary file is left. A failure in either phase, in this check or a cancel puts every file back (best effort;
+  whatever could not be put back is listed with its current name).
+- The rename runs on its own thread with a progress bar and a Cancel button (cancel = clean rollback). A scan, export or other
+  job cannot start meanwhile, and the rename refuses to start while one runs.
+- Before the first file is touched the run is written to the undo log, `<project>.rename-log.json` next to the project file (in
+  the application data folder `rename\` while the project is not saved), flushed to disk, and again after phase 1 and at the
+  end. The log says what state a run was in; "Recover" (window) decides from it and from the disk: a run whose files are all
+  at their new names is recorded as done and the project follows, any other is reversed through the temporary names with the
+  normal checks (never a direct new -> old rename of a chain). No new rename starts while the log holds an interrupted run.
+  A log that is unreadable is reported, not replaced. "Undo last rename" reverses the last finished run the same way; it
+  refuses when a file changed or a name is taken, and when none of the log's files is an image of the open project (a log
+  of another project).
+- Not done: the log is not moved when an unsaved project is saved under a name; Windows paths over the legacy limit are
+  warned about, not renamed through the long-path prefix; macOS names are not Unicode-normalised for comparison.
 
 File times and EXIF are not used to verify a rename; the sizes are compared and the block check is looked at.
 

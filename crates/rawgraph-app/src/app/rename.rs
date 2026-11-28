@@ -1,12 +1,13 @@
 //! The Library > "Rename files..." feature of [`App`]: opening the window, making the preview,
-//! loading the caption sheet, carrying the rename out and undoing it. Methods of [`App`] kept apart so
-//! `app.rs` stays readable; the rules live in `rename_ops`, the drawing in `rename_ui`.
+//! loading the caption sheet, carrying the rename out on its own thread (progress, cancel) and undoing
+//! it. Methods of [`App`] kept apart so `app.rs` stays readable; the rules live in `rename_ops`, the
+//! drawing in `rename_ui`.
 
 use super::*;
 
 use rawgraph_rename::{build, check_blocks, PlanOptions};
 
-use crate::rename_ops::{self, Activity};
+use crate::rename_ops::{self, Activity, RenameJob};
 use crate::rename_ui::{self, RenameAction, RenameInfo, RenameScope, RenameUi};
 use crate::thumbs::Wanted;
 
@@ -16,7 +17,9 @@ impl App {
         Activity {
             scanning: self.scan.is_some(),
             exporting: self.export_job.is_some(),
-            other: if self.xmp_job.is_some() {
+            other: if self.rename_job.is_some() {
+                Some("Another rename")
+            } else if self.xmp_job.is_some() {
                 Some("The XMP import")
             } else if self.capture_job.is_some() {
                 Some("The metadata refresh")
@@ -32,6 +35,16 @@ impl App {
         rename_ops::log_path(&self.session, &self.dirs)
     }
 
+    /// Reads the journal state for the window (undo possible, interrupted runs, why it is unusable).
+    fn refresh_rename_log_state(&mut self) {
+        let log = self.rename_log_path();
+        let problem = rawgraph_rename::RenameLog::load(&log).err();
+        if let Some(st) = &mut self.rename {
+            st.log = rename_ops::log_state(&log);
+            st.log_error = problem;
+        }
+    }
+
     pub(super) fn open_rename(&mut self) {
         if self.rename.is_some() {
             return;
@@ -41,7 +54,6 @@ impl App {
             return;
         }
         let mut st = RenameUi::new(RenameScope::Listed, self.session.visible().to_vec());
-        st.log = rename_ops::log_state(&self.rename_log_path());
         st.sheet_status = self.session.caption_sheet.as_ref().map(|b| (false, rawgraph_rename::sheet::describe(&b.sheet)));
         if let Some(b) = &self.session.caption_sheet {
             st.rules.pattern = b.pattern.spec();
@@ -50,23 +62,22 @@ impl App {
             }
         }
         self.rename = Some(st);
+        self.refresh_rename_log_state();
     }
 
-    /// "Undo last rename" from the Library menu.
-    pub(super) fn undo_rename_command(&mut self) {
+    /// "Undo last rename" from the Library menu and the window: runs on its own thread like the rename.
+    pub(super) fn undo_rename_command(&mut self, ctx: &egui::Context) {
         let log = self.rename_log_path();
-        let activity = self.rename_activity();
-        match rename_ops::undo(&mut self.session, &log, &activity) {
-            Ok(o) => {
-                self.after_relink(&[]);
-                self.status.info(format!("Undone: {} file(s) have their old names again", o.files));
+        if let Some(why) = rename_ops::refusal(&self.session, &self.rename_activity()).or_else(|| rename_ops::log_refusal(&self.session, &log, true)) {
+            self.status.error(format!("Undo refused: {why}"));
+            if let Some(st) = &mut self.rename {
+                st.message = Some((true, why));
             }
-            Err(e) => self.status.error(format!("Undo failed: {e}")),
+            return;
         }
-        if let Some(st) = &mut self.rename {
-            st.log = rename_ops::log_state(&log);
-            st.invalidate();
-        }
+        let repaint = ctx.clone();
+        self.rename_job = Some(RenameJob::start(None, log, "undo".to_owned(), move || repaint.request_repaint()));
+        self.status.info("Undoing the last rename...");
     }
 
     fn load_caption_sheet(&mut self) {
@@ -119,30 +130,66 @@ impl App {
         st.mark_planned(self.rename_sheet_gen);
     }
 
-    fn run_rename(&mut self) {
+    /// Starts the rename of the shown plan on its own thread.
+    fn run_rename(&mut self, ctx: &egui::Context) {
         let log = self.rename_log_path();
-        let activity = self.rename_activity();
+        if let Some(why) = rename_ops::refusal(&self.session, &self.rename_activity()) {
+            self.status.error(why);
+            return;
+        }
         let Some(plan) = self.rename.as_ref().and_then(|s| s.plan.clone()) else { return };
-        let result = rename_ops::run(&mut self.session, &plan, &log, &activity);
-        match &result {
-            Ok(o) => {
-                self.after_relink(&[]);
-                let mut text = format!("Renamed {} file(s) on disk; {} image(s) of the project follow. The rename can be undone.", o.files, o.images);
-                if let Some(w) = &o.warning {
-                    text.push_str(&format!(" Warning: {w}"));
-                }
-                self.status.info(text.clone());
+        let label = format!("{} file(s) in {}", plan.change_count(), self.session.project_name());
+        let repaint = ctx.clone();
+        self.rename_job = Some(RenameJob::start(Some(plan), log, label, move || repaint.request_repaint()));
+        if let Some(st) = &mut self.rename {
+            st.message = None;
+            st.confirm = false;
+        }
+    }
+
+    /// Collects the result of a running rename: the project follows (and is saved), or the error is shown.
+    pub(super) fn poll_rename_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.rename_job else { return };
+        let result = match job.rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(100));
+                return;
             }
-            Err(e) => self.status.error(format!("Rename failed: {e}")),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(rawgraph_rename::RunError::Blocked("the rename thread stopped unexpectedly".into())),
+        };
+        let Some(job) = self.rename_job.take() else { return };
+        let outcome = rename_ops::finish_job(&mut self.session, &job, result);
+        let mut message = match &outcome {
+            Ok(o) if job.undo => (false, format!("Undone: {} file(s) have their old names again.", o.files)),
+            Ok(o) => (false, format!("Renamed {} file(s) on disk; {} image(s) of the project follow. \"Undo last rename\" reverses it.", o.files, o.images)),
+            Err(e) => (true, format!("{} failed: {e}", if job.undo { "Undo" } else { "Rename" })),
+        };
+        if let Ok(o) = &outcome {
+            self.after_relink(&[]);
+            if let Some(w) = &o.warning {
+                message = (true, format!("{} WARNING: {w}", message.1));
+            }
+            if o.images > 0 {
+                if self.session.project_path.is_some() {
+                    // Keep the project file in step with the disk at once.
+                    self.session.next_summary = Some(format!("{} {} files", if job.undo { "Undid the rename of" } else { "Renamed" }, o.files));
+                    self.save_project(None, None, ctx);
+                } else {
+                    message.1.push_str(" The project has no file yet: save it, or the new names are only in this session (the rename log keeps them).");
+                }
+            }
+        }
+        if message.0 {
+            self.status.error(message.1.clone());
+        } else {
+            self.status.info(message.1.clone());
         }
         if let Some(st) = &mut self.rename {
-            st.message = Some(match result {
-                Ok(o) => (false, format!("Renamed {} file(s). Undo with \"Undo last rename\".", o.files)),
-                Err(e) => (true, e),
-            });
-            st.log = rename_ops::log_state(&log);
+            st.message = Some(message);
             st.invalidate();
         }
+        self.refresh_rename_log_state();
     }
 
     pub(super) fn rename_windows(&mut self, ctx: &egui::Context) {
@@ -154,7 +201,8 @@ impl App {
         let busy = rename_ops::refusal(&self.session, &self.rename_activity());
         let area = self.window_area;
         let project_name = self.session.project_name();
-        let info = RenameInfo { busy: busy.as_deref(), sheet_loaded: self.session.caption_sheet.is_some(), selected_available: self.session.selected.is_some(), listed: self.session.visible().len(), project_name: &project_name };
+        let progress = self.rename_job.as_ref().map(|j| j.progress());
+        let info = RenameInfo { busy: busy.as_deref(), sheet_loaded: self.session.caption_sheet.is_some(), selected_available: self.session.selected.is_some(), listed: self.session.visible().len(), project_name: &project_name, progress };
         let action = {
             let Some(st) = &mut self.rename else { return };
             rename_ui::rename_window(ctx, area, st, &info)
@@ -181,19 +229,37 @@ impl App {
                 }
                 self.rename_sheet_gen += 1;
             }
-            RenameAction::Run => self.run_rename(),
-            RenameAction::Undo => self.undo_rename_command(),
+            RenameAction::Run => self.run_rename(ctx),
+            RenameAction::Undo => self.undo_rename_command(ctx),
+            RenameAction::Cancel => {
+                if let Some(j) = &self.rename_job {
+                    j.cancel();
+                }
+            }
             RenameAction::Recover => {
                 let log = self.rename_log_path();
-                match rename_ops::recover(&mut self.session, &log) {
+                let activity = self.rename_activity();
+                match rename_ops::recover(&mut self.session, &log, &activity) {
                     Ok(m) => {
-                        self.status.info(m);
+                        self.status.info(format!("Recovery: {m}"));
                         self.after_relink(&[]);
+                        if self.session.project_path.is_some() && self.session.dirty {
+                            self.session.next_summary = Some("Rename recovered after an interruption".to_owned());
+                            self.save_project(None, None, ctx);
+                        }
+                        if let Some(st) = &mut self.rename {
+                            st.message = Some((false, format!("Recovery: {m}")));
+                        }
                     }
-                    Err(e) => self.status.error(format!("Recovery failed: {e}")),
+                    Err(e) => {
+                        self.status.error(format!("Recovery failed: {e}"));
+                        if let Some(st) = &mut self.rename {
+                            st.message = Some((true, format!("Recovery failed: {e}")));
+                        }
+                    }
                 }
+                self.refresh_rename_log_state();
                 if let Some(st) = &mut self.rename {
-                    st.log = rename_ops::log_state(&log);
                     st.invalidate();
                 }
             }
@@ -244,6 +310,17 @@ mod tests {
         app.window_area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
         let input = egui::RawInput { screen_rect: Some(app.window_area), ..Default::default() };
         ctx.run_ui(input, |ui| app.rename_windows(&ui.ctx().clone())).drop_without_applying_deltas();
+    }
+
+    /// Waits for the rename thread and applies its result (what the frame loop does).
+    fn settle(app: &mut App) {
+        let ctx = egui::Context::default();
+        let until = Instant::now() + Duration::from_secs(20);
+        while app.rename_job.is_some() {
+            app.poll_rename_job(&ctx);
+            assert!(Instant::now() < until, "the rename did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn names(dir: &std::path::Path) -> Vec<String> {
@@ -302,7 +379,11 @@ mod tests {
         frame(&mut app);
 
         app.session.dirty = false;
-        app.run_rename();
+        // A second rename cannot start while the first one runs.
+        app.run_rename(&egui::Context::default());
+        assert!(app.rename_job.is_some());
+        assert!(app.rename_activity().other.is_some(), "other jobs see the running rename");
+        settle(&mut app);
         assert_eq!(names(&job), vec!["Job_001.png", "Job_002.png", "Job_003.png"]);
         assert!(app.session.dirty, "the project is marked changed");
         assert_eq!(app.session.entry(ids[0]).unwrap().file_name(), "Job_001.png");
@@ -311,7 +392,8 @@ mod tests {
         assert_eq!(app.rename.as_ref().unwrap().log, (true, 0), "the undo is offered");
         frame(&mut app);
 
-        app.undo_rename_command();
+        app.undo_rename_command(&egui::Context::default());
+        settle(&mut app);
         assert_eq!(names(&job), vec!["a.png", "b.png", "c.png"]);
         assert_eq!(app.session.entry(ids[2]).unwrap().file_name(), "c.png");
         assert_eq!(app.rename.as_ref().unwrap().log, (false, 0));

@@ -35,6 +35,8 @@ pub enum RenameAction {
     Recover,
     /// Make a new plan (the scope changed).
     Rebuild,
+    /// Stop the running rename; every file is put back.
+    Cancel,
 }
 
 /// All state of the window. Kept only while it is open.
@@ -57,6 +59,10 @@ pub struct RenameUi {
     pub visible_blocks: Range<usize>,
     /// (an undo is possible, interrupted runs in the journal).
     pub log: (bool, usize),
+    /// Why the rename log cannot be read, if so.
+    pub log_error: Option<String>,
+    /// The block check was looked at (required before a sheet-based rename).
+    pub blocks_ack: bool,
     /// The inputs the current plan was made from.
     snapshot: Option<(RuleFields, RenameScope, u64)>,
     pub plan_ms: Option<u128>,
@@ -79,6 +85,8 @@ impl RenameUi {
             blocks_open: false,
             visible_blocks: 0..0,
             log: (false, 0),
+            log_error: None,
+            blocks_ack: false,
             snapshot: None,
             plan_ms: None,
         }
@@ -92,12 +100,14 @@ impl RenameUi {
     pub fn mark_planned(&mut self, sheet_generation: u64) {
         self.snapshot = Some((self.rules.clone(), self.scope, sheet_generation));
         self.confirm = false;
+        self.blocks_ack = false;
     }
 
     /// Forces a new plan on the next frame.
     pub fn invalidate(&mut self) {
         self.snapshot = None;
         self.confirm = false;
+        self.blocks_ack = false;
     }
 }
 
@@ -126,6 +136,8 @@ pub struct RenameInfo<'a> {
     pub selected_available: bool,
     pub listed: usize,
     pub project_name: &'a str,
+    /// (done, total) while a rename runs on its thread.
+    pub progress: Option<(usize, usize)>,
 }
 
 /// Draws the window.
@@ -280,8 +292,29 @@ fn buttons_row(ui: &mut egui::Ui, st: &mut RenameUi, info: &RenameInfo, action: 
             ui.label(RichText::new(e.as_str()).color(RED));
         }
     });
+    let warnings: Vec<String> = st.plan.iter().flat_map(|p| p.warnings.iter().cloned()).chain(st.blocks.iter().flat_map(|b| b.warnings.iter().cloned())).collect();
+    for w in &warnings {
+        ui.label(RichText::new(format!("Warning: {w}")).color(AMBER));
+    }
+    if let Some(e) = &st.log_error {
+        ui.label(RichText::new(format!("The rename log is unusable, so nothing can be renamed or undone until it is fixed: {e}")).color(RED));
+    }
+    if st.log.1 > 0 {
+        ui.label(RichText::new("A rename was interrupted. Recover it first; no new rename starts before that.").color(RED));
+    }
+    let sheet_rename = info.sheet_loaded && (st.rules.template.contains("{sheet_name}") || st.rules.template.contains("{caption}"));
+    if sheet_rename {
+        ui.checkbox(&mut st.blocks_ack, "I checked the first and last photo of every block (Block check...) and the warnings above");
+    }
     ui.horizontal(|ui| {
-        let can_run = !blocked && changes > 0 && info.busy.is_none();
+        if let Some((done, total)) = info.progress {
+            ui.add(egui::ProgressBar::new(if total == 0 { 0.0 } else { done as f32 / total as f32 }).desired_width(320.0).text(format!("Renaming {done}/{total}")));
+            if ui.button("Cancel").on_hover_text("Stops and puts every file back under its old name").clicked() {
+                *action = RenameAction::Cancel;
+            }
+            return;
+        }
+        let can_run = !blocked && changes > 0 && info.busy.is_none() && (!sheet_rename || st.blocks_ack) && st.log.1 == 0 && st.log_error.is_none();
         if st.confirm {
             ui.label(RichText::new(format!("Rename {changes} file(s) on disk now? Undo is kept in the rename log.")).color(AMBER));
             if ui.add_enabled(can_run, egui::Button::new(RichText::new("Yes, rename").strong())).clicked() {
@@ -303,7 +336,7 @@ fn buttons_row(ui: &mut egui::Ui, st: &mut RenameUi, info: &RenameInfo, action: 
         if ui.add_enabled(st.log.0 && info.busy.is_none(), egui::Button::new("Undo last rename")).on_hover_text("Puts the files of the last rename back under their old names (same safe method, with checks)").clicked() {
             *action = RenameAction::Undo;
         }
-        if st.log.1 > 0 && ui.button(RichText::new(format!("Recover {} interrupted rename(s)", st.log.1)).color(AMBER)).on_hover_text("The program stopped in the middle of a rename; this puts those files back").clicked() {
+        if st.log.1 > 0 && ui.add_enabled(info.busy.is_none(), egui::Button::new(RichText::new(format!("Recover {} interrupted rename(s)", st.log.1)).color(AMBER))).on_hover_text("The program stopped in the middle of a rename; finishes or reverses it and points the project at the right names").clicked() {
             *action = RenameAction::Recover;
         }
         ui.separator();
@@ -475,7 +508,7 @@ mod tests {
         assert!(st.plan.as_ref().unwrap().blocked(), "photo 80 has no sheet row");
         let ctx = egui::Context::default();
         let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
-        let info = RenameInfo { busy: None, sheet_loaded: true, selected_available: true, listed: 4, project_name: "p" };
+        let info = RenameInfo { busy: None, sheet_loaded: true, selected_available: true, listed: 4, project_name: "p", progress: None };
         let mut seen = Vec::new();
         for frame in 0..3 {
             let input = egui::RawInput { screen_rect: Some(area), ..Default::default() };
