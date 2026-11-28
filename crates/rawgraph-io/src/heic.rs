@@ -343,9 +343,21 @@ mod imp {
             }
         }
         let mut bytes = add_primary_properties(&bytes, &props).map_err(|e| IoError::Io(format!("HEIC container: {e}")))?;
-        // ffmpeg and other decoders read the matrix from the bitstream's VUI, not from `colr`.
-        crate::heif_box::patch_vui_colour(&mut bytes, primaries as u8, transfer as u8, 1, true)
-            .map_err(|e| IoError::Io(format!("HEIC colour signalling: {e} (the Windows encoder changed?)")))?;
+        // ffmpeg and other decoders read the matrix from the bitstream's VUI, not from `colr`. If the
+        // encoder wrote a parameter set this reader does not follow, the file still carries `nclx`
+        // (correct for MIAF readers); only bitstream-only readers would then assume BT.601.
+        if let Err(e) = crate::heif_box::patch_vui_colour(&mut bytes, primaries as u8, transfer as u8, 1, true) {
+            eprintln!("rawgraph: HEIC colour signalling in the bitstream skipped: {e}");
+        }
+        // Tile grids (pictures larger than 2048 px) of some sizes (a side of 512*n + 1 px) are written
+        // by the Windows encoder but cannot be read back by Windows itself: check before writing.
+        if width.max(height) > 2048 {
+            if let Err(e) = decode(&bytes) {
+                return Err(IoError::Unsupported(format!(
+                    "Windows cannot read back a HEIC of {width}x{height} pixels ({e}); crop or resize by one pixel, or use AVIF/JPEG"
+                )));
+            }
+        }
         Ok(HeicEncoded { bytes, exif_written, exif_requested })
     }
 

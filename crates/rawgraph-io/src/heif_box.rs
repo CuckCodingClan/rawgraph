@@ -103,7 +103,7 @@ pub(crate) fn add_primary_properties(file: &[u8], props: &[NewProp]) -> Result<V
     let first_index = existing + 1;
 
     // Associations in ipma.
-    let (ipma_version, ipma_flags) = (file[ipma.body], be(file, ipma.body + 1, 3)?);
+    let (ipma_version, ipma_flags) = (be(file, ipma.body, 1)?, be(file, ipma.body + 1, 3)?);
     let wide = ipma_flags & 1 == 1;
     let id_len = if ipma_version < 1 { 2 } else { 4 };
     let count = be(file, ipma.body + 4, 4)? as usize;
@@ -155,7 +155,7 @@ pub(crate) fn add_primary_properties(file: &[u8], props: &[NewProp]) -> Result<V
 
     // iloc: offsets that point behind the meta box move by `delta`.
     let iloc = find(&children, b"iloc")?;
-    let v = file[iloc.body];
+    let v = be(file, iloc.body, 1)?;
     let sizes = be(file, iloc.body + 4, 2)? as usize;
     let (offset_size, length_size, base_size, index_size) = (sizes >> 12, (sizes >> 8) & 15, (sizes >> 4) & 15, if v == 1 || v == 2 { sizes & 15 } else { 0 });
     if v > 2 {

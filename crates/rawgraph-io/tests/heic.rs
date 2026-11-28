@@ -159,6 +159,22 @@ fn heic_colours_match_an_independent_decoder() {
     assert!(worst_all <= 2);
 }
 
+/// Tile-grid sizes with a side of 512*n + 1 px are written by WIC but cannot be read back by Windows:
+/// the export refuses them with a clear message instead of writing an unreadable file.
+#[test]
+fn heic_sizes_windows_cannot_read_back_are_refused_clearly() {
+    if heic_available().is_err() {
+        return;
+    }
+    for (w, h) in [(4097u32, 600u32), (3000, 1025)] {
+        let rgb = vec![90u8; (w * h * 3) as usize];
+        match encode_heic8(w, h, &rgb, &SaveOptions::default()) {
+            Err(e) => assert!(e.to_string().contains("cannot read back"), "{w}x{h}: {e}"),
+            Ok(bytes) => assert!(decode_heic8(&bytes).is_ok(), "{w}x{h}: written but unreadable"),
+        }
+    }
+}
+
 /// Sizes that the Windows encoder rejects (tile remainders) work through the padded canvas and
 /// decode to the real size in WIC and in ffmpeg.
 #[test]
