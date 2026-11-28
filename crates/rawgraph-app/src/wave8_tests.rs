@@ -121,7 +121,9 @@ fn gpu_vs_cpu(graph: &Graph, out: NodeId, expect_tone_base: bool) -> Option<(u8,
     Some((worst, differing))
 }
 
+/// Legacy tone runs every Develop tone op on the GPU tail; these tests check that path.
 fn tone_values(dev: &mut Node) {
+    assert!(dev.set_param("legacy_tone", IMG, 1.0));
     for (name, v) in [("exposure", 0.5), ("contrast", 0.3), ("highlights", -0.35), ("shadows", 0.4), ("whites", 0.3), ("blacks", -0.25), ("vibrance", 0.45), ("saturation", 0.2)] {
         assert!(dev.set_param(name, IMG, v), "{name}");
     }
@@ -148,11 +150,25 @@ fn develop_tone_values_run_on_the_gpu_like_on_the_cpu() {
 fn whites_blacks_and_dynamic_alone_run_on_the_gpu_like_on_the_cpu() {
     for (name, v) in [("whites", 0.5), ("blacks", -0.4), ("blacks", 0.4), ("vibrance", 0.6), ("vibrance", -0.5)] {
         let (g, out) = chain(|d, _| {
+            d.set_param("legacy_tone", IMG, 1.0);
             d.set_param(name, IMG, v);
         });
         if let Some((worst, _)) = gpu_vs_cpu(&g, out, true) {
             assert!(worst <= 1, "{name} {v}: largest difference {worst}");
         }
+    }
+}
+
+#[test]
+fn local_develop_tone_is_a_cpu_base_and_the_gpu_frame_matches() {
+    let (g, out) = chain(|d, c| {
+        for (name, v) in [("exposure", 0.5), ("highlights", -0.6), ("shadows", 0.5), ("whites", 0.3), ("blacks", -0.25), ("saturation", 0.2)] {
+            assert!(d.set_param(name, IMG, v), "{name}");
+        }
+        set_curve(c, 0, vec![[0.0, 0.0], [0.4, 0.3], [1.0, 1.0]]);
+    });
+    if let Some((worst, share)) = gpu_vs_cpu(&g, out, false) {
+        assert!(worst <= 1, "local tone: largest difference {worst} ({share:.4} differ)");
     }
 }
 

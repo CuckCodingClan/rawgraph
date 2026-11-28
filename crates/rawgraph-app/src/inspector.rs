@@ -140,7 +140,7 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
             transform_size_line(ui, session, id, image);
         }
         if kind == NodeKind::Develop {
-            develop_section(ui, session, id, image, &grouped);
+            develop_section(ui, session, id, image, &grouped, &rest);
         } else if kind == NodeKind::ColorWheels {
             for group in &grouped {
                 wheel_group_ui(ui, session, id, image, group);
@@ -385,7 +385,7 @@ fn source_size(session: &Session, image: ImageId) -> Option<(u32, u32)> {
 }
 
 /// The Develop inspector: white balance and baseline exposure blocks.
-fn develop_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, image: ImageId, groups_: &[ParamGroup]) {
+fn develop_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, image: ImageId, groups_: &[ParamGroup], rest: &[&'static str]) {
     use rawgraph_core::BaselineSource;
     let capture = session.current_entry().map(|e| e.capture.clone());
     let rendered = is_rendered(session);
@@ -435,6 +435,13 @@ fn develop_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, image: 
                 }
             }),
             _ => {},
+        }
+    }
+    // Ungrouped Develop settings (the Legacy tone toggle) sit at the very bottom.
+    ui.add_space(4.0);
+    for name in rest {
+        if let Some(spec) = kind.param_spec(name) {
+            param_widget(ui, session, id, spec, image);
         }
     }
 }

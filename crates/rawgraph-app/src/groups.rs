@@ -129,7 +129,7 @@ pub fn param_groups(kind: NodeKind) -> (Vec<ParamGroup>, Vec<&'static str>) {
         NodeKind::Develop => {
             let pick = |names: &[&str]| -> Vec<&'static str> { names.iter().filter_map(|n| all.iter().copied().find(|a| a == n)).collect() };
             for (title, names) in [
-                ("Tone", pick(&["tone_version", "exposure", "contrast", "highlights", "shadows", "whites", "blacks"])),
+                ("Tone", pick(&["exposure", "contrast", "highlights", "shadows", "whites", "blacks"])),
                 ("Colour", pick(&["wb", "temperature", "tint", "vibrance", "saturation"])),
 
             ] {
@@ -369,11 +369,11 @@ mod tests {
     fn develop_groups_and_plain_kinds() {
         let (groups, rest) = param_groups(NodeKind::Develop);
         assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Tone", "Colour"]);
-        assert_eq!(groups[0].names, vec!["tone_version", "exposure", "contrast", "highlights", "shadows", "whites", "blacks"]);
+        assert_eq!(groups[0].names, vec!["exposure", "contrast", "highlights", "shadows", "whites", "blacks"]);
         assert_eq!(groups[1].names, vec!["wb", "temperature", "tint", "vibrance", "saturation"]);
-        assert!(rest.is_empty(), "every Develop parameter is in a group");
+        assert_eq!(rest, vec!["legacy_tone"], "only the Legacy toggle sits below the groups");
         let total: usize = groups.iter().map(|g| g.names.len()).sum();
-        assert_eq!(total + 3, NodeKind::Develop.params().len());
+        assert_eq!(total + 3 + 1, NodeKind::Develop.params().len());
         let (g, r) = param_groups(NodeKind::Exposure);
         assert!(g.is_empty());
         assert_eq!(r, vec!["ev"]);

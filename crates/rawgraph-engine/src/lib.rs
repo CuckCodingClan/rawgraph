@@ -643,7 +643,7 @@ impl Evaluator {
     ) -> Result<Value, EvalError> {
         let src = input_image(inputs, 0, node.id)?;
         let values = develop_tone(node, image);
-        let local = node.choice("tone_version", image) == 1;
+        let local = !node.toggle("legacy_tone", image);
         let tone = tone_ops(&values);
         let mapped: HashMap<_, _> = Graph::supported_parameter_inputs(node.kind).iter()
             .filter_map(|&key| parameter_values(node, image, inputs, key, &src).map(|values| (key, values)))
@@ -1349,7 +1349,10 @@ fn tail_step(graph: &Graph, node: &rawgraph_core::Node, image: ImageId, provider
         NodeKind::Exposure if !masked => TailStep::Through(gain_op(param("ev"))),
         NodeKind::Develop => {
             if masked { return TailStep::Base; }
-            if node.choice("tone_version", image) == 1 && !develop_tone(node, image).is_identity() {
+            // Local Lights/Shadows/White/Black need a neighbourhood: a CPU boundary.
+            // Exposure, Contrast and colour alone are the same pointwise ops in both modes.
+            let t = develop_tone(node, image);
+            if !node.toggle("legacy_tone", image) && (t.highlights != 0.0 || t.shadows != 0.0 || t.whites != 0.0 || t.blacks != 0.0) {
                 return TailStep::Base;
             }
             let tone = tone_ops(&develop_tone(node, image));
@@ -2108,14 +2111,14 @@ mod tests {
 
     #[test]
     fn develop_mapped_controls_match_scalar_and_invalidate_tail() {
-        for local in [0.0, 1.0] {
+        for legacy in [1.0, 0.0] {
             for name in ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"] {
                 let mut g = Graph::new();
                 let src = g.add_node(NodeKind::Source, [0.0; 2]);
                 let dev = g.add_node(NodeKind::Develop, [0.0; 2]);
                 let out = g.add_node(NodeKind::Output, [0.0; 2]);
                 g.connect(src, dev, 0).unwrap(); g.connect(dev, out, 0).unwrap();
-                set(&mut g, dev, "tone_version", A, local);
+                set(&mut g, dev, "legacy_tone", A, legacy);
                 let spec = NodeKind::Develop.param_spec(name).unwrap();
                 // The map scales the slider's effect: green 0.75 means 75 % of the slider value.
                 let slider = spec.default + 0.8 * (spec.max - spec.default);
@@ -2132,11 +2135,11 @@ mod tests {
                 let base = ev.eval_base(&g, &plan, A, &p, &CancelToken::new()).unwrap(); assert_eq!(apply_tail_cpu(&base, &plan.ops), *mapped);
                 let restored = Graph::from_json(&g.to_json()).unwrap(); assert_eq!(*mapped, *run(&restored, out, A, &p, &mut ev));
                 g.connect_ports(src, green, dev, port).unwrap(); let changed = run(&g, out, A, &p, &mut ev);
-                if name == "exposure" || name == "contrast" { assert_ne!(*mapped, *changed, "{name} local={local}"); }
+                if name == "exposure" || name == "contrast" { assert_ne!(*mapped, *changed, "{name} legacy={legacy}"); }
                 g.remove_exposed_input(dev, port);
                 set(&mut g, dev, name, A, spec.default + 0.75 * (slider - spec.default));
                 let scalar = run(&g, out, A, &p, &mut ev);
-                for (a,b) in changed.data().iter().zip(scalar.data()) { assert!((a-b).abs() < 1e-5, "{name} local={local}: {a} {b}"); }
+                for (a,b) in changed.data().iter().zip(scalar.data()) { assert!((a-b).abs() < 1e-5, "{name} legacy={legacy}: {a} {b}"); }
             }
         }
     }
@@ -2215,7 +2218,7 @@ mod tests {
 
     #[test]
     fn develop_spatial_intensity_matches_full_frame_scalar_reference() {
-        for local in [0.0, 1.0] {
+        for legacy in [1.0, 0.0] {
             for name in ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"] {
                 let mut g = Graph::new();
                 let src = g.add_node(NodeKind::Source, [0.0; 2]);
@@ -2225,7 +2228,7 @@ mod tests {
                 g.connect(src, generator, 0).unwrap();
                 g.connect(src, dev, 0).unwrap();
                 g.connect(dev, out, 0).unwrap();
-                set(&mut g, dev, "tone_version", A, local);
+                set(&mut g, dev, "legacy_tone", A, legacy);
                 let spec = NodeKind::Develop.param_spec(name).unwrap();
                 let slider = spec.default + 0.8 * (spec.max - spec.default);
                 set(&mut g, dev, name, A, slider);
@@ -2248,7 +2251,7 @@ mod tests {
                     set(&mut g, dev, name, A, value);
                     let scalar = run(&g, out, A, &p, &mut ev);
                     for (a, b) in mapped.pixel(x, 0).iter().zip(scalar.pixel(x, 0)) {
-                        assert!((a-b).abs() < 1e-5, "{name} local={local} x={x}: {a} {b}");
+                        assert!((a-b).abs() < 1e-5, "{name} legacy={legacy} x={x}: {a} {b}");
                     }
                 }
             }
@@ -4987,6 +4990,7 @@ mod tests {
         let p = TestProvider::default();
         let mut ev = Evaluator::new();
         let (mut g, src, dev) = one(NodeKind::Develop);
+        set(&mut g, dev, "legacy_tone", A, 1.0);
         let base = run(&g, src, A, &p, &mut ev);
         // Untouched: bit-identical to the old result (the same Arc for a rendered file).
         assert!(Arc::ptr_eq(&base, &run(&g, dev, A, &p, &mut ev)));
@@ -5154,6 +5158,7 @@ mod tests {
             variants.push(TONE.to_vec());
             for v in variants {
                 let (mut g, src, dev) = one(NodeKind::Develop);
+                set(&mut g, dev, "legacy_tone", A, 1.0);
                 let out = add(&mut g, NodeKind::Output);
                 g.connect(dev, out, 0).unwrap();
                 for (n, x) in &v {
@@ -5168,6 +5173,7 @@ mod tests {
         }
         // The op shapes of the full tone part.
         let (mut g, _, dev) = one(NodeKind::Develop);
+        set(&mut g, dev, "legacy_tone", A, 1.0);
         for (n, x) in TONE {
             set(&mut g, dev, n, A, x);
         }
@@ -5192,7 +5198,7 @@ mod tests {
         // Source -> Blur -> Develop(tone) -> Exposure -> Curves -> Saturation -> Output.
         let (mut g, ids, out) = build(&[
             (NodeKind::Blur, &[("radius", 4.0)]),
-            (NodeKind::Develop, &[("exposure", 0.4), ("whites", 0.3), ("vibrance", -0.5)]),
+            (NodeKind::Develop, &[("exposure", 0.4), ("whites", 0.3), ("vibrance", -0.5), ("legacy_tone", 1.0)]),
             (NodeKind::Exposure, &[("ev", 0.5)]),
             (NodeKind::PointCurve, &[]),
             (NodeKind::Saturation, &[("amount", 1.3)]),
@@ -5224,11 +5230,14 @@ mod tests {
     #[test]
     fn local_develop_is_a_cpu_tail_boundary() {
         let p = TestProvider::default();
-        let (mut g, ids, out) = build(&[(NodeKind::Develop, &[("highlights", -0.5)]), (NodeKind::Exposure, &[("ev", 0.5)])]);
-        set(&mut g, ids[1], "tone_version", A, 1.0);
+        let (g, ids, out) = build(&[(NodeKind::Develop, &[("highlights", -0.5)]), (NodeKind::Exposure, &[("ev", 0.5)])]);
         let tp = check_invariant(&g, out, A, &p);
         assert_eq!((tp.base, tp.base_before_tone), (ids[1], false));
         assert_eq!(tp.ops, vec![TailOp::Gain(2f32.powf(0.5))]);
+        // Exposure, Contrast and colour alone stay on the GPU tail in local mode too.
+        let (g, ids, out) = build(&[(NodeKind::Develop, &[("exposure", 0.4), ("contrast", 0.3), ("saturation", 0.2)]), (NodeKind::Exposure, &[("ev", 0.5)])]);
+        let tp = check_invariant(&g, out, A, &p);
+        assert_eq!((tp.base, tp.base_before_tone), (ids[1], true));
     }
 
     #[test]
@@ -5245,7 +5254,7 @@ mod tests {
     fn develop_pre_tone_base_is_cached_separately() {
         let p = TestProvider::default();
         p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(0.5)));
-        let (mut g, ids, out) = build(&[(NodeKind::Develop, &[("exposure", 0.4)])]);
+        let (mut g, ids, out) = build(&[(NodeKind::Develop, &[("exposure", 0.4), ("legacy_tone", 1.0)])]);
         let dev = ids[1];
         let mut ev = Evaluator::new();
         let c = CancelToken::new();

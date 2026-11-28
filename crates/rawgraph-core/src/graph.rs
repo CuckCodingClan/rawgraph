@@ -363,7 +363,8 @@ const DEVELOP_PARAMS: &[ParamSpec] = &[
     // Rendering offset for RAW files, calibrated against embedded camera previews
     // (see examples/calibrate_brightness.rs).
     p("brightness", "Brightness", "EV", -3.0, 3.0, 1.6),
-    choice("tone_version", "Tone processing", &["Legacy", "Local v1"], 0),
+    // Off: local Lights/Shadows/White/Black (the default). On: the older pointwise curves.
+    toggle("legacy_tone", "Legacy tone", false),
 ];
 const TONE_CURVE_PARAMS: &[ParamSpec] = &[
     p("shadows", "Shadows", "", -1.0, 1.0, 0.0),

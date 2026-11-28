@@ -812,7 +812,7 @@ fn develop_tone_table_and_defaults() {
             "baseline",
             "baseline_default",
             "brightness",
-            "tone_version"
+            "legacy_tone"
         ]
     );
     let labels: Vec<&str> = d.params().iter().take(11).map(|s| s.label).collect();

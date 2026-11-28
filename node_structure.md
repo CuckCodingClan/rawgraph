@@ -262,7 +262,7 @@ The inspector displays Radius as a percentage of the long edge; stored values ar
 | Baseline exposure | `baseline` | On | Off / On |
 | Default baseline | `baseline_default` | 0.35 | -2 to 3 EV |
 | Brightness | `brightness` | 1.6 | -3 to 3 EV |
-| Tone processing | `tone_version` | Legacy | Legacy / Local v1 |
+| Legacy tone | `legacy_tone` | Off | Off / On |
 
 ## Effects
 
