@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::app::{ScopesPos, Workspace};
+use crate::app::ScopesPos;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Cli {
@@ -19,7 +19,8 @@ pub struct Cli {
     /// Like `disconnect`, but applied after the first preview arrived
     /// (shows the dimmed last frame behind the error).
     pub late_disconnect: Vec<(usize, usize)>,
-    pub workspace: Option<Workspace>,
+    /// `--workspace <name>`: a built-in preset (see `workspace::Preset`) or a saved workspace.
+    pub workspace: Option<String>,
     pub clean_feed: bool,
     /// Show secondary windows embedded in the main window (for screenshots).
     pub embed_windows: bool,
@@ -229,7 +230,8 @@ Usage: rawgraph-app [options]
   --bench                      timing run over all images, then exit
   --renderer auto|cpu|gpu      preview renderer (gpu: fail instead of falling back; for tests)
   --dump-frame <path.png>      write the viewer picture (GPU or CPU frame) as a PNG, then exit
-  --workspace single|dual      workspace layout
+  --workspace <name>           start in a workspace: single, dual, dual-scopes, dual-scopes-clean,
+                               clean-feed or the name of a saved workspace
   --embed-windows              show secondary windows inside the main window (screenshots)
   --clean-feed                 open the clean feed window
   --size <W>x<H>               window size in points
@@ -670,11 +672,13 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String
             "--label" => cli.label.push(parse_label(it.next())?),
             "--late-disconnect" => cli.late_disconnect.push(parse_disconnect(it.next())?),
             "--workspace" => {
-                cli.workspace = Some(match it.next().as_deref() {
-                    Some("single") => Workspace::Single,
-                    Some("dual") => Workspace::Dual,
-                    other => return Err(format!("--workspace: expected single or dual, got {other:?}")),
-                });
+                // Presets and saved names are checked when the application starts (saved ones
+                // live in the settings); here only the shape of the value.
+                let v = it.next().ok_or("--workspace needs a preset or workspace name")?;
+                if v.trim().is_empty() || v.starts_with("--") || v.chars().count() > crate::workspace::MAX_NAME || v.chars().any(char::is_control) {
+                    return Err(format!("--workspace: \"{v}\" is not a workspace name"));
+                }
+                cli.workspace = Some(v);
             }
             "--clean-feed" => cli.clean_feed = true,
             "--embed-windows" => cli.embed_windows = true,
@@ -735,7 +739,9 @@ mod tests {
         assert_eq!((cli.select_node, cli.select_image, cli.view_node), (Some(3), Some(1), Some(5)));
         assert_eq!(cli.individual, vec![3]);
         assert_eq!(cli.set, vec![(3, "ev".to_owned(), 1.5), (5, "radius".to_owned(), 20.0)]);
-        assert_eq!(cli.workspace, Some(Workspace::Dual));
+        assert_eq!(cli.workspace.as_deref(), Some("dual"));
+        let named = parse("--workspace Grading").unwrap();
+        assert_eq!(named.workspace.as_deref(), Some("Grading"), "saved names are accepted; the app resolves them");
         assert_eq!(cli.size, Some((1600.0, 1000.0)));
         assert_eq!(cli.disconnect, vec![(5, 0)]);
     }
@@ -906,7 +912,8 @@ mod tests {
             "--set ev=1",
             "--set 3:ev=abc",
             "--set 3:ev=nan",
-            "--workspace triple",
+            "--workspace",
+            "--workspace --clean-feed",
             "--size 10x10",
             "--size 1600",
             "--scale 99",

@@ -21,9 +21,10 @@ arboard = { version = "3", default-features = false }
 rayon.workspace = true
 rfd = "0.18.0"
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_Devices_Display", "Win32_Graphics_Gdi"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

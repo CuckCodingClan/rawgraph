@@ -46,15 +46,22 @@ use crate::testimages::display_name;
 use crate::tools::Tools;
 use crate::viewer::{self, Viewer};
 use crate::windows::{self, AuxState, AuxWindow, MonitorInfo};
+use crate::workspace::{MainLayout, Preset, WindowRole, WorkspaceStore};
 
 mod ext;
 mod nodes;
 mod revs;
+mod workspaces;
+#[cfg(test)]
+mod workspaces_tests;
 
 /// Process exit code requested by the app (screenshot failures).
 pub static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 const SETTINGS_KEY: &str = "rawgraph.settings.v2";
+/// Workspaces live under their own key (JSON, read leniently) so that one unreadable entry can
+/// never reset the other settings.
+const WORKSPACES_KEY: &str = "rawgraph.workspaces.v1";
 const GRAPH_EXT: &str = ".rawgraph.json";
 const PROJECT_EXT: &str = ".rawgraph";
 const MIN_FRAMES_BEFORE_SHOT: u64 = 30;
@@ -147,10 +154,10 @@ enum Command {
     Fit,
     Actual,
     SetWorkspace(Workspace),
+    Preset(Preset),
     ToggleClean,
     ToggleScopes,
     SetScopesPos(ScopesPos),
-    CleanMonitor(usize),
     ResetLayout,
     Shortcuts,
     ScanReport,
@@ -222,6 +229,7 @@ fn shortcut_of(cmd: Command) -> Option<KeyboardShortcut> {
         Command::Fit => sc(c, Key::Num0),
         Command::Actual => sc(c, Key::Num1),
         Command::SetWorkspace(Workspace::Dual) => sc(cs, Key::D),
+        Command::Preset(p) => workspaces::preset_shortcut(p),
         Command::ToggleClean => sc(cs, Key::C),
         Command::ToggleScopes => sc(cs, Key::K),
         Command::ToggleMaskOverlay => sc(Modifiers::NONE, Key::M),
@@ -236,7 +244,13 @@ fn shortcut_of(cmd: Command) -> Option<KeyboardShortcut> {
 }
 
 /// Commands bound to a key, most specific modifier combination first.
-const SHORTCUT_ORDER: [Command; 18] = [
+const SHORTCUT_ORDER: [Command; 23] = [
+    // Ctrl+Alt+1..5 first: Ctrl+1 (100 %) would also match them, extra Alt is ignored by egui.
+    Command::Preset(Preset::Single),
+    Command::Preset(Preset::Dual),
+    Command::Preset(Preset::DualScopes),
+    Command::Preset(Preset::DualScopesClean),
+    Command::Preset(Preset::CleanOnly),
     Command::SaveAs,
     Command::OpenFolder,
     Command::SetWorkspace(Workspace::Dual),
@@ -419,6 +433,8 @@ pub struct App {
     clean_win: AuxWindow,
     scopes_win: AuxWindow,
     scopes_pos: ScopesPos,
+    /// Workspace presets, saved workspaces, intended window displays and panel sizes.
+    ws: workspaces::Workspaces,
     monitors: Vec<MonitorInfo>,
     monitors_at: Option<Instant>,
     cached_main_monitor: Option<usize>,
@@ -621,19 +637,28 @@ impl App {
         editor.use_system_clipboard = !screenshot_mode;
         let prefetch = Prefetcher::new(provider);
 
-        let workspace = cli.workspace.unwrap_or(settings.workspace);
+        let store = if screenshot_mode {
+            WorkspaceStore::default()
+        } else {
+            cc.storage.and_then(|s| s.get_string(WORKSPACES_KEY)).map(|text| WorkspaceStore::from_json(&text)).unwrap_or_default()
+        };
+        let (start_spec, start_note) = workspaces::startup_workspace(&settings, &store, &cli);
+        if let Some(note) = start_note {
+            status.error(note.clone());
+            eprintln!("--workspace: {note}");
+        }
+        let workspace = if start_spec.has(WindowRole::Viewer) { Workspace::Dual } else { Workspace::Single };
+        let scopes_pos = if start_spec.has(WindowRole::Scopes) { ScopesPos::Window } else { start_spec.layout.scopes_pos };
         let mut viewer_state = settings.viewer;
-        viewer_state.open = workspace == Workspace::Dual;
+        viewer_state.open = start_spec.has(WindowRole::Viewer);
         viewer_state.fullscreen = true;
         let mut scopes_state = settings.scopes;
-        let scopes_pos = cli.scopes.unwrap_or(settings.scopes_pos);
-        scopes_state.open = scopes_pos == ScopesPos::Window;
+        scopes_state.open = start_spec.has(WindowRole::Scopes);
         let mut clean_state = settings.clean;
         // A restored clean feed is always fullscreen.
         clean_state.fullscreen = true;
-        if cli.clean_feed {
-            clean_state.open = true;
-        }
+        clean_state.open = start_spec.has(WindowRole::CleanFeed);
+        let ws = workspaces::Workspaces::new(store, &start_spec);
         let cli_open_export = cli.open_export_dialog;
         let cli_mask_overlay = cli.mask_overlay;
         let (cli_export_format, cli_no_profile, cli_no_metadata) = (cli.export_format.unwrap_or(export::Fmt::Jpeg), cli.export_no_profile, cli.export_no_metadata);
@@ -693,6 +718,7 @@ impl App {
             clean_win: AuxWindow::from_state(clean_state),
             scopes_win: AuxWindow::from_state(scopes_state),
             scopes_pos,
+            ws,
             monitors: Vec::new(),
             monitors_at: None,
             cached_main_monitor: None,
@@ -856,24 +882,17 @@ impl App {
             Command::Fit => { if self.compare.active() { self.cmp_view = SharedView::default(); } else { self.viewer.fit(); } },
             Command::Actual => { if self.compare.active() { self.cmp_view.mode = crate::viewer::ZoomMode::Custom(1.0 / ctx.pixels_per_point().max(0.1)); self.cmp_view.pan = egui::Vec2::ZERO; } else { self.viewer.actual_size(ctx.pixels_per_point()); } },
             Command::SetWorkspace(w) => self.set_workspace(w),
-            Command::ToggleClean => {
-                if self.clean_win.is_open() {
-                    self.clean_win.close();
-                } else {
-                    let avoid = self.occupied_monitors(Some(Aux::Clean));
-                    self.clean_win.open(&self.monitors, &avoid, 0.6, avoid.len() as u32);
-                }
-            }
+            Command::Preset(p) => self.apply_key(p.slug()),
+            Command::ToggleClean => self.toggle_role(WindowRole::CleanFeed),
             Command::ToggleScopes => {
-                let next = if self.scopes_pos == ScopesPos::Window { ScopesPos::BottomRight } else { ScopesPos::Window };
+                let next = if self.scopes_pos == ScopesPos::Window { self.ws.layout.scopes_pos } else { ScopesPos::Window };
                 self.set_scopes_pos(next);
             }
             Command::SetScopesPos(p) => self.set_scopes_pos(p),
-            Command::CleanMonitor(index) => {
-                self.clean_win.select_monitor(ctx, ViewportId::from_hash_of(CLEAN_ID), &self.monitors, index);
-            }
             Command::ResetLayout => {
-                self.layout_epoch += 1;
+                let defaults = if self.workspace == Workspace::Dual { MainLayout::dual() } else { MainLayout::default() };
+                self.ws.layout = MainLayout { scopes_pos: self.ws.layout.scopes_pos, ..defaults };
+                self.ws.reset_panels = true;
                 self.editor.request_frame_all();
                 self.viewer.fit();
                 self.status.info("Layout reset");
@@ -881,39 +900,6 @@ impl App {
             Command::Shortcuts => self.show_shortcuts = !self.show_shortcuts,
             Command::ScanReport => self.show_report = !self.show_report,
             Command::ToggleMaskOverlay => self.show_mask_overlay = !self.show_mask_overlay,
-        }
-    }
-
-    /// Monitors already used by the main window and the other open windows.
-    fn occupied_monitors(&self, except: Option<Aux>) -> Vec<usize> {
-        let mut v: Vec<usize> = self.cached_main_monitor.into_iter().collect();
-        for (kind, win) in [(Aux::Viewer, &self.viewer_win), (Aux::Clean, &self.clean_win), (Aux::Scopes, &self.scopes_win)] {
-            if Some(kind) != except {
-                v.extend(win.monitor_index(&self.monitors));
-            }
-        }
-        v
-    }
-
-    fn set_scopes_pos(&mut self, p: ScopesPos) {
-        self.scopes_pos = p;
-        if p == ScopesPos::Window {
-            if !self.scopes_win.is_open() {
-                let avoid = self.occupied_monitors(Some(Aux::Scopes));
-                self.scopes_win.open(&self.monitors, &avoid, 0.5, avoid.len() as u32 + 1);
-            }
-        } else {
-            self.scopes_win.close();
-        }
-    }
-
-    fn set_workspace(&mut self, w: Workspace) {
-        self.workspace = w;
-        if w == Workspace::Dual {
-            let avoid = self.occupied_monitors(Some(Aux::Viewer));
-            self.viewer_win.open(&self.monitors, &avoid, 0.9, avoid.len() as u32);
-        } else {
-            self.viewer_win.close();
         }
     }
 
@@ -1370,30 +1356,8 @@ impl App {
 
     // ------------------------------------------------------------------- frame
 
-    fn refresh_monitors(&mut self, frame: &eframe::Frame) {
-        let due = self.monitors_at.is_none_or(|t| t.elapsed() > Duration::from_secs(1));
-        if !due {
-            return;
-        }
-        self.monitors_at = Some(Instant::now());
-        self.monitors = windows::enumerate_monitors(frame);
-        self.cached_main_monitor = windows::current_monitor_index(frame, &self.monitors);
-    }
-
     fn startup(&mut self) {
         self.startup_done = true;
-        if self.viewer_win.is_open() {
-            let avoid = self.occupied_monitors(Some(Aux::Viewer));
-            self.viewer_win.open(&self.monitors, &avoid, 0.9, avoid.len() as u32);
-        }
-        if self.clean_win.is_open() {
-            let avoid = self.occupied_monitors(Some(Aux::Clean));
-            self.clean_win.open(&self.monitors, &avoid, 0.6, avoid.len() as u32);
-        }
-        if self.scopes_win.is_open() {
-            let avoid = self.occupied_monitors(Some(Aux::Scopes));
-            self.scopes_win.open(&self.monitors, &avoid, 0.5, avoid.len() as u32 + 1);
-        }
         if self.cli.capture() || self.cli.bench {
             let list: Vec<String> = self.monitors.iter().map(|m| format!("{} (scale {:.2}{})", m.id, m.scale, if m.primary { ", primary" } else { "" })).collect();
             eprintln!("monitors: {}", list.join("; "));
@@ -1789,6 +1753,16 @@ impl App {
             && (self.late_disconnect_done || self.cli.late_disconnect.is_empty())
             && self.last_key.is_some() == expects_frame
             && self.curve_hist_ready()
+            && self.scopes_ready()
+    }
+
+    /// The scopes are computed after the picture; a screenshot waits until their data was uploaded.
+    fn scopes_ready(&self) -> bool {
+        let wanted = self.single_viewer_request().is_some() && !self.compare.active() && self.scopes_pos != ScopesPos::Hidden;
+        // No scopes come after an error or an excluded image (stale), and a failed GPU readback
+        // keeps the old ones: wait a few seconds after the last frame at most.
+        let waited_long = self.last_frame_at.is_some_and(|t| t.elapsed() > Duration::from_secs(5));
+        !wanted || self.scopes_stale || waited_long || !self.scope_panel.needs_refresh()
     }
 
     /// A selected Curve node gets its histogram a moment after the frame: screenshots wait for it.
@@ -2353,7 +2327,6 @@ impl App {
         let can_undo = self.history.can_undo();
         let can_redo = self.history.can_redo();
         let has_sel = self.session.selected_node.is_some();
-        let workspace = self.workspace;
         let clean_open = self.clean_win.is_open();
         let scopes_pos = self.scopes_pos;
         let preview = self.session.provider.preview_size();
@@ -2426,16 +2399,7 @@ impl App {
                 }
             });
             ui.menu_button("View", |ui| {
-                ui.label(RichText::new("Workspace").weak());
-                if ui.radio(workspace == Workspace::Single, "Single").clicked() {
-                    cmds.push(Command::SetWorkspace(Workspace::Single));
-                    ui.close();
-                }
-                let dual_label = format!("Dual ({})", ctx.format_shortcut(&sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::D)));
-                if ui.radio(workspace == Workspace::Dual, dual_label).clicked() {
-                    cmds.push(Command::SetWorkspace(Workspace::Dual));
-                    ui.close();
-                }
+                ui.menu_button("Workspace", |ui| self.workspace_menu(ui));
                 ui.separator();
                 ui.label(RichText::new("Viewer click zoom (relative to fit)").weak());
                 ui.radio_value(&mut self.viewer.click_zoom, 2.0, "2× fit");
@@ -2467,19 +2431,7 @@ impl App {
                 ui.separator();
                 let clean_label = if clean_open { "Close clean feed" } else { "Clean feed" };
                 item(ui, cmds, clean_label, Command::ToggleClean, true);
-                ui.menu_button("Clean feed display", |ui| {
-                    for (index, monitor) in self.monitors.iter().enumerate() {
-                        let name = monitor.id.split('|').next().unwrap_or("Display");
-                        let label = format!("{}: {} ({} × {} at {}, {}){}", index + 1, name,
-                            monitor.size[0], monitor.size[1], monitor.pos[0], monitor.pos[1],
-                            if monitor.primary { " — primary" } else { "" });
-                        if ui.radio(self.clean_win.state.monitor.as_deref() == Some(&monitor.id), label).clicked() {
-                            cmds.push(Command::CleanMonitor(index));
-                            ui.close();
-                        }
-                    }
-                    if self.monitors.is_empty() { ui.label("No displays available"); }
-                });
+                self.display_menu(ui, WindowRole::CleanFeed);
                 ui.menu_button("Scopes position", |ui| {
                     for p in ScopesPos::ALL {
                         if ui.radio(scopes_pos == p, p.label()).clicked() {
@@ -2574,6 +2526,10 @@ impl App {
                 ui.separator();
                 ui.label(format!("zoom {:.0} %", self.viewer.zoom_percent(ppp)));
             }
+            if let Some(note) = self.display_note() {
+                ui.separator();
+                ui.label(RichText::new("display missing").color(egui::Color32::from_rgb(255, 190, 90))).on_hover_text(format!("{note}. The windows return to their displays when these are connected again."));
+            }
             ui.separator();
             let last = self.last_recovery_ms.map_or_else(|| "No recovery copy has been written yet.".to_owned(), |ms| format!("Last recovery copy: {}", crate::clock::local_stamp(ms)));
             ui.label(RichText::new("autosave").weak().small()).on_hover_text(format!("{last}\nWhile there are unsaved changes a copy is kept every minute so a crash loses little."));
@@ -2658,12 +2614,17 @@ impl App {
             let w = ui.available_width();
             // Dual workspace: the viewer has its own window, so the scopes may never take more
             // than a third of the graph strip (they would squeeze the node graph).
-            let (default, max) = if self.workspace == Workspace::Dual { (w * 0.28, w / 3.0) } else { (w * 0.4, w * 0.75) };
-            egui::Panel::right(("scopes-br", epoch))
+            let max = if self.workspace == Workspace::Dual { w / 3.0 } else { w * 0.75 };
+            let default = w * self.ws.layout.scopes_frac;
+            self.reset_panel(ui, "scopes-br", epoch);
+            let panel = egui::Panel::right(("scopes-br", epoch))
                 .resizable(true)
                 .default_size(default.max(220.0))
                 .size_range(180.0..=max.max(240.0))
                 .show(ui, |ui| self.scopes_ui(ui));
+            if w > 1.0 {
+                self.ws.layout.scopes_frac = (panel.response.rect.width() / w).clamp(0.1, 0.75);
+            }
         }
         self.editor.timings = self.timing_debug.then(|| {
             crate::graph_editor::NodeTimings::new(self.node_timings.as_deref().unwrap_or_default(), self.timing_gpu_tail)
@@ -2705,6 +2666,7 @@ impl App {
                 ("Viewer: click, wheel, drag", "Toggle fit zoom, zoom/navigate, pan"),
                 ("Viewer: double-click", "Toggle fit / 100 %"),
                 ("Ctrl+0 / Ctrl+1", "Fit / 100 %"),
+                ("Ctrl+Alt+1 ... 5", "Workspace presets: Single, Dual, Dual + Scopes, + Clean Feed, Clean Feed only"),
                 ("Ctrl+Shift+D", "Dual workspace"),
                 ("Ctrl+Shift+C", "Clean feed window"),
                 ("Ctrl+Shift+K", "Scopes window"),
@@ -2817,12 +2779,26 @@ impl App {
     fn layout_single(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         let epoch = self.layout_epoch;
         let total = ui.available_height();
-        egui::Panel::bottom(("graph", epoch))
-            .resizable(true)
-            .default_size((total * 0.36).max(200.0))
-            .size_range(140.0..=f32::INFINITY)
-            .frame(egui::Frame::NONE)
-            .show(ui, |ui| self.graph_area(ui, epoch));
+        let layout = self.ws.layout.clone();
+        // Without the node graph the strip below the viewer only holds docked scopes (bottom right).
+        if layout.show_graph || self.scopes_pos == ScopesPos::BottomRight {
+            self.reset_panel(ui, "graph", epoch);
+            let graph = egui::Panel::bottom(("graph", epoch))
+                .resizable(true)
+                .default_size((total * layout.graph_frac).max(200.0))
+                .size_range(140.0..=f32::INFINITY)
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    if layout.show_graph {
+                        self.graph_area(ui, epoch);
+                    } else {
+                        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.scopes_ui(ui));
+                    }
+                });
+            if total > 1.0 {
+                self.ws.layout.graph_frac = (graph.response.rect.height() / total).clamp(0.1, 0.8);
+            }
+        }
         self.filmstrip_panel(ui, epoch);
         self.right_column(ui, epoch, 400.0);
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.viewer_area(ui, cmds));
@@ -2836,18 +2812,37 @@ impl App {
     }
 
     /// The inspector (always scrollable), plus the scopes in "Right column" mode.
-    fn right_column(&mut self, ui: &mut egui::Ui, epoch: u32, width: f32) {
+    fn right_column(&mut self, ui: &mut egui::Ui, epoch: u32, _width: f32) {
         let height = ui.available_height();
-        egui::Panel::right(("right", epoch)).resizable(true).default_size(width).size_range(300.0..=900.0).show(ui, |ui| {
-            if self.scopes_pos == ScopesPos::RightColumn {
-                egui::Panel::bottom(("scopes-col", epoch)).resizable(true).default_size((height * 0.4).max(220.0)).size_range(120.0..=(height * 0.8).max(200.0)).show(ui, |ui| self.scopes_ui(ui));
+        let layout = self.ws.layout.clone();
+        let scopes_column = self.scopes_pos == ScopesPos::RightColumn;
+        if !layout.show_inspector && !scopes_column {
+            return;
+        }
+        self.reset_panel(ui, "right", epoch);
+        let panel = egui::Panel::right(("right", epoch)).resizable(true).default_size(layout.inspector_w).size_range(300.0..=900.0).show(ui, |ui| {
+            if scopes_column && layout.show_inspector {
+                self.reset_panel(ui, "scopes-col", epoch);
+                let scopes = egui::Panel::bottom(("scopes-col", epoch)).resizable(true).default_size((height * layout.scopes_frac).max(220.0)).size_range(120.0..=(height * 0.8).max(200.0)).show(ui, |ui| self.scopes_ui(ui));
+                if height > 1.0 {
+                    self.ws.layout.scopes_frac = (scopes.response.rect.height() / height).clamp(0.1, 0.75);
+                }
+            } else if scopes_column {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.scopes_ui(ui));
             }
-            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| inspector::show(ui, &mut self.session));
+            if layout.show_inspector {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| inspector::show(ui, &mut self.session));
+            }
         });
+        self.ws.layout.inspector_w = panel.response.rect.width().clamp(300.0, 900.0);
     }
 
     fn filmstrip_panel(&mut self, ui: &mut egui::Ui, epoch: u32) {
-        egui::Panel::left(("filmstrip", epoch)).resizable(true).default_size(232.0).size_range(170.0..=420.0).show(ui, |ui| {
+        if !self.ws.layout.show_filmstrip {
+            return;
+        }
+        self.reset_panel(ui, "filmstrip", epoch);
+        let panel = egui::Panel::left(("filmstrip", epoch)).resizable(true).default_size(self.ws.layout.filmstrip_w).size_range(170.0..=420.0).show(ui, |ui| {
             let target = self.primary_target();
             egui::Panel::bottom(("filmstrip-info", epoch)).resizable(false).show_separator_line(true).show(ui, |ui| {
                 ui.add_space(4.0);
@@ -2870,6 +2865,7 @@ impl App {
                 job.prioritize(self.filmstrip.scan_wanted(), self.filmstrip.scan_thumbs_ready());
             }
         });
+        self.ws.layout.filmstrip_w = panel.response.rect.width().clamp(170.0, 420.0);
     }
 
     fn primary_frame(&self) -> (Option<egui::TextureId>, [u32; 2]) {
@@ -2885,9 +2881,6 @@ impl App {
         let viewer_id = ViewportId::from_hash_of(VIEWER_ID);
         let clean_id = ViewportId::from_hash_of(CLEAN_ID);
         let scopes_id = ViewportId::from_hash_of(SCOPES_ID);
-        self.viewer_win.ensure_monitor_exists(ctx, viewer_id, &monitors, 0.9);
-        self.clean_win.ensure_monitor_exists(ctx, clean_id, &monitors, 0.6);
-        self.scopes_win.ensure_monitor_exists(ctx, scopes_id, &monitors, 0.5);
 
         let mut viewer_win = std::mem::take(&mut self.viewer_win);
         let out = viewer_win.show(ctx, viewer_id, "RawGraph - Viewer", false, &monitors, Some(true), |ui| {
@@ -2900,10 +2893,7 @@ impl App {
             });
         });
         self.viewer_win = viewer_win;
-        if out.close && self.workspace == Workspace::Dual {
-            // Closing the detached viewer returns to the single workspace.
-            self.workspace = Workspace::Single;
-        }
+        let _ = out;
 
         let (texture, size) = self.primary_frame();
         let uv = if self.compare.active() { self.cmp_panes[1].viewer.preview_uv } else { self.viewer.preview_uv };
@@ -2923,7 +2913,9 @@ impl App {
                 viewer::paint_clean(ui, texture, size, uv);
             });
         });
-        if self.clean_win.state.open && !clean_out.close && editor_refocused {
+        // Not while the feed is a movable window on the primary display (its display is missing):
+        // raising it would pop it over the editor again and again.
+        if self.clean_win.state.open && !clean_out.close && editor_refocused && !self.clean_win.fallback {
             // Raise without taking keyboard focus from the editor. Immediately
             // restore normal stacking so the feed won't cover other apps later.
             ctx.send_viewport_cmd_to(clean_id, egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
@@ -2945,6 +2937,9 @@ impl App {
                 }
             });
         });
+        // Closing a window (Escape, F11, close button) removes it from the workspace; the
+        // viewer returns to the single workspace and the scopes to their docked place.
+        self.sync_closed_windows();
     }
 }
 
@@ -2974,12 +2969,6 @@ fn paint_stale_scopes(ui: &egui::Ui, area: egui::Rect) {
     painter.galley(r.center() - galley.size() / 2.0, galley, egui::Color32::WHITE);
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Aux {
-    Viewer,
-    Clean,
-    Scopes,
-}
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -2989,7 +2978,7 @@ impl eframe::App for App {
         if self.frames == 20 && self.shot.is_some() {
             eprintln!("window content rect (points): {:?}, pixels per point {}", ctx.content_rect(), ctx.pixels_per_point());
         }
-        self.refresh_monitors(frame);
+        self.poll_displays(frame, &ctx);
         if !self.startup_done {
             self.startup();
             if let Some((w, h)) = self.cli.size {
@@ -3040,10 +3029,17 @@ impl eframe::App for App {
         self.resolve_compare_pins();
         self.refresh_gallery();
         self.update_selection_preview(&ctx);
+        if self.frames == 2 && self.cli.capture() {
+            // With --scale the very first frame is laid out in a window of unknown size (thousands of
+            // points), and the panels keep the sizes they got then. Capture runs do not keep panel
+            // sizes anyway, so lay them out again once the window has its requested size.
+            self.ws.reset_panels = true;
+        }
         match self.workspace {
             Workspace::Single => self.layout_single(ui, &mut cmds),
             Workspace::Dual => self.layout_dual(ui, &mut cmds),
         }
+        self.ws.reset_panels = false;
         self.handle_ui_requests(&ctx);
         self.update_selection_preview(&ctx);
         self.shortcuts_window(&ctx);
@@ -3054,6 +3050,7 @@ impl eframe::App for App {
         self.export_windows(&ctx);
         self.node_export_windows(&ctx);
         self.secondary_windows(&ctx);
+        self.workspace_windows(&ctx);
         self.recovery_window(&ctx);
         self.xmp_window(&ctx);
         self.relink_windows(&ctx);
@@ -3063,6 +3060,7 @@ impl eframe::App for App {
         for cmd in cmds {
             self.run(cmd, &ctx);
         }
+        self.process_ws_actions();
 
         // One undo step per finished gesture, then re-render when needed.
         let gesture = ctx.input(|i| i.pointer.any_down()) || ctx.dragged_id().is_some();
@@ -3130,6 +3128,9 @@ impl eframe::App for App {
         if self.cli.capture() || self.cli.bench || self.cli.run_export_node.is_some() {
             return;
         }
+        let mut workspaces = self.ws.store.clone();
+        workspaces.session = Some(self.current_spec());
+        storage.set_string(WORKSPACES_KEY, workspaces.to_json());
         let settings = Settings {
             workspace: self.workspace,
             viewer: self.viewer_win.state.clone(),
