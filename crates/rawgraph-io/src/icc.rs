@@ -472,6 +472,77 @@ pub(crate) fn resolve_input(icc: Option<&[u8]>) -> (Option<InputTransform>, Inpu
     }
 }
 
+/// Linear light (0..=1, 8192 steps) -> sRGB code value, shared by the thumbnail conversion.
+fn srgb_code_table() -> &'static [u8] {
+    static TABLE: OnceLock<Vec<u8>> = OnceLock::new();
+    TABLE.get_or_init(|| (0..8192).map(|i| (color::srgb_oetf(i as f32 / 8191.0).clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect())
+}
+
+/// Converts RGBA8 pixels coded in the embedded profile `icc` to sRGB codes, in place (the
+/// thumbnail and provisional-preview counterpart of the full decode: same curves, same primaries
+/// and Bradford adaptation as [`resolve_input`], same ACEScg working space in between). Returns
+/// whether anything was changed: no profile, an sRGB profile and unusable profiles leave the
+/// pixels alone (as the full decode reads them as sRGB). Out-of-gamut colours are clamped.
+pub(crate) fn thumbnail_to_srgb(icc: Option<&[u8]>, rgba: &mut [u8]) -> bool {
+    let (Some(xf), _) = resolve_input(icc) else { return false };
+    let lut = [xf.lut(0, 256), xf.lut(1, 256), xf.lut(2, 256)];
+    let out = color::to_f32(&color::acescg_to_rec709());
+    let mut m = [[0.0f32; 3]; 3];
+    for (r, row) in m.iter_mut().enumerate() {
+        for (c, v) in row.iter_mut().enumerate() {
+            *v = (0..3).map(|k| out[r][k] * xf.matrix[k][c]).sum();
+        }
+    }
+    let table = srgb_code_table();
+    let code = |lin: f32| table[(lin.clamp(0.0, 1.0) * 8191.0 + 0.5) as usize];
+    for p in rgba.as_chunks_mut::<4>().0 {
+        let (r, g, b) = (lut[0][p[0] as usize], lut[1][p[1] as usize], lut[2][p[2] as usize]);
+        p[0] = code(m[0][0] * r + m[0][1] * g + m[0][2] * b);
+        p[1] = code(m[1][0] * r + m[1][1] * g + m[1][2] * b);
+        p[2] = code(m[2][0] * r + m[2][1] * g + m[2][2] * b);
+    }
+    true
+}
+
+/// The ICC profile of the first JPEG in `file` that has one (APP2 `ICC_PROFILE` marker segments),
+/// for embedded RAW previews: the decoder hands over pixels only, so the container bytes are
+/// searched. Which JPEG the profile belongs to is not checked: camera previews that carry a
+/// profile are tagged consistently.
+pub(crate) fn find_jpeg_icc(file: &[u8]) -> Option<Vec<u8>> {
+    const SIG: &[u8; 12] = b"ICC_PROFILE ";
+    let finder = memchr::memmem::Finder::new(SIG);
+    let mut from = 0usize;
+    while let Some(rel) = finder.find(file.get(from..)?) {
+        let sig_at = from + rel;
+        from = sig_at + SIG.len();
+        // Segment: FF E2, length (2, includes itself), signature, sequence, count, data.
+        let Some(start) = sig_at.checked_sub(4) else { continue };
+        if file.get(start..start + 2) != Some(&[0xFF, 0xE2]) {
+            continue;
+        }
+        let mut at = start;
+        let mut profile = Vec::new();
+        let mut expect = 1u8;
+        let mut total = 0u8;
+        while let Some(h) = file.get(at..at + 18) {
+            let len = usize::from(u16::from_be_bytes([h[2], h[3]]));
+            if h[0] != 0xFF || h[1] != 0xE2 || &h[4..16] != SIG || h[16] != expect || len < 16 {
+                break;
+            }
+            total = h[17];
+            let Some(data) = file.get(at + 18..at + 2 + len) else { break };
+            profile.extend_from_slice(data);
+            if expect == total {
+                return Some(profile);
+            }
+            expect += 1;
+            at += 2 + len;
+        }
+        let _ = total;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,5 +933,50 @@ mod input_tests {
         let lin = (128.0f64 / 255.0).powf(2.199_218_75); // 2.2 stored as u8Fixed8
         let want = expected(SRGB, [lin; 3]);
         assert!((l.image.data()[1] as f64 - want[1]).abs() < 2e-3);
+    }
+}
+
+#[cfg(test)]
+mod jpeg_icc_tests {
+    use super::find_jpeg_icc;
+
+    fn segment(seq: u8, count: u8, data: &[u8]) -> Vec<u8> {
+        let mut s = vec![0xFF, 0xE2];
+        s.extend_from_slice(&((data.len() + 16) as u16).to_be_bytes());
+        s.extend_from_slice(b"ICC_PROFILE\0");
+        s.extend_from_slice(&[seq, count]);
+        s.extend_from_slice(data);
+        s
+    }
+
+    #[test]
+    fn profile_split_over_segments_is_reassembled_after_other_bytes() {
+        let mut file = vec![0u8; 100];
+        file.extend_from_slice(&[0xFF, 0xD8]);
+        file.extend(segment(1, 2, &[1, 2, 3]));
+        file.extend(segment(2, 2, &[4, 5]));
+        file.extend_from_slice(&[0xFF, 0xDB, 0, 4, 9, 9]);
+        assert_eq!(find_jpeg_icc(&file), Some(vec![1, 2, 3, 4, 5]));
+    }
+
+    #[test]
+    #[ignore = "diagnostic timing, run explicitly with --ignored --nocapture"]
+    fn scan_cost_of_a_file_without_a_profile() {
+        let file: Vec<u8> = (0..60_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+        let t = std::time::Instant::now();
+        assert_eq!(find_jpeg_icc(&file), None);
+        println!("scan of 60 MB: {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    #[test]
+    fn broken_or_missing_chains_give_none() {
+        assert_eq!(find_jpeg_icc(&[]), None);
+        assert_eq!(find_jpeg_icc(b"ICC_PROFILE\0"), None);
+        let mut gap = segment(1, 3, &[1]);
+        gap.extend(segment(3, 3, &[2]));
+        assert_eq!(find_jpeg_icc(&gap), None, "segment 2 is missing");
+        let mut cut = segment(1, 1, &[1, 2, 3, 4]);
+        cut.truncate(cut.len() - 2);
+        assert_eq!(find_jpeg_icc(&cut), None);
     }
 }

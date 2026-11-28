@@ -29,15 +29,36 @@ pub enum Fmt {
     Png16,
     Tiff16,
     Webp,
+    /// Needs the operating system's HEVC encoder (see [`heic_status`]).
+    Heic,
+}
+
+/// Whether the system HEIC encoder works: `None` while the check (a trial encode on a worker
+/// thread, so the first look never stalls the window) is still running.
+pub fn heic_status() -> Option<Result<(), String>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    static ANSWER: OnceLock<Result<(), String>> = OnceLock::new();
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if let Some(a) = ANSWER.get() {
+        return Some(a.clone());
+    }
+    if !STARTED.swap(true, Ordering::SeqCst) {
+        let _ = std::thread::Builder::new().name("rawgraph-heic-probe".into()).spawn(|| {
+            let _ = ANSWER.set(rawgraph_io::heic_available());
+        });
+    }
+    None
 }
 
 impl Fmt {
-    pub const ALL: [Fmt; 7] = [Fmt::Jpeg, Fmt::Png, Fmt::Png16, Fmt::Tiff, Fmt::Tiff16, Fmt::Exr, Fmt::Webp];
+    pub const ALL: [Fmt; 8] = [Fmt::Jpeg, Fmt::Png, Fmt::Png16, Fmt::Tiff, Fmt::Tiff16, Fmt::Exr, Fmt::Webp, Fmt::Heic];
 
     pub fn label(self) -> &'static str {
         match self {
             Fmt::Jpeg => "JPEG",
             Fmt::Webp => "WebP",
+            Fmt::Heic => "HEIC",
             Fmt::Png => "PNG",
             Fmt::Tiff => "TIFF",
             Fmt::Exr => "EXR (linear)",
@@ -146,11 +167,17 @@ impl ExportState {
         if self.out_dir.trim().is_empty() {
             return Err("Choose an output folder".to_owned());
         }
+        if self.format == Fmt::Heic {
+            if let Some(Err(why)) = heic_status() {
+                return Err(why);
+            }
+        }
         Ok(ExportSettings {
             out_dir: PathBuf::from(self.out_dir.trim()),
             format: match self.format {
                 Fmt::Jpeg => ExportFormat::Jpeg { quality: self.quality.clamp(1, 100) },
                 Fmt::Webp => ExportFormat::Webp { quality: self.quality.clamp(1, 100), lossless: self.webp_lossless },
+                Fmt::Heic => ExportFormat::Heic { quality: self.quality.clamp(1, 100) },
                 Fmt::Png => ExportFormat::Png,
                 Fmt::Tiff => ExportFormat::Tiff,
                 Fmt::Exr => ExportFormat::Exr,
@@ -565,11 +592,33 @@ pub fn show_dialog(ctx: &egui::Context, area: egui::Rect, st: &mut ExportState, 
             ui.vertical(|ui| {
                 ui.horizontal_wrapped(|ui| {
                     for f in Fmt::ALL {
-                        ui.selectable_value(&mut st.format, f, f.label());
+                        if f == Fmt::Heic {
+                            let status = heic_status();
+                            let why = match &status {
+                                Some(Err(why)) => Some(why.clone()),
+                                None => Some("Checking whether this computer can write HEIC\u{2026}".to_owned()),
+                                Some(Ok(())) => None,
+                            };
+                            let shown = st.format == Fmt::Heic;
+                            ui.add_enabled_ui(why.is_none() || shown, |ui| {
+                                let r = ui.selectable_value(&mut st.format, f, f.label());
+                                if let Some(why) = &why {
+                                    r.on_hover_text(why.as_str()).on_disabled_hover_text(why.as_str());
+                                }
+                            });
+                            if status.is_none() {
+                                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                            }
+                        } else {
+                            ui.selectable_value(&mut st.format, f, f.label());
+                        }
                     }
                 });
-                if st.format == Fmt::Webp { ui.checkbox(&mut st.webp_lossless, "Lossless WebP"); ui.label("WebP ICC profile embedding is not supported."); }
-                if st.format == Fmt::Jpeg || (st.format == Fmt::Webp && !st.webp_lossless) {
+                if st.format == Fmt::Webp { ui.checkbox(&mut st.webp_lossless, "Lossless WebP"); }
+                if let (Fmt::Heic, Some(Err(why))) = (st.format, heic_status()) {
+                    ui.label(RichText::new(why).color(Color32::from_rgb(255, 150, 120)));
+                }
+                if matches!(st.format, Fmt::Jpeg | Fmt::Heic) || (st.format == Fmt::Webp && !st.webp_lossless) {
                     ui.add(egui::Slider::new(&mut st.quality, 1..=100).text("quality"));
                 }
                 if matches!(st.format, Fmt::Png16 | Fmt::Tiff16) {
@@ -610,7 +659,7 @@ pub fn show_dialog(ctx: &egui::Context, area: egui::Rect, st: &mut ExportState, 
             ui.label("Files");
             ui.vertical(|ui| {
                 ui.add_enabled_ui(st.format.has_profile_options(), |ui| {
-                    ui.add_enabled(st.format != Fmt::Webp, egui::Checkbox::new(&mut st.embed_profile, "Embed sRGB profile"));
+                    ui.checkbox(&mut st.embed_profile, "Embed sRGB profile");
                     ui.checkbox(&mut st.copy_metadata, "Copy capture metadata (camera, lens, exposure, date, copyright)");
                 });
                 if !st.format.has_profile_options() {
@@ -854,7 +903,14 @@ mod tests {
         let s = st.settings(&view).unwrap();
         assert!(!s.embed_profile && !s.copy_metadata);
         assert!(Fmt::ALL.contains(&Fmt::Webp));
-        assert_eq!(Fmt::ALL.len(), 7);
+        assert_eq!(Fmt::ALL.len(), 8);
+        st.format = Fmt::Heic;
+        let heic = st.settings(&view);
+        match heic_status().or_else(|| Some(rawgraph_io::heic_available())) {
+            Some(Err(why)) => assert_eq!(heic, Err(why)),
+            _ => assert_eq!(heic.unwrap().format, ExportFormat::Heic { quality: st.quality }),
+        }
+        assert_eq!(Fmt::Heic.label(), "HEIC");
         assert_eq!((Fmt::Png16.label(), Fmt::Tiff16.label()), ("PNG 16-bit", "TIFF 16-bit"));
         assert!(Fmt::Png16.has_profile_options() && !Fmt::Exr.has_profile_options());
         // The file name keeps the format's extension.

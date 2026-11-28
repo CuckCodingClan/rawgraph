@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::color::OutputSpace;
 use crate::graph::{ImageId, Node, NodeData, NodeKind};
 
-pub const EXPORT_FORMATS: [&str; 10] = ["JPEG", "PNG", "PNG 16-bit", "TIFF", "TIFF 16-bit", "EXR", "AVIF", "Adobe XMP sidecar", "PNG 16-bit data map", "WebP"];
+pub const EXPORT_FORMATS: [&str; 11] = ["JPEG", "PNG", "PNG 16-bit", "TIFF", "TIFF 16-bit", "EXR", "AVIF", "Adobe XMP sidecar", "PNG 16-bit data map", "WebP", "HEIC"];
 pub const EXPORT_SIZES: [&str; 3] = ["Original", "Long edge", "Percent"];
 pub const EXPORT_COLLISIONS: [&str; 3] = ["Skip", "Overwrite", "Rename"];
 
@@ -55,10 +55,12 @@ pub enum ExportFileFormat {
     Xmp,
     Png16Data,
     Webp,
+    /// 8-bit HEIC through the operating system's encoder (stored choice 10, appended).
+    Heic,
 }
 
 impl ExportFileFormat {
-    pub const ALL: [ExportFileFormat; 10] = [
+    pub const ALL: [ExportFileFormat; 11] = [
         ExportFileFormat::Jpeg,
         ExportFileFormat::Png,
         ExportFileFormat::Png16,
@@ -69,6 +71,7 @@ impl ExportFileFormat {
         ExportFileFormat::Xmp,
         ExportFileFormat::Png16Data,
         ExportFileFormat::Webp,
+        ExportFileFormat::Heic,
     ];
 
     /// Format with this index in [`EXPORT_FORMATS`]; out of range gives JPEG.

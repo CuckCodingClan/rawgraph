@@ -1124,20 +1124,26 @@ fn embedded_preview(path: &Path, max_dim: u32, min_dim: u32) -> Result<Option<Pr
         let params = RawDecodeParams::default();
         let md = decoder.raw_metadata(&src, &params).map_err(rawler_err)?;
         let orientation = orientation_of(&md);
+        let icc = || crate::icc::find_jpeg_icc(src.buf());
         // Accept an embedded image only if it is not much smaller than requested.
         let good = |i: &image::DynamicImage| i.width().max(i.height()) >= min_dim;
         if let Ok(Some(img)) = decoder.preview_image(&src, &params) {
             if good(&img) {
-                return Ok(Some(upright_embedded(img, orientation)));
+                return Ok(Some((upright_embedded(img, orientation), icc())));
             }
         }
         if let Ok(Some(img)) = decoder.thumbnail_image(&src, &params) {
             if good(&img) {
-                return Ok(Some(upright_embedded(img, orientation)));
+                return Ok(Some((upright_embedded(img, orientation), icc())));
             }
         }
         Ok(None)
-    }).map(|img| img.map(|img| crate::dynamic_to_thumb(img, max_dim)))
+    }).map(|found| found.map(|(img, icc)| {
+        // The preview is sRGB pixels unless its JPEG carries a profile (e.g. Adobe RGB).
+        let (w, h, mut rgba) = crate::dynamic_to_thumb(img, max_dim);
+        crate::icc::thumbnail_to_srgb(icc.as_deref(), &mut rgba);
+        (w, h, rgba)
+    }))
 }
 
 pub fn load_thumbnail(path: &Path, max_dim: u32) -> Result<PreviewPixels, IoError> {

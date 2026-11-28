@@ -363,3 +363,89 @@ fn rendered_files_report_raw_false_and_no_white_balance() {
         assert_eq!(load(p, None).unwrap().capture, info);
     }
 }
+
+// ---------------------------------------------------------------- thumbnails and input profiles
+
+/// sRGB codes of a full decode: ACEScg -> Rec.709 -> sRGB OETF, RGBA8.
+fn full_decode_srgb8(path: &Path) -> (u32, u32, Vec<u8>) {
+    let l = load(path, None).unwrap();
+    let m = rawgraph_core::color::to_f32(&rawgraph_core::color::acescg_to_rec709());
+    let rgba = l.image.data().as_chunks::<4>().0.iter().flat_map(|p| {
+        let c = |k: usize| (rawgraph_core::color::srgb_oetf((m[k][0] * p[0] + m[k][1] * p[1] + m[k][2] * p[2]).clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+        [c(0), c(1), c(2), 255]
+    }).collect();
+    (l.image.width(), l.image.height(), rgba)
+}
+
+fn tagged_codes(w: u32, h: u32) -> Vec<u8> {
+    // Saturated and neutral colours, so a missing conversion is large.
+    (0..w * h).flat_map(|i| {
+        let (x, y) = (i % w, i / w);
+        [(40 + x * 3 % 200) as u8, (30 + y * 5 % 200) as u8, (200 - (x + y) % 150) as u8]
+    }).collect()
+}
+
+#[test]
+fn thumbnails_of_tagged_files_match_the_full_decode() {
+    use rawgraph_core::color::OutputSpace;
+    let t = Tmp::new("thumb-icc");
+    let (w, h) = (64u32, 48u32);
+    let codes = tagged_codes(w, h);
+    let mut checked = 0;
+    for (space, name) in [(OutputSpace::AdobeRgb, "adobe"), (OutputSpace::DisplayP3, "p3"), (OutputSpace::Rec2020, "rec2020")] {
+        for ext in ["jpg", "png", "tif"] {
+            let p = t.file(&format!("{name}.{ext}"));
+            let options = SaveOptions { space, embed_profile: true, jpeg_quality: 98, ..Default::default() };
+            save_srgb8_with(&p, w, h, &codes, &options).unwrap();
+            let (tw, th, thumb) = load_thumbnail(&p, 256).unwrap();
+            let (fw, fh, full) = full_decode_srgb8(&p);
+            assert_eq!((tw, th), (fw, fh));
+            assert_eq!(thumb.len(), full.len());
+            let worst = thumb.iter().zip(&full).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            assert!(worst <= 2, "{name}.{ext}: largest difference {worst} code values");
+            // The conversion is not a no-op: the tagged codes differ clearly from the sRGB result.
+            let moved = thumb.as_chunks::<4>().0.iter().zip(codes.as_chunks::<3>().0).map(|(a, b)| (0..3).map(|k| a[k].abs_diff(b[k])).max().unwrap()).max().unwrap();
+            assert!(moved >= 8, "{name}.{ext}: thumbnail equals the tagged codes ({moved})");
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 9);
+}
+
+#[test]
+fn thumbnails_of_srgb_and_untagged_files_are_untouched() {
+    use rawgraph_core::color::OutputSpace;
+    let t = Tmp::new("thumb-srgb");
+    let (w, h) = (32u32, 32u32);
+    let codes = tagged_codes(w, h);
+    let tagged = t.file("srgb.png");
+    save_srgb8_with(&tagged, w, h, &codes, &SaveOptions { space: OutputSpace::Srgb, embed_profile: true, ..Default::default() }).unwrap();
+    let plain = t.file("plain.png");
+    save_srgb8_with(&plain, w, h, &codes, &SaveOptions { embed_profile: false, ..Default::default() }).unwrap();
+    for p in [&tagged, &plain] {
+        let (_, _, px) = load_thumbnail(p, 256).unwrap();
+        for (a, b) in px.as_chunks::<4>().0.iter().zip(codes.as_chunks::<3>().0) {
+            assert_eq!(&a[..3], b);
+        }
+    }
+}
+
+#[test]
+#[ignore = "diagnostic timing, run explicitly with --ignored --nocapture"]
+fn thumbnail_profile_conversion_cost() {
+    use rawgraph_core::color::OutputSpace;
+    let t = Tmp::new("thumb-cost");
+    let (w, h) = (1800u32, 1200u32);
+    let codes = tagged_codes(w, h);
+    for (space, name) in [(OutputSpace::Srgb, "srgb"), (OutputSpace::AdobeRgb, "adobe")] {
+        let p = t.file(&format!("{name}.jpg"));
+        save_srgb8_with(&p, w, h, &codes, &SaveOptions { space, jpeg_quality: 90, ..Default::default() }).unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..8 {
+            let s = std::time::Instant::now();
+            let _ = load_thumbnail(&p, 256).unwrap();
+            best = best.min(s.elapsed().as_secs_f64() * 1000.0);
+        }
+        println!("{name}: {best:.2} ms per 256 px thumbnail from a {w}x{h} JPEG");
+    }
+}

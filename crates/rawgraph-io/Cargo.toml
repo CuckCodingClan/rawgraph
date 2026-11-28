@@ -14,5 +14,14 @@ avif-serialize = "0.8.9"
 ravif = { version = "0.13.0", default-features = false, features = ["threading"] }
 rawler = "0.8.0"
 rayon.workspace = true
+memchr = "2"
 
 webp-rust = "=0.3.1"
+
+[dev-dependencies]
+# Independent WebP decoder for the container tests (the production build has no WebP in `image`).
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "tiff", "exr", "webp"] }
+
+[target.'cfg(windows)'.dependencies]
+# Windows Imaging Component (HEIC through the operating system's HEVC encoder); same version as eframe's.
+windows = { version = "0.62.2", default-features = false, features = ["Win32_Foundation", "Win32_Graphics_Imaging", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_System_Ole"] }

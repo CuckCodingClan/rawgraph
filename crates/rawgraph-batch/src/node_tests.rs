@@ -1057,6 +1057,34 @@ fn webp_node_maps_mode_and_writes_webp() {
 }
 
 #[test]
+fn heic_node_maps_format_and_writes_heic_or_reports_the_missing_encoder() {
+    let mut r = Rig::one(32, 24, [70, 120, 180]);
+    r.p("format", 10.0);
+    r.p("color_space", 1.0);
+    let spec = export_spec(r.g.node(r.exp).unwrap(), A);
+    assert_eq!(spec.format, ExportFileFormat::Heic);
+    assert_eq!(spec.format.label(), "HEIC");
+    assert_eq!(settings_from_spec(&spec, DisplayTransform::default()).format, ExportFormat::Heic { quality: 92 });
+    match rawgraph_io::heic_available() {
+        Ok(()) => {
+            let path = r.first_path();
+            assert_eq!(path.extension().unwrap(), "heic");
+            let bytes = fs::read(path).unwrap();
+            assert_eq!(&bytes[4..8], b"ftyp");
+            let img = rawgraph_io::decode_heic8(&bytes).unwrap();
+            assert_eq!((img.width, img.height), (32, 24));
+            assert_eq!(rawgraph_io::embedded_icc(&bytes).as_deref(), Some(rawgraph_io::icc_profile(spec.space)), "output-space profile embedded");
+        }
+        Err(why) => {
+            // Nothing is written; the whole batch is refused with the reason.
+            let err = export_node(&r.g, r.exp, &r.catalog, &r.ids(), DisplayTransform::default(), &CancelToken::new(), &mut |_| {}).unwrap_err();
+            assert!(err.to_string().contains(&why), "{err}");
+            assert!(!r.out().exists() || fs::read_dir(r.out()).unwrap().next().is_none());
+        }
+    }
+}
+
+#[test]
 fn quick_export_selected_uses_full_catalog_for_layer_pairing() {
     let f = folders(&[("a", &[("a1.png", [200, 100, 50]), ("a2.png", [60, 160, 220])]),
                       ("b", &[("b1.png", [180, 220, 100]), ("b2.png", [90, 40, 200])])]);

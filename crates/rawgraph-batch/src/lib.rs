@@ -50,6 +50,9 @@ pub enum ExportFormat {
     /// 8-bit AVIF in the chosen output space; `quality` is 1..=100.
     Avif { quality: u8 },
     Webp { quality: u8, lossless: bool },
+    /// 8-bit HEIC in the chosen output space through the operating system's encoder (Windows with
+    /// the HEVC extension; see `rawgraph_io::heic_available`); `quality` is 1..=100.
+    Heic { quality: u8 },
     /// Sidecars require project culling metadata and are handled by the app.
     Xmp,
 }
@@ -74,7 +77,7 @@ pub struct ExportSettings {
     /// `percent`.
     pub long_edge: Option<u32>,
     pub on_conflict: OnConflict,
-    /// Applied for Jpeg/Png/Tiff/Png16/Tiff16/Avif. Ignored for Exr.
+    /// Applied for Jpeg/Png/Tiff/Png16/Tiff16/Avif/Webp/Heic. Ignored for Exr.
     pub display: DisplayTransform,
     /// Viewer tone used to evaluate Display-mode generators, independent of export tone mapping.
     pub generator_view_tone: rawgraph_scopes::ToneMap,
@@ -140,6 +143,7 @@ pub fn settings_from_spec(spec: &ExportSpec, display: DisplayTransform) -> Expor
         ExportFileFormat::Exr => ExportFormat::Exr,
         ExportFileFormat::Avif => ExportFormat::Avif { quality: spec.quality },
         ExportFileFormat::Webp => ExportFormat::Webp { quality: spec.quality, lossless: spec.webp_lossless },
+        ExportFileFormat::Heic => ExportFormat::Heic { quality: spec.quality },
         ExportFileFormat::Xmp => ExportFormat::Xmp,
     };
     let (long_edge, percent) = match spec.size {
@@ -275,6 +279,7 @@ fn extension(format: ExportFormat) -> &'static str {
         ExportFormat::Exr => "exr",
         ExportFormat::Avif { .. } => "avif",
         ExportFormat::Webp { .. } => "webp",
+        ExportFormat::Heic { .. } => "heic",
         ExportFormat::Xmp => "xmp",
     }
 }
@@ -336,7 +341,11 @@ fn check_settings(settings: &ExportSettings) -> Result<Vec<template::Token>, Exp
             return invalid(format!("the size percentage {p} must be greater than 0"));
         }
     }
-    if let ExportFormat::Jpeg { quality } | ExportFormat::Avif { quality } | ExportFormat::Webp { quality, .. } = settings.format {
+    if matches!(settings.format, ExportFormat::Heic { .. }) {
+        // Refuse the whole batch up front instead of failing every image with the same message.
+        rawgraph_io::heic_available().map_err(ExportError::InvalidSettings)?;
+    }
+    if let ExportFormat::Jpeg { quality } | ExportFormat::Avif { quality } | ExportFormat::Webp { quality, .. } | ExportFormat::Heic { quality } = settings.format {
         if !(1..=100).contains(&quality) {
             return invalid(format!("quality {quality} is outside 1..=100"));
         }
@@ -474,7 +483,7 @@ impl Output {
 
     fn write(&self, path: &Path, settings: &ExportSettings, overwrite: bool, metadata: &Option<rawgraph_io::ExportMetadata>) -> Result<(), IoError> {
         let quality = match settings.format {
-            ExportFormat::Jpeg { quality } | ExportFormat::Avif { quality } | ExportFormat::Webp { quality, .. } => quality,
+            ExportFormat::Jpeg { quality } | ExportFormat::Avif { quality } | ExportFormat::Webp { quality, .. } | ExportFormat::Heic { quality } => quality,
             _ => 100,
         };
         let options = rawgraph_io::SaveOptions {
@@ -492,6 +501,7 @@ impl Output {
             },
             Output::Rgb8 { width, height, rgb } => match settings.format {
                 ExportFormat::Avif { .. } => rawgraph_io::save_avif8(path, *width, *height, rgb, &options),
+                ExportFormat::Heic { .. } => rawgraph_io::save_heic8(path, *width, *height, rgb, &options),
                 _ => rawgraph_io::save_srgb8_with(path, *width, *height, rgb, &options),
             },
             Output::Rgb16 { width, height, rgb } => rawgraph_io::save_srgb16_with(path, *width, *height, rgb, &options),

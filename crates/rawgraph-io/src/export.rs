@@ -207,14 +207,43 @@ pub fn save_avif8(path: &Path, width: u32, height: u32, rgb8: &[u8], options: &S
     write_atomic(path, options.overwrite, |tmp| fs::write(tmp, &bytes).map_err(|e| io_err(tmp, e)))
 }
 
-/// Writes RGBA WebP. Pixels are already encoded in the selected output space.
-/// EXIF is supported; ICC profiles are not yet embedded by this writer.
+/// Encodes an 8-bit HEIC file in memory with the operating system's encoder (see [`crate::heic`]).
+/// `rgb8` is RGB already encoded in `options.space`; `options.jpeg_quality` is the quality. With
+/// `embed_profile` the ICC profile of the space is stored, with `metadata` EXIF is attempted
+/// (best effort, see `heic`). [`IoError::Unsupported`] with the reason when no encoder exists.
+pub fn encode_heic8(width: u32, height: u32, rgb8: &[u8], options: &SaveOptions) -> Result<Vec<u8>, IoError> {
+    check_size(width, height, rgb8.len())?;
+    crate::heic::heic_available().map_err(IoError::Unsupported)?;
+    crate::heic::encode(width, height, rgb8, options.jpeg_quality.clamp(1, 100), Some(options.space), options.metadata.as_ref(), options.embed_profile)
+}
+
+/// Writes an 8-bit HEIC file (see [`encode_heic8`]); same overwrite rule and atomic write as the
+/// other writers.
+pub fn save_heic8(path: &Path, width: u32, height: u32, rgb8: &[u8], options: &SaveOptions) -> Result<(), IoError> {
+    check_size(width, height, rgb8.len())?;
+    if !options.overwrite && path.exists() {
+        return Err(IoError::Exists(path.to_path_buf()));
+    }
+    let bytes = encode_heic8(width, height, rgb8, options)?;
+    write_atomic(path, options.overwrite, |tmp| fs::write(tmp, &bytes).map_err(|e| io_err(tmp, e)))
+}
+
+/// Writes RGBA WebP. Pixels are already encoded in the selected output space. With `embed_profile`
+/// the ICC profile of `options.space` is stored in an `ICCP` chunk (extended `VP8X` container,
+/// lossy and lossless); EXIF is supported as well.
 pub fn save_webp8(path: &Path, width: u32, height: u32, rgba: &[u8], lossless: bool, options: &SaveOptions) -> Result<(), IoError> {
+    if !options.overwrite && path.exists() { return Err(IoError::Exists(path.to_path_buf())); }
+    let bytes = encode_webp8(width, height, rgba, lossless, options)?;
+    write_atomic(path, options.overwrite, |tmp| fs::write(tmp, &bytes).map_err(|e| io_err(tmp, e)))
+}
+
+/// The bytes [`save_webp8`] writes, in memory (Export preview, tests).
+pub fn encode_webp8(width: u32, height: u32, rgba: &[u8], lossless: bool, options: &SaveOptions) -> Result<Vec<u8>, IoError> {
+    let path = Path::new("(memory).webp");
     if width == 0 || height == 0 || width > 16383 || height > 16383 ||
         (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(4)) != Some(rgba.len()) {
         return Err(IoError::Io("invalid WebP dimensions or RGBA buffer".into()));
     }
-    if !options.overwrite && path.exists() { return Err(IoError::Exists(path.to_path_buf())); }
     let img = webp_rust::ImageBuffer { width: width as usize, height: height as usize, rgba: rgba.to_vec() };
     let exif = options.metadata.as_ref().map(|m| exif_blob(m, options.space == OutputSpace::Srgb));
     let bytes = if lossless {
@@ -223,7 +252,15 @@ pub fn save_webp8(path: &Path, width: u32, height: u32, rgba: &[u8], lossless: b
         let config = webp_rust::LossyEncodingConfig { quality: options.jpeg_quality.clamp(1, 100) as f32, ..Default::default() };
         webp_rust::encode_lossy_with_config(&img, &config, exif.as_deref())
     }.map_err(|e| io_err(path, e))?;
-    write_atomic(path, options.overwrite, |tmp| fs::write(tmp, &bytes).map_err(|e| io_err(tmp, e)))
+    if options.embed_profile { crate::webp_icc::with_icc(&bytes, icc_profile(options.space), width, height) } else { Ok(bytes) }
+}
+
+/// Decodes a WebP file to `(width, height, RGBA8)` (Export preview, tests).
+pub fn decode_webp8(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), IoError> {
+    let img = std::panic::catch_unwind(|| webp_rust::decode(bytes))
+        .map_err(|_| IoError::Decode("WebP decoder panicked on malformed data".into()))?
+        .map_err(|e| IoError::Decode(format!("WebP: {e}")))?;
+    Ok((img.width as u32, img.height as u32, img.rgba))
 }
 
 /// Writes 8-bit sRGB without profile and metadata; see [`save_srgb8_with`]. Refuses to replace an
