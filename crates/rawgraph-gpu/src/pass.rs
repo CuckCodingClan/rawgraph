@@ -22,6 +22,20 @@ pub(crate) fn build_pass(
     uniform_size: u64,
     table_size: Option<u64>,
 ) -> Pass {
+    build_pass_ext(ctx, label, wgsl, out_format, uniform_size, table_size, 0)
+}
+
+/// Like [`build_pass`] with `extra_textures` more read-only `Rgba32Float` textures at bindings 4, 5, ...
+/// (neighbourhood passes read a second image, e.g. the original next to its blurred copy).
+pub(crate) fn build_pass_ext(
+    ctx: &GpuContext,
+    label: &str,
+    wgsl: &str,
+    out_format: wgpu::TextureFormat,
+    uniform_size: u64,
+    table_size: Option<u64>,
+    extra_textures: u32,
+) -> Pass {
     ctx.count_pipeline();
     let device = &ctx.device;
     let mut entries = vec![
@@ -68,6 +82,18 @@ pub(crate) fn build_pass(
             count: None,
         });
     }
+    for i in 0..extra_textures {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 4 + i,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        });
+    }
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries: &entries });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
@@ -98,6 +124,21 @@ pub(crate) fn run_pass(
     dst: &wgpu::TextureView,
     uniform: &[u8],
     table: Option<&wgpu::Buffer>,
+    size: (u32, u32),
+) -> Result<(), GpuError> {
+    run_pass_ext(ctx, pass, src, dst, uniform, table, &[], size)
+}
+
+/// Like [`run_pass`] with the extra textures of [`build_pass_ext`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_pass_ext(
+    ctx: &GpuContext,
+    pass: &Pass,
+    src: &wgpu::TextureView,
+    dst: &wgpu::TextureView,
+    uniform: &[u8],
+    table: Option<&wgpu::Buffer>,
+    extra: &[&wgpu::TextureView],
     (width, height): (u32, u32),
 ) -> Result<(), GpuError> {
     let device = &ctx.device;
@@ -111,6 +152,9 @@ pub(crate) fn run_pass(
     ];
     if let Some(t) = table {
         entries.push(wgpu::BindGroupEntry { binding: 3, resource: t.as_entire_binding() });
+    }
+    for (i, view) in extra.iter().enumerate() {
+        entries.push(wgpu::BindGroupEntry { binding: 4 + i as u32, resource: wgpu::BindingResource::TextureView(view) });
     }
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pass.layout, entries: &entries });
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });

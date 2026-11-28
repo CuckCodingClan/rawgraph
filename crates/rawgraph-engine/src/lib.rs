@@ -140,11 +140,17 @@ pub struct Evaluator {
     timings: Option<Vec<NodeTiming>>,
     timing_children: Vec<std::time::Duration>,
     timing_hit: Vec<bool>,
+    /// Local tone grids by (image, grid id), see [`Evaluator::tail_grid`].
+    /// Least recently used last; kept across images (see `MAX_GRIDS`).
+    grids: Vec<((ImageId, u64), Arc<ops::LocalToneGrid>)>,
 }
+
+/// Local tone grids kept (each is about 0.7 MB at most).
+const MAX_GRIDS: usize = 16;
 
 impl Default for Evaluator {
     fn default() -> Self {
-        Self { cache: HashMap::new(), view_tone: ToneMap::AcesFit, pre_tone: HashMap::new(), hits: 0, misses: 0, keep_intermediates: true, timings: None, timing_children: Vec::new(), timing_hit: Vec::new() }
+        Self { cache: HashMap::new(), view_tone: ToneMap::AcesFit, pre_tone: HashMap::new(), grids: Vec::new(), hits: 0, misses: 0, keep_intermediates: true, timings: None, timing_children: Vec::new(), timing_hit: Vec::new() }
     }
 }
 
@@ -292,7 +298,9 @@ impl Evaluator {
     /// `fx::black_white`). Every tail operation keeps the image size, which is what makes
     /// the position-dependent Vignette valid in a tail. Any other node (Clarity, Blur, Noise
     /// Reduction, Sharpen, Transform, Lens Correction, Layer), and
-    /// Exposure/Contrast/Saturation with a connected mask, is the base.
+    /// Exposure/Contrast/Saturation with a connected mask, is the base. (This is the pointwise
+    /// planner, used by the live thumbnails; [`Evaluator::plan_tail_gpu`] also takes Filter,
+    /// Sharpen and the Develop local tone into the tail.)
     ///
     /// A Develop node with a non-neutral tone part (exposure, contrast, lights, shadows,
     /// white, black, dynamic, saturation) ends the walk: its tone part becomes the first
@@ -306,6 +314,23 @@ impl Evaluator {
     /// errors `eval` would return. `base_fingerprint` is the fingerprint the cache stores for
     /// the base, so it changes exactly when `eval_base` would recompute.
     pub fn plan_tail(&self, graph: &Graph, node: NodeId, image: ImageId, provider: &dyn ImageProvider) -> Result<TailPlan, EvalError> {
+        self.plan_tail_mode(graph, node, image, provider, false)
+    }
+
+    /// Like [`Evaluator::plan_tail`], but the tail may also contain NEIGHBOURHOOD operations
+    /// ([`TailOp::is_neighbourhood`]) that a GPU chain runs as passes over a whole texture:
+    /// the Filter node with the Gaussian or Box kernel (low or high pass) and no radius map,
+    /// Sharpen without an amount map, and the non-Legacy Develop tone with Lights, Shadows,
+    /// White or Black (its edge-aware base is estimated on the CPU, see [`Evaluator::tail_grid`]).
+    /// Everything else that is not pointwise (Clarity, Noise Reduction, Transform, Lens Correction,
+    /// Layer, the other Filter kernels, any node with a connected control map) still ends the
+    /// walk as the base. The base fingerprint follows the same rules, so a caller must use the
+    /// same planner for the plan, the GPU cache key and the base it evaluates.
+    pub fn plan_tail_gpu(&self, graph: &Graph, node: NodeId, image: ImageId, provider: &dyn ImageProvider) -> Result<TailPlan, EvalError> {
+        self.plan_tail_mode(graph, node, image, provider, true)
+    }
+
+    fn plan_tail_mode(&self, graph: &Graph, node: NodeId, image: ImageId, provider: &dyn ImageProvider, gpu: bool) -> Result<TailPlan, EvalError> {
         let images = provider.images();
         let env = Env { provider, images: &images, view_tone: self.view_tone, control: false };
         if !env.viewing_member(graph, node, image) {
@@ -327,7 +352,7 @@ impl Evaluator {
                 return Err(EvalError::MissingInput { node: cur, port: 0 });
             }
             visited.push(cur);
-            match tail_step(graph, n, image, provider) {
+            match tail_step(graph, n, image, provider, gpu) {
                 TailStep::Base => break,
                 TailStep::Through(ops) => groups.push(ops),
                 TailStep::Tone(ops) => {
@@ -344,7 +369,7 @@ impl Evaluator {
             let (up, up_port) = env.input_edge(graph, cur, port, image).ok_or(EvalError::MissingInput { node: cur, port })?;
             (cur, cur_port) = (up, up_port);
         }
-        let ops: Vec<TailOp> = groups.into_iter().rev().flatten().collect();
+        let mut ops: Vec<TailOp> = groups.into_iter().rev().flatten().collect();
         let base_fingerprint = if base_before_tone {
             let develop = graph.node(cur).ok_or(EvalError::UnknownNode(cur))?;
             pre_tone_fingerprint(graph, develop, image, &env, &mut memo)?
@@ -355,6 +380,18 @@ impl Evaluator {
             }
         };
         let base_fingerprint = if output_channel(graph.node(cur).unwrap(), cur_port).is_some() { let mut h = DefaultHasher::new(); base_fingerprint.hash(&mut h); cur_port.hash(&mut h); output_channel(graph.node(cur).unwrap(), cur_port).hash(&mut h); h.finish() } else { base_fingerprint };
+        // A local tone grid is identified by the base and everything applied before it.
+        for i in 0..ops.len() {
+            if matches!(ops[i], TailOp::LocalTone { .. }) {
+                let mut h = DefaultHasher::new();
+                base_fingerprint.hash(&mut h);
+                base_before_tone.hash(&mut h);
+                format!("{:?}", &ops[..i]).hash(&mut h);
+                if let TailOp::LocalTone { grid, .. } = &mut ops[i] {
+                    *grid = h.finish();
+                }
+            }
+        }
         Ok(TailPlan { base: cur, base_port: cur_port, ops, base_fingerprint, base_before_tone })
     }
 
@@ -484,11 +521,55 @@ impl Evaluator {
     pub fn retain_image(&mut self, image: ImageId) {
         self.cache.retain(|(_, im, _), _| *im == image);
         self.pre_tone.retain(|(_, im, _), _| *im == image);
+        // The grids stay: they are small, keyed by image and base, and stepping A -> B -> A would
+        // otherwise re-evaluate A on the CPU just to rebuild one (they age out in `tail_grid`).
     }
 
     pub fn clear(&mut self) {
         self.cache.clear();
         self.pre_tone.clear();
+        self.grids.clear();
+    }
+
+    /// The local tone grid of the [`TailOp::LocalTone`] at `index` of `plan.ops`: the guided-filter
+    /// coefficients (`ops::local_tone_grid`) of the image that operation is applied to, i.e. the plan's
+    /// base with every operation before `index` applied on the CPU. Cached by the operation's
+    /// grid id, so moving Lights / Shadows / White / Black (which are not part of the id) costs a
+    /// lookup, and the base is only evaluated when the grid is missing.
+    pub fn tail_grid(
+        &mut self,
+        graph: &Graph,
+        plan: &TailPlan,
+        index: usize,
+        image: ImageId,
+        provider: &dyn ImageProvider,
+        cancel: &CancelToken,
+    ) -> Result<Arc<ops::LocalToneGrid>, EvalError> {
+        let Some(TailOp::LocalTone { grid: id, .. }) = plan.ops.get(index) else {
+            return Err(EvalError::WrongType { node: plan.base, port: 0 });
+        };
+        let key = (image, *id);
+        if let Some(pos) = self.grids.iter().position(|(k, _)| *k == key) {
+            self.hits += 1;
+            let entry = self.grids.remove(pos);
+            let g = Arc::clone(&entry.1);
+            self.grids.push(entry);
+            return Ok(g);
+        }
+        let base = self.eval_base(graph, plan, image, provider, cancel)?;
+        if cancel.is_cancelled() {
+            return Err(EvalError::Cancelled);
+        }
+        let before = apply_tail_cpu(&base, &plan.ops[..index]);
+        let grid = ops::local_tone_grid(&before).ok_or(EvalError::Provider("local tone: the image is empty".into()))?;
+        self.misses += 1;
+        // Least recently used out: a few images and one grid per exposure step of a drag fit.
+        if self.grids.len() >= MAX_GRIDS {
+            self.grids.remove(0);
+        }
+        let grid = Arc::new(grid);
+        self.grids.push((key, Arc::clone(&grid)));
+        Ok(grid)
     }
 
     /// Cache hits since creation.
@@ -1246,6 +1327,25 @@ pub enum TailOp {
     /// `fx::lut_apply` in `space` (never Display mode: that wraps the view transform, which needs the
     /// CPU, so such a LUT node is the base of the plan instead).
     Lut { lut: Arc<rawgraph_core::Lut>, space: rawgraph_core::LutSpace, strength: f32 },
+    /// NEIGHBOURHOOD (only in plans from [`Evaluator::plan_tail_gpu`]): the per-pixel part of the
+    /// Develop local tone (`ops::develop_local_tone`: Lights, Shadows, White, Black). The edge-aware
+    /// base it needs is a 512 px grid of guided-filter coefficients estimated from the image this
+    /// operation is applied to; `grid` identifies that grid (base fingerprint and every operation
+    /// before this one), see [`Evaluator::tail_grid`]. The sliders are not part of the id.
+    LocalTone { highlights: f32, shadows: f32, whites: f32, blacks: f32, grid: u64 },
+    /// NEIGHBOURHOOD: the Filter node with the Gaussian (`box_kernel` false) or Box kernel and no
+    /// control map. `radius` is the parameter in per mille of the long edge (the pixel radius
+    /// depends on the size of the image the operation sees); `high` is the high pass.
+    Filter { radius: f32, box_kernel: bool, high: bool },
+    /// NEIGHBOURHOOD: the Sharpen node without a control map; `radius` in per mille of the long edge.
+    Sharpen { amount: f32, radius: f32, threshold: f32 },
+}
+
+impl TailOp {
+    /// Whether the operation reads more than its own pixel (it needs a whole texture on the GPU).
+    pub fn is_neighbourhood(&self) -> bool {
+        matches!(self, TailOp::LocalTone { .. } | TailOp::Filter { .. } | TailOp::Sharpen { .. })
+    }
 }
 
 /// The LUT, input space choice and strength a LUT node uses for `image`; `None` when the node
@@ -1385,7 +1485,7 @@ fn develop_base_is_neutral(settings: &DevelopSettings) -> bool {
 
 /// Classifies `node` for the tail walk. The neutral cases are exactly the evaluator's
 /// identity short-circuits in `compute`.
-fn tail_step(graph: &Graph, node: &rawgraph_core::Node, image: ImageId, provider: &dyn ImageProvider) -> TailStep {
+fn tail_step(graph: &Graph, node: &rawgraph_core::Node, image: ImageId, provider: &dyn ImageProvider, gpu: bool) -> TailStep {
     let id = node.id;
     let param = |name: &str| node.param(name, image);
     let images = provider.images();
@@ -1403,7 +1503,21 @@ fn tail_step(graph: &Graph, node: &rawgraph_core::Node, image: ImageId, provider
             // Exposure, Contrast and colour alone are the same pointwise ops in both modes.
             let t = develop_tone(node, image);
             if !node.toggle("legacy_tone", image) && (t.highlights != 0.0 || t.shadows != 0.0 || t.whites != 0.0 || t.blacks != 0.0) {
-                return TailStep::Base;
+                if !gpu {
+                    return TailStep::Base;
+                }
+                // The evaluator's order for the local tone: exposure gain, the local part, then
+                // contrast, vibrance and saturation (`compute_develop`).
+                let mut rest = t;
+                rest.exposure = 0.0;
+                rest.whites = 0.0;
+                rest.blacks = 0.0;
+                rest.highlights = 0.0;
+                rest.shadows = 0.0;
+                let mut ops = gain_op(t.exposure);
+                ops.push(TailOp::LocalTone { highlights: t.highlights, shadows: t.shadows, whites: t.whites, blacks: t.blacks, grid: 0 });
+                ops.extend(tone_ops(&rest));
+                return TailStep::Tone(ops);
             }
             let tone = tone_ops(&develop_tone(node, image));
             if !tone.is_empty() {
@@ -1496,6 +1610,24 @@ fn tail_step(graph: &Graph, node: &rawgraph_core::Node, image: ImageId, provider
             });
             TailStep::Through(vec![TailOp::Matrix([w, w, w])])
         }
+        // Neighbourhood nodes a GPU chain can run; a connected control map keeps them on the CPU.
+        NodeKind::Blur if gpu && !masked && node.choice("kernel", image) < 2 => {
+            let radius = param("radius");
+            let high = node.choice("pass", image) == 1;
+            if radius == 0.0 && !high {
+                TailStep::Through(Vec::new())
+            } else {
+                TailStep::Through(vec![TailOp::Filter { radius, box_kernel: node.choice("kernel", image) == 1, high }])
+            }
+        }
+        NodeKind::Sharpen if gpu && !masked => {
+            let amount = param("amount");
+            if amount == 0.0 {
+                TailStep::Through(Vec::new())
+            } else {
+                TailStep::Through(vec![TailOp::Sharpen { amount, radius: param("radius"), threshold: param("threshold") }])
+            }
+        }
         _ => TailStep::Base,
     }
 }
@@ -1545,7 +1677,35 @@ fn apply_op(img: &mut ImageBuf, op: &TailOp) {
         TailOp::WhitesBlacks { whites, blacks } => fx::whites_blacks(img, whites, blacks),
         TailOp::Vibrance(amount) => fx::vibrance(img, amount),
         TailOp::Lut { ref lut, space, strength } => fx::lut_apply(img, lut, space, strength),
+        TailOp::LocalTone { highlights, shadows, whites, blacks, .. } => ops::develop_local_tone(img, highlights, shadows, whites, blacks),
+        TailOp::Filter { radius, box_kernel, high } => {
+            // Exactly the Filter node (Gaussian / Box kernels without a map).
+            let sigma = radius / 1000.0 * long_edge(img);
+            if sigma.round() <= 0.0 && !high {
+                return;
+            }
+            let low = ops::filter_low(img, sigma, box_kernel);
+            *img = if high { high_pass(low, img) } else { low };
+        }
+        TailOp::Sharpen { amount, radius, threshold } => {
+            if amount != 0.0 {
+                *img = fx::sharpen(img, amount, radius / 1000.0 * long_edge(img), threshold, None);
+            }
+        }
     }
+}
+
+/// The high pass of the Filter node: `0.5 + original - low` per colour channel (centred at 0.5
+/// without clipping HDR values); alpha is coverage, not a frequency component.
+fn high_pass(low: ImageBuf, original: &ImageBuf) -> ImageBuf {
+    let mut result = low;
+    for (out, orig) in result.data_mut().as_chunks_mut::<4>().0.iter_mut().zip(original.data().as_chunks::<4>().0) {
+        for c in 0..3 {
+            out[c] = 0.5 + orig[c] - out[c];
+        }
+        out[3] = orig[3];
+    }
+    result
 }
 
 /// The error for a node the image does not leave through. A structurally broken graph
@@ -1950,16 +2110,7 @@ fn compute(
             if !high {
                 return Ok(Value::Images(Arc::new(low)));
             }
-            // Center the signed RGB residual at 0.5 without clipping HDR values;
-            // alpha is coverage, not a frequency component.
-            let mut result = low;
-            for (out, original) in result.data_mut().as_chunks_mut::<4>().0.iter_mut().zip(src.data().as_chunks::<4>().0) {
-                for c in 0..3 {
-                    out[c] = 0.5 + original[c] - out[c];
-                }
-                out[3] = original[3];
-            }
-            Ok(Value::Images(Arc::new(result)))
+            Ok(Value::Images(Arc::new(high_pass(low, &src))))
         }
     }
 }
@@ -2214,7 +2365,7 @@ mod tests {
         let mapped = run(&g, dev, A, &p, &mut ev);
         assert_ne!(*plain, *mapped);
         assert_ne!(mapped.pixel(0, 0), mapped.pixel(4, 0));
-        assert!(matches!(tail_step(&g, g.node(dev).unwrap(), A, &p), TailStep::Base));
+        assert!(matches!(tail_step(&g, g.node(dev).unwrap(), A, &p, false), TailStep::Base));
         let misses = ev.misses();
         set(&mut g, generator, "gradient_reverse", A, 1.0);
         let changed = run(&g, dev, A, &p, &mut ev);
@@ -5346,6 +5497,258 @@ mod tests {
         assert_ne!(ev.plan_tail(&g, out, A, &p).unwrap().base_fingerprint, tp3.base_fingerprint);
         // eval_base without a plan from this evaluator state still validates membership.
         assert!(ev.eval_base(&g, &tp3, ImageId(77), &p, &c).is_ok());
+    }
+
+    // ---- GPU plans: neighbourhood operations in the tail ----
+
+    fn plan_gpu(g: &Graph, n: NodeId, img: ImageId, p: &TestProvider) -> TailPlan {
+        Evaluator::new().plan_tail_gpu(g, n, img, p).unwrap()
+    }
+
+    /// `apply_tail_cpu(eval_base(plan), plan.ops)` equals `eval_image(node)` for a GPU plan, bit for bit.
+    fn check_invariant_gpu(g: &Graph, n: NodeId, img: ImageId, p: &TestProvider) -> TailPlan {
+        let mut ev = Evaluator::new();
+        let c = CancelToken::new();
+        let tp = ev.plan_tail_gpu(g, n, img, p).unwrap();
+        let base = ev.eval_base(g, &tp, img, p, &c).unwrap();
+        let tail = apply_tail_cpu(&base, &tp.ops);
+        let full = Evaluator::new().eval_image(g, n, img, p, &c).unwrap();
+        assert_eq!(tail, *full, "GPU tail plan {tp:?} must reproduce the evaluation");
+        tp
+    }
+
+    fn big_provider() -> TestProvider {
+        let p = TestProvider::default();
+        *p.dims.lock().unwrap() = Some((256, 128));
+        p
+    }
+
+    #[test]
+    fn gpu_plan_moves_filter_and_sharpen_into_the_tail_and_the_pointwise_plan_does_not() {
+        let p = big_provider();
+        let (g, ids, out) = build(&[
+            (NodeKind::Blur, &[("radius", 20.0)]),
+            (NodeKind::Sharpen, &[("amount", 0.8), ("radius", 2.0), ("threshold", 0.1)]),
+            (NodeKind::Exposure, &[("ev", 0.5)]),
+        ]);
+        let tp = check_invariant_gpu(&g, out, A, &p);
+        assert_eq!(tp.base, ids[0], "the Source is the base");
+        assert_eq!(
+            tp.ops,
+            vec![
+                TailOp::Filter { radius: 20.0, box_kernel: false, high: false },
+                TailOp::Sharpen { amount: 0.8, radius: 2.0, threshold: 0.1 },
+                TailOp::Gain(2f32.powf(0.5)),
+            ]
+        );
+        assert!(tp.ops[0].is_neighbourhood() && tp.ops[1].is_neighbourhood() && !tp.ops[2].is_neighbourhood());
+        // The pointwise planner (live thumbnails) still stops at the Sharpen node.
+        let tp = check_invariant(&g, out, A, &p);
+        assert_eq!((tp.base, tp.ops.len()), (ids[2], 1));
+    }
+
+    #[test]
+    fn gpu_plan_filter_kernels_and_passes() {
+        let p = big_provider();
+        for (kernel, pass, expect_box, expect_high) in [(0.0, 0.0, false, false), (1.0, 0.0, true, false), (0.0, 1.0, false, true), (1.0, 1.0, true, true)] {
+            let (g, ids, out) = build(&[(NodeKind::Blur, &[("radius", 30.0), ("kernel", kernel), ("pass", pass)])]);
+            let tp = check_invariant_gpu(&g, out, A, &p);
+            assert_eq!(tp.base, ids[0]);
+            assert_eq!(tp.ops, vec![TailOp::Filter { radius: 30.0, box_kernel: expect_box, high: expect_high }]);
+        }
+        // The other kernels (sampled, directional) stay on the CPU: the filter is the base.
+        let (g, ids, out) = build(&[(NodeKind::Blur, &[("radius", 30.0), ("kernel", 2.0)])]);
+        assert_eq!(plan_gpu(&g, out, A, &p).base, ids[1]);
+        // Radius 0 is neutral for the low pass, not for the high pass (it is 0.5 everywhere).
+        let (g, ids, out) = build(&[(NodeKind::Blur, &[("radius", 0.0)])]);
+        assert!(plan_gpu(&g, out, A, &p).ops.is_empty());
+        assert_eq!(plan_gpu(&g, out, A, &p).base, ids[0]);
+        let (g, _, out) = build(&[(NodeKind::Blur, &[("radius", 0.0), ("pass", 1.0)])]);
+        assert_eq!(check_invariant_gpu(&g, out, A, &p).ops.len(), 1);
+        // A pixel radius that rounds to nothing is the identity on the CPU and in the tail.
+        let (g, _, out) = build(&[(NodeKind::Blur, &[("radius", 1.0)])]);
+        check_invariant_gpu(&g, out, A, &p);
+    }
+
+    #[test]
+    fn gpu_plan_keeps_a_connected_control_map_on_the_cpu() {
+        let p = big_provider();
+        for kind in [NodeKind::Blur, NodeKind::Sharpen] {
+            let (mut g, ids, out) = if kind == NodeKind::Blur {
+                build(&[(kind, &[("radius", 20.0)])])
+            } else {
+                build(&[(kind, &[("radius", 20.0), ("amount", 0.5)])])
+            };
+            assert!(!plan_gpu(&g, out, A, &p).ops.is_empty(), "{kind:?}");
+            let map = add(&mut g, NodeKind::Generator);
+            let key = if kind == NodeKind::Blur { "radius" } else { "amount" };
+            let port = g.expose_parameter(ids[1], key, PortType::Images).unwrap();
+            g.connect(map, ids[1], port).unwrap();
+            let tp = plan_gpu(&g, out, A, &p);
+            assert_eq!((tp.base, tp.ops.len()), (ids[1], 0), "{kind:?}: the node with a map is the CPU base");
+        }
+    }
+
+    #[test]
+    fn gpu_plan_unsupported_nodes_end_the_chain() {
+        let p = big_provider();
+        // Clarity, Noise Reduction, Transform and Lens Correction are still CPU bases; the supported
+        // neighbourhood nodes above them are in the tail.
+        for kind in [NodeKind::Clarity, NodeKind::NoiseReduction, NodeKind::Transform, NodeKind::LensManual] {
+            let (g, ids, out) = build(&[(kind, &[]), (NodeKind::Blur, &[("radius", 20.0)]), (NodeKind::Exposure, &[("ev", 0.5)])]);
+            let tp = plan_gpu(&g, out, A, &p);
+            assert_eq!(tp.base, ids[1], "{kind:?}");
+            assert_eq!(tp.ops.len(), 2, "{kind:?}");
+            // Below the unsupported node nothing changes the base either.
+            assert!(check_invariant_gpu(&g, out, A, &p).ops.iter().all(|o| !matches!(o, TailOp::LocalTone { .. })));
+        }
+    }
+
+    #[test]
+    fn gpu_plan_splits_around_the_last_unsupported_node() {
+        let p = big_provider();
+        // Source -> Blur -> Noise Reduction -> Sharpen -> Saturation: Noise Reduction is the base,
+        // Sharpen and Saturation the tail; the Blur below it is in the base.
+        let (g, ids, out) = build(&[
+            (NodeKind::Blur, &[("radius", 20.0)]),
+            (NodeKind::NoiseReduction, &[("luma", 0.3)]),
+            (NodeKind::Sharpen, &[("amount", 1.0), ("radius", 5.0)]),
+            (NodeKind::Saturation, &[("amount", 1.2)]),
+        ]);
+        let tp = check_invariant_gpu(&g, out, A, &p);
+        assert_eq!(tp.base, ids[2]);
+        assert_eq!(tp.ops, vec![TailOp::Sharpen { amount: 1.0, radius: 2.0, threshold: 0.0 }, TailOp::Saturation(1.2)]);
+    }
+
+    #[test]
+    fn gpu_plan_base_fingerprint_follows_the_base_only() {
+        let p = big_provider();
+        let (mut g, ids, out) = build(&[(NodeKind::Blur, &[("radius", 20.0)]), (NodeKind::Sharpen, &[("amount", 1.0), ("radius", 5.0)])]);
+        let a = plan_gpu(&g, out, A, &p);
+        // A tail parameter (sharpen amount, blur radius) never changes the base.
+        set(&mut g, ids[2], "amount", A, 0.2);
+        set(&mut g, ids[1], "radius", A, 40.0);
+        let b = plan_gpu(&g, out, A, &p);
+        assert_eq!(a.base_fingerprint, b.base_fingerprint);
+        assert_ne!(a.ops, b.ops);
+        // A different source revision does.
+        p.revision.store(5, Ordering::Relaxed);
+        assert_ne!(plan_gpu(&g, out, A, &p).base_fingerprint, a.base_fingerprint);
+    }
+
+    fn develop_local_graph(extra: &[(&str, f32)]) -> (Graph, Vec<NodeId>, NodeId) {
+        let mut params = vec![("highlights", -0.5), ("shadows", 0.4), ("whites", 0.2), ("exposure", 0.3), ("contrast", 0.2), ("saturation", 0.1)];
+        params.extend_from_slice(extra);
+        build(&[(NodeKind::Develop, params.as_slice()), (NodeKind::Exposure, &[("ev", 0.5)])])
+    }
+
+    #[test]
+    fn gpu_plan_runs_the_local_develop_tone_as_a_neighbourhood_operation() {
+        let p = TestProvider::default();
+        p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(0.5)));
+        let (g, ids, out) = develop_local_graph(&[]);
+        let tp = check_invariant_gpu(&g, out, A, &p);
+        assert_eq!((tp.base, tp.base_before_tone), (ids[1], true));
+        // Exposure gain, the local part, then contrast and saturation; the Exposure node follows.
+        assert!(matches!(tp.ops[0], TailOp::Gain(_)));
+        assert!(matches!(tp.ops[1], TailOp::LocalTone { highlights, shadows, whites, blacks, grid } if highlights == -0.5 && shadows == 0.4 && whites == 0.2 && blacks == 0.0 && grid != 0));
+        assert!(matches!(tp.ops[2], TailOp::Contrast { .. }) && matches!(tp.ops[3], TailOp::Saturation(_)) && matches!(tp.ops[4], TailOp::Gain(_)));
+        assert_eq!(tp.ops.len(), 5);
+        // The pointwise planner and Legacy mode keep their plans.
+        assert_eq!(plan(&g, out, A, &p).base, ids[1]);
+        assert!(!plan(&g, out, A, &p).base_before_tone);
+        let (g2, _, out2) = develop_local_graph(&[("legacy_tone", 1.0)]);
+        let legacy = check_invariant_gpu(&g2, out2, A, &p);
+        assert!(legacy.ops.iter().all(|o| !o.is_neighbourhood()) && legacy.base_before_tone);
+        // Lights / Shadows / White / Black neutral: no neighbourhood operation at all.
+        let (g3, _, out3) = develop_local_graph(&[("highlights", 0.0), ("shadows", 0.0), ("whites", 0.0)]);
+        assert!(check_invariant_gpu(&g3, out3, A, &p).ops.iter().all(|o| !o.is_neighbourhood()));
+    }
+
+    #[test]
+    fn local_tone_grid_ids_follow_the_picture_the_grid_is_estimated_from() {
+        let p = TestProvider::default();
+        p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(0.5)));
+        let (mut g, ids, out) = develop_local_graph(&[]);
+        let grid_of = |g: &Graph, p: &TestProvider, image: ImageId| match plan_gpu(g, out, image, p).ops[1] {
+            TailOp::LocalTone { grid, .. } => grid,
+            ref other => panic!("{other:?}"),
+        };
+        let first = grid_of(&g, &p, A);
+        // The four sliders (and everything after the operation) are not part of the id: dragging them reuses the grid.
+        for (name, v) in [("highlights", 0.3), ("shadows", -0.2), ("whites", -0.6), ("blacks", 0.4), ("contrast", -0.3), ("saturation", 0.5)] {
+            set(&mut g, ids[1], name, A, v);
+            assert_eq!(grid_of(&g, &p, A), first, "{name}");
+        }
+        // The exposure gain changes the picture the grid is estimated from, a base change does too.
+        set(&mut g, ids[1], "exposure", A, 0.9);
+        let after_exposure = grid_of(&g, &p, A);
+        assert_ne!(after_exposure, first);
+        p.revision.store(3, Ordering::Relaxed);
+        assert_ne!(grid_of(&g, &p, A), after_exposure);
+        // Another image never shares it.
+        assert_ne!(grid_of(&g, &p, B), grid_of(&g, &p, A));
+    }
+
+    #[test]
+    fn tail_grid_is_estimated_once_and_matches_the_cpu() {
+        let p = TestProvider::default();
+        p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(0.5)));
+        let (mut g, ids, out) = develop_local_graph(&[]);
+        let mut ev = Evaluator::new();
+        let c = CancelToken::new();
+        let tp = ev.plan_tail_gpu(&g, out, A, &p).unwrap();
+        // Only a local tone operation has a grid.
+        assert!(ev.tail_grid(&g, &tp, 0, A, &p, &c).is_err());
+        let grid = ev.tail_grid(&g, &tp, 1, A, &p, &c).unwrap();
+        let base = ev.eval_base(&g, &tp, A, &p, &c).unwrap();
+        let expected = ops::local_tone_grid(&apply_tail_cpu(&base, &tp.ops[..1])).unwrap();
+        assert_eq!(*grid, expected, "estimated on the base with the exposure gain applied");
+        let (calls, misses) = (p.calls(), ev.misses());
+        // Slider drags: same grid, no provider call, nothing recomputed.
+        for v in [0.1, 0.2, 0.3] {
+            set(&mut g, ids[1], "shadows", A, v);
+            let tp2 = ev.plan_tail_gpu(&g, out, A, &p).unwrap();
+            let again = ev.tail_grid(&g, &tp2, 1, A, &p, &c).unwrap();
+            assert!(Arc::ptr_eq(&grid, &again));
+        }
+        assert_eq!((p.calls(), ev.misses()), (calls, misses));
+        // A new exposure is a new grid; a cancelled request returns Cancelled, not a half result.
+        set(&mut g, ids[1], "exposure", A, 1.0);
+        let tp3 = ev.plan_tail_gpu(&g, out, A, &p).unwrap();
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        assert!(ev.tail_grid(&g, &tp3, 1, A, &p, &cancelled).is_err());
+        let moved = ev.tail_grid(&g, &tp3, 1, A, &p, &c).unwrap();
+        assert!(!Arc::ptr_eq(&grid, &moved));
+        assert_ne!(*grid, *moved);
+        // Stepping to another image and back keeps the grid: no CPU evaluation for it.
+        ev.retain_image(B);
+        ev.retain_image(A);
+        let calls_before = p.calls();
+        let again = ev.tail_grid(&g, &tp3, 1, A, &p, &c).unwrap();
+        assert!(Arc::ptr_eq(&moved, &again), "the grid survives retain_image");
+        assert_eq!(p.calls(), calls_before, "and costs no provider call or base evaluation");
+    }
+
+    #[test]
+    fn local_tone_after_a_neighbourhood_operation_estimates_on_the_filtered_picture() {
+        let p = big_provider();
+        p.caps.lock().unwrap().insert(A.0, raw_capture(Some(5200.0), Some(0.5)));
+        // Source -> Blur -> Develop (local): the Develop output is the base-before-tone, the Blur lives in the base.
+        let (g, ids, out) = build(&[(NodeKind::Blur, &[("radius", 20.0)]), (NodeKind::Develop, &[("highlights", -0.5), ("shadows", 0.5)])]);
+        let tp = check_invariant_gpu(&g, out, A, &p);
+        assert_eq!((tp.base, tp.base_before_tone), (ids[2], true));
+        // Develop -> Blur: the blur is part of the tail and the grid belongs to the Develop output.
+        let (g, ids, out) = build(&[(NodeKind::Develop, &[("highlights", -0.5), ("shadows", 0.5)]), (NodeKind::Blur, &[("radius", 20.0)])]);
+        let tp = check_invariant_gpu(&g, out, A, &p);
+        assert_eq!(tp.base, ids[1]);
+        assert!(matches!(tp.ops[0], TailOp::LocalTone { .. }) && matches!(tp.ops[1], TailOp::Filter { .. }));
+        // A local tone behind a filter that is in the tail: the grid id covers the filter.
+        let a = tp.clone();
+        let (g, _, out) = build(&[(NodeKind::Develop, &[("highlights", -0.5), ("shadows", 0.5)]), (NodeKind::Blur, &[("radius", 40.0)])]);
+        let b = plan_gpu(&g, out, A, &p);
+        assert_eq!(a.ops[0], b.ops[0], "the filter comes after the local tone, so it is not part of its id");
     }
 
     #[test]

@@ -454,6 +454,9 @@ fn worker<B: Backend>(
     let base_ms: Cell<Option<f32>> = Cell::new(None);
     let mut preloader = Preloader::default();
     let mut job: Option<PreloadJob> = None;
+    if let Some(g) = gpu.as_mut() {
+        g.warm_up();
+    }
     loop {
         let refine = gpu.as_ref().and_then(|g| g.scopes.refine_due());
         let preload = preloader.due();
@@ -710,7 +713,7 @@ fn run_gpu<B: Backend>(
     started: Instant,
     resting: &mut Option<RestingScopes>,
 ) -> GpuStep {
-    let plan = match evaluator.plan_tail(&req.graph, req.node, req.image, provider) {
+    let plan = match evaluator.plan_tail_gpu(&req.graph, req.node, req.image, provider) {
         Ok(p) => p,
         Err(e) => return GpuStep::Done(error_reply(req, e)),
     };
@@ -732,10 +735,24 @@ fn run_gpu<B: Backend>(
     if req.cancel.is_cancelled() {
         return GpuStep::Done(None);
     }
+    // The edge-aware base of a local tone operation is estimated on the CPU (a 512 px grid) and
+    // cached by its id: moving Lights / Shadows / White / Black only looks it up.
+    let mut grids = Vec::with_capacity(plan.ops.len());
+    for (i, op) in plan.ops.iter().enumerate() {
+        if matches!(op, rawgraph_engine::TailOp::LocalTone { .. }) {
+            match evaluator.tail_grid(&req.graph, &plan, i, req.image, provider, &req.cancel) {
+                Ok(g) => grids.push(Some(g)),
+                Err(rawgraph_engine::EvalError::Cancelled) => return GpuStep::Done(None),
+                Err(e) => return GpuStep::Done(error_reply(req, e)),
+            }
+        } else {
+            grids.push(None);
+        }
+    }
     let eval_ms = started.elapsed().as_secs_f32() * 1000.0;
     let display = DisplayArgs { exposure_ev: req.view.exposure_ev, tone: gpu_tone(req.view.tone.tone_map()) };
     let t = Instant::now();
-    let picture = match gpu.show(&key, base.as_deref(), &plan.ops, display, req.generation, env.shown) {
+    let picture = match gpu.show_with(&key, base.as_deref(), &plan.ops, &grids, display, req.generation, env.shown) {
         Shown::Gpu(p) => p,
         Shown::Cpu { reason, notice } => return GpuStep::Cpu { reason, notice },
         Shown::Failed(message) => return GpuStep::Done(Some(Reply::Error { generation: req.generation, message })),
@@ -810,7 +827,7 @@ const CHEAP_BASE_MS: f32 = 60.0;
 
 /// The tail plan and the key of the base of `image` for the graph and node of `job`.
 fn preload_key(evaluator: &Evaluator, job: &PreloadJob, image: ImageId, provider: &dyn ImageProvider) -> Option<(rawgraph_engine::TailPlan, BaseKey)> {
-    let plan = evaluator.plan_tail(&job.graph, job.node, image, provider).ok()?;
+    let plan = evaluator.plan_tail_gpu(&job.graph, job.node, image, provider).ok()?;
     let key = BaseKey { image, fingerprint: plan.base_fingerprint, preview: job.hints.preview, revision: provider.revision(image) };
     Some((plan, key))
 }
@@ -835,13 +852,30 @@ pub fn preload_step<B: Backend>(
     let Some((plan, key)) = preload_key(evaluator, job, id, provider) else {
         return PreloadOutcome::Skipped("the neighbour is not part of the viewed collection");
     };
-    if !gpu.wants_preload(&key) {
+    let wanted = gpu.wants_preload(&key);
+    let has_grid = plan.ops.iter().any(|o| matches!(o, rawgraph_engine::TailOp::LocalTone { .. })) && (wanted || gpu.holds(&key));
+    if !wanted && !has_grid {
         return PreloadOutcome::Skipped("not wanted");
     }
     // The base must be cheap: the decoded proxy itself, or something the CPU made quickly before.
     let is_source = job.graph.node(plan.base).is_some_and(|n| n.kind == rawgraph_core::NodeKind::Source);
     if !is_source && !last_base_ms.is_some_and(|ms| ms <= CHEAP_BASE_MS) {
         return PreloadOutcome::Skipped("the base needs more CPU work than a background upload may cost");
+    }
+    // A local tone needs its 512 px grid when the neighbour is shown: estimate it now, while the
+    // base is in hand (also when the base is on the GPU already), so stepping costs no CPU work.
+    for (i, op) in plan.ops.iter().enumerate() {
+        if job.cancel.is_cancelled() {
+            return PreloadOutcome::Abandoned;
+        }
+        if matches!(op, rawgraph_engine::TailOp::LocalTone { .. })
+            && evaluator.tail_grid(&job.graph, &plan, i, id, provider, &job.cancel).is_err()
+        {
+            return PreloadOutcome::Abandoned;
+        }
+    }
+    if !wanted {
+        return PreloadOutcome::Skipped("already on the GPU");
     }
     // Protected: the picture on screen and both neighbours.
     let mut protect = Vec::new();

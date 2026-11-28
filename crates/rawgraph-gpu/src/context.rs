@@ -25,6 +25,10 @@ pub struct GpuContext {
     pub(crate) sample_targets: Mutex<Option<SampleTargets>>,
     /// Uniform buffers waiting for the next pass, by size, so a slider drag allocates none.
     uniform_pool: Mutex<Vec<(u64, wgpu::Buffer)>>,
+    /// Compiled neighbourhood passes (filter, local tone, sharpen), one per kind.
+    pub(crate) neigh_cache: Mutex<HashMap<crate::chain::NeighKind, Arc<crate::pass::Pass>>>,
+    /// Uploaded local tone coefficient grids by id, oldest first (a few small textures).
+    pub(crate) grid_cache: Mutex<Vec<(u64, Arc<crate::image::GpuImage>)>>,
 }
 
 /// Most uniform buffers kept for reuse (one per distinct op-kind sequence in use).
@@ -77,6 +81,8 @@ impl GpuContext {
             display_float_pipeline: OnceLock::new(),
             sample_targets: Mutex::new(None),
             uniform_pool: Mutex::new(Vec::new()),
+            neigh_cache: Mutex::new(HashMap::new()),
+            grid_cache: Mutex::new(Vec::new()),
         }
     }
 
@@ -180,6 +186,11 @@ impl GpuContext {
         if pool.len() < UNIFORM_POOL_MAX {
             pool.push((size, buffer));
         }
+    }
+
+    /// Frees the uploaded local tone grids (memory pressure, device reset of the session).
+    pub fn clear_grid_cache(&self) {
+        self.grid_cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     /// Blocks until all submitted work has finished (benchmarks, tests).

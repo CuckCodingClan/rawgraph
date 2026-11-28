@@ -255,7 +255,7 @@ pub fn display_into(
     display_into_view(ctx, src.view(), &view, (w, h), exposure_ev, tone)
 }
 
-fn display_into_view(
+pub(crate) fn display_into_view(
     ctx: &GpuContext,
     src: &wgpu::TextureView,
     dst: &wgpu::TextureView,
