@@ -1559,7 +1559,6 @@ const FIXTURE_V3: &str = include_str!("../tests/fixtures/graph_v3.json");
 
 #[test]
 fn version_3_fixture_round_trips_and_routes_images() {
-    assert_eq!(GRAPH_FORMAT_VERSION, 5);
     assert!(FIXTURE_V3.contains("\"format_version\": 3"));
     let g = Graph::from_json(FIXTURE_V3).expect("version 3 loads");
     assert_eq!(g.nodes().count(), 11);
@@ -1605,12 +1604,12 @@ fn version_3_fixture_round_trips_and_routes_images() {
 
     // Saving writes the current version, which loads back to the same graph.
     let json = g.to_json();
-    assert!(json.contains("\"format_version\": 5"));
+    assert!(json.contains(&format!("\"format_version\": {GRAPH_FORMAT_VERSION}")));
     assert_eq!(Graph::from_json(&json), Ok(g.clone()));
     // Current files and no newer ones.
     assert!(Graph::from_json(&json).is_ok());
-    let newer = json.replace("\"format_version\": 5", "\"format_version\": 6");
-    assert_eq!(Graph::from_json(&newer), Err(GraphError::UnsupportedVersion(6)));
+    let newer = json.replace(&format!("\"format_version\": {GRAPH_FORMAT_VERSION}"), &format!("\"format_version\": {}", GRAPH_FORMAT_VERSION + 1));
+    assert_eq!(Graph::from_json(&newer), Err(GraphError::UnsupportedVersion(GRAPH_FORMAT_VERSION + 1)));
 }
 
 #[test]

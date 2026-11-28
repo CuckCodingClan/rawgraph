@@ -703,6 +703,23 @@ impl App {
                 Err(e) => eprintln!("--save-recipe {name}: {e}"),
             }
         }
+        if let Some(name) = &cli.save_macro {
+            let result = self.session.selected_node.ok_or_else(|| "no group is selected".to_owned()).and_then(|id| {
+                let m = self.session.project.graph.extract_macro(id, name, "").map_err(|e| e.to_string())?;
+                let dir = self.editor.recipes_dir().ok_or_else(|| "macros are not available".to_owned())?;
+                crate::macros::save(&dir, &m)
+            });
+            match result {
+                Ok(p) => eprintln!("macro saved: {}", p.display()),
+                Err(e) => eprintln!("--save-macro {name}: {e}"),
+            }
+        }
+        for n in &cli.open_group {
+            let opened = self.session.node_by_index(*n).is_some_and(|id| self.editor.open_group(&self.session.project.graph, id));
+            if !opened {
+                eprintln!("--open-group: node {n} is not a group on this level");
+            }
+        }
         if cli.open_recipes {
             self.editor.open_manage();
         }

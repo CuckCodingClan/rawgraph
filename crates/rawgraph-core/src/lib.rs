@@ -37,6 +37,7 @@ pub use graph::{
     CurveEntry, DataKind, Edge, Graph, GraphError, ImageId, Issue, Mode, NamedRange, Node, NodeData, NodeId, NodeKind,
     OutputSpec, ParamKind, ParamSpec, PortType, Subgraph, CURVE_CHANNELS, GRAPH_FORMAT_VERSION, KEYWORD_OPS,
 };
+pub use graph::{End, GroupDef, GroupPort, LevelEdge, MacroFile, Published, MACRO_FORMAT_VERSION, MAX_GROUP_DEPTH};
 pub use generator::{ColorStop, OpacityStop, GradientRamp};
 pub use image::{ImageBuf, MaskBuf};
 pub use layer::{

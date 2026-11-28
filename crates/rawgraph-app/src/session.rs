@@ -1055,6 +1055,15 @@ impl Session {
     pub fn viewer_target(&self, image_pin: Option<ImageId>, node_pin: Option<NodeId>) -> ViewerTarget {
         let (image, node) = crate::compare::Pane { image: image_pin, node: node_pin.filter(|id| self.project.graph.node(*id).is_some()) }
             .target(self.selected, self.selected_node.filter(|id| self.project.graph.node(*id).is_some()));
+        // Viewing a group means viewing the node behind its first output port.
+        // A group whose first output is a plain view of an inner node is that node. One that stands for a
+        // Split range or an output alias stays the target (the engine and the member list then both
+        // follow its port), and so does a group without outputs (the renderer says it has nothing to show).
+        let graph = &self.project.graph;
+        let node = node.map(|n| match graph.view_target(n).filter(|_| graph.node(n).is_some_and(|g| g.kind == NodeKind::Group)) {
+            Some((inner, 0)) if graph.node(inner).is_some_and(|i| i.kind != NodeKind::MetadataSplit) => inner,
+            _ => n,
+        });
         ViewerTarget { node, image: node.and(image), image_pinned: image_pin.is_some() }
     }
 
@@ -1107,12 +1116,17 @@ impl Session {
     pub fn image_for_target(&self, node: NodeId, port: Option<usize>) -> Option<ImageId> {
         let eval = rawgraph_engine::Evaluator::new();
         let graph = &self.project.graph;
-        let output = port.unwrap_or(0);
+        // A group stands for the inner node and output port behind its first output.
+        let via_group = graph.node(node).is_some_and(|n| n.kind == NodeKind::Group);
+        let (node, output) = match graph.view_target(node).filter(|_| via_group) {
+            Some((inner, p)) => (inner, p),
+            None => (node, port.unwrap_or(0)),
+        };
         let provider = self.provider.as_ref();
         // Normal photo views preserve the selection, including excluded photos.
         // Metadata Split preview is the unfiltered input, not its first output.
         if let Some(image) = self.selected {
-            if graph.node(node).is_some_and(|n| n.kind == NodeKind::MetadataSplit) && port.is_none()
+            if graph.node(node).is_some_and(|n| n.kind == NodeKind::MetadataSplit) && port.is_none() && !via_group
                 || eval.contains_output(graph, node, output, image, provider) {
                 return Some(image);
             }

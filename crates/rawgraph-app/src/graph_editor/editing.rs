@@ -35,6 +35,21 @@ pub enum EditOp {
     InsertRecipe(String, Option<[f32; 2]>),
     ManageRecipes,
     ImportRecipeFile,
+    /// Ctrl+G: the selected nodes become a group.
+    GroupSelection,
+    /// Ctrl+Shift+G: the selected groups are dissolved.
+    Ungroup,
+    OpenGroup(NodeId),
+    /// Enter: opens the selected group.
+    OpenSelected,
+    /// Esc: up one level.
+    CloseGroup,
+    /// Back to the level with this many open groups (breadcrumb bar).
+    GoToLevel(usize),
+    RenameGroup(NodeId),
+    SaveMacro,
+    InsertMacro(String, Option<[f32; 2]>),
+    ImportMacroFile,
 }
 
 /// Rubber band in progress.
@@ -55,12 +70,15 @@ pub(super) struct RecipePrompt {
 pub(super) struct ManageUi {
     pub rename: Option<(String, String)>,
     pub confirm_delete: Option<String>,
+    pub confirm_delete_macro: Option<String>,
     pub message: Option<(String, bool)>,
 }
 
 enum DialogPurpose {
     Import,
     Export(String),
+    ImportMacro,
+    ExportMacro(String),
 }
 
 pub(super) struct RecipeDialog {
@@ -119,6 +137,11 @@ impl GraphEditor {
     pub fn save_selection_as_recipe(&mut self, session: &Session, name: &str) -> Result<PathBuf, String> {
         let sub = session.project.graph.extract_subgraph(session.node_sel.ids());
         self.save_recipe_now(name, &sub)
+    }
+
+    /// The recipes folder (macros live beside the recipes).
+    pub fn recipes_dir(&self) -> Option<PathBuf> {
+        self.recipes_dir.clone()
     }
 
     pub fn open_manage(&mut self) {
@@ -188,10 +211,19 @@ impl GraphEditor {
                 a
             }
         };
+        let backup = session.project.graph.clone();
         let ids = graph_clip::insert_at(&mut session.project.graph, &sub, anchor);
         let n = ids.len();
+        let top = match self.settle_inserted(session, &ids) {
+            Ok(top) => top,
+            Err(why) => {
+                session.project.graph = backup;
+                status.error(format!("Nothing was pasted: {why}"));
+                return false;
+            }
+        };
         let mut sel = NodeSelection::default();
-        sel.replace(ids);
+        sel.replace(top);
         session.set_node_selection(sel);
         status.info(format!("Pasted {}", pluralize(n)));
         status.migration("Paste", notes);
@@ -209,6 +241,16 @@ impl GraphEditor {
             self.edit.paste_count = 0;
             status.info(format!("Duplicated {}", pluralize(n)));
         }
+    }
+
+    /// New nodes land in the group that is open, and only the boxes shown (not their insides) are selected.
+    /// Fails (the caller restores the graph) when the groups would nest too deeply.
+    fn settle_inserted(&mut self, session: &mut Session, ids: &[NodeId]) -> Result<Vec<NodeId>, String> {
+        let top = session.project.graph.top_level_of(ids);
+        if let Some(open) = self.groups.level() {
+            session.project.graph.adopt(open, &top).map_err(|e| e.to_string())?;
+        }
+        Ok(top)
     }
 
     pub(super) fn recipe_list(&mut self) -> Vec<RecipeInfo> {
@@ -232,10 +274,19 @@ impl GraphEditor {
                     },
                     Anchor::At,
                 );
+                let backup = session.project.graph.clone();
                 let ids = graph_clip::insert_at(&mut session.project.graph, &sub, anchor);
                 let n = ids.len();
+                let top = match self.settle_inserted(session, &ids) {
+                    Ok(top) => top,
+                    Err(why) => {
+                        session.project.graph = backup;
+                        status.error(format!("Recipe \"{stem}\" was not inserted: {why}"));
+                        return false;
+                    }
+                };
                 let mut sel = NodeSelection::default();
-                sel.replace(ids);
+                sel.replace(top);
                 session.set_node_selection(sel);
                 status.info(format!("Inserted recipe \"{stem}\" ({})", pluralize(n)));
                 status.migration("Recipe", notes);
@@ -276,6 +327,19 @@ impl GraphEditor {
                 }
             }
             let c = egui::Modifiers::COMMAND;
+            if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(c | egui::Modifiers::SHIFT, egui::Key::G))) {
+                ops.push(EditOp::Ungroup);
+            } else if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(c, egui::Key::G))) {
+                ops.push(EditOp::GroupSelection);
+            }
+            let group_selected = session.selected_node.and_then(|id| session.project.graph.node(id)).is_some_and(|n| n.kind == rawgraph_core::NodeKind::Group);
+            if group_selected && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+                ops.push(EditOp::OpenSelected);
+            }
+            let modal_open = self.groups.macro_prompt.is_some() || self.groups.rename.is_some() || self.edit.prompt.is_some() || self.manage_open;
+            if !self.groups.path.is_empty() && !modal_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                ops.push(EditOp::CloseGroup);
+            }
             if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(c, egui::Key::A))) {
                 ops.push(EditOp::SelectAll);
             }
@@ -300,7 +364,7 @@ impl GraphEditor {
                 EditOp::Duplicate => self.duplicate_selection(session, status),
                 EditOp::SelectAll => {
                     let mut sel = session.node_sel.clone();
-                    sel.select_all(&session.project.graph);
+                    sel.select_level(&session.project.graph, self.groups.level());
                     // The previously primary node stays primary.
                     if let Some(p) = session.selected_node {
                         sel.add(p);
@@ -324,6 +388,30 @@ impl GraphEditor {
                     }));
                     self.insert_recipe(&stem, at, session, status);
                 }
+                EditOp::GroupSelection => self.group_selection(session, status),
+                EditOp::Ungroup => self.ungroup_selection(session, status),
+                EditOp::OpenGroup(id) => {
+                    if self.open_group(&session.project.graph, id) {
+                        session.set_node_selection(NodeSelection::default());
+                    }
+                }
+                EditOp::OpenSelected => {
+                    self.open_selected_group(session);
+                }
+                EditOp::CloseGroup => {
+                    self.close_group(session);
+                }
+                EditOp::GoToLevel(depth) => self.go_to_level(session, depth),
+                EditOp::RenameGroup(id) => self.rename_group_prompt(session, id),
+                EditOp::SaveMacro => self.start_save_macro(session, status),
+                EditOp::InsertMacro(stem, at) => {
+                    let at = at.or_else(|| Some({
+                        let g = xf.to_graph(rect.center());
+                        [g.x, g.y]
+                    }));
+                    self.insert_macro(&stem, at, session, status);
+                }
+                EditOp::ImportMacroFile => self.pick_recipe_file(DialogPurpose::ImportMacro),
                 EditOp::ManageRecipes => self.manage_open = true,
                 EditOp::ImportRecipeFile => self.pick_recipe_file(DialogPurpose::Import),
             }
@@ -335,14 +423,18 @@ impl GraphEditor {
             return;
         }
         let (tx, rx) = channel();
+        let is_macro = matches!(purpose, DialogPurpose::ImportMacro | DialogPurpose::ExportMacro(_));
         let export_name = match &purpose {
             DialogPurpose::Export(stem) => Some(format!("{stem}{}", recipes::RECIPE_EXT)),
-            DialogPurpose::Import => None,
+            DialogPurpose::ExportMacro(stem) => Some(format!("{stem}{}", crate::macros::MACRO_EXT)),
+            DialogPurpose::Import | DialogPurpose::ImportMacro => None,
         };
         let spawned = std::thread::Builder::new().name("rawgraph-recipe-dialog".into()).spawn(move || {
-            let d = rfd::FileDialog::new().add_filter("RawGraph recipe", &["json"]);
+            let d = rfd::FileDialog::new().add_filter(if is_macro { "RawGraph macro" } else { "RawGraph recipe" }, &["json"]);
             let picked = match export_name {
+                Some(name) if is_macro => d.set_title("Export macro").set_file_name(name).save_file(),
                 Some(name) => d.set_title("Export recipe").set_file_name(name).save_file(),
+                None if is_macro => d.set_title("Import macro").pick_file(),
                 None => d.set_title("Import recipe").pick_file(),
             };
             let _ = tx.send(picked);
@@ -366,6 +458,22 @@ impl GraphEditor {
                 Ok(p) => status.info(format!("Imported recipe {}", p.display())),
                 Err(why) => status.error(why),
             },
+            DialogPurpose::ExportMacro(stem) => {
+                let mut dest = path;
+                if !dest.file_name().is_some_and(|n| n.to_string_lossy().ends_with(crate::macros::MACRO_EXT)) {
+                    let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let stem_only = name.strip_suffix(".json").unwrap_or(&name).to_owned();
+                    dest.set_file_name(format!("{stem_only}{}", crate::macros::MACRO_EXT));
+                }
+                match crate::macros::export(&dir, &stem, &dest) {
+                    Ok(()) => status.info(format!("Exported macro to {}", dest.display())),
+                    Err(why) => status.error(why),
+                }
+            }
+            DialogPurpose::ImportMacro => match crate::macros::import(&dir, &path) {
+                Ok(p) => status.info(format!("Imported macro {}", p.display())),
+                Err(why) => status.error(why),
+            },
             DialogPurpose::Export(stem) => {
                 let mut dest = path;
                 if !dest.file_name().is_some_and(|n| n.to_string_lossy().ends_with(recipes::RECIPE_EXT)) {
@@ -380,6 +488,7 @@ impl GraphEditor {
             }
         }
         self.refresh_recipes();
+        self.groups.macro_list = None;
     }
 
     /// The name prompt and the manage window.
@@ -396,6 +505,11 @@ impl GraphEditor {
         let mut import = false;
         let mut do_delete: Option<String> = None;
         let mut do_rename: Option<(String, String)> = None;
+        let macro_list = match &self.recipes_dir { Some(d) => super::groups_ui::cached_macro_list(&mut self.groups.macro_list, d), None => Vec::new() };
+        let mut macro_insert: Option<String> = None;
+        let mut macro_export: Option<String> = None;
+        let mut macro_delete: Option<String> = None;
+        let mut macro_import = false;
         let dir_text = self.recipes_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
         egui::Window::new("Manage recipes").open(&mut open).resizable(true).default_width(520.0).constrain_to(rect).default_pos(rect.center() - egui::vec2(260.0, 120.0)).show(ctx, |ui| {
             if self.recipes_dir.is_none() {
@@ -462,6 +576,46 @@ impl GraphEditor {
             if ui.button("Import recipe file...").clicked() {
                 import = true;
             }
+            ui.separator();
+            ui.label(egui::RichText::new("Macros").strong());
+            ui.label(egui::RichText::new(crate::macros::COPY_NOTE).weak().small());
+            if macro_list.is_empty() {
+                ui.label(egui::RichText::new("No macros yet. Right-click a group and choose \"Save group as macro...\".").weak());
+            }
+            for m in &macro_list {
+                ui.horizontal(|ui| {
+                    if self.edit.manage.confirm_delete_macro.as_deref() == Some(m.stem.as_str()) {
+                        ui.label(egui::RichText::new(format!("Delete \"{}\"? This cannot be undone.", m.stem)).color(egui::Color32::from_rgb(255, 190, 120)));
+                        if ui.button("Delete").clicked() {
+                            macro_delete = self.edit.manage.confirm_delete_macro.take();
+                        }
+                        if ui.button("Keep").clicked() {
+                            self.edit.manage.confirm_delete_macro = None;
+                        }
+                        return;
+                    }
+                    ui.label(egui::RichText::new(&m.stem).strong());
+                    if m.usable {
+                        ui.label(egui::RichText::new(format!("{} in, {} out, {} parameters", m.inputs, m.outputs, m.published)).weak());
+                    } else {
+                        ui.label(egui::RichText::new(format!("unusable: {}", m.note)).color(egui::Color32::from_rgb(255, 150, 120)));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Delete").clicked() {
+                            self.edit.manage.confirm_delete_macro = Some(m.stem.clone());
+                        }
+                        if ui.add_enabled(m.usable, egui::Button::new("Export...")).clicked() {
+                            macro_export = Some(m.stem.clone());
+                        }
+                        if ui.add_enabled(m.usable, egui::Button::new("Insert")).on_hover_text("Adds a copy of the macro in the middle of the editor, not connected").clicked() {
+                            macro_insert = Some(m.stem.clone());
+                        }
+                    });
+                });
+            }
+            if ui.button("Import macro file...").clicked() {
+                macro_import = true;
+            }
         });
         if !open {
             self.manage_open = false;
@@ -487,6 +641,25 @@ impl GraphEditor {
             if self.insert_recipe(&stem, Some([g.x, g.y]), session, status) {
                 self.edit.manage.message = Some((format!("Inserted \"{stem}\""), false));
             }
+        }
+        if let Some(stem) = macro_delete {
+            self.edit.manage.message = Some(match crate::macros::delete(&dir, &stem) {
+                Ok(()) => (format!("Deleted macro \"{stem}\""), false),
+                Err(why) => (why, true),
+            });
+            self.groups.macro_list = None;
+        }
+        if let Some(stem) = macro_insert {
+            let g = xf.to_graph(rect.center());
+            if self.insert_macro(&stem, Some([g.x, g.y]), session, status) {
+                self.edit.manage.message = Some((format!("Inserted a copy of \"{stem}\""), false));
+            }
+        }
+        if let Some(stem) = macro_export {
+            self.pick_recipe_file(DialogPurpose::ExportMacro(stem));
+        }
+        if macro_import {
+            self.pick_recipe_file(DialogPurpose::ImportMacro);
         }
         if let Some(stem) = export {
             self.pick_recipe_file(DialogPurpose::Export(stem));

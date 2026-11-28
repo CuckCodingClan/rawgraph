@@ -60,6 +60,8 @@ pub enum Value {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EvalError {
     UnknownNode(NodeId),
+    /// A group without any output port was asked for a picture.
+    GroupWithoutOutput(NodeId),
     /// Required input not connected (also reported for a cyclic connection).
     MissingInput { node: NodeId, port: usize },
     /// Connected value has the wrong type.
@@ -74,6 +76,7 @@ impl fmt::Display for EvalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EvalError::UnknownNode(n) => write!(f, "node {} does not exist", n.0),
+            EvalError::GroupWithoutOutput(n) => write!(f, "group {} has no output port, so there is nothing to show", n.0),
             EvalError::MissingInput { node, port } => {
                 write!(f, "node {}: required input {} is not connected", node.0, port)
             }
@@ -210,9 +213,11 @@ impl Evaluator {
 
     /// Pixel-free cache identity for a node and one image, using the same inputs as evaluation.
     pub fn fingerprint(&self, graph: &Graph, node: NodeId, image: ImageId, provider: &dyn ImageProvider) -> Result<u64, EvalError> {
+        let (node, port) = view_through(graph, node)?;
         let images = provider.images();
         let env = Env { provider, images: &images, view_tone: self.view_tone, control: false };
-        node_fingerprint(graph, node, image, &env, &mut FingerprintMemo::new(), &mut Vec::new())
+        let fp = node_fingerprint(graph, node, image, &env, &mut FingerprintMemo::new(), &mut Vec::new())?;
+        Ok(with_port(fp, port))
     }
 
     /// Evaluates output port 0 of `node`. For a Metadata Split node this means viewing
@@ -225,8 +230,17 @@ impl Evaluator {
         provider: &dyn ImageProvider,
         cancel: &CancelToken,
     ) -> Result<Value, EvalError> {
+        let (node, port) = view_through(graph, node)?;
         let images = provider.images();
-        self.eval_env(graph, node, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false }, cancel)
+        self.eval_view(graph, node, port, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false }, cancel)
+    }
+
+    /// Viewing a node (`port` is `None`), or the output port of the node a group stands for.
+    fn eval_view(&mut self, graph: &Graph, node: NodeId, port: Option<usize>, image: ImageId, env: &Env, cancel: &CancelToken) -> Result<Value, EvalError> {
+        match port {
+            Some(port) => self.eval_output_env(graph, node, port, image, env, cancel),
+            None => self.eval_env(graph, node, image, env, cancel),
+        }
     }
 
     fn eval_env(&mut self, graph: &Graph, node: NodeId, image: ImageId, env: &Env, cancel: &CancelToken) -> Result<Value, EvalError> {
@@ -245,6 +259,7 @@ impl Evaluator {
         provider: &dyn ImageProvider,
         cancel: &CancelToken,
     ) -> Result<Value, EvalError> {
+        let (node, port) = through(graph, node, port);
         let images = provider.images();
         self.eval_output_env(graph, node, port, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false }, cancel)
     }
@@ -331,15 +346,24 @@ impl Evaluator {
     }
 
     fn plan_tail_mode(&self, graph: &Graph, node: NodeId, image: ImageId, provider: &dyn ImageProvider, gpu: bool) -> Result<TailPlan, EvalError> {
+        let (node, view_port) = view_through(graph, node)?;
         let images = provider.images();
         let env = Env { provider, images: &images, view_tone: self.view_tone, control: false };
-        if !env.viewing_member(graph, node, image) {
+        let member = match view_port {
+            Some(port) => env.contains_output(graph, node, port, image),
+            None => env.viewing_member(graph, node, image),
+        };
+        if !member {
             return Err(not_a_member_error(graph, node));
         }
         // Validates the whole structure below `node` exactly like `eval` and memoises
         // the fingerprints used for the base.
         let mut memo = FingerprintMemo::new();
-        node_fingerprint(graph, node, image, &env, &mut memo, &mut Vec::new())?;
+        let node_fp = node_fingerprint(graph, node, image, &env, &mut memo, &mut Vec::new())?;
+        // A group whose first output is a Split range or an alias shows exactly that port: no tail to peel off.
+        if let Some(port) = view_port.filter(|p| *p != 0 || graph.node(node).is_some_and(|n| n.kind == NodeKind::MetadataSplit)) {
+            return Ok(TailPlan { base: node, base_port: port, ops: Vec::new(), base_fingerprint: with_port(node_fp, Some(port)), base_before_tone: false });
+        }
 
         let mut groups: Vec<Vec<TailOp>> = Vec::new();
         let mut visited: Vec<NodeId> = Vec::new();
@@ -425,14 +449,21 @@ impl Evaluator {
 
     /// True if `image` leaves output `port` of `node` (metadata only).
     pub fn contains_output(&self, graph: &Graph, node: NodeId, port: usize, image: ImageId, provider: &dyn ImageProvider) -> bool {
+        let (node, port) = through(graph, node, port);
         let images = provider.images();
         Env { provider, images: &images, view_tone: self.view_tone, control: false }.contains_output(graph, node, port, image)
     }
 
     /// True if `image` is part of the collection `node` outputs (metadata only).
     pub fn contains(&self, graph: &Graph, node: NodeId, image: ImageId, provider: &dyn ImageProvider) -> bool {
+        let is_group = graph.node(node).is_some_and(|n| n.kind == NodeKind::Group);
+        let (node, port) = through(graph, node, 0);
         let images = provider.images();
-        Env { provider, images: &images, view_tone: self.view_tone, control: false }.cat(|c| graph.contains_in(node, image, c))
+        let env = Env { provider, images: &images, view_tone: self.view_tone, control: false };
+        if is_group {
+            return env.contains_output(graph, node, port, image);
+        }
+        env.cat(|c| graph.contains_in(node, image, c))
     }
 
     /// Evaluate the same auxiliary image used by a consumer, including output
@@ -451,6 +482,7 @@ impl Evaluator {
     /// The ordered collection leaving output `port` of `node` (metadata only).
     /// Order depends on the node: catalog for Source, driver for Layer, ports for Merge.
     pub fn members(&self, graph: &Graph, node: NodeId, port: usize, provider: &dyn ImageProvider) -> Vec<ImageId> {
+        let (node, port) = through(graph, node, port);
         let images = provider.images();
         Env { provider, images: &images, view_tone: self.view_tone, control: false }.cat(|c| graph.members(node, port, c))
     }
@@ -473,12 +505,13 @@ impl Evaluator {
         provider: &dyn ImageProvider,
         cancel: &CancelToken,
     ) -> Result<Arc<ImageBuf>, EvalError> {
+        let (node, port) = view_through(graph, node)?;
         let images = provider.images();
-        self.eval_image_env(graph, node, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false }, cancel)
+        self.eval_image_env(graph, node, port, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false }, cancel)
     }
 
-    fn eval_image_env(&mut self, graph: &Graph, node: NodeId, image: ImageId, env: &Env, cancel: &CancelToken) -> Result<Arc<ImageBuf>, EvalError> {
-        match self.eval_env(graph, node, image, env, cancel)? {
+    fn eval_image_env(&mut self, graph: &Graph, node: NodeId, port: Option<usize>, image: ImageId, env: &Env, cancel: &CancelToken) -> Result<Arc<ImageBuf>, EvalError> {
+        match self.eval_view(graph, node, port, image, env, cancel)? {
             Value::Images(img) => Ok(img),
         }
     }
@@ -493,6 +526,10 @@ impl Evaluator {
         cancel: &CancelToken,
         progress: &mut dyn FnMut(usize, usize),
     ) -> Vec<(ImageId, Result<Arc<ImageBuf>, EvalError>)> {
+        let (node, port) = match view_through(graph, node) {
+            Ok(x) => x,
+            Err(e) => return images.iter().map(|i| (*i, Err(e.clone()))).collect(),
+        };
         let catalog = provider.images();
         let env = Env { provider, images: &catalog, view_tone: self.view_tone, control: false };
         let listed: HashSet<ImageId> = images.iter().copied().collect();
@@ -502,7 +539,7 @@ impl Evaluator {
             let result = if cancel.is_cancelled() {
                 Err(EvalError::Cancelled)
             } else {
-                self.eval_image_env(graph, node, img, &env, cancel)
+                self.eval_image_env(graph, node, port, img, &env, cancel)
             };
             self.cache.retain(|(_, im, _), _| *im != img);
             self.pre_tone.retain(|(_, im, _), _| *im != img);
@@ -1873,6 +1910,38 @@ fn render_generator(node: &rawgraph_core::Node, image: ImageId, width: u32, heig
         .map_err(|e| EvalError::Provider(format!("Generator: {e}")))
 }
 
+/// A group port stands for the inner port behind it; every other node is itself. Groups never
+/// change what is evaluated, so caches and fingerprints are keyed by the inner nodes' own ids.
+fn through(graph: &Graph, node: NodeId, port: usize) -> (NodeId, usize) {
+    graph.resolve_output(node, port)
+}
+
+/// What viewing `node` evaluates. A group shows the inner output port behind its first output port
+/// (`Some(port)` when that is a Split range or an alias, so they keep their meaning); an ordinary node,
+/// or the plain first port of one, is viewed as itself (`None`). A group without any output port has nothing to show.
+fn view_through(graph: &Graph, node: NodeId) -> Result<(NodeId, Option<usize>), EvalError> {
+    if graph.node(node).is_some_and(|n| n.kind == NodeKind::Group) {
+        let (inner, port) = graph.view_target(node).ok_or(EvalError::GroupWithoutOutput(node))?;
+        // Port 0 of an ordinary node is the plain view of that node.
+        let special = port != 0 || graph.node(inner).is_some_and(|n| n.kind == NodeKind::MetadataSplit);
+        return Ok((inner, special.then_some(port)));
+    }
+    Ok((node, None))
+}
+
+/// A fingerprint that also tells which output port is shown.
+fn with_port(fp: u64, port: Option<usize>) -> u64 {
+    match port {
+        Some(p) => {
+            let mut h = DefaultHasher::new();
+            fp.hash(&mut h);
+            p.hash(&mut h);
+            h.finish()
+        }
+        None => fp,
+    }
+}
+
 fn compute(
     node: &rawgraph_core::Node,
     image: ImageId,
@@ -1885,6 +1954,8 @@ fn compute(
     let id = node.id;
     let param = |name: &str| node.param(name, image);
     match node.kind {
+        // Groups are flattened: the evaluator only ever reaches the real nodes inside them.
+        NodeKind::Group => Err(EvalError::GroupWithoutOutput(id)),
         NodeKind::Generator | NodeKind::Draw => {
             let (width, height) = match inputs.first().and_then(|v| v.as_ref()) {
                 Some(Value::Images(src)) => (src.width(), src.height()),
@@ -2314,6 +2385,127 @@ mod tests {
         assert_ne!(*first, *second);
         let restored = Graph::from_json(&g.to_json()).unwrap();
         assert_eq!(*second, *run(&restored, out, A, &p, &mut ev));
+    }
+
+    #[test]
+    fn grouping_and_ungrouping_change_no_fingerprint_no_render_and_no_tail_plan() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let exp = g.add_node(NodeKind::Exposure, [200.0, 0.0]);
+        let con = g.add_node(NodeKind::Contrast, [400.0, 0.0]);
+        let sat = g.add_node(NodeKind::Saturation, [600.0, 0.0]);
+        let out = g.add_node(NodeKind::Output, [800.0, 0.0]);
+        for (a, b) in [(src, exp), (exp, con), (con, sat), (sat, out)] { g.connect(a, b, 0).unwrap(); }
+        g.node_mut(exp).unwrap().set_param("ev", A, 1.0);
+        g.node_mut(exp).unwrap().mode = rawgraph_core::Mode::Individual;
+        g.node_mut(exp).unwrap().set_param("ev", B, -0.5);
+        g.node_mut(con).unwrap().set_param("amount", A, 1.4);
+        let p = TestProvider::default();
+        *p.catalog.lock().unwrap() = vec![A, B];
+        *p.dims.lock().unwrap() = Some((4, 3));
+        p.flat.lock().unwrap().insert(A.0, [0.2, 0.4, 0.6]);
+        p.flat.lock().unwrap().insert(B.0, [0.3, 0.1, 0.5]);
+        let mut ev = Evaluator::new();
+        let snapshot = |g: &Graph, ev: &mut Evaluator| {
+            let mut fps = Vec::new();
+            let mut renders = Vec::new();
+            let mut plans = Vec::new();
+            for img in [A, B] {
+                for n in [src, exp, con, sat, out] { fps.push(fingerprint_of(g, n, img, &p)); }
+                renders.push(run(g, out, img, &p, ev));
+                let plan = ev.plan_tail(g, out, img, &p).unwrap();
+                plans.push((plan.base, plan.base_port, plan.base_fingerprint, plan.ops.len()));
+            }
+            (fps, renders, plans)
+        };
+        let before = snapshot(&g, &mut ev);
+        let grp = g.group_nodes(&[exp, con], "Tone").unwrap();
+        let during = snapshot(&g, &mut Evaluator::new());
+        assert_eq!(before.0, during.0, "fingerprints");
+        assert_eq!(before.2, during.2, "GPU tail plans");
+        for (a, b) in before.1.iter().zip(&during.1) { assert_eq!(**a, **b, "bit-identical renders"); }
+        // Viewing the group evaluates the node behind its first output.
+        let direct = run(&g, con, A, &p, &mut Evaluator::new());
+        let through_group = run(&g, grp, A, &p, &mut Evaluator::new());
+        assert_eq!(*direct, *through_group);
+        assert_eq!(Evaluator::new().fingerprint(&g, grp, A, &p).unwrap(), fingerprint_of(&g, con, A, &p));
+        g.ungroup(grp).unwrap();
+        let after = snapshot(&g, &mut Evaluator::new());
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.2, after.2);
+        for (a, b) in before.1.iter().zip(&after.1) { assert_eq!(**a, **b); }
+        // A cache that already holds the results keeps hitting after the selection is grouped.
+        let misses = ev.misses();
+        g.group_nodes(&[exp, con], "Tone").unwrap();
+        for img in [A, B] { run(&g, out, img, &p, &mut ev); }
+        assert_eq!(ev.misses(), misses, "no node is recomputed");
+    }
+
+    #[test]
+    fn viewing_a_group_follows_the_port_behind_its_first_output() {
+        // Source -> Split by Metadata; only range "mid" (port 1) is wired on to Saturation.
+        let mut g = Graph::new();
+        let src = add(&mut g, NodeKind::Source);
+        let sp = add(&mut g, NodeKind::MetadataSplit);
+        let sat = add(&mut g, NodeKind::Saturation);
+        let out = add(&mut g, NodeKind::Output);
+        g.connect(src, sp, 0).unwrap();
+        g.connect_ports(sp, 1, sat, 0).unwrap();
+        g.connect(sat, out, 0).unwrap();
+        set_data(&mut g, sp, A, Some(ranges(&[("low", 50.0, 400.0), ("mid", 401.0, 1600.0)])));
+        let grp = g.group_nodes(&[sp], "Splitter").unwrap();
+        assert_eq!(g.view_target(grp), Some((sp, 1)));
+        let p = TestProvider::default();
+        let (lo, mid) = (ImageId(10), ImageId(11));
+        set_iso(&p, lo, 200.0);
+        set_iso(&p, mid, 800.0);
+        let cancel = CancelToken::new();
+        let mut ev = Evaluator::new();
+        // The group carries exactly what leaves that range.
+        let Value::Images(direct) = ev.eval_output(&g, sp, 1, mid, &p, &cancel).unwrap();
+        let Value::Images(via) = ev.eval(&g, grp, mid, &p, &cancel).unwrap();
+        assert_eq!(*direct, *via);
+        assert_eq!(*ev.eval_image(&g, grp, mid, &p, &cancel).unwrap(), *direct);
+        assert!(matches!(ev.eval(&g, grp, lo, &p, &cancel), Err(EvalError::NotInCollection { .. })));
+        assert!(ev.contains(&g, grp, mid, &p) && !ev.contains(&g, grp, lo, &p));
+        assert_eq!(ev.members(&g, grp, 0, &p), ev.members(&g, sp, 1, &p));
+        // The fingerprint tells the range from the plain view of the Split.
+        assert_ne!(ev.fingerprint(&g, grp, mid, &p).unwrap(), ev.fingerprint(&g, sp, mid, &p).unwrap());
+        // The tail plan and the batch follow the same port.
+        let plan = ev.plan_tail(&g, grp, mid, &p).unwrap();
+        assert_eq!((plan.base, plan.base_port), (sp, 1));
+        assert_eq!(*ev.eval_base(&g, &plan, mid, &p, &cancel).unwrap(), *direct);
+        assert!(matches!(ev.plan_tail(&g, grp, lo, &p), Err(EvalError::NotInCollection { .. })));
+        let batch = ev.render_batch(&g, grp, &[lo, mid], &p, &cancel, &mut |_, _| {});
+        assert!(matches!(batch[0].1, Err(EvalError::NotInCollection { .. })));
+        assert_eq!(*batch[1].1.as_ref().unwrap().as_ref(), *direct);
+    }
+
+    #[test]
+    fn a_group_without_an_output_port_is_never_evaluated() {
+        let (mut g, [_, exp, con, _], _) = chain_for_groups();
+        let grp = g.group_nodes(&[exp, con], "Tone").unwrap();
+        g.remove_group_port(grp, false, 0).unwrap();
+        let p = TestProvider::default();
+        let cancel = CancelToken::new();
+        let mut ev = Evaluator::new();
+        assert!(matches!(ev.eval(&g, grp, A, &p, &cancel), Err(EvalError::GroupWithoutOutput(n)) if n == grp));
+        assert_eq!(ev.eval_image(&g, grp, A, &p, &cancel).err(), Some(EvalError::GroupWithoutOutput(grp)));
+        assert_eq!(ev.fingerprint(&g, grp, A, &p), Err(EvalError::GroupWithoutOutput(grp)));
+        assert_eq!(ev.plan_tail(&g, grp, A, &p).err(), Some(EvalError::GroupWithoutOutput(grp)));
+        let batch = ev.render_batch(&g, grp, &[A], &p, &cancel, &mut |_, _| {});
+        assert_eq!(batch[0].1.as_ref().err(), Some(&EvalError::GroupWithoutOutput(grp)));
+        assert!(EvalError::GroupWithoutOutput(grp).to_string().contains("no output"));
+    }
+
+    fn chain_for_groups() -> (Graph, [NodeId; 4], ()) {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let exp = g.add_node(NodeKind::Exposure, [200.0, 0.0]);
+        let con = g.add_node(NodeKind::Contrast, [400.0, 0.0]);
+        let out = g.add_node(NodeKind::Output, [600.0, 0.0]);
+        for (a, b) in [(src, exp), (exp, con), (con, out)] { g.connect(a, b, 0).unwrap(); }
+        (g, [src, exp, con, out], ())
     }
 
     #[test]

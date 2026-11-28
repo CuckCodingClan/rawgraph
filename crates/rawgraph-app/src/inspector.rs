@@ -102,6 +102,10 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
         return;
     };
     let kind = session.project.graph.node(id).map_or(NodeKind::Source, |n| n.kind);
+    if kind == NodeKind::Group {
+        group_section(ui, session, id);
+        return;
+    }
     let image = if kind == NodeKind::Draw { session.draw_image(id, session.current_image()) } else { session.current_image() };
     ui.heading(kind.label());
     if session.node_sel.len() > 1 {
@@ -527,12 +531,16 @@ fn param_widget_opts(ui: &mut egui::Ui, session: &mut Session, id: rawgraph_core
     let label = if filter_radius { "Radius (% of long edge)".to_owned() }
         else if spec.unit.is_empty() { spec.label.to_owned() } else { format!("{} ({})", spec.label, spec.unit) };
     let kind = widget_for(spec);
+    // The widget a right-click on opens the "Publish to group" menu.
+    let menu_resp: Option<egui::Response>;
     match kind {
         WidgetKind::Check => {
             let mut on = current >= 0.5;
-            if ui.checkbox(&mut on, label).changed() {
+            let r = ui.checkbox(&mut on, label);
+            if r.changed() {
                 value = if on { 1.0 } else { 0.0 };
             }
+            menu_resp = Some(r);
         }
         WidgetKind::Combo => {
             let rawgraph_core::ParamKind::Choice(options) = spec.kind else { return };
@@ -547,6 +555,7 @@ fn param_widget_opts(ui: &mut egui::Ui, session: &mut Session, id: rawgraph_core
                     }
                 })
                 .response;
+            menu_resp = Some(combo.clone());
             match label_resp {
                 Some(l) => {
                     combo.labelled_by(l.id);
@@ -565,6 +574,7 @@ fn param_widget_opts(ui: &mut egui::Ui, session: &mut Session, id: rawgraph_core
             if resp.double_clicked() {
                 value = spec.default;
             }
+            menu_resp = Some(resp);
         }
         WidgetKind::Slider | WidgetKind::LogSlider => {
             let label_resp = ui.add(egui::Label::new(label).sense(egui::Sense::click())).on_hover_text("Double-click to reset to the default");
@@ -577,11 +587,103 @@ fn param_widget_opts(ui: &mut egui::Ui, session: &mut Session, id: rawgraph_core
             } else {
                 crate::fine_slider::show(ui, &mut value, spec.min..=spec.max, spec.default, kind == WidgetKind::LogSlider, &label_resp, width, 3);
             }
+            menu_resp = Some(label_resp);
         }
+    }
+    if let Some(r) = menu_resp {
+        publish_menu(&r, session, id, spec);
     }
     if (value - current).abs() > f32::EPSILON {
         if let Some(n) = session.project.graph.node_mut(id) {
             n.set_param(spec.name, image, value);
+        }
+    }
+}
+
+/// Right-click menu of a parameter: publish it on the group the node is in, or unpublish it.
+fn publish_menu(resp: &egui::Response, session: &mut Session, id: rawgraph_core::NodeId, spec: &rawgraph_core::graph::ParamSpec) {
+    resp.context_menu(|ui| {
+        let Some(group) = session.project.graph.parent_of(id) else {
+            ui.add_enabled(false, egui::Button::new("Publish to group"))
+                .on_disabled_hover_text("This node is not inside a group. Select nodes and press Ctrl+G to make one.");
+            return;
+        };
+        let group_label = session.project.graph.node(group).and_then(|n| n.group()).map(|g| g.label.clone()).unwrap_or_default();
+        if let Some(index) = session.project.graph.published_index(group, id, spec.name) {
+            ui.label(RichText::new(format!("Published on \"{group_label}\"")).weak());
+            if ui.button("Unpublish").clicked() {
+                let _ = session.project.graph.unpublish_param(group, index);
+                ui.close();
+            }
+            return;
+        }
+        let key = ui.make_persistent_id(("publish_label", id.0, spec.name));
+        let mut text: String = ui.data_mut(|d| d.get_temp::<String>(key)).unwrap_or_else(|| spec.label.to_owned());
+        ui.label("Label on the group");
+        ui.add(egui::TextEdit::singleline(&mut text).desired_width(170.0));
+        ui.data_mut(|d| d.insert_temp(key, text.clone()));
+        if ui.add_enabled(!text.trim().is_empty(), egui::Button::new(format!("Publish to group \"{group_label}\""))).clicked() {
+            let _ = session.project.graph.publish_param(group, id, spec.name, Some(&text));
+            ui.data_mut(|d| d.remove_temp::<String>(key));
+            ui.close();
+        }
+    });
+}
+
+/// Inspector of a Group node: name, ports and the published parameters, which edit the inner nodes directly.
+fn group_section(ui: &mut egui::Ui, session: &mut Session, id: rawgraph_core::NodeId) {
+    let image = session.current_image();
+    let Some(def) = session.project.graph.node(id).and_then(|n| n.group()).cloned() else { return };
+    ui.heading(&def.label);
+    if session.node_sel.len() > 1 {
+        ui.label(RichText::new(format!("{} nodes selected", session.node_sel.len())).color(Color32::from_rgb(255, 210, 90)));
+    }
+    let inside = session.project.graph.leaves_of(id).len();
+    ui.label(RichText::new(format!("Group {} | {inside} node{} inside | double-click or Enter opens it", id.0, if inside == 1 { "" } else { "s" })).weak());
+    if let Some(origin) = &def.origin {
+        ui.label(RichText::new(format!("Inserted from the macro \"{origin}\". This group is a copy: editing the macro file does not change it.")).weak());
+    }
+    ui.add_space(4.0);
+    ui.label("Name");
+    if let Some(name) = crate::node_ui::text_field(ui, ui.make_persistent_id(("group_name", id.0)), &def.label, 220.0, "Group name") {
+        let _ = session.project.graph.set_group_label(id, &name);
+    }
+    ui.add_space(6.0);
+    ui.label(RichText::new("Published parameters").strong());
+    if def.published.is_empty() {
+        ui.label(RichText::new("None yet. Open the group, right-click a parameter in the inspector of an inner node and choose \"Publish to group\".").weak());
+    }
+    let mut unpublish: Option<usize> = None;
+    for (i, p) in def.published.iter().enumerate() {
+        let Some(spec) = session.project.graph.node(p.node).and_then(|n| n.kind.param_spec(&p.param)) else { continue };
+        let individual = session.project.graph.node(p.node).is_some_and(|n| n.mode == Mode::Individual);
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                if let Some(label) = crate::node_ui::text_field(ui, ui.make_persistent_id(("published_label", id.0, i)), &p.label, 150.0, "Label") {
+                    let _ = session.project.graph.rename_published(id, i, &label);
+                }
+                if ui.small_button("Unpublish").clicked() {
+                    unpublish = Some(i);
+                }
+            });
+            let inner = session.project.graph.node(p.node).map_or("node", |n| n.kind.label());
+            ui.label(RichText::new(format!("{inner} (node {}) | {}", p.node.0, if individual { "Individual: moving the slider sets this image's own value" } else { "All" })).weak().small());
+            param_widget(ui, session, p.node, spec, image);
+        });
+    }
+    if let Some(i) = unpublish {
+        let _ = session.project.graph.unpublish_param(id, i);
+    }
+    for (title, list, input) in [("Inputs", &def.inputs, true), ("Outputs", &def.outputs, false)] {
+        ui.add_space(6.0);
+        ui.label(RichText::new(title).strong());
+        if list.is_empty() {
+            ui.label(RichText::new("No ports").weak());
+        }
+        for (k, port) in list.iter().enumerate() {
+            if let Some(label) = crate::node_ui::text_field(ui, ui.make_persistent_id(("group_port", id.0, input, k)), &port.label, 220.0, "Port name") {
+                let _ = session.project.graph.set_group_port_label(id, input, k, &label);
+            }
         }
     }
 }

@@ -1,6 +1,6 @@
 # RawGraph node structure
 
-Current inventory for graph format 5 (sub-graph format 4; format 5 added the Keyword measure, `keyword_op` and the Export `meta_keywords` toggle; older Export nodes that copied no metadata get `meta_keywords` off when they load, so they do not start embedding keywords), not a list of what shipped in `2611.001`. Node labels, stable keys, port types, choice order and defaults come from the core graph definitions. Tables describe stored settings; the inspector may group settings or hide ones that do not apply.
+Current inventory for graph format 6 (sub-graph format 5; format 5 added the Keyword measure, `keyword_op` and the Export `meta_keywords` toggle, format 6 added node groups; older Export nodes that copied no metadata get `meta_keywords` off when they load, so they do not start embedding keywords), not a list of what shipped in `2611.001`. Node labels, stable keys, port types, choice order and defaults come from the core graph definitions. Tables describe stored settings; the inspector may group settings or hide ones that do not apply.
 
 Graphs of format 1 and 2 (and sub-graphs of format 1) are rewritten to these nodes when loaded; see the README section "Per-pixel image controls" for the mapping of the removed mask kinds and ports.
 
@@ -14,6 +14,16 @@ Edit the relevant node section in Git. To distinguish a request from an implemen
 - **Ports:** All fixed ports carry `Images` collections. Merge and Layer have multiple collection inputs; Split by Metadata has multiple collection outputs.
 - **Add Input:** Use the inset blue **+** tab at the left of the title bar. Each exposed input sits on the left edge beside its parameter name and value, which remain visible even at the default value. A scalar control reads clamped linear ACEScg luminance and scales the slider's effect per pixel (black = no effect / neutral value, white = the slider value). Filter Direction instead reads encoded XY in R/G. The matching image is used, otherwise a single-image output applies to every photo; a disjoint multi-image output is ignored. Controls do not join the main collection and a disconnected control leaves its slider in charge.
 - **Add Output:** Use the inset red **+** tab at the far right of the title bar, outside the A/I badge; image-producing nodes can expose Luma, R, G, B and A from the first built-in image output. These are additional labelled edge ports, not replacements for the original image output. Right-click an added port to remove it; additions and removals are undoable.
+
+## Structure
+
+### Group (`Group`)
+A structural node, not part of the add-node menu: Ctrl+G turns selected nodes into one, a macro inserts one. It is never evaluated and has no stored settings of its own; the evaluator sees the nodes inside it exactly as before (they keep their ids, wires and values).
+
+- **Inputs / Outputs:** defined by the group, all `Images`. An input stands for an inner input port (a wire into the box is stored as a wire into that inner port), an output for an inner output port (a wire out of the box starts at that inner port). Labels are editable; they start as "<inner node>: <inner port>". Viewing a group shows the node behind its first output.
+- **Stored in the node:** `label`, optional `color` (RGB), optional `origin` (the macro it was inserted from; a note only, the group is a copy), `members` (direct children, nodes and nested groups), `inputs`, `outputs` (`label`, inner `node`, `port`), `published` (`label`, inner `node`, parameter key).
+- **Published parameters:** listed on the box and in the group's inspector; they read and write the inner node's own parameter, with its All / Individual mode.
+- **Rules checked on load:** every group has members; a node is in at most one group; groups never contain themselves and nest at most 16 deep; ports and published entries are unique and point at real ports and parameters of nodes inside the group; every wire across a group boundary has a port on each group it crosses; wires never end at a group node.
 
 ## Collection
 
