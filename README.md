@@ -25,7 +25,7 @@ Local-first RAW photo analysis, organization, and non-destructive editing throug
 RawGraph should feel snappy on the first view of a RAW, not just after it is cached. A wait of over two seconds for the first visible frame from an unedited Source is unacceptable. Treat responsiveness as a requirement for new features, and prioritize measured performance improvements when no feature requests are queued.
 
 When you select a photo, the viewer replaces the old picture with a cached proxy or
-filmstrip thumbnail if one is ready. Otherwise it shows **Rendering…** and tries the
+filmstrip thumbnail if one is ready. Otherwise it shows **Renderingâ€¦** and tries the
 on-disk thumbnail cache and the camera's embedded preview on a background worker.
 **Preview** means the displayed picture is provisional; the graph render replaces it
 and clears the badge. Edits to the current photo retain the last frame and show the
@@ -102,7 +102,7 @@ warm cache) the count arrives after about 55 ms and the full list after about
 100 ms. The previous scanner added images one at a time, each only after its hash
 and metadata were read; the full list took about 950 ms here with 8 workers and
 far longer for RAWs over SMB. A cold NFS cache made the first listing much slower
-(0.3–9.6 s for the same folder), so cold numbers vary with the server.
+(0.3â€“9.6 s for the same folder), so cold numbers vary with the server.
 Each later file stage costs one network open per file. Listing speed still
 depends on the NAS and the number of subfolders; Windows SMB numbers are
 unmeasured. Reproduce with:
@@ -152,7 +152,7 @@ cargo test -p rawgraph-io --test synthetic_raw synthetic_first_draw -- --ignored
 - [ ] Analysis filters for image measures such as brightness; make heuristic nature clear. Support configurable flash-related filtering.
 - [ ] Merge/collect and export nodes with defined ordering, duplicate, partial-failure, and retry behavior.
 - [ ] Rust graph evaluator with validation, bounded scheduling, progress, cancellation, caching, logs, and reproducible execution.
-- [ ] Demonstrate end-to-end: folder → ISO ranges → separate noise-reduction settings → merge → export.
+- [ ] Demonstrate end-to-end: folder â†’ ISO ranges â†’ separate noise-reduction settings â†’ merge â†’ export.
 
 ### 4. RAW development and scopes
 - [ ] Integrate and benchmark RAW decode/demosaic for priority cameras, using Rust libraries or bounded FFI where necessary.
@@ -218,7 +218,7 @@ The Windows GUI starts without creating a console and shows a small startup spla
 
 Click a node to preview its result. Pin the viewer to keep that stage visible while editing another node. With no selected or pinned node, there is no preview. New graphs no longer include an Output node; old graphs can still be opened. Use an Export node to save files or Quick Export to write from the stage you are viewing.
 
-The gallery, scopes, and Clean Feed follow the single viewer or the right **Primary** pane in Split Viewer, not the inspector’s selected node. The gallery lists the primary node’s collection and highlights the primary image. Both split panes have independent image and node pins; unpinned dimensions follow selection (an image-only pin can retain its last compatible node). The left **Reference** pane does not drive the gallery, scopes, or Clean Feed. Wheel and arrow navigation and gallery clicks stay in the primary collection; unpin the primary image to step through it. The single viewer uses fit-relative click zoom (2× or 3×), and the View menu switches wheel behavior between zooming and stepping images. Drag a connection from a port to blank canvas to add and wire a compatible node. You can delete any node, including the last Source, and undo the deletion. An empty graph has a blank viewer and an empty gallery.
+The gallery, scopes, and Clean Feed follow the single viewer or the right **Primary** pane in Split Viewer, not the inspectorâ€™s selected node. The gallery lists the primary nodeâ€™s collection and highlights the primary image. Both split panes have independent image and node pins; unpinned dimensions follow selection (an image-only pin can retain its last compatible node). The left **Reference** pane does not drive the gallery, scopes, or Clean Feed. Wheel and arrow navigation and gallery clicks stay in the primary collection; unpin the primary image to step through it. The single viewer uses fit-relative click zoom (2Ã— or 3Ã—), and the View menu switches wheel behavior between zooming and stepping images. Drag a connection from a port to blank canvas to add and wire a compatible node. You can delete any node, including the last Source, and undo the deletion. An empty graph has a blank viewer and an empty gallery.
 
 ### Gallery thumbnails
 
@@ -229,7 +229,7 @@ are provisional until the editable render is ready. The tile retains its last
 picture while rendering. Depth Map, Pixel Sort and stages measured as slow defer
 updates during a drag; a small amber dot means the picture is stale.
 
-**View → Editable thumbnail cache** controls the persistent disk budget (default
+**View â†’ Editable thumbnail cache** controls the persistent disk budget (default
 **8 GiB**, oldest access evicted first). Set it to zero to keep editable bases in
 memory only. These small scene-linear bases are separate from embedded JPEGs and
 are reused when you change nodes or settings. Reduced-resolution effects can
@@ -237,12 +237,12 @@ look different from a full viewer proxy or export.
 
 ### Export node preview
 
-Viewing an Export node set to JPEG or 8-bit PNG automatically shows the result of encoding and decoding the viewer image with the node’s settings. It writes no files. The preview can use a reduced-resolution image, so compression artifacts may differ from a full-resolution export. XMP has no image output; other formats do not yet support this preview. For PNG and TIFF, select 8 or 16 bits per channel separately from the format.
+Viewing an Export node set to JPEG or 8-bit PNG automatically shows the result of encoding and decoding the viewer image with the nodeâ€™s settings. It writes no files. The preview can use a reduced-resolution image, so compression artifacts may differ from a full-resolution export. XMP has no image output; other formats do not yet support this preview. For PNG and TIFF, select 8 or 16 bits per channel separately from the format.
 
 ### Data-map export
 
 Choose **PNG 16-bit data map** on an Export node for RGB normal maps or other
-encoded data. RGB values reaching the node are clamped to 0–1 and rounded to
+encoded data. RGB values reaching the node are clamped to 0â€“1 and rounded to
 16-bit directly, without display transform, colour-space conversion, or ICC
 profile or EXIF metadata. Alpha is discarded. Use Original size: resizing averages values and
 does not renormalize normals. This does not undo transforms applied upstream.
@@ -268,22 +268,56 @@ settings (size, colour space, profile and metadata groups) do not apply. A run
 with mixed per-image XMP and rendered formats reports rendered items as failed;
 run those separately. Quick Export remains a rendered-image export.
 
+### What runs on the GPU
+
+The viewer splits the graph at the node it shows. Everything upstream of the **last node the
+GPU cannot run** is evaluated on the CPU (the *base*, cached and uploaded once); the nodes behind
+it form the *tail*, a chain of GPU nodes (`rawgraph-gpu`, `chain.rs`) that is re-run for every
+slider move, followed by the display transform. The CPU functions stay the reference: every GPU
+operation is tested against them and agrees within one code value after the display transform
+(measured differences below). Any error, out-of-memory condition or unsupported node falls back to
+the CPU for that frame; the status bar then says why.
+
+| Node | On the GPU | Notes |
+| --- | --- | --- |
+| Capture EV, Exposure, White Balance, Saturation, Contrast, Highlights / Shadows, Color Wheels, Tone Curve, Curves (all channels), Hue / Saturation, Vignette, Black & White | pointwise tail, fused into **one pass** | without a connected control map |
+| Develop (exposure, contrast, vibrance, saturation, Legacy tone, white/black, dynamic) | pointwise tail | the base part (white balance, baseline) is the cached CPU base |
+| Develop **Lights / Shadows / White / Black** (non-Legacy local tone) | neighbourhood node | the 512 px guided-filter grid is estimated on the CPU from the base with the exposure gain applied, cached by an id and uploaded once; the per-pixel part runs on the GPU. Dragging Lights, Shadows, White, Black, Contrast or Saturation only re-runs that pass; changing Exposure or the base re-estimates the grid |
+| Filter: Gaussian and Box, low and high pass | neighbourhood node | separable passes; radii from 16 px on use the same box-downscaled approximation as the CPU |
+| Sharpen | neighbourhood node | log-luminance guide, true Gaussian below 4 px, box blur above, soft limiter |
+| Filter with a connected radius map, Filter Lens/Motion/Radial/Diamond/Median/Bilateral, Sharpen with an amount map | CPU base | |
+| Clarity, Noise Reduction, Layer, Lens Correction, Transform, Depth Map, Pixel Sort, anything with a connected control map | CPU base | everything behind such a node still runs on the GPU |
+
+Measured on an RTX 3070 (1280 px picture, slider to frame without the window, median of nine
+moves; `cargo test -p rawgraph-app slider_to_frame -- --ignored --nocapture`, `RG_BENCH_EDGE`
+sets the size): Develop Lights CPU 23.7 ms, GPU 2.5 ms; Filter radius CPU 7.5 ms, GPU 4.9 ms;
+Sharpen amount CPU 8.2 ms, GPU 3.0 ms. CPU and GPU pictures of a generated 2560 px test image
+(`cargo run -p rawgraph-app --example gentest`, `--dump-frame`, `--example pngdiff`) differ by at
+most one code value in under 0.07 % of the pixels.
+
+Intermediate textures: the base is never written. Passes ping-pong between a few scratch
+textures of the base's size that belong to the display class; a third one exists only while an
+operation needs the original next to its blurred copy (high pass, Sharpen after another node), and
+a low-resolution pair only while a blur radius of 16 px or more is in the chain. A frame that needs
+fewer textures frees the rest. An out-of-memory error while allocating one follows the usual rules
+(everything is released, this image is shown on the CPU).
+
 ### Per-node timing
 
-Enable **Debug → Per-node CPU timing** to profile the previews. Each node then shows a
+Enable **Debug â†’ Per-node CPU timing** to profile the previews. Each node then shows a
 small label just under its bottom-right corner with its exclusive CPU wall time for the
 last preview (upstream node evaluation excluded), or **cached** when its result came from
 the cache. The node taking at least half of the preview's time is red, one taking at least
 a fifth is amber. Hover a label for the exact time, its share, and the number of
 computations and result-cache hits. Cache hits are reported separately,
 not as operation timings. Times include evaluation overhead and are diagnostic, not a
-benchmark. The GPU tail is batched and has no per-node GPU timings; a GPU-resident
+benchmark. The GPU tail (pointwise and neighbourhood operations) has no per-node GPU timings; a GPU-resident
 base or Develop pre-tone base may not appear. Turning the option off disables the
 per-node timing clocks. Overlay, histogram, and scope work is not included.
 
 ### Workspaces and display layouts
 
-A **workspace** is the layout of the main window (which panels are visible and how large they are) plus the secondary windows with the display each one wants. There are three kinds of secondary window: the **Viewer** of the dual workspace, the **Scopes** window and the **Clean feed**. Choose one under **View → Workspace**:
+A **workspace** is the layout of the main window (which panels are visible and how large they are) plus the secondary windows with the display each one wants. There are three kinds of secondary window: the **Viewer** of the dual workspace, the **Scopes** window and the **Clean feed**. Choose one under **View â†’ Workspace**:
 
 | Preset | Shortcut | Windows |
 | --- | --- | --- |
@@ -295,8 +329,8 @@ A **workspace** is the layout of the main window (which panels are visible and h
 
 Display 1 is the display of the main window; displays 2, 3 and 4 are the other displays from left to right. Ctrl+Alt+digit is checked before Ctrl+digit (Fit/100 %); Ctrl+Shift+D (dual), Ctrl+Shift+K (scopes window) and Ctrl+Shift+C (clean feed) still toggle single windows. Ctrl+Alt+1..5 work on German and Austrian layouts as well: the right Alt key (AltGr) does not trigger them, and the left Ctrl+Alt+digit types nothing.
 
-- **Save workspace as...** stores the current panel sizes, panel visibility (View → Workspace → Panels: filmstrip, inspector, node graph) and the open windows with their displays under a name. **Manage workspaces...** renames and deletes saved workspaces and picks the **default** workspace used at start. Without a default, RawGraph starts with the workspace of the last session, including windows opened or closed by hand. Saved workspaces live with the application settings.
-- **View → Workspace → Window displays** sends a window to a specific display or back to "Automatic" (its slot). The same choice is under **View → Clean feed display**; it is remembered for the next time the window opens.
+- **Save workspace as...** stores the current panel sizes, panel visibility (View â†’ Workspace â†’ Panels: filmstrip, inspector, node graph) and the open windows with their displays under a name. **Manage workspaces...** renames and deletes saved workspaces and picks the **default** workspace used at start. Without a default, RawGraph starts with the workspace of the last session, including windows opened or closed by hand. Saved workspaces live with the application settings.
+- **View â†’ Workspace â†’ Window displays** sends a window to a specific display or back to "Automatic" (its slot). The same choice is under **View â†’ Clean feed display**; it is remembered for the next time the window opens.
 - `--workspace <name>` starts in a preset (`single`, `dual`, `dual-scopes`, `dual-scopes-clean`, `clean-feed`) or a saved workspace (case-insensitive); an unknown name is reported and the normal start workspace is used. `--clean-feed` and `--scopes` add to the chosen workspace. Screenshot and benchmark runs do not read the settings, so they only know the presets.
 - The **Scopes window** shows the full scope panel (histogram, waveform, parade, vectorscope and all their options) with the same widgets as the docked scopes. It follows the single viewer or the Primary pane in Split Viewer, like the docked scopes and the clean feed. Closing it (Escape, F11 or the close button) docks the scopes again.
 
@@ -312,12 +346,12 @@ Platform notes: placement uses the monitor list of winit, so it depends on what 
 
 ### Clean feed
 
-Open **View → Clean feed** for a fullscreen, image-only output. It shows
+Open **View â†’ Clean feed** for a fullscreen, image-only output. It shows
 the current preview aspect-fitted on black and hides when RawGraph loses focus.
 The Dual Screen viewer stays fullscreen and does not hide on focus loss.
 Neither output adds a Windows taskbar entry. Press
 **Escape** (or F11) while the feed has focus to close it; the editor stays open.
-Choose a display under **View → Clean feed display**, before or while it is open
+Choose a display under **View â†’ Clean feed display**, before or while it is open
 (see Workspaces above for how a missing display is handled). Placement depends on the
 OS/window manager; verify it on your display setup, especially on Wayland.
 
@@ -343,7 +377,7 @@ The inset blue **+** tab at the left of the title bar adds supported input maps.
 
 ### Source nodes
 
-A new Source, including the starter Source, supplies no images until you choose a folder. Clearing the folder makes it empty again. **File → Open folder** assigns the path to a Source before scanning; it does not create an input shared by all nodes. Older saved Sources with no folder setting retain their catalog-wide behavior so saved graphs keep their inputs.
+A new Source, including the starter Source, supplies no images until you choose a folder. Clearing the folder makes it empty again. **File â†’ Open folder** assigns the path to a Source before scanning; it does not create an input shared by all nodes. Older saved Sources with no folder setting retain their catalog-wide behavior so saved graphs keep their inputs.
 
 The Source count updates as files are discovered. Once enumeration finishes,
 the gallery gets the list together; thumbnails and capture details fill in
@@ -355,9 +389,9 @@ original identity.
 
 ### Per-pixel image controls
 
-Click the blue title-bar **+** tab to add a control input. Develop exposes Exposure, Contrast, Lights, Shadows, White and Black; Exposure is available on the standalone Exposure node; Contrast, Saturation and Sharpen each expose their amount; Filter exposes Radius and Direction (RGB). A connected map scales that slider's effect per pixel: black gives no effect (the parameter's neutral value), white gives the slider value, and values in between interpolate linearly; values outside 0–1 are clamped. The slider still sets the strength. Image inputs use linear ACEScg luminance; use an exposed image channel if you need a particular channel. Both the local tone processing and Legacy tone support these inputs. An unconnected input leaves the slider in control.
+Click the blue title-bar **+** tab to add a control input. Develop exposes Exposure, Contrast, Lights, Shadows, White and Black; Exposure is available on the standalone Exposure node; Contrast, Saturation and Sharpen each expose their amount; Filter exposes Radius and Direction (RGB). A connected map scales that slider's effect per pixel: black gives no effect (the parameter's neutral value), white gives the slider value, and values in between interpolate linearly; values outside 0â€“1 are clamped. The slider still sets the strength. Image inputs use linear ACEScg luminance; use an exposed image channel if you need a particular channel. Both the local tone processing and Legacy tone support these inputs. An unconnected input leaves the slider in control.
 
-Intensity maps are resized to the photo. A control uses the matching photo when present; otherwise a single-image output such as a standalone Generator or Draw applies to every photo. A disjoint multi-image output is ignored. Control images do not enter the main gallery. **View → Show mask overlay** (M) tints the first connected intensity control red without affecting the render, scopes or export.
+Intensity maps are resized to the photo. A control uses the matching photo when present; otherwise a single-image output such as a standalone Generator or Draw applies to every photo. A disjoint multi-image output is ignored. Control images do not enter the main gallery. **View â†’ Show mask overlay** (M) tints the first connected intensity control red without affecting the render, scopes or export.
 
 Graph format 3 removes the Mask category and all fixed mask ports. Use Generator for gradients or radial maps, Draw for painted images, and the image/channel outputs of ordinary nodes for other control maps. Graphs, projects, recipes and copied nodes saved before format 3 are migrated automatically when they are opened; the next save writes the current format (4). Format 4 only marks files written with Develop's Legacy tone toggle: a Develop node in a file of format 3 or older without a stored tone choice keeps the Legacy pointwise curves it was made with. Each change that is not exact is reported once in the status bar (hover for the full list, click to dismiss).
 
@@ -373,7 +407,7 @@ Graph format 3 removes the Mask category and all fixed mask ports. Use Generator
 | Depth Estimate, Normals | Depth Map, Normal Map (the chosen input becomes the image input) |
 | Exposure mask, Amount mask, Radius mask, Direction normal | the same parameter exposed as a control input, wired from the migrated node |
 
-Generated maps take the frame (and so the photos) of the nodes they feed, like the old masks did: consumers in one chain of pixel-only nodes share one map framed by the chain's start; a mask used with different frames is copied once per frame, and a consumer behind Crop / Rotate (whose frame comes after the mask) gets its own copy in that frame — check the placement of such copies. A generated map left without an image input is reported. Mask Combine keeps the old clamping to 0..1 (Add is followed by a clamping curve, Subtract becomes a minus min(a, b)). Develop nodes keep their look: the old Tone choice becomes the Legacy tone toggle (files without the choice were Legacy; Local v1 becomes the improved local tone, which can differ slightly), also in graphs saved between the two changes. What stays approximate (each case is reported in a note): an exact result is not possible at the pixel level because the Generator samples pixel edges where the old masks sampled pixel centres (differences of about 0.5 px, visible only at hard edges), hard gradient edges become a 1 % transition, Radial Mask with unequal Radius X/Y uses their geometric mean and drops the angle, curves are sampled with at most 32 points (errors of a few percent at steep edges), pixels of exactly zero luminance are not remapped by a luminance range, per-image Mask Combine modes and per-image Normals input choices are not kept, an exposed Develop or Exposure input that used to map the whole parameter range now scales the slider, and an Exposure that had both an exposed input and a mask port keeps only the mask port. The original graph stays in the project history until it is pruned.
+Generated maps take the frame (and so the photos) of the nodes they feed, like the old masks did: consumers in one chain of pixel-only nodes share one map framed by the chain's start; a mask used with different frames is copied once per frame, and a consumer behind Crop / Rotate (whose frame comes after the mask) gets its own copy in that frame â€” check the placement of such copies. A generated map left without an image input is reported. Mask Combine keeps the old clamping to 0..1 (Add is followed by a clamping curve, Subtract becomes a minus min(a, b)). Develop nodes keep their look: the old Tone choice becomes the Legacy tone toggle (files without the choice were Legacy; Local v1 becomes the improved local tone, which can differ slightly), also in graphs saved between the two changes. What stays approximate (each case is reported in a note): an exact result is not possible at the pixel level because the Generator samples pixel edges where the old masks sampled pixel centres (differences of about 0.5 px, visible only at hard edges), hard gradient edges become a 1 % transition, Radial Mask with unequal Radius X/Y uses their geometric mean and drops the angle, curves are sampled with at most 32 points (errors of a few percent at steep edges), pixels of exactly zero luminance are not remapped by a luminance range, per-image Mask Combine modes and per-image Normals input choices are not kept, an exposed Develop or Exposure input that used to map the whole parameter range now scales the slider, and an Exposure that had both an exposed input and a mask port keeps only the mask port. The original graph stays in the project history until it is pruned.
 
 Click the blue title-bar **+** tab on a Filter node and choose **Radius** to drive radius per pixel from image luminance. Black gives no blur and white gives the slider radius, so the slider still sets the maximum radius. Gaussian and Box use the existing multi-level radius approximation; other kernels use the existing bounded spatial sampler. Unsupported controls are not listed.
 
@@ -393,7 +427,7 @@ Draw paints white strokes on an opaque black RGBA canvas. Select it to paint in 
 
 ### Generator
 
-Generator uses an optional input's dimensions and collection, or produces a standalone image at the configured dimensions. It offers Gradient, seeded Noise, and checker Pattern. Gradient supports Linear, Radial, Angle, Reflected, and Diamond styles, with angle, scale, reverse, interpolation, smoothness, and optional dithering. Click in either ramp lane to add a colour or opacity stop, drag it to move it, or select it to edit its value, position, midpoint to the next stop, or delete it. **Output: Display** (default) interprets colours and stops as sRGB display values and inverts the current viewer tone map after interpolation; the default black-to-white ramp therefore reads 0–1023 on display scopes. Changing the view tone re-evaluates Display generators. Values are clamped to 0–1 before inversion; saturated colours outside the ACES fit’s invertible gamut are projected and can change hue. **Data** preserves the generated numeric channel values directly, for normal maps and other data. When feeding a control input, Display behaves as Data so white is 100% control. Export evaluation uses the session view tone as well; preview exposure is excluded from the inverse and from exports. Export tone-map and colour-space settings still affect the final file. Reverse does not move stored stops. Noise is a separate Generator mode.
+Generator uses an optional input's dimensions and collection, or produces a standalone image at the configured dimensions. It offers Gradient, seeded Noise, and checker Pattern. Gradient supports Linear, Radial, Angle, Reflected, and Diamond styles, with angle, scale, reverse, interpolation, smoothness, and optional dithering. Click in either ramp lane to add a colour or opacity stop, drag it to move it, or select it to edit its value, position, midpoint to the next stop, or delete it. **Output: Display** (default) interprets colours and stops as sRGB display values and inverts the current viewer tone map after interpolation; the default black-to-white ramp therefore reads 0â€“1023 on display scopes. Changing the view tone re-evaluates Display generators. Values are clamped to 0â€“1 before inversion; saturated colours outside the ACES fitâ€™s invertible gamut are projected and can change hue. **Data** preserves the generated numeric channel values directly, for normal maps and other data. When feeding a control input, Display behaves as Data so white is 100% control. Export evaluation uses the session view tone as well; preview exposure is excluded from the inverse and from exports. Export tone-map and colour-space settings still affect the final file. Reverse does not move stored stops. Noise is a separate Generator mode.
 
 Preview filenames, the window title, and `--version` use `YYMM.###` (three-digit monthly build number, starting at `001`). Cargo stores the equivalent unpadded SemVer, such as `26.11.1` for `2611.001`.
 
@@ -414,8 +448,8 @@ changes the photo on screen. Space+drag and the middle button still pan.
   default 50 % / 50 %, so older graphs look the same). Double-click the centre to recentre;
   double-click an end to reset angle and scale.
 - **Crop / Rotate:** besides the crop frame, a knob above the top edge straightens: drag it
-  around the picture to turn the image (−45° to 45°, the fine grid shows while turning).
-  Double-click it for 0°. Scale and move are the crop frame itself (corners and inside);
+  around the picture to turn the image (âˆ’45Â° to 45Â°, the fine grid shows while turning).
+  Double-click it for 0Â°. Scale and move are the crop frame itself (corners and inside);
   there are no separate scale or offset settings.
 - **Vignette:** three rings at the exact distances the effect uses (the same
   centre-to-half-diagonal metric): the bright ring is the midpoint, the faint inner and
@@ -474,10 +508,11 @@ revisions, history, graph restore, conflict check and crash recovery, and a pack
 updated in place in one rollback-journal transaction (only changed rows, appended history, conflict check inside
 the transaction, only on local drives outside sync folders, otherwise the whole file is rewritten; see `docs/project-format.md`), saving works while a folder scan runs, XMP import reads
 with its own 8-thread pool, and undo steps share unchanged nodes instead of copying the graph.
-The interactive preview runs the trailing pointwise operations and the display transform on the GPU
+The interactive preview runs the trailing operations (pointwise ones, the Develop local tone, Filter
+and Sharpen; see "What runs on the GPU") and the display transform on the GPU
 with automatic CPU fallback; everything else, including export, uses the CPU reference path.
-Not yet built: Layer mode "All combinations", HEIC, a lens database, GPU versions of the
-non-pointwise effects, HDR output and ACES output transforms, merging of concurrent edits, node
+Not yet built: Layer mode "All combinations", HEIC, a lens database, GPU versions of Noise
+Reduction, Clarity, Layer and Lens Correction, HDR output and ACES output transforms, merging of concurrent edits, node
 groups and macros, installer and signing, macOS/Linux verification. Interactive use with a real
 mouse and keyboard has not been tested by hand yet. Open questions: `docs/offene-punkte.md`.
 
@@ -485,13 +520,13 @@ Update this section as implementation files are added.
 
 ## Change log
 
-- 2026-11-28 — Project defects: save during a folder scan, in-place incremental project saves (rollback journal, atomic conflict check), XMP import on a dedicated 8-thread pool, undo history shares unchanged nodes (`Graph` nodes are `Arc`, copy on write).
-- 2026-11-15 — Wave 8: nodes of `node_structure.md` (Source folders, Merge rule, Layer, Develop tone, Curves set, Lens Correction auto, Export node), colourised scopes, output colour spaces, AVIF, project format 2 with history and conflict check; new requirements (platforms, project storage and collaboration).
-- 2026-11-15 — Wave 7: Lift/Gamma/Gain, Clarity/Texture, more GPU operations, brush behind crop, curve histogram, packaging script.
-- 2026-11-15 — Wave 6: GPU preview path in the application with CPU fallback.
-- 2026-11-15 — Waves 4 and 5: Develop stage, effects crate, masks, split node, curve, brush, crop, 16-bit export, GPU prototype (see Structure).
-- 2026-11-13 — First working prototype: eight workspace crates, real RAW files in the application (see Structure).
-- 2026-11-13 — Added persistent per-image Individual-node settings and RAW/JPEG parity of controls, including absolute/relative white-balance requirements.
+- 2026-11-28 â€” Project defects: save during a folder scan, in-place incremental project saves (rollback journal, atomic conflict check), XMP import on a dedicated 8-thread pool, undo history shares unchanged nodes (`Graph` nodes are `Arc`, copy on write).
+- 2026-11-15 â€” Wave 8: nodes of `node_structure.md` (Source folders, Merge rule, Layer, Develop tone, Curves set, Lens Correction auto, Export node), colourised scopes, output colour spaces, AVIF, project format 2 with history and conflict check; new requirements (platforms, project storage and collaboration).
+- 2026-11-15 â€” Wave 7: Lift/Gamma/Gain, Clarity/Texture, more GPU operations, brush behind crop, curve histogram, packaging script.
+- 2026-11-15 â€” Wave 6: GPU preview path in the application with CPU fallback.
+- 2026-11-15 â€” Waves 4 and 5: Develop stage, effects crate, masks, split node, curve, brush, crop, 16-bit export, GPU prototype (see Structure).
+- 2026-11-13 â€” First working prototype: eight workspace crates, real RAW files in the application (see Structure).
+- 2026-11-13 â€” Added persistent per-image Individual-node settings and RAW/JPEG parity of controls, including absolute/relative white-balance requirements.
 
 ### Develop local tone
 

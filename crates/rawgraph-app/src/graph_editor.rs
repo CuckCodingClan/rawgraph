@@ -396,7 +396,7 @@ impl NodeTimings {
             else if share >= 0.2 { Color32::from_rgb(230, 180, 90) }
             else { Color32::from_gray(185) };
         let mut tip = format!("{ms:.3} ms exclusive CPU time ({:.0} % of this preview), {} computed, {} cache hits", share * 100.0, r.computed, r.cache_hits);
-        if self.gpu_tail { tip.push_str("\nThe pointwise tail ran batched on the GPU; those nodes have no CPU time here."); }
+        if self.gpu_tail { tip.push_str("\nThe tail (pointwise and neighbourhood operations) ran on the GPU; those nodes have no CPU time here."); }
         Some((text, color, tip))
     }
 }

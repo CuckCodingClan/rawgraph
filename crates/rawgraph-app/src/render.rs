@@ -710,7 +710,7 @@ fn run_gpu<B: Backend>(
     started: Instant,
     resting: &mut Option<RestingScopes>,
 ) -> GpuStep {
-    let plan = match evaluator.plan_tail(&req.graph, req.node, req.image, provider) {
+    let plan = match evaluator.plan_tail_gpu(&req.graph, req.node, req.image, provider) {
         Ok(p) => p,
         Err(e) => return GpuStep::Done(error_reply(req, e)),
     };
@@ -732,10 +732,24 @@ fn run_gpu<B: Backend>(
     if req.cancel.is_cancelled() {
         return GpuStep::Done(None);
     }
+    // The edge-aware base of a local tone operation is estimated on the CPU (a 512 px grid) and
+    // cached by its id: moving Lights / Shadows / White / Black only looks it up.
+    let mut grids = Vec::with_capacity(plan.ops.len());
+    for (i, op) in plan.ops.iter().enumerate() {
+        if matches!(op, rawgraph_engine::TailOp::LocalTone { .. }) {
+            match evaluator.tail_grid(&req.graph, &plan, i, req.image, provider, &req.cancel) {
+                Ok(g) => grids.push(Some(g)),
+                Err(rawgraph_engine::EvalError::Cancelled) => return GpuStep::Done(None),
+                Err(e) => return GpuStep::Done(error_reply(req, e)),
+            }
+        } else {
+            grids.push(None);
+        }
+    }
     let eval_ms = started.elapsed().as_secs_f32() * 1000.0;
     let display = DisplayArgs { exposure_ev: req.view.exposure_ev, tone: gpu_tone(req.view.tone.tone_map()) };
     let t = Instant::now();
-    let picture = match gpu.show(&key, base.as_deref(), &plan.ops, display, req.generation, env.shown) {
+    let picture = match gpu.show_with(&key, base.as_deref(), &plan.ops, &grids, display, req.generation, env.shown) {
         Shown::Gpu(p) => p,
         Shown::Cpu { reason, notice } => return GpuStep::Cpu { reason, notice },
         Shown::Failed(message) => return GpuStep::Done(Some(Reply::Error { generation: req.generation, message })),
@@ -810,7 +824,7 @@ const CHEAP_BASE_MS: f32 = 60.0;
 
 /// The tail plan and the key of the base of `image` for the graph and node of `job`.
 fn preload_key(evaluator: &Evaluator, job: &PreloadJob, image: ImageId, provider: &dyn ImageProvider) -> Option<(rawgraph_engine::TailPlan, BaseKey)> {
-    let plan = evaluator.plan_tail(&job.graph, job.node, image, provider).ok()?;
+    let plan = evaluator.plan_tail_gpu(&job.graph, job.node, image, provider).ok()?;
     let key = BaseKey { image, fingerprint: plan.base_fingerprint, preview: job.hints.preview, revision: provider.revision(image) };
     Some((plan, key))
 }

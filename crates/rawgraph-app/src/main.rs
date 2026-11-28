@@ -60,6 +60,8 @@ mod tool_panels;
 mod tools;
 mod viewer;
 #[cfg(test)]
+mod gpu_chain_tests;
+#[cfg(test)]
 mod wave8_tests;
 #[cfg(test)]
 mod wave8b_tests;

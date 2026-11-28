@@ -2,10 +2,13 @@
 //! and what happens when something fails. It talks to the GPU through the small [`Backend`]
 //! trait so every rule can be tested with a fake that fails on demand.
 
+use std::sync::Arc;
+
 use eframe::egui::TextureId;
+use rawgraph_core::ops::LocalToneGrid;
 use rawgraph_core::ImageBuf;
 use rawgraph_engine::TailOp;
-use rawgraph_gpu::{GpuError, GpuToneMap, PointOp};
+use rawgraph_gpu::{FilterOp, GpuError, GpuNode, GpuToneMap, LocalToneOp, PointOp, SharpenOp};
 use rawgraph_scopes::{DisplayImage, ToneMap};
 
 use crate::gpu_path::{Attempt, BaseKey, Fallback, Lru, RendererMode, ScopeScheduler};
@@ -29,35 +32,90 @@ pub trait Backend {
     fn texture_id(&self, class: &Self::Class) -> TextureId;
     /// Unregisters the class from egui and frees it.
     fn release_class(&mut self, class: Self::Class);
-    fn render(&mut self, base: &Self::Image, class: &Self::Class, ops: &[PointOp], exposure_ev: f32, tone: GpuToneMap) -> Result<(), GpuError>;
+    /// Runs the chain `nodes` on `base` and presents it in the class's target. The class keeps the
+    /// scratch textures of the chain (pooled between frames, trimmed to what the chain needs) and
+    /// where the float result lives.
+    fn render(&mut self, base: &Self::Image, class: &mut Self::Class, nodes: &[GpuNode], exposure_ev: f32, tone: GpuToneMap) -> Result<(), GpuError>;
     /// The display picture sampled at every `step`-th pixel (after the ops, i.e. what is shown).
     fn samples(&mut self, base: &Self::Image, class: &Self::Class, ops_empty: bool, exposure_ev: f32, tone: GpuToneMap, step: u32) -> Result<DisplayImage, GpuError>;
     fn read_rgba8(&mut self, class: &Self::Class) -> Result<Vec<u8>, GpuError>;
     /// Blocks until the submitted work has finished.
     fn wait_idle(&self);
+    /// Frees caches that live outside the images (uploaded grids): the GPU is being released.
+    fn free_caches(&mut self) {}
 }
 
 /// `TailOp` -> the GPU crate's `PointOp` (same variants, same meaning; no wildcard on purpose).
 pub fn point_ops(ops: &[TailOp]) -> Vec<PointOp> {
-    ops.iter()
-        .map(|op| match op {
-            TailOp::Gain(g) => PointOp::Gain(*g),
-            TailOp::Matrix(m) => PointOp::Matrix(*m),
-            TailOp::Saturation(a) => PointOp::Saturation(*a),
-            TailOp::Contrast { amount, pivot } => PointOp::Contrast { amount: *amount, pivot: *pivot },
-            TailOp::HighlightsShadows { highlights, shadows } => PointOp::HighlightsShadows { highlights: *highlights, shadows: *shadows },
-            TailOp::Cdl { slope, offset, power } => PointOp::Cdl { slope: *slope, offset: *offset, power: *power },
-            TailOp::ToneCurve { shadows, darks, lights, highlights } => {
-                PointOp::ToneCurve { shadows: *shadows, darks: *darks, lights: *lights, highlights: *highlights }
+    ops.iter().filter_map(point_op).collect()
+}
+
+/// The pointwise `TailOp` as `PointOp`; `None` for the neighbourhood operations, which are
+/// separate nodes of the chain ([`gpu_nodes`]).
+fn point_op(op: &TailOp) -> Option<PointOp> {
+    Some(match op {
+        TailOp::Gain(g) => PointOp::Gain(*g),
+        TailOp::Matrix(m) => PointOp::Matrix(*m),
+        TailOp::Saturation(a) => PointOp::Saturation(*a),
+        TailOp::Contrast { amount, pivot } => PointOp::Contrast { amount: *amount, pivot: *pivot },
+        TailOp::HighlightsShadows { highlights, shadows } => PointOp::HighlightsShadows { highlights: *highlights, shadows: *shadows },
+        TailOp::Cdl { slope, offset, power } => PointOp::Cdl { slope: *slope, offset: *offset, power: *power },
+        TailOp::ToneCurve { shadows, darks, lights, highlights } => {
+            PointOp::ToneCurve { shadows: *shadows, darks: *darks, lights: *lights, highlights: *highlights }
+        }
+        TailOp::PointCurve { points, channel } => PointOp::PointCurve { points: points.clone(), channel: *channel },
+        TailOp::HueSaturation { bands } => PointOp::HueSaturation { bands: *bands },
+        TailOp::Vignette { amount, midpoint, feather } => PointOp::Vignette { amount: *amount, midpoint: *midpoint, feather: *feather },
+        TailOp::WhitesBlacks { whites, blacks } => PointOp::WhitesBlacks { whites: *whites, blacks: *blacks },
+        TailOp::Vibrance(a) => PointOp::Vibrance(*a),
+        TailOp::Lut { lut, space, strength } => PointOp::Lut { lut: Arc::clone(lut), space: *space, strength: *strength },
+        TailOp::LocalTone { .. } | TailOp::Filter { .. } | TailOp::Sharpen { .. } => return None,
+    })
+}
+
+/// The grids of the local tone operations of a tail: one entry per operation, `Some` for
+/// [`TailOp::LocalTone`].
+pub type TailGrids = [Option<Arc<LocalToneGrid>>];
+
+/// The tail as a GPU chain for a base of `size`: consecutive pointwise operations are fused into one
+/// pass, every neighbourhood operation is its own node. Pixel radii follow the CPU: the parameter
+/// is per mille of the long edge of the image the operation sees (the base size, as every tail
+/// operation keeps it). A local tone operation without its grid is an error.
+pub fn gpu_nodes(ops: &[TailOp], grids: &TailGrids, size: (u32, u32)) -> Result<Vec<GpuNode>, GpuError> {
+    let long = size.0.max(size.1) as f32;
+    let mut nodes: Vec<GpuNode> = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        if let Some(p) = point_op(op) {
+            match nodes.last_mut() {
+                Some(GpuNode::Point(run)) => run.push(p),
+                _ => nodes.push(GpuNode::Point(vec![p])),
             }
-            TailOp::PointCurve { points, channel } => PointOp::PointCurve { points: points.clone(), channel: *channel },
-            TailOp::HueSaturation { bands } => PointOp::HueSaturation { bands: *bands },
-            TailOp::Vignette { amount, midpoint, feather } => PointOp::Vignette { amount: *amount, midpoint: *midpoint, feather: *feather },
-            TailOp::WhitesBlacks { whites, blacks } => PointOp::WhitesBlacks { whites: *whites, blacks: *blacks },
-            TailOp::Vibrance(a) => PointOp::Vibrance(*a),
-            TailOp::Lut { lut, space, strength } => PointOp::Lut { lut: std::sync::Arc::clone(lut), space: *space, strength: *strength },
-        })
-        .collect()
+            continue;
+        }
+        nodes.push(match op {
+            TailOp::LocalTone { highlights, shadows, whites, blacks, grid } => {
+                let Some(Some(data)) = grids.get(i) else {
+                    return Err(GpuError::InvalidArgument("the local tone grid is missing".into()));
+                };
+                GpuNode::LocalTone(LocalToneOp {
+                    id: *grid,
+                    grid: Arc::clone(data),
+                    highlights: *highlights,
+                    shadows: *shadows,
+                    whites: *whites,
+                    blacks: *blacks,
+                })
+            }
+            TailOp::Filter { radius, box_kernel, high } => {
+                GpuNode::Filter(FilterOp { sigma: radius / 1000.0 * long, box_kernel: *box_kernel, high: *high })
+            }
+            TailOp::Sharpen { amount, radius, threshold } => {
+                GpuNode::Sharpen(SharpenOp { amount: *amount, radius_px: radius / 1000.0 * long, threshold: *threshold })
+            }
+            _ => continue,
+        });
+    }
+    Ok(nodes)
 }
 
 pub fn gpu_tone(tone: ToneMap) -> GpuToneMap {
@@ -261,6 +319,7 @@ impl<B: Backend> GpuSession<B> {
     /// Drops every GPU image (out of memory, device lost, preview size change).
     fn release_all(&mut self, generation: u64) {
         self.bases.drain();
+        self.backend.free_caches();
         for class in self.classes.drain() {
             self.retire(class, generation);
         }
@@ -291,10 +350,18 @@ impl<B: Backend> GpuSession<B> {
 
     /// Renders the frame into the display target. `base` is needed when [`Begin::NeedBase`] was
     /// returned. Never panics; every failure becomes a CPU frame (or `Failed` in GPU-only mode).
-    #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn show(&mut self, key: &BaseKey, base: Option<&ImageBuf>, ops: &[TailOp], display: DisplayArgs, generation: u64, shown: u64) -> Shown {
+        self.show_with(key, base, ops, &[], display, generation, shown)
+    }
+
+    /// [`GpuSession::show`] for a tail with neighbourhood operations: `grids` has one entry per
+    /// operation (`Some` for the local tone ones, see `Evaluator::tail_grid`); it may be empty for a
+    /// pointwise tail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn show_with(&mut self, key: &BaseKey, base: Option<&ImageBuf>, ops: &[TailOp], grids: &TailGrids, display: DisplayArgs, generation: u64, shown: u64) -> Shown {
         self.sweep(shown);
-        match self.try_show(key, base, ops, display, generation) {
+        match self.try_show(key, base, ops, grids, display, generation) {
             Ok(picture) => {
                 self.fallback.on_success();
                 Shown::Gpu(picture)
@@ -303,7 +370,7 @@ impl<B: Backend> GpuSession<B> {
         }
     }
 
-    fn try_show(&mut self, key: &BaseKey, base: Option<&ImageBuf>, ops: &[TailOp], display: DisplayArgs, generation: u64) -> Result<GpuPicture, GpuError> {
+    fn try_show(&mut self, key: &BaseKey, base: Option<&ImageBuf>, ops: &[TailOp], grids: &TailGrids, display: DisplayArgs, generation: u64) -> Result<GpuPicture, GpuError> {
         if !self.bases.contains(key) {
             let img = base.ok_or_else(|| GpuError::Readback("the base image was not provided".into()))?;
             let (w, h) = (img.width(), img.height());
@@ -328,16 +395,16 @@ impl<B: Backend> GpuSession<B> {
             self.stats.classes_created += 1;
             drop(self.classes.insert((w, h), class));
         }
-        let gpu_ops = point_ops(ops);
+        let nodes = gpu_nodes(ops, grids, (w, h))?;
         let (Some(held), Some(class)) = (self.bases.get_mut(key), self.classes.get_mut(&(w, h))) else {
             return Err(GpuError::Readback("GPU images vanished".into()));
         };
-        self.backend.render(&held.image, class, &gpu_ops, display.exposure_ev, display.tone)?;
+        self.backend.render(&held.image, class, &nodes, display.exposure_ev, display.tone)?;
         self.stats.renders += 1;
         // The UI shows the picture as soon as it is told: make sure the work is done.
         self.backend.wait_idle();
         let texture = self.backend.texture_id(class);
-        self.last = Some(Last { key: *key, class: (w, h), ops_empty: gpu_ops.is_empty(), display });
+        self.last = Some(Last { key: *key, class: (w, h), ops_empty: nodes.is_empty(), display });
         Ok(GpuPicture { texture, width: w, height: h })
     }
 
@@ -425,7 +492,7 @@ pub mod fake {
     pub struct FakeBackend {
         pub live_images: Rc<Cell<usize>>,
         pub live_classes: Rc<Cell<usize>>,
-        pub renders: Vec<(usize, Vec<PointOp>)>,
+        pub renders: Vec<(usize, Vec<GpuNode>)>,
         pub fail_upload: Option<GpuError>,
         pub fail_class: Option<GpuError>,
         pub fail_render: Option<GpuError>,
@@ -487,7 +554,7 @@ pub mod fake {
         fn release_class(&mut self, _class: FakeClass) {
             self.live_classes.set(self.live_classes.get() - 1);
         }
-        fn render(&mut self, base: &FakeImage, _c: &FakeClass, ops: &[PointOp], _ev: f32, _t: GpuToneMap) -> Result<(), GpuError> {
+        fn render(&mut self, base: &FakeImage, _c: &mut FakeClass, ops: &[GpuNode], _ev: f32, _t: GpuToneMap) -> Result<(), GpuError> {
             if let Some(e) = &self.fail_render {
                 return Err(e.clone());
             }

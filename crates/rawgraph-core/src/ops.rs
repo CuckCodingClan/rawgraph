@@ -267,7 +267,13 @@ fn box_filter(data: &[f32], w: usize, h: usize, radius: usize, passes: usize) ->
 
 /// Radii from this size on are blurred on a box-downscaled copy and sampled
 /// back bilinearly; smaller radii use the exact full-resolution path.
-const LOW_RES_MIN_RADIUS: usize = 16;
+pub const LOW_RES_MIN_RADIUS: usize = 16;
+
+/// Downscale factor of a box blur of `radius` >= [`LOW_RES_MIN_RADIUS`]: the largest power of
+/// two that keeps at least 8 low-res pixels of radius. The GPU filter follows the same rule.
+pub fn low_res_scale(radius: usize) -> usize {
+    1usize << (radius / 8).ilog2()
+}
 
 /// A blurred image that may still live at reduced resolution.
 enum Blurred {
@@ -381,8 +387,7 @@ fn blurred(img: &ImageBuf, radius: usize, passes: usize, downscaled: &mut Vec<(u
     if radius < LOW_RES_MIN_RADIUS {
         return Some(Blurred::Full(blur_exact(img, radius, passes)));
     }
-    // Largest power of two that keeps at least 8 low-res pixels of radius.
-    let scale = 1usize << (radius / 8).ilog2();
+    let scale = low_res_scale(radius);
     if !downscaled.iter().any(|(s, _)| *s == scale) {
         downscaled.push((scale, box_downscale(img, scale)));
     }
@@ -838,26 +843,56 @@ fn local_tone_coefficients(l: &[f32], lw: usize, lh: usize) -> Vec<f32> {
     fine.chunks_exact(4).zip(coarse.chunks_exact(4)).flat_map(|(f, c)| [f[0], f[1], c[0], c[1]]).collect()
 }
 
-/// Local tone with optional spatial control values; the base is computed once.
-pub fn develop_local_tone_mapped(img: &mut ImageBuf, highlights: f32, shadows: f32, whites: f32, blacks: f32, maps: &DevelopControlMaps<'_>) {
-    maps.validate(img.width() as usize * img.height() as usize);
-    if highlights == 0.0 && shadows == 0.0 && whites == 0.0 && blacks == 0.0 && maps.highlights.is_none() && maps.shadows.is_none() && maps.whites.is_none() && maps.blacks.is_none() { return; }
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    if w == 0 || h == 0 { return; }
-    let lum: Vec<f32> = img.data().par_chunks_exact(4).map(|px| {
+/// The guided-filter coefficients of the local tone on their coarse grid (at most
+/// [`LOCAL_GRID`] px on the long edge): four floats `[a_fine, b_fine, a_coarse, b_coarse]` per
+/// cell, row-major. It is all the neighbourhood information the per-pixel part needs, so a
+/// Lights / Shadows / White / Black change only has to re-run the per-pixel part.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalToneGrid {
+    pub width: u32,
+    pub height: u32,
+    pub coeff: Vec<f32>,
+}
+
+/// Log2 luminance in stops around mid grey of every pixel (the guide of the local tone).
+fn local_tone_log_luminance(img: &ImageBuf) -> Vec<f32> {
+    img.data().par_chunks_exact(4).map(|px| {
         let y = AP1_LUMA[0]*px[0] + AP1_LUMA[1]*px[1] + AP1_LUMA[2]*px[2];
         (if y.is_finite() && y > 0.0 { y / 0.18 } else { 0.0 } + LOCAL_FLOOR).log2()
-    }).collect();
+    }).collect()
+}
+
+fn local_tone_grid_from_lum(lum: &[f32], w: usize, h: usize) -> LocalToneGrid {
     let long = w.max(h);
     let (lw, lh) = if long > LOCAL_GRID {
         let s = LOCAL_GRID as f32 / long as f32;
         (((w as f32 * s).round() as usize).max(1), ((h as f32 * s).round() as usize).max(1))
     } else { (w, h) };
     let coeff = if (lw, lh) == (w, h) {
-        local_tone_coefficients(&lum, w, h)
+        local_tone_coefficients(lum, w, h)
     } else {
-        local_tone_coefficients(&area_resize(&lum, w, h, lw, lh), lw, lh)
+        local_tone_coefficients(&area_resize(lum, w, h, lw, lh), lw, lh)
     };
+    LocalToneGrid { width: lw as u32, height: lh as u32, coeff }
+}
+
+/// The coefficient grid the local tone estimates from `img` (the image it is applied to, i.e.
+/// after the exposure gain). `None` for an empty image.
+pub fn local_tone_grid(img: &ImageBuf) -> Option<LocalToneGrid> {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w == 0 || h == 0 { return None; }
+    Some(local_tone_grid_from_lum(&local_tone_log_luminance(img), w, h))
+}
+
+/// Local tone with optional spatial control values; the base is computed once.
+pub fn develop_local_tone_mapped(img: &mut ImageBuf, highlights: f32, shadows: f32, whites: f32, blacks: f32, maps: &DevelopControlMaps<'_>) {
+    maps.validate(img.width() as usize * img.height() as usize);
+    if highlights == 0.0 && shadows == 0.0 && whites == 0.0 && blacks == 0.0 && maps.highlights.is_none() && maps.shadows.is_none() && maps.whites.is_none() && maps.blacks.is_none() { return; }
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w == 0 || h == 0 { return; }
+    let lum = local_tone_log_luminance(img);
+    let LocalToneGrid { width: lw, height: lh, coeff } = local_tone_grid_from_lum(&lum, w, h);
+    let (lw, lh) = (lw as usize, lh as usize);
     let (xt, yt) = (centre_taps(w, lw), centre_taps(h, lh));
     img.data_mut().par_chunks_exact_mut(w * 4).enumerate().for_each(|(y, row)| {
         let (y0, y1, fy) = yt[y];

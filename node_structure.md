@@ -210,6 +210,8 @@ The inspector displays Radius as a percentage of the long edge; stored values ar
 | Kernel | `kernel` | Gaussian | Gaussian / Box / Lens (disk) / Motion / Radial zoom / Radial spin / Shape (diamond) / Median / Bilateral |
 | Motion angle | `angle` | 0 | 0 to 360 deg |
 
+GPU preview: Gaussian and Box, low and high pass, without a connected Radius map, run in the GPU tail (separable passes). The other kernels and a connected Radius or Direction map are a CPU base.
+
 ### Noise Reduction (`NoiseReduction`)
 
 - **Inputs:** Images: Images (required)
@@ -233,6 +235,8 @@ The inspector displays Radius as a percentage of the long edge; stored values ar
 | Amount | `amount` | 0 | 0 to 3 |
 | Radius | `radius` | 0.15 | 0.05 to 2 ‰ of long edge |
 | Threshold | `threshold` | 0 | 0 to 1 |
+
+GPU preview: runs in the GPU tail unless an Amount map is connected (then the node is a CPU base).
 
 ### Clarity / Texture (`Clarity`)
 
@@ -278,6 +282,8 @@ The inspector displays Radius as a percentage of the long edge; stored values ar
 | Default baseline | `baseline_default` | 0.35 | -2 to 3 EV |
 | Brightness | `brightness` | 1.6 | -3 to 3 EV |
 | Legacy tone | `legacy_tone` | Off | Off / On |
+
+GPU preview: the base part (white balance, baseline, brightness) is the cached CPU base; all tone values run in the GPU tail. Without Legacy tone, Lights / Shadows / White / Black are a neighbourhood operation there: its 512 px guided-filter grid is estimated on the CPU from the base with the exposure gain applied (cached; it does not depend on the four values, Contrast, Dynamic or Saturation) and only the per-pixel part runs on the GPU. A connected control map keeps the node on the CPU.
 
 ## Effects
 
