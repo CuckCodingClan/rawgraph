@@ -168,7 +168,13 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
                 }
             }
         } else {
+            let keyword_measure = matches!(kind, NodeKind::MetadataFilter | NodeKind::MetadataSplit)
+                && session.project.graph.node(id).is_some_and(|n| n.choice("measure", image) == rawgraph_core::Measure::Keyword as usize);
             for name in rest {
+                // The Keyword measure has no numeric range; the numeric measures have no keyword test.
+                if matches!(kind, NodeKind::MetadataFilter | NodeKind::MetadataSplit) && ((keyword_measure && matches!(name, "min" | "max" | "missing")) || (!keyword_measure && name == "keyword_op")) {
+                    continue;
+                }
                 if kind == NodeKind::Generator && (name.starts_with("start_") || name.starts_with("end_") || (name.starts_with("ramp_") && !matches!(name, "ramp_interpolation" | "ramp_smoothness" | "ramp_dither"))) { continue; }
                 if kind == NodeKind::Blur && name == "angle" && !session.project.graph.node(id).is_some_and(|n| n.choice("kernel", image) == 3) {
                     continue;
@@ -233,7 +239,7 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
         _ => {}
     }
     if kind == NodeKind::MetadataFilter {
-        filter_section(ui, session, id);
+        filter_section(ui, session, id, image);
     }
     if kind == NodeKind::Merge {
         merge_section(ui, session, id);
@@ -580,9 +586,17 @@ fn param_widget_opts(ui: &mut egui::Ui, session: &mut Session, id: rawgraph_core
     }
 }
 
-fn filter_section(ui: &mut egui::Ui, session: &Session, id: rawgraph_core::NodeId) {
+fn filter_section(ui: &mut egui::Ui, session: &mut Session, id: rawgraph_core::NodeId, image: rawgraph_core::ImageId) {
+    let keyword = session.project.graph.node(id).is_some_and(|n| n.choice("measure", image) == rawgraph_core::Measure::Keyword as usize);
+    if keyword {
+        node_ui::keyword_filter_field(ui, session, id, image);
+    }
     ui.add_space(8.0);
     ui.group(|ui| match session.collection.filters.get(&id) {
+        Some(s) if keyword => {
+            ui.label(RichText::new(filter_text(s)).strong());
+            ui.label(RichText::new("Keeps images with a keyword that contains the text (any part of the path, upper and lower case alike), or, with \"does not contain\", images without one. Images without keywords contain nothing.").weak());
+        }
         Some(s) => {
             ui.label(RichText::new(filter_text(s)).strong());
             ui.label(RichText::new("Keeps images whose metadata value lies in the range. Images without the value follow the Missing metadata option.").weak());

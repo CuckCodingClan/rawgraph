@@ -217,8 +217,8 @@ fn description_is_stored_as_utf8_in_imagedescription() {
 
 #[test]
 fn select_applies_every_switch() {
-    let all = MetaSelection { camera: true, exposure: true, date: true, gps: true, author: true, software: true };
-    let none = MetaSelection { camera: false, exposure: false, date: false, gps: false, author: false, software: false };
+    let all = MetaSelection { camera: true, exposure: true, date: true, gps: true, author: true, software: true, keywords: true };
+    let none = MetaSelection { camera: false, exposure: false, date: false, gps: false, author: false, software: false, keywords: false };
     let full = ExportMetadata { software: Some("App 1".into()), ..with_gps(gps_cases()[0], Some("desc")) };
     assert_eq!(full.select(&all), full, "all on keeps everything");
     assert_eq!(

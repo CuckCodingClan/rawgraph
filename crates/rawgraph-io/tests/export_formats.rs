@@ -62,6 +62,7 @@ fn meta() -> ExportMetadata {
         software: None,
         gps: None,
         description: None,
+        keywords: Vec::new(),
     }
 }
 

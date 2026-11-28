@@ -102,12 +102,21 @@ impl ViewSettings {
     }
 }
 
-type Edit = (u8, Flag, Option<ColorLabel>);
+/// Rating, flag, label and keywords of an image edited while a scan runs.
+type Edit = (u8, Flag, Option<ColorLabel>, Vec<String>);
 
-/// The capture metadata of an entry with the source path filled in (what the collection queries need).
+/// The capture metadata of an entry with the source path and the keywords filled in (what the
+/// collection queries need).
 pub fn capture_with_path(e: &ImageEntry) -> CaptureInfo {
-    let mut c = e.capture.clone();
+    let mut c = capture_with_keywords(e);
     c.path = Some(e.path.to_string_lossy().into_owned());
+    c
+}
+
+/// The capture metadata of an entry with its keywords (what the image provider hands to the graph).
+pub fn capture_with_keywords(e: &ImageEntry) -> CaptureInfo {
+    let mut c = e.capture.clone();
+    c.keywords = e.keywords.clone();
     c
 }
 
@@ -163,6 +172,9 @@ pub struct Session {
     pub project: Project,
     pub provider: Arc<FileProvider>,
     pub selected: Option<ImageId>,
+    /// Further selected images (Ctrl/Shift+click in the filmstrip); the selection as a whole is
+    /// [`Session::selected_images`]. Session-only, never saved.
+    pub image_sel: std::collections::BTreeSet<ImageId>,
     /// The primary node: the one selected last (the inspector shows it).
     pub selected_node: Option<NodeId>,
     /// All selected nodes; its primary node is `selected_node`.
@@ -225,6 +237,7 @@ impl Session {
             project,
             provider,
             selected: None,
+            image_sel: std::collections::BTreeSet::new(),
             selected_node: None,
             node_sel: NodeSelection::default(),
             edit_gen: 0,
@@ -546,12 +559,12 @@ impl Session {
         self.provider.reset_paths();
         if self.demo {
             self.provider.set_paths(self.demo_entries.iter().map(|e| (e.id, e.path.clone())));
-            self.provider.set_captures(self.demo_entries.iter().map(|e| (e.id, e.capture.clone())));
+            self.provider.set_captures(self.demo_entries.iter().map(|e| (e.id, capture_with_keywords(e))));
         } else {
             self.provider.set_paths(self.project.images().iter().map(|e| (e.id, e.path.clone())));
-            self.provider.set_captures(self.project.images().iter().map(|e| (e.id, e.capture.clone())));
+            self.provider.set_captures(self.project.images().iter().map(|e| (e.id, capture_with_keywords(e))));
             self.provider.set_paths(self.scan_map.values().map(|e| (e.id, e.path.clone())));
-            self.provider.set_captures(self.scan_map.values().map(|e| (e.id, e.capture.clone())));
+            self.provider.set_captures(self.scan_map.values().map(|e| (e.id, capture_with_keywords(e))));
         }
     }
 
@@ -576,7 +589,7 @@ impl Session {
         self.edit_gen += 1;
         if self.scanning {
             if let Some(e) = self.entry(id) {
-                let edit = (e.rating, e.flag, e.color_label);
+                let edit = (e.rating, e.flag, e.color_label, e.keywords.clone());
                 self.scan_edits.insert(id, edit);
             }
         }
@@ -600,6 +613,120 @@ impl Session {
     pub fn toggle_label(&mut self, id: ImageId, label: ColorLabel) -> bool {
         let new = if self.entry(id).and_then(|e| e.color_label) == Some(label) { None } else { Some(label) };
         self.edit_entry(id, |e| e.color_label = new)
+    }
+
+    // ------------------------------------------------------------ keywords
+
+    /// Applies `edit` to the keyword list of every image in `ids` (project entries and, during a
+    /// scan, the entries found so far). Returns the images that changed. The graph's keyword
+    /// measure sees the change at once; the project counts as unsaved.
+    pub fn edit_keywords(&mut self, ids: &[ImageId], edit: impl Fn(&mut Vec<String>) -> bool) -> Vec<ImageId> {
+        if self.demo {
+            return Vec::new();
+        }
+        let mut changed = Vec::new();
+        for &id in ids {
+            let mut hit = false;
+            for entry in self.project.image_mut(id).into_iter().chain(self.scan_map.get_mut(&id)) {
+                hit |= edit(&mut entry.keywords);
+            }
+            if hit {
+                changed.push(id);
+            }
+        }
+        self.after_keyword_edit(&changed);
+        changed
+    }
+
+    /// Renames a keyword in the whole project (and the entries of a running scan). Returns the images that changed.
+    pub fn rename_keyword(&mut self, from: &str, to: &str) -> Vec<ImageId> {
+        let ids: Vec<ImageId> = self.project.images().iter().map(|e| e.id).chain(self.scan_map.keys().copied()).collect();
+        let (from, to) = (from.to_owned(), to.to_owned());
+        self.edit_keywords(&ids, move |list| rawgraph_core::keywords::rename_in_list(list, &from, &to))
+    }
+
+    fn after_keyword_edit(&mut self, changed: &[ImageId]) {
+        if changed.is_empty() {
+            return;
+        }
+        let pushed: Vec<(ImageId, CaptureInfo)> = changed.iter().filter_map(|id| self.entry(*id).map(|e| (*id, capture_with_keywords(e)))).collect();
+        if self.scanning {
+            for id in changed {
+                if let Some(e) = self.entry(*id) {
+                    let edit = (e.rating, e.flag, e.color_label, e.keywords.clone());
+                    self.scan_edits.insert(*id, edit);
+                }
+            }
+        }
+        self.provider.set_captures(pushed);
+        self.images_gen += 1;
+        self.touch();
+        if !self.scanning {
+            self.refresh_visible();
+        }
+    }
+
+    /// Every keyword in use with the number of images that carry exactly it (project entries and,
+    /// during a scan, the entries found so far), sorted.
+    pub fn keyword_counts(&self) -> Vec<rawgraph_project::KeywordCount> {
+        if self.demo {
+            return Vec::new();
+        }
+        let extra = self.scan_map.values().filter(|e| self.project.image(e.id).is_none());
+        rawgraph_project::count_keywords(self.project.images().iter().chain(extra))
+    }
+
+    /// The keywords the graph sees for an image (test helper).
+    #[cfg(test)]
+    pub fn provider_keywords(&self, id: ImageId) -> Vec<String> {
+        self.provider.capture(id).map(|c| c.keywords).unwrap_or_default()
+    }
+
+    // ------------------------------------------------------------ image selection
+
+    /// The selected images: the Ctrl/Shift selection when there is one, otherwise the primary image.
+    pub fn selected_images(&self) -> Vec<ImageId> {
+        let multi: Vec<ImageId> = self.image_sel.iter().copied().filter(|id| self.entry(*id).is_some()).collect();
+        match self.selected {
+            Some(sel) if multi.contains(&sel) => multi,
+            // The primary image moved on without the list (arrow keys, other code): it is the selection.
+            Some(sel) => vec![sel],
+            None => multi,
+        }
+    }
+
+    /// A click on an image of the list `ids`: plain = only this one, Ctrl = toggle it in the
+    /// selection, Shift = everything between the primary image and this one.
+    pub fn click_image(&mut self, id: ImageId, ctrl: bool, shift: bool, ids: &[ImageId]) {
+        if shift {
+            let anchor = self.selected.and_then(|s| ids.iter().position(|x| *x == s));
+            let to = ids.iter().position(|x| *x == id);
+            if let (Some(a), Some(b)) = (anchor, to) {
+                let (lo, hi) = (a.min(b), a.max(b));
+                self.image_sel.extend(ids[lo..=hi].iter().copied());
+                return;
+            }
+        }
+        if ctrl {
+            if self.image_sel.is_empty() {
+                self.image_sel.extend(self.selected);
+            }
+            if !self.image_sel.remove(&id) {
+                self.image_sel.insert(id);
+            }
+            if self.image_sel.contains(&id) {
+                self.selected = Some(id);
+            } else if self.selected == Some(id) {
+                self.selected = self.image_sel.iter().next().copied().or(Some(id));
+            }
+            if self.image_sel.len() <= 1 {
+                // One image left: back to the plain selection.
+                self.image_sel.clear();
+            }
+            return;
+        }
+        self.image_sel.clear();
+        self.selected = Some(id);
     }
 
     // ------------------------------------------------------------ scan
@@ -644,14 +771,14 @@ impl Session {
 
     pub fn scan_catalog(&mut self, entries: Vec<ImageEntry>) {
         self.provider.set_paths(entries.iter().map(|e| (e.id, e.path.clone())));
-        self.provider.set_captures(entries.iter().map(|e| (e.id, e.capture.clone())));
+        self.provider.set_captures(entries.iter().map(|e| (e.id, capture_with_keywords(e))));
         self.scan_map.extend(entries.into_iter().map(|e| (e.id, e)));
         self.images_gen += 1;
         self.refresh_visible();
     }
 
     pub fn scan_metadata(&mut self, entries: Vec<ImageEntry>) {
-        self.provider.set_captures(entries.iter().map(|e| (e.id, e.capture.clone())));
+        self.provider.set_captures(entries.iter().filter_map(|e| self.scan_map.get(&e.id).map(|old| (e.id, CaptureInfo { keywords: old.keywords.clone(), ..e.capture.clone() }))));
         for entry in entries {
             if let Some(e) = self.scan_map.get_mut(&entry.id) { e.capture = entry.capture; }
         }
@@ -669,14 +796,15 @@ impl Session {
         let mut captures = Vec::new();
         for mut entry in entries {
             let id = entry.id;
-            let old = self.entry(id);
-            if old.is_none_or(|e| e.path != entry.path) { paths.push((id, entry.path.clone())); }
-            if old.is_none_or(|e| e.capture != entry.capture) { captures.push((id, entry.capture.clone())); }
-            if let Some((r, f, l)) = self.scan_edits.get(&id) {
+            if let Some((r, f, l, k)) = self.scan_edits.get(&id) {
                 entry.rating = *r;
                 entry.flag = *f;
                 entry.color_label = *l;
+                entry.keywords = k.clone();
             }
+            let old = self.entry(id);
+            if old.is_none_or(|e| e.path != entry.path) { paths.push((id, entry.path.clone())); }
+            if old.is_none_or(|e| capture_with_keywords(e) != capture_with_keywords(&entry)) { captures.push((id, capture_with_keywords(&entry))); }
             self.scan_map.insert(id, entry);
         }
         if !paths.is_empty() || !captures.is_empty() {
@@ -688,17 +816,18 @@ impl Session {
     }
 
     /// The scan worker is done: swap in the finished project, keeping what the
-    /// user changed meanwhile (graph, ratings, flags, labels).
+    /// user changed meanwhile (graph, ratings, flags, labels, keywords).
     pub fn finish_scan(&mut self, mut finished: Project, force_dirty: bool) {
         // The scan worked on a copy: carry over the commit state (revision, history) of the
         // project the user may have saved meanwhile, or the next save would conflict with it.
         finished.inherit_versioning(&self.project);
         finished.graph = self.project.graph.clone();
-        for (id, (r, f, l)) in std::mem::take(&mut self.scan_edits) {
+        for (id, (r, f, l, k)) in std::mem::take(&mut self.scan_edits) {
             if let Some(e) = finished.image_mut(id) {
                 e.rating = r;
                 e.flag = f;
                 e.color_label = l;
+                e.keywords = k;
             }
         }
         // Compared after everything the user did meanwhile is taken over: a scan that brought nothing

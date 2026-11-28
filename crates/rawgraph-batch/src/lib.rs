@@ -71,7 +71,8 @@ pub struct ExportSettings {
     pub out_dir: PathBuf,
     pub format: ExportFormat,
     /// Placeholders: `{name}` source file stem, `{index}` 1-based position in the batch,
-    /// `{index:04}` zero-padded, `{id}` image id. Default `{name}`.
+    /// `{index:04}` zero-padded, `{id}` image id, `{keywords}` the last level of every keyword of
+    /// the image joined with `-` (file-name safe, empty without keywords). Default `{name}`.
     pub name_template: String,
     /// Exact long edge of the output in pixels; `None` = see `percent`. Never upscales. Wins over
     /// `percent`.
@@ -119,7 +120,7 @@ impl Default for ExportSettings {
             embed_profile: true,
             copy_metadata: true,
             space: OutputSpace::Srgb,
-            meta: MetaSelection { camera: true, exposure: true, date: true, gps: false, author: true, software: true },
+            meta: MetaSelection { camera: true, exposure: true, date: true, gps: false, author: true, software: true, keywords: true },
             artist: None,
             copyright: None,
             description: None,
@@ -168,7 +169,7 @@ pub fn settings_from_spec(spec: &ExportSpec, display: DisplayTransform) -> Expor
         display,
         generator_view_tone: display.tone_map,
         embed_profile: spec.embed_profile,
-        copy_metadata: m.camera || m.exposure || m.date || m.gps || m.author || m.software || description.is_some(),
+        copy_metadata: m.camera || m.exposure || m.date || m.gps || m.author || m.software || m.keywords || description.is_some(),
         space: spec.space,
         meta: m,
         artist: non_empty(&spec.text.artist),
@@ -182,6 +183,16 @@ pub fn settings_from_spec(spec: &ExportSpec, display: DisplayTransform) -> Expor
 pub struct ExportItem {
     pub id: ImageId,
     pub source: PathBuf,
+    /// Keywords of the image (normalised): the `{keywords}` file name token, the keyword measure of
+    /// the graph's filters and, with the Keywords switch on, the XMP keywords of rendered files.
+    pub keywords: Vec<String>,
+}
+
+impl ExportItem {
+    /// An item without keywords.
+    pub fn new(id: ImageId, source: PathBuf) -> Self {
+        ExportItem { id, source, keywords: Vec::new() }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -288,7 +299,7 @@ fn plan(item: &ExportItem, index: usize, settings: &ExportSettings, tokens: &[te
     let stem = if item.source.as_os_str().is_empty() { format!("generated-{}", item.id.0) } else if let Some(stem) = item.source.file_stem().map(|s| s.to_string_lossy().into_owned()) { stem } else {
         return invalid(format!("source {} has no file name", item.source.display()));
     };
-    let name = template::expand(tokens, &stem, index, item.id.0);
+    let name = template::expand(tokens, &stem, index, item.id.0, &item.keywords);
     template::check_stem(&name).map_err(|e| ExportError::InvalidSettings(format!("{e} (source {})", item.source.display())))?;
     Ok(settings.out_dir.join(format!("{name}.{}", extension(settings.format))))
 }
@@ -377,6 +388,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) struct CatalogProvider<'a> {
     order: Vec<ImageId>,
     paths: HashMap<ImageId, PathBuf>,
+    keywords: HashMap<ImageId, Vec<String>>,
     read_capture: CaptureReader<'a>,
     read_lens: LensReader<'a>,
     captures: Mutex<HashMap<ImageId, CaptureInfo>>,
@@ -388,9 +400,13 @@ impl<'a> CatalogProvider<'a> {
     pub(crate) fn new(catalog: &[ExportItem], read_capture: CaptureReader<'a>, read_lens: LensReader<'a>) -> Self {
         let mut order = Vec::with_capacity(catalog.len());
         let mut paths = HashMap::with_capacity(catalog.len());
+        let mut keywords = HashMap::new();
         for it in catalog {
             if it.source.as_os_str().is_empty() { continue; }
             if let std::collections::hash_map::Entry::Vacant(v) = paths.entry(it.id) {
+                if !it.keywords.is_empty() {
+                    keywords.insert(it.id, it.keywords.clone());
+                }
                 order.push(it.id);
                 v.insert(it.source.clone());
             }
@@ -398,6 +414,7 @@ impl<'a> CatalogProvider<'a> {
         CatalogProvider {
             order,
             paths,
+            keywords,
             read_capture,
             read_lens,
             captures: Mutex::new(HashMap::new()),
@@ -441,6 +458,7 @@ impl ImageProvider for CatalogProvider<'_> {
         // filter's Missing option).
         let mut info = (self.read_capture)(path).unwrap_or_default();
         info.path = Some(path.to_string_lossy().into_owned());
+        info.keywords = self.keywords.get(&id).cloned().unwrap_or_default();
         lock(&self.captures).insert(id, info.clone());
         Some(info)
     }
@@ -563,12 +581,15 @@ fn effective_long_edge(settings: &ExportSettings, width: u32, height: u32) -> Op
 
 /// The metadata block of one export: the source's, narrowed to the selected groups, plus the
 /// overrides. `None` when metadata is switched off.
-fn build_metadata(source: &Path, settings: &ExportSettings) -> Option<rawgraph_io::ExportMetadata> {
+fn build_metadata(source: &Path, settings: &ExportSettings, keywords: &[String]) -> Option<rawgraph_io::ExportMetadata> {
     if !settings.copy_metadata {
         return None;
     }
     // Reading metadata never fails an item: an unreadable source gives an (almost) empty block.
-    let mut meta = rawgraph_io::read_export_metadata(source).select(&settings.meta);
+    let mut meta = rawgraph_io::read_export_metadata(source);
+    // The keywords come from the project, not from the source file.
+    meta.keywords = keywords.to_vec();
+    let mut meta = meta.select(&settings.meta);
     let set = |v: &Option<String>| v.as_ref().filter(|s| !s.is_empty()).cloned();
     if settings.meta.author {
         if let Some(a) = set(&settings.artist) {
@@ -711,7 +732,7 @@ fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job
         }
     };
     drop(image);
-    let metadata = build_metadata(&item.source, settings);
+    let metadata = build_metadata(&item.source, settings, &item.keywords);
 
     if ctx.cancel.is_cancelled() {
         return ItemStatus::Cancelled;
@@ -853,7 +874,7 @@ pub(crate) fn export_node_with(
         .map(|(&id, s)| match by_id.get(&id) {
             Some(it) => Job { item: (*it).clone(), settings: s, pre_failure: None },
             None => Job {
-                item: ExportItem { id, source: PathBuf::new() },
+                item: ExportItem { id, source: PathBuf::new(), keywords: Vec::new() },
                 settings: s,
                 pre_failure: (!members.contains(&id)).then(|| format!("image {} is not part of the project", id.0)),
             },

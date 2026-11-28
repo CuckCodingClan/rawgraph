@@ -1,4 +1,4 @@
-# RawGraph project file format (schema 2)
+# RawGraph project file format (schema 3)
 
 Implemented by the crate `rawgraph-project`. A project is one SQLite database
 (extension `.rawgraph`, rusqlite with bundled SQLite). Source images are never
@@ -10,6 +10,7 @@ part of it.
 |---|---|
 | `meta` | `key` TEXT PK, `value` TEXT. Keys: `application` (`rawgraph`), `schema_version`, `next_image_id`, `project_uuid`, `revision`. Recovery copies add `recovery_*` keys. |
 | `images` | `position` INTEGER PK (project order), `id` INTEGER UNIQUE (numeric image id used by graphs), `uuid` TEXT UNIQUE, `path` TEXT (absolute), `content_hash` TEXT, `file_size` INTEGER, `modified_unix_ms` INTEGER NULL, `capture` TEXT (JSON of the camera metadata), `rating` 0..5, `flag` (`none`/`pick`/`reject`), `color_label` NULL, `missing` 0/1 |
+| `keywords` | `image_id` INTEGER, `keyword` TEXT, primary key `(image_id, keyword)`, `WITHOUT ROWID` (schema 3): one row per keyword of an image, see "Keywords" below |
 | `graph` | `id` INTEGER PK (always 1), `json` TEXT (the node graph, with its own `format_version`) |
 | `folders` | `position` INTEGER PK, `path` TEXT, `recursive` 0/1: folders that were scanned into the project |
 | `history` | `revision` INTEGER PK, `time_unix_ms`, `author`, `device`, `summary` (all NOT NULL), `graph_json` TEXT NULL (the graph of that revision, NULL once dropped) |
@@ -22,7 +23,8 @@ Two ways, both all-or-nothing. Which one is used is decided per file (see "Which
   belongs to the same project and has the current schema version): one SQLite
   transaction updates the file where it lies. Only rows that differ are written:
   changed or new `images` rows (matched by `id`; rows that only moved get a new
-  `position`), the `graph` row if its JSON changed, `folders` if the list changed,
+  `position`), the `keywords` rows that were added or removed (per image, compared as sets; the rows of a removed
+  image are deleted), the `graph` row if its JSON changed, `folders` if the list changed,
   the `meta` values that changed (other `meta` keys are removed, so the result equals
   a full write), and the new `history` entry. Old history entries are not rewritten
   (and their snapshots are not read: a snapshot never changes, so metadata and
@@ -145,7 +147,7 @@ share gets the full write).
 ## What is stored, what is not
 
 - Stored: image entries (path, size, partial content hash, capture metadata,
-  rating, flag, colour label, missing state), the graph with all per-image
+  rating, flag, colour label, keywords, missing state), the graph with all per-image
   parameters, the scanned folders, the history.
 - Not stored: image pixels, sidecars, thumbnails (a separate cache outside the
   project), UI state, the scan thread count. Source images are referenced by
@@ -157,7 +159,7 @@ share gets the full write).
 ## Versioning and migration
 
 - `meta.schema_version` is an integer, `SCHEMA_VERSION` is the highest one this
-  build writes (2).
+  build writes (3).
 - Loading a file with an older version copies it into an in-memory database,
   runs the ordered steps `vN -> vN+1` there, and reads the result. The file on
   disk is not modified by loading.
@@ -166,14 +168,50 @@ share gets the full write).
 - The first write over an older file (`save` or `commit`) first copies it to
   `<name>.v<N>.bak`; if that exists, `<name>.v<N> (2).bak`, `(3)`, and so on. An
   existing backup is never overwritten. A failed copy aborts the write.
-- Adding schema 3: bump `SCHEMA_VERSION`, update the table SQL and reader/writer
-  in `store.rs`, write `migrate_2_to_3(&Connection)` and append `(2, migrate_2_to_3)`
-  to `MIGRATIONS`. A test fails if a step is missing.
+- Adding a schema version N+1 (schema 3 was added this way): bump `SCHEMA_VERSION`, update the
+  table SQL, the full writer, the reader and the row-by-row `apply_diff` in `store.rs`, write
+  `migrate_N_to_N1(&Connection)` and append `(N, migrate_N_to_N1)` to `MIGRATIONS`. A test fails if
+  a step is missing.
+- Migration 2 -> 3 creates the empty `keywords` table (no image had keywords before) and nothing
+  else. Loading a schema-2 file does not touch it; the first write (`save` or `commit`) converts it
+  as a whole file (an in-place update needs the current schema) after copying it to
+  `<name>.v2.bak`. A file written by this build cannot be opened by a build that only knows schema 2
+  (`ProjectError::TooNew`); keep the `.v2.bak` copy for going back (keywords are not in it).
 - Migration 1 -> 2 adds `images.uuid` (generated per image), `project_uuid`,
   `revision = 0`, and empty `folders` and `history`. A fixture of a real schema 1
   file is in `crates/rawgraph-project/tests/fixtures/`. Each load of a schema 1
   file generates fresh uuids, because the file is not changed; they become
   permanent with the first write.
+
+## Keywords
+
+Schema 3 stores the keywords (Stichwörter) of every image in the `keywords` table, one row per
+`(image_id, keyword)`; `image_id` is `images.id`. In the program they are `ImageEntry::keywords`, a
+sorted `Vec<String>`.
+
+- A keyword is plain text or a hierarchical path `Parent|Child|Grandchild`, the convention of
+  Lightroom's `lr:hierarchicalSubject`. The path is the keyword: `Travel|Italy` and `Travel` are two
+  keywords (the second is the parent; it only has a row when an image carries it itself).
+- The text keeps the case it was typed in and is compared case-insensitively (Unicode lower-casing);
+  an image never holds two keywords that differ only in case (the first spelling wins). Levels are
+  trimmed, empty levels dropped, control characters and runs of blanks become one blank, a path is
+  cut at 200 characters. The list is sorted by the lower-cased text. Rows that violate this are
+  normalised when loaded; the next in-place commit corrects them in the file.
+- In-place commits compare the stored rows with the project per image and write only the rows that
+  were added or removed (rows of removed images are deleted). Where the whole file is rewritten
+  (network drive, sync folder, "Always rewrite the whole project file", migration, save as) the
+  table is written like every other table.
+- Keywords are part of the current state only: they are not in the revision history (like ratings,
+  flags and labels). The project summary of a save counts "keyword changes".
+- Keywords are not stored in the capture metadata of an image (`images.capture`): the graph reads
+  them from the `keywords` table through the image provider (the Keyword measure of Metadata Filter
+  and Split by Metadata).
+- A rename is a change of the keyword rows of every image that has the keyword or one below it
+  (`Travel` renamed to `Trips` turns `Travel|Italy` into `Trips|Italy`; a rename into an existing
+  keyword merges them).
+- XMP: `Project::apply_xmp_keywords` merges the keywords of `dc:subject` (flat names) and
+  `lr:hierarchicalSubject` (paths) into an image (a union; nothing is removed). A flat name is only
+  added when no path ends in it.
 
 ## Ids
 

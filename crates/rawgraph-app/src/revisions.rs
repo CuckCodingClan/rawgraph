@@ -15,7 +15,7 @@ use crate::session::Session;
 
 // ------------------------------------------------------------------ summary of a save
 
-type Cull = (u8, Flag, Option<ColorLabel>);
+type Cull = (u8, Flag, Option<ColorLabel>, Vec<String>);
 
 /// The state of the document as of the last commit or load: what a new
 /// revision's summary is compared against.
@@ -27,7 +27,7 @@ pub struct Baseline {
 
 impl Baseline {
     pub fn of(project: &Project) -> Self {
-        Self { graph: project.graph.clone(), images: project.images().iter().map(|e| (e.id, (e.rating, e.flag, e.color_label))).collect() }
+        Self { graph: project.graph.clone(), images: project.images().iter().map(|e| (e.id, (e.rating, e.flag, e.color_label, e.keywords.clone()))).collect() }
     }
 
     /// A short factual text of what changed since the baseline; "Saved" when nothing can be derived.
@@ -44,13 +44,14 @@ impl Baseline {
         add(d.removed.len(), "node removed", "nodes removed");
         add(d.param_changes, "parameter change", "parameter changes");
         add(d.edge_changes, "connection change", "connection changes");
-        let now: HashMap<ImageId, Cull> = project.images().iter().map(|e| (e.id, (e.rating, e.flag, e.color_label))).collect();
+        let now: HashMap<ImageId, Cull> = project.images().iter().map(|e| (e.id, (e.rating, e.flag, e.color_label, e.keywords.clone()))).collect();
         add(now.keys().filter(|k| !self.images.contains_key(k)).count(), "image added", "images added");
         add(self.images.keys().filter(|k| !now.contains_key(k)).count(), "image removed", "images removed");
         let both = || now.iter().filter_map(|(k, v)| self.images.get(k).map(|old| (old, v)));
         add(both().filter(|(o, n)| o.0 != n.0).count(), "rating", "ratings");
         add(both().filter(|(o, n)| o.1 != n.1).count(), "flag", "flags");
         add(both().filter(|(o, n)| o.2 != n.2).count(), "label", "labels");
+        add(both().filter(|(o, n)| o.3 != n.3).count(), "keyword change", "keyword changes");
         if parts.is_empty() {
             "Saved".to_owned()
         } else {

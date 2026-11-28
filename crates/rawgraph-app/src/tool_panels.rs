@@ -54,26 +54,36 @@ pub fn split_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
         buf = RangeBuf { key: Some(key), applied: graph_rows.clone(), rows: graph_rows, message: None };
     }
 
+    // The Keyword measure: every range is a keyword test (the name is the text), no numbers.
+    let keyword = session.project.graph.node(id).is_some_and(|n| n.choice("measure", image) == rawgraph_core::Measure::Keyword as usize);
     ui.add_space(8.0);
     ui.group(|ui| {
         ui.set_min_width(ui.available_width());
-        ui.label(RichText::new("Ranges").strong());
-        ui.label(RichText::new("An image leaves through the first range that contains its value; the others go to Unmatched.").weak());
+        ui.label(RichText::new(if keyword { "Keywords" } else { "Ranges" }).strong());
+        if keyword {
+            ui.label(RichText::new("The name of a range is the keyword text to look for (upper and lower case alike, any part of the path). An image leaves through the first range it matches; the others go to Unmatched. With \"does not contain\" an image matches when it has no such keyword.").weak());
+        } else {
+            ui.label(RichText::new("An image leaves through the first range that contains its value; the others go to Unmatched.").weak());
+        }
         let mut remove = None;
         if buf.rows.is_empty() {
-            ui.label(RichText::new("No ranges yet: every image is Unmatched.").weak());
+            ui.label(RichText::new(if keyword { "No keywords yet: every image is Unmatched." } else { "No ranges yet: every image is Unmatched." }).weak());
         } else {
-            egui::Grid::new(("ranges-grid", id.0)).num_columns(4).spacing([6.0, 4.0]).show(ui, |ui| {
-                ui.label(RichText::new("Name").weak());
-                ui.label(RichText::new("Min").weak());
-                ui.label(RichText::new("Max").weak());
+            egui::Grid::new(("ranges-grid", id.0)).num_columns(if keyword { 2 } else { 4 }).spacing([6.0, 4.0]).show(ui, |ui| {
+                ui.label(RichText::new(if keyword { "Keyword" } else { "Name" }).weak());
+                if !keyword {
+                    ui.label(RichText::new("Min").weak());
+                    ui.label(RichText::new("Max").weak());
+                }
                 ui.label("");
                 ui.end_row();
                 for (i, row) in buf.rows.iter_mut().enumerate() {
-                    ui.add_sized([112.0, 20.0], egui::TextEdit::singleline(&mut row.name).char_limit(60));
-                    for v in [&mut row.min, &mut row.max] {
-                        let speed = (v.abs() * 0.01).max(0.001);
-                        ui.add(egui::DragValue::new(v).speed(speed).custom_formatter(|n, _| number_text(n as f32)).custom_parser(|t| t.trim().parse::<f64>().ok()));
+                    ui.add_sized([if keyword { 190.0 } else { 112.0 }, 20.0], egui::TextEdit::singleline(&mut row.name).char_limit(60));
+                    if !keyword {
+                        for v in [&mut row.min, &mut row.max] {
+                            let speed = (v.abs() * 0.01).max(0.001);
+                            ui.add(egui::DragValue::new(v).speed(speed).custom_formatter(|n, _| number_text(n as f32)).custom_parser(|t| t.trim().parse::<f64>().ok()));
+                        }
                     }
                     if crate::icons::button(ui, crate::icons::Icon::Delete, "Delete this range", true).clicked() {
                         remove = Some(i);
@@ -87,7 +97,7 @@ pub fn split_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
         }
         let can_add = buf.rows.len() < rawgraph_core::graph::MAX_RANGES;
         ui.horizontal(|ui| {
-            if ui.add_enabled(can_add, egui::Button::new("Add range")).on_hover_text("Up to six ranges").clicked() {
+            if ui.add_enabled(can_add, egui::Button::new(if keyword { "Add keyword" } else { "Add range" })).on_hover_text("Up to six").clicked() {
                 if let Some(row) = ranges_logic::next_row(&buf.rows) {
                     buf.rows.push(row);
                 }
@@ -119,7 +129,7 @@ pub fn split_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
             Some(s) => {
                 ui.label(RichText::new(format!("{} image(s) reach this node", crate::collection::with_thousands(s.reaching))).strong());
                 for (port, n) in s.per_port.iter().take(rawgraph_core::graph::SPLIT_RANGES).enumerate() {
-                    if let Some(row) = graph_rows_name(session, id, image, port) {
+                    if let Some(row) = graph_rows_name(session, id, image, port, keyword) {
                         ui.label(format!("{row}: {} image(s)", crate::collection::with_thousands(*n)));
                     }
                 }
@@ -138,8 +148,8 @@ pub fn split_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
 }
 
 /// Name of range `port` if it is defined for `image`.
-fn graph_rows_name(session: &Session, id: NodeId, image: ImageId, port: usize) -> Option<String> {
-    ranges_of(session, id, image).get(port).map(|r| format!("{} ({}..{})", r.name, number_text(r.min), number_text(r.max)))
+fn graph_rows_name(session: &Session, id: NodeId, image: ImageId, port: usize, keyword: bool) -> Option<String> {
+    ranges_of(session, id, image).get(port).map(|r| if keyword { r.name.clone() } else { format!("{} ({}..{})", r.name, number_text(r.min), number_text(r.max)) })
 }
 
 // ---------------------------------------------------------------- drawing
@@ -318,7 +328,8 @@ mod tests {
         let (mut s, id) = session_with(NodeKind::MetadataSplit);
         let img = s.current_image();
         apply_ranges(&mut s, id, img, &[r("Low", 0.0, 400.0)]).unwrap();
-        assert_eq!(graph_rows_name(&s, id, img, 0).as_deref(), Some("Low (0..400)"));
-        assert_eq!(graph_rows_name(&s, id, img, 1), None);
+        assert_eq!(graph_rows_name(&s, id, img, 0, false).as_deref(), Some("Low (0..400)"));
+        assert_eq!(graph_rows_name(&s, id, img, 0, true).as_deref(), Some("Low"));
+        assert_eq!(graph_rows_name(&s, id, img, 1, false), None);
     }
 }

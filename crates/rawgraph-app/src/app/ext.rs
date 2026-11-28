@@ -507,7 +507,8 @@ impl App {
         if self.cli.import_xmp || self.session.demo {
             return;
         }
-        let opts = xmp_import::XmpOptions::default();
+        // The quiet look only counts ratings; keywords are merged by the import dialog.
+        let opts = xmp_import::XmpOptions { merge_keywords: false, ..Default::default() };
         let (targets, skipped) = xmp_import::pick_targets(self.session.project.images(), &opts);
         if targets.is_empty() {
             return;

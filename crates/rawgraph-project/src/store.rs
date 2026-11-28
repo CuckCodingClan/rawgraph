@@ -1,15 +1,15 @@
-//! SQLite persistence: one file holding `meta`, `images`, `graph`, `folders`
-//! and `history` (schema 2), plus the schema migrations.
+//! SQLite persistence: one file holding `meta`, `images`, `keywords`, `graph`, `folders`
+//! and `history` (schema 3), plus the schema migrations.
 //!
 //! # Adding a schema version
 //!
-//! To introduce schema 3:
-//! 1. raise [`SCHEMA_VERSION`] to 3 and update `SCHEMA_SQL` / the writer and
-//!    reader for the new layout;
-//! 2. write `fn migrate_2_to_3(conn: &Connection) -> Result<(), ProjectError>`
-//!    that turns a schema-2 database into schema 3 with plain SQL (and Rust
+//! To introduce schema N+1 (schema 3 was added exactly this way):
+//! 1. raise [`SCHEMA_VERSION`] and update `SCHEMA_SQL` / the writer, the reader and the
+//!    row-by-row `apply_diff` for the new layout;
+//! 2. write `fn migrate_N_to_N1(conn: &Connection) -> Result<(), ProjectError>`
+//!    that turns a schema-N database into schema N+1 with plain SQL (and Rust
 //!    where values must be generated). It must not touch `schema_version`;
-//! 3. append `(2, migrate_2_to_3)` to [`MIGRATIONS`].
+//! 3. append `(N, migrate_N_to_N1)` to [`MIGRATIONS`].
 //!
 //! Steps run in order on an in-memory copy of the file, so a failing step
 //! never damages the file on disk; the test `migration_chain_is_complete`
@@ -46,6 +46,11 @@ CREATE TABLE images (
     color_label  TEXT,
     missing      INTEGER NOT NULL
 );
+CREATE TABLE keywords (
+    image_id INTEGER NOT NULL,
+    keyword  TEXT NOT NULL,
+    PRIMARY KEY (image_id, keyword)
+) WITHOUT ROWID;
 CREATE TABLE graph (
     id   INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
     json TEXT NOT NULL
@@ -69,7 +74,7 @@ CREATE TABLE history (
 type Migration = fn(&Connection) -> Result<(), ProjectError>;
 
 /// Ordered migration steps, `(from_version, step)`. See the module documentation.
-const MIGRATIONS: &[(u32, Migration)] = &[(1, migrate_1_to_2)];
+const MIGRATIONS: &[(u32, Migration)] = &[(1, migrate_1_to_2), (2, migrate_2_to_3)];
 
 fn db_err(e: rusqlite::Error) -> ProjectError {
     if let rusqlite::Error::SqliteFailure(f, _) = &e {
@@ -186,6 +191,14 @@ fn write_all(
                 e.modified_unix_ms,
             ])
             .map_err(db_err)?;
+        }
+    }
+    {
+        let mut ins = tx.prepare("INSERT INTO keywords (image_id, keyword) VALUES (?1, ?2)").map_err(db_err)?;
+        for e in &project.images {
+            for k in &e.keywords {
+                ins.execute(params![to_i64(e.id.0, "image id")?, k]).map_err(db_err)?;
+            }
         }
     }
     tx.execute("INSERT INTO graph (id, json) VALUES (1, ?1)", params![project.graph.to_json()]).map_err(db_err)?;
@@ -502,6 +515,18 @@ fn migrate_1_to_2(conn: &Connection) -> Result<(), ProjectError> {
     Ok(())
 }
 
+/// Schema 2 -> 3: the `keywords` table (empty: no image had keywords before).
+fn migrate_2_to_3(conn: &Connection) -> Result<(), ProjectError> {
+    conn.execute_batch(
+        "CREATE TABLE keywords (
+             image_id INTEGER NOT NULL,
+             keyword  TEXT NOT NULL,
+             PRIMARY KEY (image_id, keyword)
+         ) WITHOUT ROWID;",
+    )
+    .map_err(db_err)
+}
+
 /// Reads a database that is in the current schema.
 fn read_current(conn: &Connection) -> Result<Project, ProjectError> {
     let next_text = get_meta(conn, "next_image_id")?.ok_or_else(|| ProjectError::Corrupt("missing next_image_id".into()))?;
@@ -549,6 +574,18 @@ fn read_current(conn: &Connection) -> Result<Project, ProjectError> {
         })
         .map_err(db_err)?;
 
+    let mut keywords: HashMap<u64, Vec<String>> = HashMap::new();
+    {
+        let mut kstmt = conn.prepare("SELECT image_id, keyword FROM keywords").map_err(db_err)?;
+        let krows = kstmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).map_err(db_err)?;
+        for k in krows {
+            let (image_id, keyword) = k.map_err(db_err)?;
+            if let Ok(image_id) = u64::try_from(image_id) {
+                keywords.entry(image_id).or_default().push(keyword);
+            }
+        }
+    }
+
     let mut images: Vec<ImageEntry> = Vec::new();
     for row in rows {
         let row = row.map_err(db_err)?;
@@ -579,6 +616,7 @@ fn read_current(conn: &Connection) -> Result<Project, ProjectError> {
             rating,
             flag: flag_from_text(&row.flag)?,
             color_label: row.label.as_deref().map(label_from_text).transpose()?,
+            keywords: keywords.remove(&id).map(rawgraph_core::keywords::normalize_keywords).unwrap_or_default(),
             missing: row.missing != 0,
         });
     }
@@ -827,6 +865,7 @@ fn apply_diff(tx: &Connection, project: &Project, ver: &Versioning<'_>) -> Resul
         tx.execute("DELETE FROM meta WHERE key NOT IN ('application', 'schema_version', 'next_image_id', 'project_uuid', 'revision')", [])?;
     }
     diff_images(tx, project)?;
+    diff_keywords(tx, project)?;
     diff_graph(tx, project)?;
     diff_folders(tx, project)?;
     diff_history(tx, ver)?;
@@ -907,6 +946,42 @@ fn diff_images(tx: &Connection, project: &Project) -> Result<(), DiffError> {
                 mv.execute(params![pos, id])?;
             }
             Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Writes only the keyword rows that differ: rows of images that are gone, rows no longer
+/// wanted, rows that are new. Unchanged images cost nothing.
+fn diff_keywords(tx: &Connection, project: &Project) -> Result<(), DiffError> {
+    let mut old: HashMap<i64, HashSet<String>> = HashMap::new();
+    {
+        let mut stmt = tx.prepare("SELECT image_id, keyword FROM keywords")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (id, keyword) = row?;
+            old.entry(id).or_default().insert(keyword);
+        }
+    }
+    let mut del = tx.prepare("DELETE FROM keywords WHERE image_id = ?1 AND keyword = ?2")?;
+    let mut ins = tx.prepare("INSERT INTO keywords (image_id, keyword) VALUES (?1, ?2)")?;
+    let mut present: HashSet<i64> = HashSet::with_capacity(project.images.len());
+    for e in &project.images {
+        let id = to_i64(e.id.0, "image id")?;
+        present.insert(id);
+        let have = old.remove(&id).unwrap_or_default();
+        let want: HashSet<&String> = e.keywords.iter().collect();
+        for gone in have.iter().filter(|k| !want.contains(k)) {
+            del.execute(params![id, gone])?;
+        }
+        for k in e.keywords.iter().filter(|k| !have.contains(*k)) {
+            ins.execute(params![id, k])?;
+        }
+    }
+    // Rows of images that no longer exist (what is left in `old`).
+    for (id, keywords) in old {
+        for k in keywords {
+            del.execute(params![id, k])?;
         }
     }
     Ok(())

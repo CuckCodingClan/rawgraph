@@ -52,6 +52,8 @@ pub struct Filmstrip {
     pub actions: Vec<FilmAction>,
     /// "n images have ratings in XMP" banner above the list (set by the app).
     pub xmp_banner: Option<usize>,
+    /// The keyword panel under the list (K focuses its add field).
+    pub keyword_panel: crate::keyword_panel::KeywordPanel,
 }
 
 pub(crate) fn gallery_keyboard_available(ctx: &egui::Context) -> bool {
@@ -61,7 +63,7 @@ pub(crate) fn gallery_keyboard_available(ctx: &egui::Context) -> bool {
 
 impl Filmstrip {
     pub fn with_thumbs(thumbs: ThumbLoader, live: crate::live_thumbs::LiveThumbs) -> Self {
-        Self { thumbs, live, live_wanted: Vec::new(), live_visible: 0, last_selected: None, last_range: 0..0, scan_wanted: Vec::new(), scan_hash_pending: false, actions: Vec::new(), xmp_banner: None }
+        Self { thumbs, live, live_wanted: Vec::new(), live_visible: 0, last_selected: None, last_range: 0..0, scan_wanted: Vec::new(), scan_hash_pending: false, actions: Vec::new(), xmp_banner: None, keyword_panel: Default::default() }
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
@@ -81,6 +83,7 @@ impl Filmstrip {
     /// Header controls. Returns true if the filter or sort changed.
     fn header(ui: &mut egui::Ui, session: &mut Session) -> bool {
         let before = session.filter.clone();
+        let counts = session.keyword_counts();
         let f = &mut session.filter;
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
         ui.add(egui::TextEdit::singleline(&mut f.text).hint_text("Filter by name").desired_width(f32::INFINITY));
@@ -125,6 +128,7 @@ impl Filmstrip {
                     ui.selectable_value(&mut f.flash, Some(false), "No flash");
                 });
         });
+        Self::keyword_filter(ui, f, &counts);
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("flt-sort").width(66.0).selected_text(format!("Sort: {}", sort_label(f.sort))).show_ui(ui, |ui| {
                 for k in SORT_KEYS {
@@ -140,6 +144,47 @@ impl Filmstrip {
             }
         });
         session.filter != before
+    }
+
+    /// The keyword filter: a button with the summary that opens the list of all keywords of the
+    /// project (tree, with counts), Any/All and "No keywords".
+    fn keyword_filter(ui: &mut egui::Ui, f: &mut crate::filter::FilterUi, counts: &[rawgraph_project::KeywordCount]) {
+        use rawgraph_core::keywords::{keyword_depth, keyword_is_within, keyword_leaf, keywords_equal, tree_paths};
+        use rawgraph_project::KeywordMatch;
+        let button = ui.add(egui::Button::new(f.keyword_summary()).selected(f.keyword_filter_active())).on_hover_text("Show only images with these keywords");
+        egui::Popup::from_toggle_button_response(&button).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            ui.set_min_width(220.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut f.keyword_match, KeywordMatch::Any, "Any of them");
+                ui.selectable_value(&mut f.keyword_match, KeywordMatch::All, "All of them");
+            });
+            if ui.checkbox(&mut f.no_keywords, "No keywords").changed() && f.no_keywords {
+                f.keywords.clear();
+            }
+            ui.separator();
+            if counts.is_empty() {
+                ui.weak("No image has keywords yet.");
+            }
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                for path in tree_paths(&counts.iter().map(|c| c.keyword.clone()).collect::<Vec<_>>()) {
+                    // A path counts the images that carry it or anything below it.
+                    let below: usize = counts.iter().filter(|c| keyword_is_within(&c.keyword, &path)).map(|c| c.images).sum();
+                    let on = f.keywords.iter().any(|k| keywords_equal(k, &path));
+                    ui.horizontal(|ui| {
+                        ui.add_space((keyword_depth(&path) - 1) as f32 * 14.0);
+                        let mut checked = on;
+                        if ui.checkbox(&mut checked, keyword_leaf(&path)).on_hover_text(&path).changed() {
+                            f.toggle_keyword(&path);
+                        }
+                        ui.weak(below.to_string());
+                    });
+                }
+            });
+            if ui.add_enabled(f.keyword_filter_active(), egui::Button::new("Clear keyword filter")).clicked() {
+                f.keywords.clear();
+                f.no_keywords = false;
+            }
+        });
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, session: &mut Session, mut target: ViewerTarget, members: Option<&std::collections::HashSet<rawgraph_core::ImageId>>) {
@@ -209,7 +254,8 @@ impl Filmstrip {
             }
             self.last_selected = target.image;
         }
-        let mut clicked = None;
+        let mut clicked: Option<(rawgraph_core::ImageId, egui::Modifiers)> = None;
+        let multi: std::collections::BTreeSet<rawgraph_core::ImageId> = session.image_sel.clone();
         let out = scroll.show_rows(ui, ROW_H, rows, |ui, range| {
             for row in range.clone() {
                 ui.horizontal(|ui| {
@@ -217,11 +263,11 @@ impl Filmstrip {
                     for &id in ids.iter().skip(row * columns).take(columns) {
                         if let Some(entry) = session.entry(id).cloned() {
                             let tex = self.live.texture(id).or_else(|| self.thumbs.texture(id));
-                            let resp = draw_row(ui, width, &entry, target.image == Some(id), tex.as_ref(), self.thumbs.has_failed(id), false);
+                            let resp = draw_row(ui, width, &entry, target.image == Some(id) || multi.contains(&id), tex.as_ref(), self.thumbs.has_failed(id), false);
                             if self.live.stale(id) {
                                 ui.painter().circle_filled(resp.rect.right_top() + egui::vec2(-8.0, 8.0), 2.5, Color32::from_rgb(255, 184, 77));
                             }
-                            if resp.clicked() { clicked = Some(id); }
+                            if resp.clicked() { clicked = Some((id, ui.input(|i| i.modifiers))); }
                             resp.context_menu(|ui| {
                                 if ui.button("Set as reference").clicked() { self.actions.push(FilmAction::SetReference(id)); ui.close(); }
                                 if entry.missing {
@@ -240,7 +286,7 @@ impl Filmstrip {
                             }
                             if target.image == Some(id) { ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, Color32::LIGHT_BLUE), egui::StrokeKind::Inside); }
                             if self.live.stale(id) { ui.painter().circle_filled(rect.right_top() + egui::vec2(-8.0, 8.0), 2.5, Color32::from_rgb(255, 184, 77)); }
-                            if resp.clicked() { clicked = Some(id); }
+                            if resp.clicked() { clicked = Some((id, ui.input(|i| i.modifiers))); }
                         }
                     }
                 });
@@ -249,7 +295,10 @@ impl Filmstrip {
         });
         let range = out.inner;
         self.last_range = range.clone();
-        if let Some(id) = clicked.filter(|_| !target.image_pinned) { session.selected = Some(id); }
+        if let Some((id, mods)) = clicked.filter(|_| !target.image_pinned) {
+            // Ctrl/Cmd+click toggles, Shift+click selects a range (the keyword panel works on all of them).
+            session.click_image(id, mods.command, mods.shift, &ids);
+        }
         let (lo, hi) = (range.start.saturating_sub(MARGIN_ROWS), (range.end + MARGIN_ROWS).min(rows));
         let mut order: Vec<usize> = (range.start..range.end).collect();
         order.extend((range.end..hi).chain((lo..range.start).rev()));
@@ -269,6 +318,11 @@ impl Filmstrip {
     pub(crate) fn request_live(&mut self, ctx: &egui::Context, session: &mut Session, target: ViewerTarget, gpu: bool) {
         if self.live_wanted.is_empty() { self.live.suspend(); }
         else { self.live.request(ctx, session, target, (&self.live_wanted, self.live_visible), gpu); }
+    }
+
+    /// The keyword panel for the selected images, shown under the details.
+    pub fn keywords_ui(&mut self, ui: &mut egui::Ui, session: &mut Session) {
+        self.keyword_panel.show(ui, session);
     }
 
     /// Details of the selected image, shown under the list.

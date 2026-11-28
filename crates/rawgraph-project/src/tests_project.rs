@@ -136,7 +136,7 @@ fn fixture_v1_loads_intact_and_the_file_is_not_touched() {
 }
 
 #[test]
-fn first_commit_over_a_v1_file_keeps_a_backup_and_writes_schema_2() {
+fn first_commit_over_a_v1_file_keeps_a_backup_and_writes_the_current_schema() {
     let t = Tmp::new();
     let file = t.v1_copy("old.rawgraph");
     let original = fs::read(&file).unwrap();
@@ -147,7 +147,7 @@ fn first_commit_over_a_v1_file_keeps_a_backup_and_writes_schema_2() {
     assert_eq!(p.commit(&file, "migrate").unwrap(), 1);
     let bak = t.path("old.rawgraph.v1.bak");
     assert_eq!(fs::read(&bak).unwrap(), original, "the backup is the untouched old file");
-    assert_eq!(schema_version_of(&file), "2");
+    assert_eq!(schema_version_of(&file), SCHEMA_VERSION.to_string());
     assert!(!t.path("old.rawgraph.saving").exists());
 
     let back = Project::load(&file).unwrap();
@@ -158,7 +158,7 @@ fn first_commit_over_a_v1_file_keeps_a_backup_and_writes_schema_2() {
     assert_eq!(back.history().len(), 1);
     assert_eq!(back.image(ImageId(1)).unwrap().rating, 5);
 
-    // A file that is already schema 2 gets no further backup.
+    // A file that already has the current schema gets no further backup.
     let mut back = back;
     back.commit(&file, "again").unwrap();
     let baks: Vec<_> = fs::read_dir(&t.0).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".bak")).collect();

@@ -109,12 +109,14 @@ pub struct MetaSelection {
     pub gps: bool,
     pub author: bool,
     pub software: bool,
+    /// The keywords of the image (dc:subject / lr:hierarchicalSubject).
+    pub keywords: bool,
 }
 
 impl Default for MetaSelection {
     /// The defaults of the Export node: everything except GPS.
     fn default() -> Self {
-        MetaSelection { camera: true, exposure: true, date: true, gps: false, author: true, software: true }
+        MetaSelection { camera: true, exposure: true, date: true, gps: false, author: true, software: true, keywords: true }
     }
 }
 
@@ -193,6 +195,7 @@ pub fn export_spec(node: &Node, image: ImageId) -> ExportSpec {
             gps: node.toggle("meta_gps", image),
             author: node.toggle("meta_author", image),
             software: node.toggle("meta_software", image),
+            keywords: node.toggle("meta_keywords", image),
         },
         text,
     }

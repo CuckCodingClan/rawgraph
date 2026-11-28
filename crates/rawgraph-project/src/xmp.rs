@@ -1,4 +1,4 @@
-//! XMP culling data (rating and colour label) and its import into a project.
+//! XMP culling data (rating, colour label and keywords) and its import into a project.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -11,21 +11,65 @@ use rawgraph_core::ImageId;
 use crate::{ColorLabel, Flag, Project, ProjectError};
 
 const XMP_NS: &str = "http://ns.adobe.com/xap/1.0/";
+const DC_NS: &str = "http://purl.org/dc/elements/1.1/";
+const LR_NS: &str = "http://ns.adobe.com/lightroom/1.0/";
 /// Real packets are a few KiB; anything beyond this is not a sidecar.
 const MAX_XMP_BYTES: usize = 4 * 1024 * 1024;
 
-/// Rating and colour label as found in an XMP packet.
+/// Rating, colour label and keywords as found in an XMP packet.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct XmpCulling {
     /// As written: -1 = rejected in Adobe tools, 0..=5.
     pub rating: Option<i8>,
     pub label: Option<String>,
+    /// Keywords: the paths of `lr:hierarchicalSubject` (`Parent|Child`) plus the names of
+    /// `dc:subject` that no path ends in, normalised and sorted. Empty when the packet has none.
+    pub keywords: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Field {
     Rating,
     Label,
+}
+
+/// The two keyword lists of a packet.
+#[derive(Clone, Copy, PartialEq)]
+enum KeywordList {
+    /// `dc:subject`: flat names.
+    Flat,
+    /// `lr:hierarchicalSubject`: `Parent|Child` paths.
+    Hierarchical,
+}
+
+#[derive(Default)]
+struct Keywords {
+    flat: Vec<String>,
+    hierarchical: Vec<String>,
+    list: Option<KeywordList>,
+    in_item: bool,
+    text: String,
+}
+
+impl Keywords {
+    fn finish(self, out: &mut XmpCulling) {
+        out.keywords = rawgraph_core::keywords::merge_xmp_keywords(&self.flat, &self.hierarchical);
+    }
+}
+
+fn list_of(prefixes: &HashMap<String, String>, qname: &[u8]) -> Option<KeywordList> {
+    let (prefix, local) = split_name(qname);
+    let (prefix, local) = (std::str::from_utf8(prefix).ok()?, std::str::from_utf8(local).ok()?);
+    let uri = prefixes.get(prefix).map(String::as_str);
+    match local {
+        "subject" if uri == Some(DC_NS) || (uri.is_none() && prefix == "dc") => Some(KeywordList::Flat),
+        "hierarchicalSubject" if uri == Some(LR_NS) || (uri.is_none() && prefix == "lr") => Some(KeywordList::Hierarchical),
+        _ => None,
+    }
+}
+
+fn is_list_item(qname: &[u8]) -> bool {
+    split_name(qname).1 == b"li"
 }
 
 fn split_name(name: &[u8]) -> (&[u8], &[u8]) {
@@ -100,7 +144,8 @@ fn scan_attributes(prefixes: &mut HashMap<String, String>, out: &mut XmpCulling,
 }
 
 /// Parses an XMP packet (sidecar content or an embedded packet) and extracts
-/// `xmp:Rating` and `xmp:Label`, written as attributes or child elements.
+/// `xmp:Rating` and `xmp:Label`, written as attributes or child elements, and the keywords of
+/// `dc:subject` and `lr:hierarchicalSubject`.
 /// Input that is not XMP yields `Ok(default)` or an error, never a panic.
 pub fn parse_xmp_culling(xmp: &str) -> Result<XmpCulling, ProjectError> {
     if xmp.len() > MAX_XMP_BYTES {
@@ -109,12 +154,14 @@ pub fn parse_xmp_culling(xmp: &str) -> Result<XmpCulling, ProjectError> {
     let mut reader = Reader::from_str(xmp);
     let mut prefixes: HashMap<String, String> = HashMap::new();
     let mut out = XmpCulling::default();
+    let mut kw = Keywords::default();
     let mut current: Option<Field> = None;
     loop {
         let event = match reader.read_event() {
             Ok(ev) => ev,
             Err(e) => {
-                if out.rating.is_some() || out.label.is_some() {
+                if out.rating.is_some() || out.label.is_some() || !kw.flat.is_empty() || !kw.hierarchical.is_empty() {
+                    kw.finish(&mut out);
                     return Ok(out);
                 }
                 return Err(ProjectError::Corrupt(format!("XMP is not well-formed: {e}")));
@@ -124,22 +171,57 @@ pub fn parse_xmp_culling(xmp: &str) -> Result<XmpCulling, ProjectError> {
             Event::Start(e) => {
                 scan_attributes(&mut prefixes, &mut out, &e);
                 current = field_of(&prefixes, e.name().as_ref());
+                if let Some(list) = list_of(&prefixes, e.name().as_ref()) {
+                    kw.list = Some(list);
+                } else if kw.list.is_some() && is_list_item(e.name().as_ref()) {
+                    kw.in_item = true;
+                    kw.text.clear();
+                }
             }
             Event::Empty(e) => {
                 scan_attributes(&mut prefixes, &mut out, &e);
                 current = None;
             }
             Event::Text(t) => {
+                let text = String::from_utf8_lossy(t.as_ref()).into_owned();
+                if kw.in_item {
+                    kw.text.push_str(&text);
+                }
                 if let Some(field) = current {
-                    let text = String::from_utf8_lossy(t.as_ref()).into_owned();
                     store(&mut out, field, &text);
                 }
             }
-            Event::End(_) => current = None,
+            Event::CData(t) if kw.in_item => kw.text.push_str(&String::from_utf8_lossy(t.as_ref())),
+            Event::GeneralRef(r) if kw.in_item => match r.resolve_char_ref() {
+                Ok(Some(c)) => kw.text.push(c),
+                _ => match r.as_ref() {
+                    b"amp" => kw.text.push('&'),
+                    b"lt" => kw.text.push('<'),
+                    b"gt" => kw.text.push('>'),
+                    b"quot" => kw.text.push('"'),
+                    b"apos" => kw.text.push('\''),
+                    _ => {}
+                },
+            },
+            Event::End(e) => {
+                current = None;
+                if kw.in_item && is_list_item(e.name().as_ref()) {
+                    kw.in_item = false;
+                    let text = std::mem::take(&mut kw.text);
+                    match kw.list {
+                        Some(KeywordList::Flat) => kw.flat.push(text),
+                        Some(KeywordList::Hierarchical) => kw.hierarchical.push(text),
+                        None => {}
+                    }
+                } else if list_of(&prefixes, e.name().as_ref()).is_some() {
+                    kw.list = None;
+                }
+            }
             Event::Eof => break,
             _ => {}
         }
     }
+    kw.finish(&mut out);
     Ok(out)
 }
 
@@ -216,10 +298,20 @@ impl Project {
         changed
     }
 
+    /// Adds the keywords of an XMP packet to an entry (a union: nothing is removed). Returns whether
+    /// anything changed.
+    pub fn apply_xmp_keywords(&mut self, id: ImageId, xmp: &XmpCulling) -> bool {
+        if xmp.keywords.is_empty() {
+            return false;
+        }
+        let Some(entry) = self.image_mut(id) else { return false };
+        crate::keywords::add_to_list(&mut entry.keywords, &xmp.keywords)
+    }
+
     /// For every non-missing entry with a sidecar: read, parse, apply. With
     /// `only_unrated`, only entries that still have rating 0, no flag and no
-    /// label are touched. Unreadable or broken sidecars are skipped. Returns
-    /// the ids that changed.
+    /// label are touched. Unreadable or broken sidecars are skipped. The keywords of the
+    /// sidecars are merged into the entries (a union, nothing is removed). Returns the ids that changed.
     pub fn import_xmp_sidecars(&mut self, only_unrated: bool) -> Vec<ImageId> {
         let todo: Vec<(ImageId, PathBuf)> = self
             .images()
@@ -231,7 +323,9 @@ impl Project {
         let mut changed = Vec::new();
         for (id, sidecar) in todo {
             if let Some(xmp) = read_sidecar(&sidecar) {
-                if self.apply_xmp_culling(id, &xmp) {
+                let a = self.apply_xmp_culling(id, &xmp);
+                let b = self.apply_xmp_keywords(id, &xmp);
+                if a || b {
                     changed.push(id);
                 }
             }

@@ -179,7 +179,7 @@ fn settings_from_spec_maps_every_field() {
     assert_eq!((s.artist, s.copyright, s.description), (None, None, None));
 
     // Everything switched off means no metadata block at all.
-    for g in ["meta_camera", "meta_exposure", "meta_date", "meta_gps", "meta_author", "meta_software"] {
+    for g in ["meta_camera", "meta_exposure", "meta_date", "meta_gps", "meta_author", "meta_software", "meta_keywords"] {
         r.p(g, 0.0);
     }
     let node = r.g.node(r.exp).expect("node");
@@ -480,6 +480,7 @@ fn full_meta() -> rawgraph_io::ExportMetadata {
         software: None,
         gps: Some(rawgraph_io::GpsInfo { latitude: 47.07, longitude: 15.44, altitude_m: Some(353.0) }),
         description: None,
+        keywords: Vec::new(),
     }
 }
 
@@ -541,6 +542,7 @@ fn default_metadata_has_no_gps_and_gps_can_be_enabled() {
     for (g, _) in GROUPS {
         r.p(g, 0.0);
     }
+    r.p("meta_keywords", 0.0);
     assert!(exif_of(&r.first_path()).is_none());
 }
 
@@ -1149,4 +1151,66 @@ fn an_unreadable_lut_fails_only_its_own_images() {
         other => panic!("{other:?}"),
     }
     assert!(matches!(rep.items[1].1, ItemStatus::Written { .. }));
+}
+
+// ------------------------------------------------------------------------------ keywords
+
+fn tag(r: &mut Rig, id: usize, keywords: &[&str]) {
+    r.catalog[id].keywords = keywords.iter().map(|k| (*k).to_owned()).collect();
+}
+
+#[test]
+fn keywords_reach_the_exported_files_and_follow_the_switch() {
+    for (format, ext) in [(0.0, "jpg"), (1.0, "png"), (3.0, "tif"), (9.0, "webp")] {
+        let mut r = Rig::one(16, 16, [90, 90, 90]);
+        tag(&mut r, 0, &["Reise|Österreich|Graz", "Food"]);
+        r.p("format", format);
+        r.p("collision", 1.0);
+        let path = r.first_path();
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some(ext));
+        let packet = rawgraph_io::read_xmp_packet(&path).unwrap_or_else(|| panic!("{ext}: no packet"));
+        assert!(packet.contains("<rdf:li>Graz</rdf:li>") && packet.contains("<rdf:li>Reise|Österreich|Graz</rdf:li>"), "{ext}: {packet}");
+        // Switch off: the file carries no keywords.
+        r.p("meta_keywords", 0.0);
+        assert_eq!(rawgraph_io::read_xmp_packet(&r.first_path()), None, "{ext}");
+    }
+    // Other formats and untagged images: no packet.
+    let mut r = Rig::new(&[("a.png", 8, 8, [10, 10, 10]), ("b.png", 8, 8, [10, 10, 10])]);
+    tag(&mut r, 0, &["x"]);
+    let report = r.run();
+    assert_eq!(rawgraph_io::read_xmp_packet(&written_of(&report.items[1].1)), None);
+    assert!(rawgraph_io::read_xmp_packet(&written_of(&report.items[0].1)).is_some_and(|p| p.contains("<rdf:li>x</rdf:li>")));
+}
+
+#[test]
+fn the_keywords_token_names_the_files() {
+    let mut r = Rig::new(&[("a.png", 8, 8, [10, 10, 10]), ("b.png", 8, 8, [10, 10, 10]), ("c.png", 8, 8, [10, 10, 10])]);
+    tag(&mut r, 0, &["Travel|Italy|Rome", "a/b"]);
+    tag(&mut r, 1, &["Ärger"]);
+    r.text(|x| x.name_template = "{name}_{keywords}".into());
+    let report = r.run();
+    let names: Vec<String> = report.items.iter().map(|(_, s)| written_of(s).file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned()).collect();
+    assert_eq!(names, ["a_Rome-a_b.jpg", "b_Ärger.jpg", "c_.jpg"], "last level of each keyword, unsafe characters replaced, empty without keywords");
+}
+
+#[test]
+fn the_keyword_measure_of_a_filter_sees_the_items_keywords() {
+    let mut r = Rig::new(&[("a.png", 8, 8, [10, 10, 10]), ("b.png", 8, 8, [10, 10, 10]), ("c.png", 8, 8, [10, 10, 10])]);
+    tag(&mut r, 0, &["Wedding|Church"]);
+    tag(&mut r, 2, &["wedding"]);
+    let f = r.g.add_node(NodeKind::MetadataFilter, [0.0; 2]);
+    r.g.connect(r.src, f, 0).expect("connect");
+    r.g.disconnect(r.exp, 0);
+    r.g.connect(f, r.exp, 0).expect("connect");
+    let node = r.g.node_mut(f).expect("filter");
+    node.set_param("measure", A, 5.0);
+    assert!(node.set_data(A, Some(NodeData::Keyword("WEDDING".into()))));
+    let report = r.run();
+    let status: Vec<bool> = report.items.iter().map(|(_, s)| matches!(s, ItemStatus::Written { .. })).collect();
+    assert_eq!(status, [true, false, true]);
+    let node = r.g.node_mut(f).expect("filter");
+    node.set_param("keyword_op", A, 1.0);
+    r.p("collision", 1.0);
+    let status: Vec<bool> = r.run().items.iter().map(|(_, s)| matches!(s, ItemStatus::Written { .. })).collect();
+    assert_eq!(status, [false, true, false], "does not contain");
 }

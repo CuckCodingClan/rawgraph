@@ -71,7 +71,7 @@ fn settings(out: &Path, format: ExportFormat) -> ExportSettings {
 }
 
 pub(crate) fn item(id: u64, p: PathBuf) -> ExportItem {
-    ExportItem { id: ImageId(id), source: p }
+    ExportItem { id: ImageId(id), source: p, keywords: Vec::new() }
 }
 
 fn run(g: &Graph, n: NodeId, items: &[ExportItem], s: &ExportSettings) -> ExportReport {

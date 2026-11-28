@@ -34,6 +34,12 @@ pub struct Cli {
     pub save_project: Option<PathBuf>,
     /// `(image index in the filtered list, rating)`
     pub rate: Vec<(usize, u8)>,
+    /// `(image index in the filtered list, keywords)`: added to the image.
+    pub keyword: Vec<(usize, Vec<String>)>,
+    /// Keyword filter of the filmstrip (any of these).
+    pub filter_keyword: Vec<String>,
+    /// Select the image range `first..=last` (indices in the list), Shift+click style.
+    pub select_range: Option<(usize, usize)>,
     /// Inclusive ISO bounds for the filmstrip filter.
     pub filter_iso: Option<(Option<f32>, Option<f32>)>,
     pub preview_size: Option<u32>,
@@ -125,7 +131,7 @@ pub struct Cli {
     pub save_recipe: Vec<String>,
     /// Open the "Manage recipes" window at start.
     pub open_recipes: bool,
-    /// Run "Import ratings from XMP" with the dialog defaults after the scan and show its dialog.
+    /// Run "Import ratings and keywords from XMP" with the dialog defaults after the scan and show its dialog.
     pub import_xmp: bool,
     /// Open the XMP import dialog at start (does not import).
     pub open_xmp_dialog: bool,
@@ -176,6 +182,9 @@ Usage: rawgraph-app [options]
   --project <file.rawgraph>    open a project at start
   --save-project <file>        save the project as a new revision after the start-up actions
   --rate <image>:<n>           rate image (index in the list) 0-5 (repeatable)
+  --keyword <image>:<a,b|c>    add keywords to an image (index in the list; repeatable)
+  --filter-keyword <a,b>       filmstrip filter: images with any of these keywords
+  --select-images <a>:<b>      select the images a..b of the list (the keyword panel works on them)
   --filter-iso <min>:<max>     ISO filter, either side may be empty
   --preview-size <n>           preview long edge (1280, 1920, 2560, 3840)
   --no-recursive               do not scan sub-folders
@@ -315,6 +324,13 @@ fn parse_rate(value: Option<String>) -> Result<(usize, u8), String> {
         return Err(bad());
     }
     Ok((i.trim().parse().map_err(|_| bad())?, n))
+}
+
+fn parse_keyword(value: Option<String>) -> Result<(usize, Vec<String>), String> {
+    let v = value.ok_or("--keyword needs <image>:<keywords>")?;
+    let (i, list) = v.split_once(':').ok_or_else(|| format!("--keyword: \"{v}\" is not of the form <image>:<keywords>"))?;
+    let index = i.trim().parse().map_err(|_| format!("--keyword: \"{i}\" is not an image index"))?;
+    Ok((index, list.split(',').filter_map(rawgraph_core::keywords::normalize_keyword).collect()))
 }
 
 fn parse_iso(value: Option<String>) -> Result<(Option<f32>, Option<f32>), String> {
@@ -511,6 +527,17 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String
             "--project" => cli.project = Some(PathBuf::from(it.next().ok_or("--project needs a path")?)),
             "--save-project" => cli.save_project = Some(PathBuf::from(it.next().ok_or("--save-project needs a path")?)),
             "--rate" => cli.rate.push(parse_rate(it.next())?),
+            "--keyword" => cli.keyword.push(parse_keyword(it.next())?),
+            "--filter-keyword" => {
+                let v = it.next().ok_or("--filter-keyword needs a list of keywords")?;
+                cli.filter_keyword = v.split(',').filter_map(rawgraph_core::keywords::normalize_keyword).collect();
+            }
+            "--select-images" => {
+                let v = it.next().ok_or("--select-images needs <a>:<b>")?;
+                let bad = || format!("--select-images: \"{v}\" is not of the form <a>:<b>");
+                let (a, b) = v.split_once(':').ok_or_else(bad)?;
+                cli.select_range = Some((a.trim().parse().map_err(|_| bad())?, b.trim().parse().map_err(|_| bad())?));
+            }
             "--filter-iso" => cli.filter_iso = Some(parse_iso(it.next())?),
             "--preview-size" => {
                 let v = it.next().ok_or("--preview-size needs a value")?;
@@ -803,6 +830,17 @@ mod tests {
         assert_eq!(parse("--filter-iso :800").unwrap().filter_iso, Some((None, Some(800.0))));
         assert_eq!(parse("--filter-iso 400:").unwrap().filter_iso, Some((Some(400.0), None)));
         for bad in ["--rate 1:9", "--rate 1", "--filter-iso 100", "--filter-iso a:b", "--preview-size 5", "--open-folder"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn keyword_flags() {
+        let cli = parse("--keyword 0:Reise|Graz,Food --keyword 2:x --filter-keyword reise,food --select-images 1:3").unwrap();
+        assert_eq!(cli.keyword, vec![(0, vec!["Reise|Graz".to_owned(), "Food".to_owned()]), (2, vec!["x".to_owned()])]);
+        assert_eq!(cli.filter_keyword, vec!["reise".to_owned(), "food".to_owned()]);
+        assert_eq!(cli.select_range, Some((1, 3)));
+        for bad in ["--keyword 1", "--keyword a:b", "--filter-keyword", "--select-images 1", "--select-images a:b"] {
             assert!(parse(bad).is_err(), "{bad}");
         }
     }

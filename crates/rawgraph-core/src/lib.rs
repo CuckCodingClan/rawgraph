@@ -15,6 +15,7 @@ pub mod generator;
 pub mod image;
 pub mod layer;
 pub mod lens;
+pub mod keywords;
 mod migrate;
 pub mod lut;
 pub mod ops;
@@ -34,7 +35,7 @@ pub use export::{
 pub use graph::{
     cdl_params, curve_set, default_curve, iso_noise_scale, lut_file, lut_file_status, neutral_curve, BrushStroke, Catalog, CaptureFn, CdlParams,
     CurveEntry, DataKind, Edge, Graph, GraphError, ImageId, Issue, Mode, NamedRange, Node, NodeData, NodeId, NodeKind,
-    OutputSpec, ParamKind, ParamSpec, PortType, Subgraph, CURVE_CHANNELS, GRAPH_FORMAT_VERSION,
+    OutputSpec, ParamKind, ParamSpec, PortType, Subgraph, CURVE_CHANNELS, GRAPH_FORMAT_VERSION, KEYWORD_OPS,
 };
 pub use generator::{ColorStop, OpacityStop, GradientRamp};
 pub use image::{ImageBuf, MaskBuf};

@@ -47,6 +47,7 @@ fn synthetic_entries(from: u64, count: u64) -> Vec<ImageEntry> {
             rating: (n % 6) as u8,
             flag: Flag::None,
             color_label: None,
+            keywords: Vec::new(),
             missing: false,
         })
         .collect()

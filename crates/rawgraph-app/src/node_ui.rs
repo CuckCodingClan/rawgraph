@@ -246,7 +246,27 @@ pub fn colour_space_applies(format: ExportFileFormat) -> bool {
 }
 
 pub const EXR_SPACE_NOTE: &str = "EXR files are linear ACEScg: the colour space and the profile do not apply.";
-pub const NAME_TEMPLATE_HELP: &str = "{name} source name, {index} / {index:04} position, {id} image id";
+pub const NAME_TEMPLATE_HELP: &str = "{name} source name, {index} / {index:04} position, {id} image id, {keywords} last level of each keyword joined with -";
+
+/// The text field of a Metadata Filter with the Keyword measure. Written to the node when it
+/// loses focus (one undo step).
+pub fn keyword_filter_field(ui: &mut egui::Ui, session: &mut Session, id: NodeId, image: ImageId) {
+    let current = match session.project.graph.node(id).and_then(|n| n.data(image)) {
+        Some(NodeData::Keyword(t)) => t.clone(),
+        _ => String::new(),
+    };
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label("Text");
+        let key = ui.make_persistent_id(("keyword-filter-text", id.0));
+        let width = ui.available_width().max(80.0);
+        if let Some(v) = text_field(ui, key, &current, width, "keyword to look for (empty: any keyword)") {
+            if let Some(n) = session.project.graph.node_mut(id) {
+                n.set_data(image, Some(NodeData::Keyword(v)));
+            }
+        }
+    });
+}
 
 /// The two rows of the box of an Export node: format and quality, then the folder.
 pub fn export_box_rows(node: &Node, image: ImageId) -> Vec<(String, String)> {
@@ -281,7 +301,7 @@ pub fn export_lines(spec: &ExportSpec) -> Vec<(String, String)> {
         ),
     ];
     let m = spec.meta;
-    let on: Vec<&str> = [(m.camera, "camera"), (m.exposure, "exposure"), (m.date, "date"), (m.gps, "GPS"), (m.author, "author"), (m.software, "software")]
+    let on: Vec<&str> = [(m.camera, "camera"), (m.exposure, "exposure"), (m.date, "date"), (m.gps, "GPS"), (m.author, "author"), (m.software, "software"), (m.keywords, "keywords")]
         .into_iter()
         .filter(|(b, _)| *b)
         .map(|(_, n)| n)
@@ -923,13 +943,14 @@ pub fn export_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, imag
 
             ui.label("Metadata");
             egui::Grid::new(("export-meta", id.0)).num_columns(2).spacing([14.0, 2.0]).show(ui, |ui| {
-                let switches: [(&'static str, &str, bool); 6] = [
+                let switches: [(&'static str, &str, bool); 7] = [
                     ("meta_camera", "Camera data", spec.meta.camera),
                     ("meta_exposure", "Exposure data", spec.meta.exposure),
                     ("meta_date", "Date", spec.meta.date),
                     ("meta_gps", "GPS location", spec.meta.gps),
                     ("meta_author", "Author", spec.meta.author),
                     ("meta_software", "Software", spec.meta.software),
+                    ("meta_keywords", "Keywords", spec.meta.keywords),
                 ];
                 for (i, (name, label, value)) in switches.into_iter().enumerate() {
                     let mut on = value;
@@ -1260,6 +1281,7 @@ mod tests {
             ("meta_gps", 1.0),
             ("meta_author", 0.0),
             ("meta_software", 0.0),
+            ("meta_keywords", 0.0),
         ] {
             assert!(g.node_mut(e).unwrap().set_param(name, IMG, v), "{name}");
         }

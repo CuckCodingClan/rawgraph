@@ -1,4 +1,4 @@
-//! File-name templates: `{name}`, `{index}`, `{index:04}`, `{id}`.
+//! File-name templates: `{name}`, `{index}`, `{index:04}`, `{id}`, `{keywords}`.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Token {
@@ -7,6 +7,8 @@ pub(crate) enum Token {
     /// Zero-padded to this width (0 = no padding).
     Index(usize),
     Id,
+    /// The keywords of the image, file-name safe (see `rawgraph_core::keywords::keywords_file_token`).
+    Keywords,
 }
 
 const INVALID_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
@@ -51,6 +53,7 @@ pub(crate) fn parse(template: &str) -> Result<Vec<Token>, String> {
                 tokens.push(match body.as_str() {
                     "name" => Token::Name,
                     "id" => Token::Id,
+                    "keywords" => Token::Keywords,
                     "index" => Token::Index(0),
                     other => match other.strip_prefix("index:") {
                         Some(w) if !w.is_empty() && w.chars().all(|d| d.is_ascii_digit()) => {
@@ -72,7 +75,7 @@ pub(crate) fn parse(template: &str) -> Result<Vec<Token>, String> {
     Ok(tokens)
 }
 
-pub(crate) fn expand(tokens: &[Token], stem: &str, index: usize, id: u64) -> String {
+pub(crate) fn expand(tokens: &[Token], stem: &str, index: usize, id: u64, keywords: &[String]) -> String {
     let mut out = String::new();
     for t in tokens {
         match t {
@@ -80,6 +83,7 @@ pub(crate) fn expand(tokens: &[Token], stem: &str, index: usize, id: u64) -> Str
             Token::Name => out.push_str(stem),
             Token::Index(w) => out.push_str(&format!("{index:0w$}", w = *w)),
             Token::Id => out.push_str(&id.to_string()),
+            Token::Keywords => out.push_str(&rawgraph_core::keywords::keywords_file_token(keywords)),
         }
     }
     out
@@ -107,9 +111,15 @@ mod tests {
     #[test]
     fn parses_and_expands() {
         let t = parse("{name}_{index:04}-{id}").unwrap_or_default();
-        assert_eq!(expand(&t, "IMG", 7, 42), "IMG_0007-42");
+        assert_eq!(expand(&t, "IMG", 7, 42, &[]), "IMG_0007-42");
         let t = parse("x{index}").unwrap_or_default();
-        assert_eq!(expand(&t, "a", 12, 1), "x12");
+        assert_eq!(expand(&t, "a", 12, 1, &[]), "x12");
+        let kw = ["Travel|Italy|Rome".to_owned(), "a/b: c".to_owned(), "Ärger".to_owned()];
+        let t = parse("{name}_{keywords}").unwrap_or_default();
+        assert_eq!(expand(&t, "IMG", 1, 1, &kw), "IMG_Rome-a_b_ c-Ärger", "last levels, joined by -, unsafe characters replaced");
+        assert_eq!(expand(&t, "IMG", 1, 1, &[]), "IMG_");
+        let long: Vec<String> = (0..100).map(|i| format!("keyword{i}")).collect();
+        assert!(expand(&t, "IMG", 1, 1, &long).chars().count() <= 4 + 80, "the token is limited to 80 characters");
     }
 
     #[test]

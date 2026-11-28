@@ -38,6 +38,11 @@ pub struct CaptureInfo {
     /// never written to files.
     #[serde(skip)]
     pub path: Option<String>,
+    /// Keywords of the image (normalised, see `keywords`). Filled in by the image provider at
+    /// lookup time like `path`: they live in the project's keyword table, not in the capture data,
+    /// and are never written to files. Metadata Filter / Split by Metadata read them here.
+    #[serde(skip)]
+    pub keywords: Vec<String>,
 }
 
 /// Normalised form used for path comparisons: backslash read as `/`, repeated
@@ -92,11 +97,13 @@ pub enum Measure {
     Aperture,
     Ev100,
     Flash,
+    /// Text measure: the keywords of the image (no number; see `keywords_contain_text`).
+    Keyword,
 }
 
 impl Measure {
     /// Display labels, indexed like [`Measure::from_index`].
-    pub const LABELS: [&'static str; 5] = ["ISO", "Shutter time (s)", "Aperture (f)", "EV100", "Flash"];
+    pub const LABELS: [&'static str; 6] = ["ISO", "Shutter time (s)", "Aperture (f)", "EV100", "Flash", "Keyword"];
 
     pub fn from_index(i: usize) -> Option<Measure> {
         match i {
@@ -105,6 +112,7 @@ impl Measure {
             2 => Some(Measure::Aperture),
             3 => Some(Measure::Ev100),
             4 => Some(Measure::Flash),
+            5 => Some(Measure::Keyword),
             _ => None,
         }
     }
@@ -120,6 +128,7 @@ impl CaptureInfo {
             Measure::Aperture => self.aperture,
             Measure::Ev100 => self.ev100(),
             Measure::Flash => self.flash_fired.map(|f| if f { 1.0 } else { 0.0 }),
+            Measure::Keyword => None,
         }
     }
 
@@ -194,7 +203,9 @@ mod tests {
         }
         assert_eq!(Measure::from_index(0), Some(Measure::Iso));
         assert_eq!(Measure::from_index(4), Some(Measure::Flash));
-        assert_eq!(Measure::from_index(5), None);
+        assert_eq!(Measure::from_index(5), Some(Measure::Keyword));
+        assert_eq!(Measure::from_index(6), None);
+        assert_eq!(CaptureInfo { iso: Some(100.0), ..Default::default() }.measure(Measure::Keyword), None, "text measure has no number");
     }
 
     #[test]

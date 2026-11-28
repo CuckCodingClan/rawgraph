@@ -24,6 +24,7 @@ mod lens;
 mod meta;
 mod webp_icc;
 mod orient;
+mod xmp;
 pub mod raw;
 pub mod rendered;
 

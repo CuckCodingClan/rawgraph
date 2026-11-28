@@ -21,13 +21,16 @@ const MAX_SIDECAR_BYTES: u64 = 4 << 20;
 pub struct XmpOptions {
     pub sidecars: bool,
     pub embedded: bool,
-    /// Skip images that already carry a rating, flag or label here.
+    /// Skip images that already carry a rating, flag or label here (their keywords as well).
     pub only_unrated: bool,
+    /// Also read the keywords (`dc:subject`, `lr:hierarchicalSubject`) and add them to the images
+    /// (a union with what the image has; nothing is removed).
+    pub merge_keywords: bool,
 }
 
 impl Default for XmpOptions {
     fn default() -> Self {
-        Self { sidecars: true, embedded: true, only_unrated: true }
+        Self { sidecars: true, embedded: true, only_unrated: true, merge_keywords: true }
     }
 }
 
@@ -57,33 +60,48 @@ pub enum Decision {
     Error,
 }
 
-fn useful(c: &XmpCulling) -> bool {
+fn has_culling(c: &XmpCulling) -> bool {
     c.rating.is_some() || c.label.is_some()
 }
 
-/// The decision table. The sidecar wins whenever it carries something; the
-/// embedded packet is the fallback; a broken source only counts as an error
-/// when nothing else gave data.
+/// The decision table. Rating and colour label: the sidecar wins whenever it carries one, the
+/// embedded packet is the fallback. Keywords (with `merge_keywords`): the union of what every
+/// source that was read carries. A broken source only counts as an error when nothing else gave
+/// data.
 pub fn decide(opts: &XmpOptions, sidecar: &SourceRead, embedded: &SourceRead) -> Decision {
     let mut broken = false;
-    if opts.sidecars {
-        match sidecar {
-            SourceRead::Read(c) if useful(c) => return Decision::Use(c.clone(), Origin::Sidecar),
+    let mut chosen: Option<(XmpCulling, Origin)> = None;
+    let mut keywords: Vec<String> = Vec::new();
+    let mut keywords_from: Option<Origin> = None;
+    for (enabled, source, origin) in [(opts.sidecars, sidecar, Origin::Sidecar), (opts.embedded, embedded, Origin::Embedded)] {
+        if !enabled {
+            continue;
+        }
+        match source {
+            SourceRead::Read(c) => {
+                if chosen.is_none() && has_culling(c) {
+                    chosen = Some((XmpCulling { rating: c.rating, label: c.label.clone(), keywords: Vec::new() }, origin));
+                }
+                if opts.merge_keywords && !c.keywords.is_empty() {
+                    keywords.extend(c.keywords.iter().cloned());
+                    keywords_from.get_or_insert(origin);
+                }
+            }
             SourceRead::Broken => broken = true,
-            _ => {}
+            SourceRead::Absent => {}
         }
     }
-    if opts.embedded {
-        match embedded {
-            SourceRead::Read(c) if useful(c) => return Decision::Use(c.clone(), Origin::Embedded),
-            SourceRead::Broken => broken = true,
-            _ => {}
+    if !keywords.is_empty() {
+        let merged = rawgraph_core::keywords::normalize_keywords(&keywords);
+        match &mut chosen {
+            Some((c, _)) => c.keywords = merged,
+            None => chosen = keywords_from.map(|o| (XmpCulling { keywords: merged, ..Default::default() }, o)),
         }
     }
-    if broken {
-        Decision::Error
-    } else {
-        Decision::NoXmp
+    match chosen {
+        Some((c, origin)) => Decision::Use(c, origin),
+        None if broken => Decision::Error,
+        None => Decision::NoXmp,
     }
 }
 
@@ -140,8 +158,9 @@ fn read_embedded(path: &Path) -> SourceRead {
 /// Reads what the options ask for and decides.
 pub fn read_target(path: &Path, opts: &XmpOptions) -> Decision {
     let sidecar = if opts.sidecars { read_sidecar(path) } else { SourceRead::Absent };
-    // The embedded packet is not even opened when the sidecar already decides.
-    if opts.sidecars && matches!(&sidecar, SourceRead::Read(c) if useful(c)) {
+    // The embedded packet is not even opened when the sidecar already says everything that is
+    // asked for: a rating or label, and (when keywords are merged) keywords.
+    if opts.sidecars && matches!(&sidecar, SourceRead::Read(c) if has_culling(c) && (!opts.merge_keywords || !c.keywords.is_empty())) {
         return decide(opts, &sidecar, &SourceRead::Absent);
     }
     let embedded = if opts.embedded { read_embedded(path) } else { SourceRead::Absent };
@@ -182,7 +201,10 @@ pub fn apply(project: &mut Project, found: &XmpFound) -> (XmpSummary, Vec<ImageI
     let mut s = XmpSummary { without_xmp: found.without_xmp, errors: found.errors, skipped_rated: found.skipped_rated, unchanged: found.skipped_rated, ..Default::default() };
     let mut changed = Vec::new();
     for (id, culling, origin) in &found.items {
-        if project.apply_xmp_culling(*id, culling) {
+        // Keywords are only present when the read was asked to merge them.
+        let culling_changed = project.apply_xmp_culling(*id, culling);
+        let keywords_changed = project.apply_xmp_keywords(*id, culling);
+        if culling_changed || keywords_changed {
             s.changed += 1;
             changed.push(*id);
         } else {
@@ -317,7 +339,7 @@ impl XmpJob {
     }
 }
 
-/// State of the "Import ratings from XMP" dialog.
+/// State of the "Import ratings and keywords from XMP" dialog.
 pub struct XmpDialog {
     pub opts: XmpOptions,
     pub summary: Option<XmpSummary>,
@@ -342,10 +364,10 @@ mod tests {
     use super::*;
 
     fn rating(r: i8) -> XmpCulling {
-        XmpCulling { rating: Some(r), label: None }
+        XmpCulling { rating: Some(r), label: None, ..Default::default() }
     }
 
-    const BOTH: XmpOptions = XmpOptions { sidecars: true, embedded: true, only_unrated: true };
+    const BOTH: XmpOptions = XmpOptions { sidecars: true, embedded: true, only_unrated: true, merge_keywords: true };
 
     #[test]
     fn the_sidecar_wins_over_the_embedded_packet() {
@@ -385,6 +407,7 @@ mod tests {
             rating,
             flag: Flag::None,
             color_label: None,
+            keywords: Vec::new(),
             missing: false,
             uuid: format!("{id:032x}"),
         }
@@ -520,8 +543,8 @@ mod tests {
         let e = entry(1, "a.png", 3);
         assert!(would_change(&e, &rating(4)) && !would_change(&e, &rating(3)) && !would_change(&e, &rating(0)));
         assert!(would_change(&e, &rating(-1)));
-        assert!(would_change(&e, &XmpCulling { rating: None, label: Some("Rot".into()) }));
-        assert!(!would_change(&e, &XmpCulling { rating: None, label: Some("Turquoise".into()) }));
+        assert!(would_change(&e, &XmpCulling { rating: None, label: Some("Rot".into()), ..Default::default() }));
+        assert!(!would_change(&e, &XmpCulling { rating: None, label: Some("Turquoise".into()), ..Default::default() }));
     }
 
     fn fake_targets(n: u64) -> Vec<Target> {
@@ -597,5 +620,97 @@ mod tests {
         assert_eq!((found.items.len(), found.errors, found.without_xmp), (10, 10, 20));
         let ids: Vec<u64> = found.items.iter().map(|(id, _, _)| id.0).collect();
         assert_eq!(ids, (0..40u64).filter(|i| i % 4 == 0).map(|i| i + 1).collect::<Vec<_>>(), "found items stay in image order");
+    }
+
+    // ------------------------------------------------------------------ keywords
+
+    fn with_keywords(rating: Option<i8>, keywords: &[&str]) -> XmpCulling {
+        XmpCulling { rating, label: None, keywords: keywords.iter().map(|k| (*k).to_owned()).collect() }
+    }
+
+    #[test]
+    fn keywords_of_both_sources_are_merged_while_the_rating_follows_the_sidecar() {
+        let side = SourceRead::Read(with_keywords(Some(2), &["Food", "Reise|Graz"]));
+        let emb = SourceRead::Read(with_keywords(Some(5), &["food", "Wedding"]));
+        assert_eq!(decide(&BOTH, &side, &emb), Decision::Use(with_keywords(Some(2), &["Food", "Reise|Graz", "Wedding"]), Origin::Sidecar));
+        // A sidecar with keywords only does not hide the rating of the embedded packet.
+        let kw_only = SourceRead::Read(with_keywords(None, &["a"]));
+        assert_eq!(decide(&BOTH, &kw_only, &emb), Decision::Use(with_keywords(Some(5), &["a", "food", "Wedding"]), Origin::Embedded));
+        // Keywords alone are a result of their own.
+        assert_eq!(decide(&BOTH, &kw_only, &SourceRead::Absent), Decision::Use(with_keywords(None, &["a"]), Origin::Sidecar));
+        // Switched off: the same packets give no keywords (and nothing at all when there is no rating).
+        let off = XmpOptions { merge_keywords: false, ..BOTH };
+        assert_eq!(decide(&off, &side, &emb), Decision::Use(rating(2), Origin::Sidecar));
+        assert_eq!(decide(&off, &kw_only, &SourceRead::Absent), Decision::NoXmp);
+    }
+
+    #[test]
+    fn imported_keywords_are_added_to_the_images_and_never_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |n: &str| dir.path().join(n);
+        let packet = SIDECAR_XML.replace("RATING", "3").replace(
+            "xmp:Label=\"Red\"/>",
+            "xmp:Label=\"Red\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:lr=\"http://ns.adobe.com/lightroom/1.0/\"><dc:subject><rdf:Bag><rdf:li>Wörthersee</rdf:li><rdf:li>日本</rdf:li></rdf:Bag></dc:subject><lr:hierarchicalSubject><rdf:Bag><rdf:li>Reise|Österreich|Wörthersee</rdf:li></rdf:Bag></lr:hierarchicalSubject></rdf:Description>",
+        );
+        png(&p("a.png"), None);
+        std::fs::write(p("a.xmp"), &packet).unwrap();
+        png(&p("b.png"), None);
+        let mut project = Project::new();
+        project.scan_folder(dir.path(), false, &rawgraph_io::is_supported, &|_| None);
+        let a = project.images().iter().find(|e| e.file_name() == "a.png").unwrap().id;
+        project.set_keywords(a, &["Mine".to_owned()]);
+        let all = XmpOptions { only_unrated: false, ..BOTH };
+        let (targets, skipped) = pick_targets(project.images(), &all);
+        let found = run(XmpJob::start(egui::Context::default(), targets, skipped, all));
+        let (summary, changed) = apply(&mut project, &found);
+        assert_eq!((summary.changed, changed.len()), (1, 1));
+        let kw = &project.image(a).unwrap().keywords;
+        assert_eq!(kw, &vec!["Mine".to_owned(), "Reise|Österreich|Wörthersee".to_owned(), "日本".to_owned()], "added to the existing keyword, nothing removed");
+        // Reading again changes nothing.
+        let (targets, skipped) = pick_targets(project.images(), &all);
+        let found = run(XmpJob::start(egui::Context::default(), targets, skipped, all));
+        assert_eq!(apply(&mut project, &found).0.changed, 0);
+        // Without "merge keywords" they are not read.
+        let mut other = Project::new();
+        other.scan_folder(dir.path(), false, &rawgraph_io::is_supported, &|_| None);
+        let off = XmpOptions { merge_keywords: false, only_unrated: false, ..BOTH };
+        let (targets, skipped) = pick_targets(other.images(), &off);
+        let found = run(XmpJob::start(egui::Context::default(), targets, skipped, off));
+        apply(&mut other, &found);
+        assert!(other.images().iter().all(|e| e.keywords.is_empty()));
+    }
+
+    #[test]
+    fn keywords_exported_into_every_rendered_format_read_back_through_the_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let keywords: Vec<String> = vec!["Reise|Österreich|Wörthersee".into(), "Tom & <Jerry>".into(), "日本".into(), "Food".into()];
+        let wanted = rawgraph_core::keywords::normalize_keywords(&keywords);
+        let md = rawgraph_io::ExportMetadata { keywords: keywords.clone(), ..Default::default() };
+        let options = rawgraph_io::SaveOptions { overwrite: true, metadata: Some(md), ..Default::default() };
+        let rgb: Vec<u8> = (0..16 * 16).flat_map(|i| [i as u8, 90, 160]).collect();
+        let rgba: Vec<u8> = rgb.chunks(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect();
+        let rgb16: Vec<u16> = rgb.iter().map(|v| u16::from(*v) * 257).collect();
+        let mut files = Vec::new();
+        for name in ["k.jpg", "k.png", "k.tif"] {
+            let path = dir.path().join(name);
+            rawgraph_io::save_srgb8_with(&path, 16, 16, &rgb, &options).unwrap();
+            files.push(path);
+        }
+        for name in ["k16.png", "k16.tif"] {
+            let path = dir.path().join(name);
+            rawgraph_io::save_srgb16_with(&path, 16, 16, &rgb16, &options).unwrap();
+            files.push(path);
+        }
+        for (name, lossless) in [("kl.webp", true), ("ky.webp", false)] {
+            let path = dir.path().join(name);
+            rawgraph_io::save_webp8(&path, 16, 16, &rgba, lossless, &options).unwrap();
+            files.push(path);
+        }
+        for path in files {
+            match read_target(&path, &BOTH) {
+                Decision::Use(c, Origin::Embedded) => assert_eq!(c.keywords, wanted, "{}", path.display()),
+                other => panic!("{}: {other:?}", path.display()),
+            }
+        }
     }
 }
