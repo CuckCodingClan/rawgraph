@@ -592,9 +592,9 @@ fn version_1_fixture_loads_and_its_brush_mask_becomes_a_draw() {
 }
 
 #[test]
-fn format_3_documents_are_not_touched_and_report_nothing() {
+fn format_3_documents_keep_their_nodes_and_only_report_the_assumed_tone() {
     let (g, notes) = Graph::from_json_with_notes(include_str!("../tests/fixtures/graph_v3.json")).unwrap();
-    assert!(notes.is_empty());
+    assert!(notes.iter().all(|t| t.contains("assumed Legacy tone")), "{notes:?}");
     assert_eq!(g.nodes().count(), 11);
 }
 
@@ -647,9 +647,14 @@ fn format_3_graphs_with_a_tone_choice_load_and_keep_their_meaning() {
     let (g, notes) = develop_graph(3, json!({"tone_version": 1.0}), json!({}));
     assert_eq!(legacy(&g, 1), 0.0);
     assert!(notes.iter().any(|t| t.contains("Local tone v1")), "{notes:?}");
-    // Without the choice a format-3 file meant Legacy (the default was stored sparsely) ...
-    let (g, _) = develop_graph(3, json!({"exposure": 0.1}), json!({}));
+    // Without the choice a format-3 file of release 2611.002 meant Legacy (stored sparsely): assumed, with a note ...
+    let (g, notes) = develop_graph(3, json!({"exposure": 0.1}), json!({}));
     assert_eq!(legacy(&g, 1), 1.0);
+    assert!(notes.iter().any(|t| t.contains("assumed Legacy tone")), "{notes:?}");
+    // ... unless the file already stores the toggle somewhere (written by a build with the toggle).
+    let (g, notes) = develop_graph(3, json!({"exposure": 0.1}), json!({"2": {"legacy_tone": 0.0}}));
+    assert_eq!(legacy(&g, 1), 0.0);
+    assert!(!notes.iter().any(|t| t.contains("assumed")), "{notes:?}");
     // ... while format 4 files are written with the toggle: absent means local.
     let (g, _) = develop_graph(4, json!({"exposure": 0.1}), json!({}));
     assert_eq!(legacy(&g, 1), 0.0);

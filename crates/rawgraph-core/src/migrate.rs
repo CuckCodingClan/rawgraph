@@ -1139,7 +1139,28 @@ fn run(nodes: BTreeMap<u64, Obj>, edges: Vec<E>, next_id: u64) -> Result<Work, G
 /// (`legacy_tone`, off = local). Files up to graph format 3 / sub-graph format 2 without the choice meant
 /// Legacy (the default was stored sparsely), so those get the toggle on; an explicit Local v1 keeps the
 /// default (off). Graph format 4 / sub-graph format 3 mark files written with the toggle.
-fn tone_step<'a>(nodes: impl Iterator<Item = (u64, &'a mut Obj)>, absent_means_legacy: bool, notes: &mut Vec<String>) {
+/// `Tone` says what an absent choice means: Legacy for sure (files before format 3), Legacy by
+/// assumption (an ambiguous format-3 file: reported), or local (written with the toggle).
+#[derive(Clone, Copy, PartialEq)]
+enum AbsentTone {
+    Legacy,
+    AssumedLegacy,
+    Local,
+}
+
+/// True if any Develop node of the document already stores the Legacy toggle: then it was written by
+/// a build with the toggle, where an absent toggle means local tone.
+fn has_legacy_toggle<'a>(mut nodes: impl Iterator<Item = &'a Obj>) -> bool {
+    nodes.any(|n| {
+        n.get("kind").and_then(Value::as_str) == Some("Develop")
+            && (n.get("all").and_then(Value::as_object).is_some_and(|a| a.contains_key("legacy_tone"))
+                || n.get("individual").and_then(Value::as_object).is_some_and(|ind| {
+                    ind.values().any(|v| v.as_object().is_some_and(|p| p.contains_key("legacy_tone")))
+                }))
+    })
+}
+
+fn tone_step<'a>(nodes: impl Iterator<Item = (u64, &'a mut Obj)>, absent: AbsentTone, notes: &mut Vec<String>) {
     for (id, n) in nodes {
         if n.get("kind").and_then(Value::as_str) != Some("Develop") {
             continue;
@@ -1148,9 +1169,17 @@ fn tone_step<'a>(nodes: impl Iterator<Item = (u64, &'a mut Obj)>, absent_means_l
         if let Some(Value::Object(all)) = n.get_mut("all") {
             let tv = all.remove("tone_version").and_then(|v| num(&v));
             local_v1 |= tv.is_some_and(|v| v >= 0.5);
-            let legacy = tv.map_or(absent_means_legacy, |v| v < 0.5);
+            let legacy = tv.map_or(absent != AbsentTone::Local, |v| v < 0.5);
             if legacy && !all.contains_key("legacy_tone") {
                 all.insert("legacy_tone".into(), json!(1.0));
+                if tv.is_none() && absent == AbsentTone::AssumedLegacy {
+                    let text = format!(
+                        "Develop (node {id}): assumed Legacy tone (the file does not say which tone it used); switch Legacy tone off if it was made with the local tone"
+                    );
+                    if !notes.contains(&text) {
+                        notes.push(text);
+                    }
+                }
             }
         }
         if let Some(Value::Object(ind)) = n.get_mut("individual") {
@@ -1172,16 +1201,25 @@ fn tone_step<'a>(nodes: impl Iterator<Item = (u64, &'a mut Obj)>, absent_means_l
     }
 }
 
-/// Rewrites a graph document of format 1 or 2 in place into format 3 and returns the notes.
-/// Documents of format 3 and later are left untouched.
+/// Rewrites an older graph document in place into the current format and returns the notes:
+/// formats 1 and 2 lose the old mask nodes and ports, formats up to 3 get the Develop tone toggle.
 pub(crate) fn migrate_graph(root: &mut Value) -> Result<Vec<String>, GraphError> {
     let Some(obj) = root.as_object_mut() else { return Ok(Vec::new()) };
     let Some(version) = obj.get("format_version").and_then(Value::as_u64) else { return Ok(Vec::new()) };
     let mut tone_notes = Vec::new();
     if version < u64::from(GRAPH_FORMAT_VERSION) {
         if let Some(Value::Object(nodes)) = obj.get_mut("nodes") {
+            // Format 3 was written both before the Legacy toggle (absent = Legacy, release 2611.002)
+            // and by builds with it (absent = local): a stored toggle anywhere marks the latter.
+            let absent = if version < MASK_FREE_GRAPH_FORMAT {
+                AbsentTone::Legacy
+            } else if has_legacy_toggle(nodes.values().filter_map(Value::as_object)) {
+                AbsentTone::Local
+            } else {
+                AbsentTone::AssumedLegacy
+            };
             let it = nodes.iter_mut().filter_map(|(k, v)| Some((k.parse::<u64>().ok()?, v.as_object_mut()?)));
-            tone_step(it, true, &mut tone_notes);
+            tone_step(it, absent, &mut tone_notes);
         }
     }
     if version >= MASK_FREE_GRAPH_FORMAT {
@@ -1214,15 +1252,22 @@ pub(crate) fn migrate_graph(root: &mut Value) -> Result<Vec<String>, GraphError>
     Ok(tone_notes)
 }
 
-/// Rewrites a sub-graph document of format 1 in place into format 2 and returns the notes.
+/// Rewrites an older sub-graph document in place into the current format and returns the notes.
 pub(crate) fn migrate_subgraph(root: &mut Value) -> Result<Vec<String>, GraphError> {
     let Some(obj) = root.as_object_mut() else { return Ok(Vec::new()) };
     let Some(version) = obj.get("format_version").and_then(Value::as_u64) else { return Ok(Vec::new()) };
     let mut tone_notes = Vec::new();
     if version < u64::from(SUBGRAPH_FORMAT_VERSION) {
         if let Some(Value::Array(nodes)) = obj.get_mut("nodes") {
+            let absent = if version < MASK_FREE_SUBGRAPH_FORMAT {
+                AbsentTone::Legacy
+            } else if has_legacy_toggle(nodes.iter().filter_map(Value::as_object)) {
+                AbsentTone::Local
+            } else {
+                AbsentTone::AssumedLegacy
+            };
             let it = nodes.iter_mut().enumerate().filter_map(|(i, v)| Some((i as u64 + 1, v.as_object_mut()?)));
-            tone_step(it, true, &mut tone_notes);
+            tone_step(it, absent, &mut tone_notes);
         }
     }
     if version >= MASK_FREE_SUBGRAPH_FORMAT {
