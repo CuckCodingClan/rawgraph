@@ -49,6 +49,7 @@ use crate::windows::{self, AuxState, AuxWindow, MonitorInfo};
 use crate::workspace::{MainLayout, Preset, WindowRole, WorkspaceStore};
 
 mod ext;
+mod ff_driver;
 mod nodes;
 mod revs;
 mod workspaces;
@@ -424,6 +425,10 @@ pub struct App {
     quick_generation: u64,
     /// The selection placeholder is the gallery's edited thumbnail (not an unedited preview).
     placeholder_edited: bool,
+    /// What the selection placeholder shows (for `--bench-first-frame`).
+    placeholder_src: &'static str,
+    /// `--bench-first-frame`: the measurement driver.
+    first_frame: Option<ff_driver::Driver>,
     editor: GraphEditor,
     scope_panel: ScopePanel,
     /// UI-thread time of the last scope upload (`set_prepared`) in ms.
@@ -583,7 +588,7 @@ impl App {
         if let Some(scale) = cli.scale {
             cc.egui_ctx.set_pixels_per_point(scale);
         }
-        let screenshot_mode = cli.capture() || cli.bench || cli.run_export_node.is_some();
+        let screenshot_mode = cli.capture() || cli.benching() || cli.run_export_node.is_some();
         let settings: Settings = if screenshot_mode {
             Settings::default()
         } else {
@@ -677,6 +682,7 @@ impl App {
         let (cli_export_format, cli_no_profile, cli_no_metadata) = (cli.export_format.unwrap_or(export::Fmt::Jpeg), cli.export_no_profile, cli.export_no_metadata);
         let cli_export_folder = cli.export_folder.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
         let shot = cli.capture().then(|| Shot { path: cli.screenshot.clone(), dump: cli.dump_frame.clone(), dump_sent: false, dump_done: false, requested: false, rx: None, reply_at: None, started: Instant::now() });
+        let cli_first_frame = cli.bench_first_frame.is_some().then(|| ff_driver::Driver::new(&cli));
         let bench = cli.bench.then(|| Bench {
             phase: BenchPhase::Wait,
             idx: 0,
@@ -721,6 +727,8 @@ impl App {
             quick_preview: crate::quick_preview::QuickPreview::new(cc.egui_ctx.clone(), thumb_cache.clone()),
             quick_generation: 0,
             placeholder_edited: false,
+            placeholder_src: "",
+            first_frame: cli_first_frame,
             editor,
             scope_panel: ScopePanel::new(),
             scope_ms: 0.0,
@@ -922,7 +930,7 @@ impl App {
 
     /// Asks about unsaved changes before an action that replaces the document.
     fn guard(&mut self, p: Pending, ctx: &egui::Context) {
-        if self.session.dirty && self.shot.is_none() && self.bench.is_none() {
+        if self.session.dirty && self.shot.is_none() && self.bench.is_none() && self.first_frame.is_none() {
             self.prompt = Some(p);
         } else {
             self.execute(p, ctx);
@@ -1365,7 +1373,7 @@ impl App {
 
     fn startup(&mut self) {
         self.startup_done = true;
-        if self.cli.capture() || self.cli.bench {
+        if self.cli.capture() || self.cli.benching() {
             let list: Vec<String> = self.monitors.iter().map(|m| format!("{} (scale {:.2}{})", m.id, m.scale, if m.primary { ", primary" } else { "" })).collect();
             eprintln!("monitors: {}", list.join("; "));
         }
@@ -1443,11 +1451,17 @@ impl App {
                         self.allow_close = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
+                    if let Some(ff) = &mut self.first_frame {
+                        ff.on_failed(format!("render error: {message}"));
+                    }
                     self.last_error = Some(message.clone());
                     self.viewer.set_error(message);
                     if !self.compare.active() { self.scopes_stale = true; }
                 }
                 Reply::Excluded { message, .. } => {
+                    if let Some(ff) = &mut self.first_frame {
+                        ff.on_failed(format!("not shown: {message}"));
+                    }
                     self.last_error = None;
                     self.viewer.set_excluded(message);
                     if !self.compare.active() { self.scopes_stale = true; }
@@ -1463,6 +1477,9 @@ impl App {
         self.viewer.set_frame(ctx, f);
         self.last_error = None;
         self.last_frame_at = Some(Instant::now());
+        if let Some(ff) = &mut self.first_frame {
+            ff.on_frame(f.image, f.path.short(), f.eval_ms, f.display_ms);
+        }
         if let Some(note) = &f.notice {
             self.status.info(note.clone());
         }
@@ -1504,7 +1521,8 @@ impl App {
             }
         }
         // Step to a neighbour instantly: decode them in the background now.
-        let cold_bench = self.bench.as_ref().is_some_and(|b| matches!(b.phase, BenchPhase::Wait | BenchPhase::Uncached));
+        let cold_bench = self.bench.as_ref().is_some_and(|b| matches!(b.phase, BenchPhase::Wait | BenchPhase::Uncached))
+            || self.first_frame.as_ref().is_some_and(ff_driver::Driver::cold);
         if f.image == self.session.current_image() && !cold_bench {
             self.prefetch.request(self.session.neighbours());
         }
@@ -1591,21 +1609,26 @@ impl App {
             self.prefetch.forget();
             self.scopes_stale = true;
             self.placeholder_edited = false;
+            self.placeholder_src = "";
             let provider = &self.session.provider;
             if let Some(tex) = edited.clone() {
                 viewer.set_placeholder(self.quick_generation, tex.clone(), edited_geometry(&self.session, node, image, &tex));
                 self.placeholder_edited = true;
+                self.placeholder_src = "edited thumbnail";
             } else if let Some(proxy) = provider.cached_proxy(image) {
                 let size = (proxy.width(), proxy.height());
                 let tex = crate::quick_preview::proxy_texture(ctx, &proxy, self.session.view.transform());
                 viewer.set_placeholder(self.quick_generation, tex, crate::quick_preview::geometry(&self.session, node, image, size));
+                self.placeholder_src = "proxy cache";
             } else if let Some(tex) = self.filmstrip.thumbs.texture(image) {
                 let [w, h] = tex.size();
                 let size = crate::quick_preview::estimate_proxy_size(provider, image, (w as u32, h as u32));
                 viewer.set_placeholder(self.quick_generation, tex, crate::quick_preview::geometry(&self.session, node, image, size));
+                self.placeholder_src = "thumbnail";
             } else if let Some(path) = provider.path_of(image) {
                 let hash = self.session.entry(image).map_or_else(String::new, |e| e.content_hash.clone());
                 self.quick_preview.request(crate::quick_preview::Job { generation: self.quick_generation, path, hash });
+                self.placeholder_src = "quick preview pending";
             }
             ctx.request_repaint();
         }
@@ -1614,14 +1637,16 @@ impl App {
             if let Some(tex) = edited {
                 viewer.set_placeholder(self.quick_generation, tex.clone(), edited_geometry(&self.session, node, image, &tex));
                 self.placeholder_edited = true;
+                self.placeholder_src = "edited thumbnail";
             }
         }
-        for (generation, pixels) in self.quick_preview.poll() {
+        for (generation, pixels, source) in self.quick_preview.poll() {
             if generation != self.quick_generation || !viewer.awaiting_final() || self.placeholder_edited { continue; }
             let [w, h] = pixels.size;
             let size = crate::quick_preview::estimate_proxy_size(&self.session.provider, image, (w as u32, h as u32));
             let tex = ctx.load_texture("embedded selection preview", pixels, egui::TextureOptions::LINEAR);
             viewer.set_placeholder(generation, tex, crate::quick_preview::geometry(&self.session, node, image, size));
+            self.placeholder_src = source;
         }
     }
 
@@ -3011,7 +3036,7 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.session.dirty && self.shot.is_none() && self.bench.is_none() {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.session.dirty && self.shot.is_none() && self.bench.is_none() && self.first_frame.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.prompt = Some(Pending::Quit);
         }
@@ -3097,6 +3122,7 @@ impl eframe::App for App {
         self.autosave_step(&ctx);
         self.refresh_collection();
         self.tool_bench_step(&ctx);
+        self.first_frame_drive(&ctx);
         self.update_selection_preview(&ctx);
         self.compare_step(&ctx);
         self.submit_if_needed();
@@ -3107,6 +3133,7 @@ impl eframe::App for App {
         self.report_fill_time();
         self.screenshot_step(&ctx);
         self.bench_step(&ctx);
+        self.first_frame_observe(&ctx);
         self.cli_run_export_finish(&ctx);
 
         let title = self.session.window_title();
@@ -3124,6 +3151,7 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         // A clean quit: the recovery copies of this session are not needed any more.
+        rawgraph_engine::depth::shutdown_depth_workers();
         self.shutdown();
     }
 
@@ -3151,7 +3179,7 @@ impl eframe::App for App {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        if self.cli.capture() || self.cli.bench || self.cli.run_export_node.is_some() {
+        if self.cli.capture() || self.cli.benching() || self.cli.run_export_node.is_some() {
             return;
         }
         let mut workspaces = self.ws.store.clone();
@@ -3175,7 +3203,7 @@ impl eframe::App for App {
     }
 
     fn persist_egui_memory(&self) -> bool {
-        !self.cli.capture() && !self.cli.bench && self.cli.run_export_node.is_none()
+        !self.cli.capture() && !self.cli.benching() && self.cli.run_export_node.is_none()
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

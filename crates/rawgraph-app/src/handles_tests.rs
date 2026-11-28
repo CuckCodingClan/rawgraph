@@ -343,7 +343,7 @@ fn white_balance_picker_neutralises_the_node_input() {
         let node = tinted_input(&mut g, kind);
         let Value::Images(before) = ev.eval(&g, node, IMG, s.provider.as_ref(), &CancelToken::new()).unwrap();
         assert!(!neutral(sample_patch(&before, GREY), 0.03), "the input is tinted");
-        let (values, note) = pick_values(&g, s.provider.as_ref(), rawgraph_scopes::ToneMap::AcesFit, node, IMG, GREY).unwrap();
+        let (values, note) = pick_values(&g, s.provider.as_ref(), rawgraph_scopes::ToneMap::AcesFit, node, IMG, GREY, &CancelToken::new()).unwrap();
         assert!(note.is_none(), "{note:?}");
         if kind == NodeKind::Develop {
             assert_eq!(values[0], ("wb", 1.0), "Develop switches to Custom");
@@ -357,7 +357,7 @@ fn white_balance_picker_neutralises_the_node_input() {
     }
     // A colour without one of the channels cannot be balanced: an error, nothing set.
     let wb = s.project.graph.nodes().find(|n| n.kind == NodeKind::WhiteBalance).unwrap().id;
-    assert!(pick_values(&s.project.graph, s.provider.as_ref(), rawgraph_scopes::ToneMap::AcesFit, wb, IMG, [0.3, 0.3]).is_err(), "pure cyan bar");
+    assert!(pick_values(&s.project.graph, s.provider.as_ref(), rawgraph_scopes::ToneMap::AcesFit, wb, IMG, [0.3, 0.3], &CancelToken::new()).is_err(), "pure cyan bar");
 }
 
 #[test]

@@ -7,7 +7,7 @@ use rawgraph_scopes::DisplayTransform;
 
 pub struct QuickPreview {
     tx: Sender<Job>,
-    rx: Receiver<(u64, ColorImage)>,
+    rx: Receiver<(u64, ColorImage, &'static str)>,
 }
 
 pub struct Job {
@@ -25,11 +25,15 @@ impl QuickPreview {
                 let job = jobs.try_iter().last().unwrap_or(job);
                 let pixels = cache.as_ref().and_then(|cache| (!job.hash.is_empty()).then(|| cache.get(&job.hash, crate::thumbs::THUMB_SIZE)).flatten())
                     .and_then(|bytes| crate::thumbs::decode_jpeg(&bytes))
+                    .map(|p| (p, "thumbnail cache"))
                     .or_else(|| {
-                        (rawgraph_io::source_kind(&job.path) == Some(rawgraph_io::SourceKind::Raw)).then(|| rawgraph_io::raw::load_embedded_preview(&job.path, 1280).ok().flatten()).flatten()
+                        (rawgraph_io::source_kind(&job.path) == Some(rawgraph_io::SourceKind::Raw))
+                            .then(|| rawgraph_io::raw::load_embedded_preview(&job.path, 1280).ok().flatten())
+                            .flatten()
+                            .map(|p| (p, "embedded preview"))
                     });
-                if let Some((w, h, rgba)) = pixels {
-                    if out.send((job.generation, ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba))).is_err() { break; }
+                if let Some(((w, h, rgba), source)) = pixels {
+                    if out.send((job.generation, ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba), source)).is_err() { break; }
                     ctx.request_repaint();
                 }
             }
@@ -39,7 +43,7 @@ impl QuickPreview {
 
     pub fn request(&self, job: Job) { let _ = self.tx.send(job); }
 
-    pub fn poll(&self) -> impl Iterator<Item = (u64, ColorImage)> + '_ { self.rx.try_iter() }
+    pub fn poll(&self) -> impl Iterator<Item = (u64, ColorImage, &'static str)> + '_ { self.rx.try_iter() }
 }
 
 pub fn proxy_texture(ctx: &egui::Context, proxy: &ImageBuf, view: DisplayTransform) -> TextureHandle {

@@ -726,7 +726,7 @@ impl App {
 
     /// Prints how long the filmstrip took to fill (screenshot and bench runs).
     pub(super) fn report_fill_time(&mut self) {
-        if self.fill_reported || !self.cli.capture() && !self.cli.bench {
+        if self.fill_reported || !self.cli.capture() && !self.cli.benching() {
             return;
         }
         let Some(first) = self.filmstrip.thumbs.first_request else { return };

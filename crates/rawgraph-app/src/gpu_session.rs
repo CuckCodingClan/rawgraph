@@ -250,6 +250,13 @@ impl<B: Backend> GpuSession<B> {
         self.graveyard.push((class, generation));
     }
 
+    /// Drops the uploaded base images (they are uploaded again when needed); the frame on
+    /// screen keeps its target. Used before a cold-start measurement.
+    pub fn forget_bases(&mut self) {
+        drop(self.bases.drain());
+        self.last = None;
+    }
+
     /// Drops every GPU image (out of memory, device lost, preview size change).
     fn release_all(&mut self, generation: u64) {
         self.bases.drain();

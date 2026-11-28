@@ -17,6 +17,7 @@ mod develop;
 mod dialogs;
 mod export;
 mod filmstrip;
+mod first_frame;
 mod live_thumbs;
 mod fine_slider;
 mod filter;
@@ -85,7 +86,7 @@ fn main() {
         println!("RawGraph {}", display_version());
         return;
     }
-    let cli = match cli::parse_args(std::env::args().skip(1)) {
+    let mut cli = match cli::parse_args(std::env::args().skip(1)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("rawgraph-app: {e}\n\n{}", cli::USAGE);
@@ -97,6 +98,18 @@ fn main() {
         return;
     }
 
+    if let Some(folder) = &cli.bench_first_frame {
+        if let Err(e) = first_frame::validate(folder, cli.data_dir.as_deref(), cli.bench_out.as_deref()) {
+            eprintln!("rawgraph-app: {e}");
+            std::process::exit(2);
+        }
+    }
+    // The first-frame benchmark empties and refills RawGraph's caches: never in the user's own
+    // data folder. Without --data-dir it gets a fresh temporary one (removed again at the end).
+    let bench_temp_dir = (cli.bench_first_frame.is_some() && cli.data_dir.is_none()).then(|| std::env::temp_dir().join(format!("rawgraph-bench-{}", std::process::id())));
+    if bench_temp_dir.is_some() {
+        cli.data_dir.clone_from(&bench_temp_dir);
+    }
     let _splash = splash::start(&cli);
     let (w, h) = cli.size.unwrap_or((1600.0, 1000.0));
     let mut viewport = eframe::egui::ViewportBuilder::default()
@@ -122,9 +135,17 @@ fn main() {
     };
     let cli_for_app = cli.clone();
     let result = eframe::run_native("RawGraph", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, cli_for_app)))));
+    // No orphan Depth Map worker process after the window is gone.
+    rawgraph_engine::depth::shutdown_depth_workers();
     if let Err(e) = result {
         eprintln!("rawgraph-app: {e}");
+        if let Some(dir) = &bench_temp_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         std::process::exit(1);
+    }
+    if let Some(dir) = &bench_temp_dir {
+        let _ = std::fs::remove_dir_all(dir);
     }
     let code = app::EXIT_CODE.load(Ordering::SeqCst);
     if code != 0 {
