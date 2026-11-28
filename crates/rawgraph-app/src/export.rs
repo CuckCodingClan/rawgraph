@@ -175,7 +175,7 @@ impl ExportState {
         let Some(node) = export_node(session) else { return Vec::new(); };
         let ids: Vec<_> = session.project.images().iter().map(|entry| entry.id).collect();
         let capture = |id| session.entry(id).map(crate::session::capture_with_path);
-        let catalog = rawgraph_core::Catalog { images: &ids, capture: &capture };
+        let catalog = rawgraph_core::Catalog { images: &ids, capture: &capture, memo: None };
         session.project.graph.members(node, 0, &catalog).into_iter()
             .filter(|id| session.entry(*id).is_none()).collect()
     }
@@ -251,7 +251,11 @@ pub fn counts(report: &ExportReport) -> (usize, usize, usize, usize, usize) {
 
 pub fn summarize(report: &ExportReport) -> String {
     let (w, s, x, f, c) = counts(report);
-    format!("Export finished: {w} written, {s} skipped, {x} excluded, {f} failed, {c} cancelled")
+    let merged = match report.merged() {
+        0 => String::new(),
+        m => format!(", {m} merged into another image"),
+    };
+    format!("Export finished: {w} written, {s} skipped, {x} excluded{merged}, {f} failed, {c} cancelled")
 }
 
 pub enum ExportMsg {
@@ -422,7 +426,7 @@ pub fn node_selection(session: &mut Session, node: NodeId, scope: Scope) -> Vec<
 pub fn node_members(session: &mut Session, node: NodeId) -> Vec<ImageId> {
     let (ids, caps) = session.id_captures();
     let capture = |i: ImageId| caps.get(&i).cloned();
-    let catalog = rawgraph_core::Catalog { images: &ids, capture: &capture };
+    let catalog = rawgraph_core::Catalog { images: &ids, capture: &capture, memo: None };
     session.project.graph.members(node, 0, &catalog)
 }
 
@@ -811,6 +815,11 @@ pub fn show_report(ctx: &egui::Context, area: egui::Rect, fin: &FinishedExport) 
             ui.label("Excluded (not in the collection)");
             ui.label(x.to_string());
             ui.end_row();
+            if fin.report.merged() > 0 {
+                ui.label("Merged into another image (HDR Merge)");
+                ui.label(fin.report.merged().to_string());
+                ui.end_row();
+            }
             ui.label("Failed");
             ui.label(f.to_string());
             ui.end_row();
@@ -1030,11 +1039,16 @@ mod tests {
                 (ImageId(3), ItemStatus::Failed("nope".into())),
                 (ImageId(4), ItemStatus::Cancelled),
                 (ImageId(5), ItemStatus::Excluded),
+                (ImageId(6), ItemStatus::MergedInto(ImageId(1))),
             ],
         };
         assert_eq!(counts(&report), (1, 1, 1, 1, 1));
-        assert_eq!(summarize(&report), "Export finished: 1 written, 1 skipped, 1 excluded, 1 failed, 1 cancelled");
-        let items: Vec<ExportItem> = (1..=5).map(|i| ExportItem { id: ImageId(i), source: format!("{i}.arw").into() }).collect();
+        assert_eq!(report.merged(), 1);
+        assert_eq!(
+            summarize(&report),
+            "Export finished: 1 written, 1 skipped, 1 excluded, 1 merged into another image, 1 failed, 1 cancelled"
+        );
+        let items: Vec<ExportItem> = (1..=6).map(|i| ExportItem { id: ImageId(i), source: format!("{i}.arw").into() }).collect();
         assert_eq!(report.retry_items(&items).len(), 2);
     }
 }

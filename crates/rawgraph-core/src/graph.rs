@@ -21,6 +21,7 @@ use crate::export::{
 };
 use crate::layer::{LAYER_BLEND_MODES, LAYER_FILTERS, LAYER_FITS, LAYER_MODES, MAX_LAYERS};
 use crate::lens::LENS_MODES;
+use crate::stack::{group_images, GroupRule, GroupSettings, ImageGroup, Reference};
 
 /// Bumped whenever the serialized graph layout changes incompatibly.
 /// Version 2 added the Layer and Export kinds, Source folders, curve sets and
@@ -108,6 +109,8 @@ pub enum NodeKind {
     Generator,
     /// Colour lookup table from a `.cube` file (path stored as node data).
     Lut,
+    /// Merges each bracket of exposures (image group) into one HDR image.
+    HdrMerge,
 }
 
 /// How a parameter is edited and which values it accepts.
@@ -173,6 +176,8 @@ pub struct Catalog<'a> {
     /// family then answers per image without listing anything.
     pub images: &'a [ImageId],
     pub capture: CaptureFn<'a>,
+    /// Answers shared by every query made with this catalog (see [`QueryMemo`]); `None` = every query starts fresh.
+    pub memo: Option<&'a QueryMemo>,
 }
 /// Whether a Metadata Filter node accepts `image`. A present value is tested
 /// against min..=max (inclusive) and then flipped by `invert`; a missing value
@@ -449,6 +454,20 @@ const CURVE_APPLY_ORDER: [u8; 7] = [0, 1, 2, 3, 5, 6, 4];
 const CURVE_CHANNEL_OPTIONS: &[&str] = &CURVE_CHANNELS;
 const POINT_CURVE_PARAMS: &[ParamSpec] = &[choice("channel", "Channel", CURVE_CHANNEL_OPTIONS, 0)];
 
+const HDR_GROUP_OPTIONS: &[&str] = &crate::stack::GROUP_RULES;
+const HDR_EXPOSURE_OPTIONS: &[&str] = &["Measured", "Metadata"];
+const HDR_MERGE_PARAMS: &[ParamSpec] = &[
+    choice("group_by", "Group by", HDR_GROUP_OPTIONS, 1),
+    p("gap_s", "Max gap", "s", 0.0, 60.0, 2.0),
+    p("max_size", "Max group size", "images", 2.0, 25.0, 9.0),
+    p("group", "Group number", "0 = none", 0.0, 999.0, 0.0),
+    choice("exposure", "Exposure ratios", HDR_EXPOSURE_OPTIONS, 0),
+    toggle("align", "Align frames", true),
+    p("max_shift_pct", "Max shift", "% of long side", 0.0, 10.0, 3.0),
+    p("deghost", "Deghost", "", 0.0, 1.0, 0.5),
+    p("clip", "Clip level", "of white", 0.5, 1.0, 0.95),
+];
+
 const SOURCE_PARAMS: &[ParamSpec] = &[toggle("subfolders", "Include subfolders", true)];
 const MERGE_COLLISION_OPTIONS: &[&str] = &["Keep both", "First input wins", "Last input wins"];
 const MERGE_PARAMS: &[ParamSpec] = &[choice("collision", "Same file name", MERGE_COLLISION_OPTIONS, 0)];
@@ -612,7 +631,7 @@ pub fn curve_set(node: &Node, image: ImageId) -> Vec<CurveEntry> {
 }
 
 impl NodeKind {
-    pub const ALL: [NodeKind; 32] = [
+    pub const ALL: [NodeKind; 33] = [
         NodeKind::Source,
         NodeKind::CaptureEv,
         NodeKind::Exposure,
@@ -647,6 +666,7 @@ impl NodeKind {
         NodeKind::DepthMap,
         NodeKind::Generator,
         NodeKind::Lut,
+        NodeKind::HdrMerge,
     ];
 
     /// Menu group of this kind.
@@ -664,7 +684,7 @@ impl NodeKind {
             NodeKind::NoiseReduction | NodeKind::Sharpen | NodeKind::Blur | NodeKind::Clarity => "Detail",
             NodeKind::Transform | NodeKind::LensManual => "Geometry",
             NodeKind::Vignette | NodeKind::PixelSort => "Effects",
-            NodeKind::MetadataFilter | NodeKind::Merge | NodeKind::MetadataSplit | NodeKind::Layer => "Collection",
+            NodeKind::MetadataFilter | NodeKind::Merge | NodeKind::MetadataSplit | NodeKind::Layer | NodeKind::HdrMerge => "Collection",
             NodeKind::Draw | NodeKind::DepthMap | NodeKind::NormalMap | NodeKind::Generator => "Generators",
         }
     }
@@ -705,6 +725,7 @@ impl NodeKind {
             NodeKind::DepthMap => "Depth Map",
             NodeKind::Generator => "Generator",
             NodeKind::Lut => "LUT",
+            NodeKind::HdrMerge => "HDR Merge",
         }
     }
 
@@ -744,6 +765,7 @@ impl NodeKind {
             NodeKind::DepthMap => &[],
             NodeKind::Generator => GENERATOR_PARAMS,
             NodeKind::Lut => LUT_PARAMS,
+            NodeKind::HdrMerge => HDR_MERGE_PARAMS,
         }
     }
 
@@ -1300,31 +1322,40 @@ type Listing = Rc<Vec<ImageId>>;
 /// The images of a Merge with the input port each comes from.
 type MergeEntries = Vec<(ImageId, usize)>;
 
-struct Ctx<'c> {
-    catalog: Catalog<'c>,
+/// What collection queries have already worked out: captures, listings, Merge and group plans.
+/// Valid only while graph, catalog and capture data do not change: an evaluator creates one per
+/// evaluation (so a batch does not rebuild the group plan below an HDR Merge for every call) and
+/// drops it afterwards. Put it into [`Catalog::memo`]; a catalog without one starts fresh.
+#[derive(Default)]
+pub struct QueryMemo {
     caps: RefCell<HashMap<ImageId, Option<Rc<CaptureInfo>>>>,
     members: RefCell<HashMap<(NodeId, usize), Listing>>,
     merges: RefCell<HashMap<NodeId, Rc<MergeEntries>>>,
+    groups: RefCell<HashMap<NodeId, Rc<Vec<ImageGroup>>>>,
+}
+
+struct Ctx<'c> {
+    catalog: Catalog<'c>,
+    own: QueryMemo,
     depth: Cell<usize>,
 }
 
 impl<'c> Ctx<'c> {
     fn new(catalog: &Catalog<'c>) -> Self {
-        Ctx {
-            catalog: *catalog,
-            caps: RefCell::new(HashMap::new()),
-            members: RefCell::new(HashMap::new()),
-            merges: RefCell::new(HashMap::new()),
-            depth: Cell::new(0),
-        }
+        Ctx { catalog: *catalog, own: QueryMemo::default(), depth: Cell::new(0) }
+    }
+
+    /// The memo in use: the catalog's shared one, else this query's own.
+    fn m(&self) -> &QueryMemo {
+        self.catalog.memo.unwrap_or(&self.own)
     }
 
     fn cap(&self, id: ImageId) -> Option<Rc<CaptureInfo>> {
-        if let Some(c) = self.caps.borrow().get(&id) {
+        if let Some(c) = self.m().caps.borrow().get(&id) {
             return c.clone();
         }
         let c = (self.catalog.capture)(id).map(Rc::new);
-        self.caps.borrow_mut().insert(id, c.clone());
+        self.m().caps.borrow_mut().insert(id, c.clone());
         c
     }
 
@@ -1703,7 +1734,7 @@ impl Graph {
             let Some(n) = self.node(cur) else { return false };
             match n.kind {
                 NodeKind::Source => return true,
-                NodeKind::Transform | NodeKind::LensManual | NodeKind::Layer => return false,
+                NodeKind::Transform | NodeKind::LensManual | NodeKind::Layer | NodeKind::HdrMerge => return false,
                 _ => {}
             }
             let next = n
@@ -1761,7 +1792,7 @@ impl Graph {
     /// folder contains every image, a Merge keeps both of equally named
     /// images, a Layer contains what any of its inputs contains.
     pub fn contains(&self, node: NodeId, image: ImageId, capture: CaptureFn) -> bool {
-        self.contains_in(node, image, &Catalog { images: &[], capture })
+        self.contains_in(node, image, &Catalog { images: &[], capture, memo: None })
     }
 
     /// True if `image` is part of the collection that `node` outputs.
@@ -1793,7 +1824,7 @@ impl Graph {
     /// [`Graph::split_port`]); a range output without a defined range carries
     /// nothing. Single-output nodes only have port 0.
     pub fn contains_output(&self, node: NodeId, port: usize, image: ImageId, capture: CaptureFn) -> bool {
-        self.contains_output_in(node, port, image, &Catalog { images: &[], capture })
+        self.contains_output_in(node, port, image, &Catalog { images: &[], capture, memo: None })
     }
 
     /// [`Graph::contains_output`] with a catalog.
@@ -1808,7 +1839,7 @@ impl Graph {
     /// it has no value for the measure and `missing` is "Exclude" (with
     /// "Unmatched" such images go to the Unmatched port).
     pub fn split_port(&self, node: NodeId, image: ImageId, capture: CaptureFn) -> Option<usize> {
-        self.split_port_in(node, image, &Catalog { images: &[], capture })
+        self.split_port_in(node, image, &Catalog { images: &[], capture, memo: None })
     }
 
     /// [`Graph::split_port`] with a catalog.
@@ -1820,7 +1851,7 @@ impl Graph {
     /// For a Merge node: the input port that supplies `image`, the first
     /// connected input in port order whose collection contains it.
     pub fn merge_source(&self, node: NodeId, image: ImageId, capture: CaptureFn) -> Option<usize> {
-        self.merge_source_in(node, image, &Catalog { images: &[], capture })
+        self.merge_source_in(node, image, &Catalog { images: &[], capture, memo: None })
     }
 
     /// [`Graph::merge_source`] with a catalog: after the `collision` option has
@@ -1840,7 +1871,7 @@ impl Graph {
     /// (2 or more is a duplicate, resolved by port order).
     pub fn merge_candidates(&self, node: NodeId, image: ImageId, capture: CaptureFn) -> usize {
         let Some(n) = self.node(node).filter(|n| n.kind == NodeKind::Merge) else { return 0 };
-        let catalog = Catalog { images: &[], capture };
+        let catalog = Catalog { images: &[], capture, memo: None };
         let ctx = Ctx::new(&catalog);
         (0..n.kind.inputs().len())
             .filter(|&port| self.input_contains_ctx(&ctx, node, port, image))
@@ -1940,6 +1971,13 @@ impl Graph {
                     self.members_ctx(ctx, node, 0).contains(&image)
                 }
             }
+            NodeKind::HdrMerge => {
+                if ctx.catalog.images.is_empty() {
+                    self.input_contains_ctx(ctx, node, 0, image)
+                } else {
+                    self.group_plan(ctx, node).iter().any(|g| g.reference == image)
+                }
+            }
             NodeKind::MetadataFilter => {
                 self.input_contains_ctx(ctx, node, 0, image) && {
                     let cap = ctx.cap(image);
@@ -1964,7 +2002,7 @@ impl Graph {
     }
 
     fn members_ctx(&self, ctx: &Ctx, node: NodeId, port: usize) -> Rc<Vec<ImageId>> {
-        if let Some(v) = ctx.members.borrow().get(&(node, port)) {
+        if let Some(v) = ctx.m().members.borrow().get(&(node, port)) {
             return Rc::clone(v);
         }
         if !ctx.enter() {
@@ -1972,7 +2010,7 @@ impl Graph {
         }
         let list = self.compute_members(ctx, node, port);
         ctx.leave();
-        ctx.members.borrow_mut().insert((node, port), Rc::clone(&list));
+        ctx.m().members.borrow_mut().insert((node, port), Rc::clone(&list));
         list
     }
 
@@ -2033,6 +2071,7 @@ impl Graph {
                 )
             }
             NodeKind::Merge => Rc::new(self.merge_entries(ctx, node).iter().map(|(i, _)| *i).collect()),
+            NodeKind::HdrMerge => Rc::new(self.group_plan(ctx, node).iter().map(|g| g.reference).collect()),
             NodeKind::Layer => match self.layer_plan(ctx, node) {
                 Some((driver, _)) => driver,
                 None => none(),
@@ -2046,7 +2085,7 @@ impl Graph {
     /// "Keep both" (or the catalog is empty), only the images of the winning
     /// input per file name stay.
     fn merge_entries(&self, ctx: &Ctx, node: NodeId) -> Rc<Vec<(ImageId, usize)>> {
-        if let Some(v) = ctx.merges.borrow().get(&node) {
+        if let Some(v) = ctx.m().merges.borrow().get(&node) {
             return Rc::clone(v);
         }
         let Some(n) = self.node(node).filter(|n| n.kind == NodeKind::Merge) else { return Rc::new(Vec::new()) };
@@ -2083,8 +2122,69 @@ impl Graph {
                 .collect();
         }
         let out = Rc::new(entries);
-        ctx.merges.borrow_mut().insert(node, Rc::clone(&out));
+        ctx.m().merges.borrow_mut().insert(node, Rc::clone(&out));
         out
+    }
+
+    /// For an HDR Merge: the groups of its input collection (see [`crate::stack`]),
+    /// listed by the input position of their reference.
+    fn group_plan(&self, ctx: &Ctx, node: NodeId) -> Rc<Vec<ImageGroup>> {
+        if let Some(v) = ctx.m().groups.borrow().get(&node) {
+            return Rc::clone(v);
+        }
+        let Some(n) = self.node(node).filter(|n| n.kind == NodeKind::HdrMerge) else { return Rc::new(Vec::new()) };
+        let input = self.input_members(ctx, node, 0);
+        let settings = GroupSettings {
+            rule: GroupRule::from_index(n.all_choice("group_by")),
+            gap_s: n.all_value("gap_s").clamp(0.0, 60.0),
+            max_size: n.all_value("max_size").round().clamp(2.0, 25.0) as usize,
+        };
+        let manual = |i: ImageId| {
+            let v = n.param("group", i);
+            v.is_finite().then(|| v.round() as i64)
+        };
+        let groups =
+            group_images(&input, &|i| ctx.cap(i), &manual, &settings, Reference::MiddleExposure);
+        let out = Rc::new(groups);
+        ctx.m().groups.borrow_mut().insert(node, Rc::clone(&out));
+        out
+    }
+
+    /// For an HDR Merge node and an image of its output collection (a group
+    /// reference): the group it stands for, members in group order. `None` if
+    /// `node` is no HDR Merge, `image` is not one of its outputs, or the
+    /// catalog is empty.
+    pub fn image_group(&self, node: NodeId, image: ImageId, catalog: &Catalog) -> Option<ImageGroup> {
+        if catalog.images.is_empty() || !self.node(node).is_some_and(|n| n.kind == NodeKind::HdrMerge) {
+            return None;
+        }
+        let ctx = Ctx::new(catalog);
+        self.group_plan(&ctx, node).iter().find(|g| g.reference == image).cloned()
+    }
+
+    /// Every group of an HDR Merge node, listed by the input position of the reference
+    /// (the order of its output collection). Empty if `node` is no HDR Merge or the
+    /// catalog is empty. One query for all images: use it instead of asking per image.
+    pub fn image_groups(&self, node: NodeId, catalog: &Catalog) -> Vec<ImageGroup> {
+        if catalog.images.is_empty() || !self.node(node).is_some_and(|n| n.kind == NodeKind::HdrMerge) {
+            return Vec::new();
+        }
+        let ctx = Ctx::new(catalog);
+        self.group_plan(&ctx, node).as_ref().clone()
+    }
+
+    /// The nearest HDR Merge at or above `node`, following the first connected image input
+    /// (used to label group references further down the graph).
+    pub fn upstream_hdr_merge(&self, node: NodeId) -> Option<NodeId> {
+        let mut cur = node;
+        for _ in 0..MAX_WALK {
+            let n = self.node(cur)?;
+            if n.kind == NodeKind::HdrMerge {
+                return Some(cur);
+            }
+            cur = (0..n.kind.inputs().len()).find_map(|port| self.input_of(cur, port))?;
+        }
+        None
     }
 
     /// For a Layer: the driver's members and the members of every connected layer.
@@ -2954,6 +3054,7 @@ mod tests {
             (NodeKind::MetadataSplit, "Split by Metadata", "Collection"),
             (NodeKind::ColorWheels, "Lift / Gamma / Gain", "Colour"),
             (NodeKind::Clarity, "Clarity / Texture", "Detail"),
+            (NodeKind::HdrMerge, "HDR Merge", "Collection"),
         ];
         assert_eq!(labels.len(), NodeKind::ALL.len());
         for (kind, label, category) in labels {
@@ -3414,7 +3515,7 @@ mod tests {
         assert_eq!(s.param_spec("missing").unwrap().kind, ParamKind::Choice(&["Unmatched", "Exclude"]));
         assert_eq!(s.params().len(), 2);
         assert!(NodeKind::ALL.contains(&c) && NodeKind::ALL.contains(&b) && NodeKind::ALL.contains(&s));
-        assert_eq!(NodeKind::ALL.len(), 32);
+        assert_eq!(NodeKind::ALL.len(), 33);
     }
 
     #[test]
@@ -4326,7 +4427,7 @@ mod exposed_port_tests {
         assert_eq!(g.connect(mask, exp, p), Ok(()));
         let alias = g.expose_output(src, 0, "copy").unwrap();
         let ids = [ImageId(1), ImageId(2)];
-        let catalog = Catalog { images: &ids, capture: &|_| None };
+        let catalog = Catalog { images: &ids, capture: &|_| None, memo: None };
         assert_eq!(g.members(src, alias, &catalog), g.members(src, 0, &catalog));
         let sub = g.extract_subgraph(&[src, exp, other]);
         let sub = Subgraph::from_json(&sub.to_json()).unwrap();

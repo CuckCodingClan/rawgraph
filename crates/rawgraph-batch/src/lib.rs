@@ -201,6 +201,10 @@ pub enum ItemStatus {
     /// The image is not part of the collection that reaches the export node (filtered out by the
     /// graph). Nothing was decoded or written; this is not a failure and is not retried.
     Excluded,
+    /// The image is a member of an HDR Merge group and went into the merged image of the given
+    /// reference image (which is written under its own name). Nothing was written for this image;
+    /// not a failure, not retried.
+    MergedInto(ImageId),
 }
 
 /// `current` is the source file the event concerns: the first item in the initial call
@@ -241,6 +245,11 @@ impl ExportReport {
 
     pub fn excluded(&self) -> usize {
         self.count(|s| matches!(s, ItemStatus::Excluded))
+    }
+
+    /// Images that went into the merged image of an HDR Merge group (see [`ItemStatus::MergedInto`]).
+    pub fn merged(&self) -> usize {
+        self.count(|s| matches!(s, ItemStatus::MergedInto(_)))
     }
 
     /// The items that failed or were cancelled, in batch order (excluded items are not retried).
@@ -626,6 +635,30 @@ struct Ctx<'a> {
     sources: HashSet<String>,
     /// The graph's structural problem, if any: fails every item that is not excluded.
     problem: Option<String>,
+    /// Non-reference members of the HDR Merge group above the export node, with the reference image
+    /// they were merged into.
+    merged: HashMap<ImageId, ImageId>,
+}
+
+/// The images that an HDR Merge above `node` folds into another image: member -> reference.
+fn merged_members(graph: &Graph, node: NodeId, provider: &dyn ImageProvider) -> HashMap<ImageId, ImageId> {
+    let Some(hdr) = graph.upstream_hdr_merge(node) else { return HashMap::new() };
+    let images = provider.images();
+    let capture = |i: ImageId| provider.capture(i);
+    let catalog = rawgraph_core::Catalog { images: &images, capture: &capture, memo: None };
+    graph
+        .image_groups(hdr, &catalog)
+        .into_iter()
+        .flat_map(|g| {
+            let reference = g.reference;
+            g.members.into_iter().filter(move |m| *m != reference).map(move |m| (m, reference))
+        })
+        .collect()
+}
+
+/// The status of an image that is not part of the collection reaching the export node.
+fn excluded_status(ctx: &Ctx, image: ImageId) -> ItemStatus {
+    ctx.merged.get(&image).map_or(ItemStatus::Excluded, |&r| ItemStatus::MergedInto(r))
 }
 
 /// First structural problem (missing required connection) among the nodes `node` depends on.
@@ -704,7 +737,7 @@ fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job
     let image = match evaluated {
         Ok(img) => img,
         Err(EvalError::Cancelled) => return ItemStatus::Cancelled,
-        Err(EvalError::NotInCollection { .. }) => return ItemStatus::Excluded,
+        Err(EvalError::NotInCollection { .. }) => return excluded_status(ctx, item.id),
         Err(e) => return ItemStatus::Failed(format!("evaluating the graph: {e}")),
     };
 
@@ -949,6 +982,7 @@ fn run_batch(
         cancel,
         sources: catalog.iter().map(|it| norm_key(&it.source)).collect(),
         problem: graph_problem(graph, node),
+        merged: merged_members(graph, node, &provider),
     };
 
     // Membership first, from metadata and paths only: no pixel is decoded for an excluded image.
@@ -1039,7 +1073,7 @@ fn run_batch(
     });
     for (i, (job, path)) in jobs.iter().zip(&planned).enumerate() {
         let status = if !included[i] {
-            ItemStatus::Excluded
+            excluded_status(&ctx, job.item.id)
         } else {
             let plan = path.clone().unwrap_or_default();
             catch_unwind(AssertUnwindSafe(|| run_item(&ctx, &mut ev, &provider, job, &plan, &reserved)))
