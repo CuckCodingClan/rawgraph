@@ -607,6 +607,8 @@ fn graph_problem(graph: &Graph, node: NodeId) -> Option<String> {
         .into_iter()
         // Notes that only say a fallback is used do not stop an export.
         .filter(|i| !i.message.contains("not available yet"))
+        // An unreadable LUT file hits only the images that use it: those items fail, the rest export.
+        .filter(|i| !i.per_item)
         .find(|i| upstream.contains(&i.node))
         .map(|i| i.message)
 }
@@ -642,6 +644,9 @@ fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job
     }
     if let Some(problem) = &ctx.problem {
         return ItemStatus::Failed(format!("the graph cannot be evaluated: {problem}"));
+    }
+    if let Some(problem) = ctx.graph.lut_problem(ctx.node, item.id) {
+        return ItemStatus::Failed(problem);
     }
     if let Some(first) = &plan.duplicate_of {
         return ItemStatus::SkippedExisting(first.clone());

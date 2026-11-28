@@ -15,6 +15,7 @@ mod geometry;
 mod layer;
 mod lens;
 mod local;
+mod lut;
 mod masks;
 mod pixel_sort;
 mod sharpen;
@@ -30,6 +31,7 @@ pub use geometry::{
 pub use layer::{blend_layer, place_layer};
 pub use lens::{vignette_radial, warp_rectilinear};
 pub use local::local_contrast;
+pub use lut::{lut_apply, lut_apply_encoded};
 pub use masks::resize_mask;
 pub use pixel_sort::{pixel_sort, SortMetric};
 pub use sharpen::sharpen;

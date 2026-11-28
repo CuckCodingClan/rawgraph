@@ -6,12 +6,15 @@ use crate::display::{DisplayPipeline, SampleTargets};
 use crate::error::GpuError;
 use crate::point_ops::{OpKind, PointPipeline};
 
+/// Cached point-op pipelines by op-kind sequence, with the tick of their last use.
+pub(crate) type PointCache = HashMap<Vec<OpKind>, (Arc<PointPipeline>, u64)>;
+
 /// wgpu device + queue and the shader/pipeline caches.
 pub struct GpuContext {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     adapter_info: Option<wgpu::AdapterInfo>,
-    pub(crate) point_cache: Mutex<HashMap<Vec<OpKind>, Arc<PointPipeline>>>,
+    pub(crate) point_cache: Mutex<PointCache>,
     pub(crate) display_pipeline: OnceLock<DisplayPipeline>,
     pipelines_created: AtomicUsize,
     allocations_created: AtomicUsize,

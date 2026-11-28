@@ -449,6 +449,80 @@ pub fn source_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
     });
 }
 
+// --------------------------------------------------------------------------------- LUT UI
+
+/// Sets (or, with `None`, removes) the LUT file of a LUT node for `image`: in All mode for every
+/// image, in Individual mode for this image only.
+///
+/// Removing a file in Individual mode stores an EMPTY path for the image ("no LUT for this image"),
+/// so it does not fall back to the file of All; in All mode the data is removed.
+pub fn set_lut_file(graph: &mut Graph, id: NodeId, image: ImageId, file: Option<String>) -> Result<(), String> {
+    let Some(n) = graph.node_mut(id).filter(|n| n.kind == NodeKind::Lut) else { return Err("The LUT node no longer exists".to_owned()) };
+    let data = match file {
+        Some(f) => Some(NodeData::LutFile(f)),
+        None if n.mode == Mode::Individual => Some(NodeData::LutFile(String::new())),
+        None => None,
+    };
+    if n.set_data(image, data) {
+        Ok(())
+    } else {
+        Err(format!("This LUT path is too long (the limit is {} characters)", rawgraph_core::export::MAX_EXPORT_TEXT_CHARS))
+    }
+}
+
+/// The inspector part of a LUT node: file, Choose / Reload / Clear and what loading it said.
+pub fn lut_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, image: ImageId) {
+    let Some(node) = session.project.graph.node(id) else { return };
+    let file = rawgraph_core::lut_file(node, image).map(str::to_owned);
+    let display_mode = node.choice("input_space", image) == 0;
+    ui.add_space(4.0);
+    ui.group(|ui| {
+        ui.set_min_width(ui.available_width());
+        ui.label(RichText::new("LUT file").strong());
+        match &file {
+            Some(f) => {
+                ui.label(crate::export::elide_middle(f, 44)).on_hover_text(f.as_str());
+            }
+            None => {
+                ui.label("No file chosen (the image passes through)");
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Choose\u{2026}").on_hover_text("Pick an Adobe / Resolve .cube file (1D or 3D)").clicked() {
+                session.ui_requests.push(UiRequest::PickLutFile(id));
+            }
+            if ui.add_enabled(file.is_some(), egui::Button::new("Reload")).on_hover_text("Read the file again").clicked() {
+                if let Some(f) = &file {
+                    rawgraph_core::lut::forget(std::path::Path::new(f));
+                }
+            }
+            if ui.add_enabled(file.is_some(), egui::Button::new("Clear")).on_hover_text("Remove the file; the image passes through").clicked() {
+                // Individual mode stores "no LUT" for this image; removing cannot fail.
+                let _ = set_lut_file(&mut session.project.graph, id, image, None);
+            }
+        });
+        if let Some(f) = &file {
+            // Only the last known state: a background thread reads the disk.
+            match rawgraph_core::lut_file_status(f) {
+                Some(rawgraph_core::LutState::Ready(lut)) => {
+                    let title = lut.title.as_deref().filter(|t| !t.is_empty()).map(|t| format!(" \u{2013} {t}")).unwrap_or_default();
+                    ui.label(RichText::new(format!("{}{title}", lut.describe())).color(Color32::from_rgb(130, 190, 175)));
+                }
+                Some(rawgraph_core::LutState::Failed(e)) => {
+                    ui.label(RichText::new(format!("{e}. The image passes through unchanged.")).color(WARN));
+                }
+                Some(rawgraph_core::LutState::Unknown) => {
+                    ui.label(RichText::new("Reading the file\u{2026}").weak());
+                }
+                None => {}
+            }
+        }
+        if display_mode {
+            ui.label(RichText::new("Display mode applies the view transform on the CPU, the LUT, then its inverse.").weak());
+        }
+    });
+}
+
 // -------------------------------------------------------------------------------- Merge UI
 
 pub fn merge_rule_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
@@ -1277,3 +1351,39 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod lut_file_tests {
+    use super::*;
+
+    #[test]
+    fn clear_in_individual_mode_means_no_lut_for_that_image() {
+        let mut g = Graph::new();
+        let lut = g.add_node(NodeKind::Lut, [0.0, 0.0]);
+        let (a, b) = (ImageId(1), ImageId(2));
+        set_lut_file(&mut g, lut, a, Some("D:/luts/all.cube".into())).unwrap();
+        assert_eq!(rawgraph_core::lut_file(g.node(lut).unwrap(), b), Some("D:/luts/all.cube"));
+        g.node_mut(lut).unwrap().mode = Mode::Individual;
+        set_lut_file(&mut g, lut, b, Some("D:/luts/own.cube".into())).unwrap();
+        assert_eq!(rawgraph_core::lut_file(g.node(lut).unwrap(), b), Some("D:/luts/own.cube"));
+        // Clear: the image has its own, empty, path - it does NOT fall back to the file of All.
+        set_lut_file(&mut g, lut, b, None).unwrap();
+        assert_eq!(rawgraph_core::lut_file(g.node(lut).unwrap(), b), None);
+        assert_eq!(rawgraph_core::lut_file(g.node(lut).unwrap(), a), Some("D:/luts/all.cube"), "other images still inherit");
+        // In All mode Clear removes the data.
+        g.node_mut(lut).unwrap().mode = Mode::All;
+        set_lut_file(&mut g, lut, a, None).unwrap();
+        assert_eq!(rawgraph_core::lut_file(g.node(lut).unwrap(), a), None);
+    }
+
+    #[test]
+    fn a_missing_node_and_a_too_long_path_have_their_own_messages() {
+        let mut g = Graph::new();
+        let lut = g.add_node(NodeKind::Lut, [0.0, 0.0]);
+        let other = g.add_node(NodeKind::Source, [0.0, 0.0]);
+        assert!(set_lut_file(&mut g, other, ImageId(1), Some("x".into())).unwrap_err().contains("no longer exists"));
+        let long = "a".repeat(rawgraph_core::export::MAX_EXPORT_TEXT_CHARS + 1);
+        let e = set_lut_file(&mut g, lut, ImageId(1), Some(long)).unwrap_err();
+        assert!(e.contains("too long") && e.contains("1024"), "{e}");
+    }
+}

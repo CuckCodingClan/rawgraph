@@ -106,6 +106,8 @@ pub enum NodeKind {
     DepthMap,
     /// Generate pixels at the incoming image dimensions.
     Generator,
+    /// Colour lookup table from a `.cube` file (path stored as node data).
+    Lut,
 }
 
 /// How a parameter is edited and which values it accepts.
@@ -235,6 +237,12 @@ const NORMALS_PARAMS: &[ParamSpec] = &[
 const PIXEL_SORT_PARAMS: &[ParamSpec] = &[
     choice("metric", "Sort by", &["Brightness", "Saturation", "Hue"], 0),
     toggle("reverse", "Reverse", false),
+];
+/// Input spaces of the LUT node (the choice index is stored; keep the order).
+pub const LUT_SPACES: &[&str] = &["Display (view transform)", "sRGB / Rec.709 display (clamped)", "ACEScct (log)", "Linear ACEScg"];
+const LUT_PARAMS: &[ParamSpec] = &[
+    p("strength", "Strength", "", 0.0, 1.0, 1.0),
+    choice("input_space", "Input space", LUT_SPACES, 0),
 ];
 const GENERATOR_PARAMS: &[ParamSpec] = &[
     p("width", "Width", "px", 1.0, 8192.0, 1024.0),
@@ -604,7 +612,7 @@ pub fn curve_set(node: &Node, image: ImageId) -> Vec<CurveEntry> {
 }
 
 impl NodeKind {
-    pub const ALL: [NodeKind; 31] = [
+    pub const ALL: [NodeKind; 32] = [
         NodeKind::Source,
         NodeKind::CaptureEv,
         NodeKind::Exposure,
@@ -638,6 +646,7 @@ impl NodeKind {
         NodeKind::NormalMap,
         NodeKind::DepthMap,
         NodeKind::Generator,
+        NodeKind::Lut,
     ];
 
     /// Menu group of this kind.
@@ -651,7 +660,7 @@ impl NodeKind {
             | NodeKind::ToneCurve
             | NodeKind::PointCurve => "Tone",
             NodeKind::WhiteBalance | NodeKind::Saturation | NodeKind::HueSaturation | NodeKind::BlackWhite => "Colour",
-            NodeKind::ColorWheels => "Colour",
+            NodeKind::ColorWheels | NodeKind::Lut => "Colour",
             NodeKind::NoiseReduction | NodeKind::Sharpen | NodeKind::Blur | NodeKind::Clarity => "Detail",
             NodeKind::Transform | NodeKind::LensManual => "Geometry",
             NodeKind::Vignette | NodeKind::PixelSort => "Effects",
@@ -695,6 +704,7 @@ impl NodeKind {
             NodeKind::NormalMap => "Normal Map",
             NodeKind::DepthMap => "Depth Map",
             NodeKind::Generator => "Generator",
+            NodeKind::Lut => "LUT",
         }
     }
 
@@ -733,6 +743,7 @@ impl NodeKind {
             NodeKind::NormalMap => NORMALS_PARAMS,
             NodeKind::DepthMap => &[],
             NodeKind::Generator => GENERATOR_PARAMS,
+            NodeKind::Lut => LUT_PARAMS,
         }
     }
 
@@ -776,6 +787,7 @@ impl NodeKind {
             NodeKind::MetadataSplit => &[DataKind::Ranges],
             NodeKind::Source => &[DataKind::Folder],
             NodeKind::Export => &[DataKind::Export],
+            NodeKind::Lut => &[DataKind::LutFile],
             _ => &[],
         }
     }
@@ -820,6 +832,8 @@ pub enum NodeData {
     CurveSet(Vec<CurveEntry>),
     /// Export: folder, file name template and text metadata.
     Export(ExportText),
+    /// LUT: absolute path of the `.cube` file; "" = none chosen.
+    LutFile(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -831,6 +845,7 @@ pub enum DataKind {
     Folder,
     CurveSet,
     Export,
+    LutFile,
 }
 
 impl NodeData {
@@ -843,6 +858,7 @@ impl NodeData {
             NodeData::Folder(_) => DataKind::Folder,
             NodeData::CurveSet(_) => DataKind::CurveSet,
             NodeData::Export(_) => DataKind::Export,
+            NodeData::LutFile(_) => DataKind::LutFile,
         }
     }
 }
@@ -885,6 +901,7 @@ fn validate_data(kind: NodeKind, data: &NodeData) -> Result<(), String> {
             }
         }
         NodeData::Folder(path) => validate_text("folder", path)?,
+        NodeData::LutFile(path) => validate_text("LUT file", path)?,
         NodeData::Export(t) => {
             validate_text("output folder", &t.out_dir)?;
             validate_text("name template", &t.name_template)?;
@@ -1228,11 +1245,31 @@ impl std::error::Error for GraphError {}
 pub struct Issue {
     pub node: NodeId,
     pub message: String,
+    /// Only some images are affected (a LUT file that cannot be read). The viewer passes those
+    /// through and an export fails just the affected items, so it must not stop a whole run.
+    pub per_item: bool,
 }
 
 /// Longest walk along a chain of nodes (graphs are acyclic, this only guards
 /// against hand-built nonsense).
 const MAX_WALK: usize = 512;
+
+/// The last known state of the LUT file named by a LUT node's data, without touching the disk
+/// (see [`crate::lut::peek`]); `None` when no file is chosen.
+pub fn lut_file_status(path: &str) -> Option<crate::lut::LutState> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    Some(crate::lut::peek(std::path::Path::new(path)))
+}
+
+/// The LUT file path a LUT node uses for `image` (`None` when no file is chosen).
+pub fn lut_file(node: &Node, image: ImageId) -> Option<&str> {
+    match node.data(image) {
+        Some(NodeData::LutFile(p)) if !p.trim().is_empty() => Some(p.as_str()),
+        _ => None,
+    }
+}
 
 /// The folder a Source restricts its images to and whether subfolders count.
 fn source_folder(n: &Node) -> Option<(&str, bool)> {
@@ -1569,30 +1606,50 @@ impl Graph {
     pub fn validate(&self) -> Vec<Issue> {
         let mut issues = Vec::new();
         for node in self.nodes.values() {
-            let mut add = |message: String| issues.push(Issue { node: node.id, message });
+            let mut add_with = |message: String, per_item: bool| issues.push(Issue { node: node.id, message, per_item });
             let label = node.kind.label();
+            macro_rules! add {
+                ($m:expr $(,)?) => {
+                    add_with($m, false)
+                };
+            }
             if matches!(node.kind, NodeKind::Merge | NodeKind::Layer)
                 && (0..node.kind.inputs().len()).all(|p| self.input_of(node.id, p).is_none())
             {
-                add(format!("{label}: no input is connected"));
+                add!(format!("{label}: no input is connected"));
             }
             for (port, spec) in node.kind.inputs().iter().enumerate() {
                 if spec.required && self.input_of(node.id, port).is_none() {
-                    add(format!("{label}: input \"{}\" is not connected", spec.label));
+                    add!(format!("{label}: input \"{}\" is not connected", spec.label));
                 }
             }
             match node.kind {
                 NodeKind::Layer if node.all_choice("mode") == 1 => {
-                    add("All combinations is not available yet; Match is used".to_owned());
+                    add!("All combinations is not available yet; Match is used".to_owned());
                 }
                 NodeKind::Export => {
                     let dir_set = matches!(node.all_data(), Some(NodeData::Export(t)) if !t.out_dir.trim().is_empty());
                     if !dir_set {
-                        add("Export: no output folder set".to_owned());
+                        add!("Export: no output folder set".to_owned());
+                    }
+                }
+                NodeKind::Lut => {
+                    // Only the data in effect: in All mode the All file; in Individual mode the own
+                    // file of each image that has one, plus the All file the other images inherit.
+                    // A problem is reported, the node passes its input through meanwhile. The UI
+                    // calls this every frame, so it only reads the last known state of the files.
+                    let all = node.data.iter().map(|d| (None, d));
+                    let own = node.individual_data.iter().filter(|_| node.mode == Mode::Individual).map(|(i, d)| (Some(*i), d));
+                    for (image, data) in all.chain(own) {
+                        let NodeData::LutFile(path) = data else { continue };
+                        if let Some(crate::lut::LutState::Failed(e)) = lut_file_status(path) {
+                            let whose = image.map_or(String::new(), |i| format!(" (image {})", i.0));
+                            add_with(format!("LUT{whose}: {path}: {e}; the image passes through unchanged"), true);
+                        }
                     }
                 }
                 NodeKind::LensManual if node.all_choice("mode") == 1 && !self.lens_auto_usable(node.id) => {
-                    add(
+                    add!(
                         "Lens Correction: Auto needs the uncropped frame of a source (no Crop / Rotate, Layer or \
                          other Lens Correction in between)"
                             .to_owned(),
@@ -1602,6 +1659,33 @@ impl Graph {
             }
         }
         issues
+    }
+
+    /// The first LUT file problem that would hit `image` when it is evaluated at `node`: a LUT node
+    /// upstream (strength above 0) whose file for this image cannot be read. Reads the files, so it
+    /// is for export threads, not the UI. `None` when every LUT is fine or no file is chosen.
+    pub fn lut_problem(&self, node: NodeId, image: ImageId) -> Option<String> {
+        let mut upstream = BTreeSet::from([node]);
+        let mut stack = vec![node];
+        while let Some(n) = stack.pop() {
+            for e in self.edges.iter().filter(|e| e.to == n) {
+                if upstream.insert(e.from) {
+                    stack.push(e.from);
+                }
+            }
+        }
+        for id in upstream {
+            let Some(n) = self.node(id).filter(|n| n.kind == NodeKind::Lut) else { continue };
+            let strength = n.param("strength", image);
+            if strength.is_nan() || strength <= 0.0 {
+                continue;
+            }
+            let Some(path) = lut_file(n, image) else { continue };
+            if let Err(e) = crate::lut::load_cached(std::path::Path::new(path)) {
+                return Some(format!("LUT {path}: {e}"));
+            }
+        }
+        None
     }
 
     /// True if the Lens Correction `node` can use the lens profile of its
@@ -2859,6 +2943,7 @@ mod tests {
             (NodeKind::PixelSort, "Pixel Sort", "Effects"),
             (NodeKind::NormalMap, "Normal Map", "Generators"),
             (NodeKind::Generator, "Generator", "Generators"),
+            (NodeKind::Lut, "LUT", "Colour"),
             (NodeKind::DepthMap, "Depth Map", "Generators"),
             (NodeKind::MetadataFilter, "Metadata Filter", "Collection"),
             (NodeKind::Merge, "Merge", "Collection"),
@@ -3292,6 +3377,7 @@ mod tests {
                 NodeKind::MetadataSplit => Some(DataKind::Ranges),
                 NodeKind::Source => Some(DataKind::Folder),
                 NodeKind::Export => Some(DataKind::Export),
+                NodeKind::Lut => Some(DataKind::LutFile),
                 _ => None,
             };
             assert_eq!(kind.data_kind(), expected, "{kind:?}");
@@ -3328,7 +3414,7 @@ mod tests {
         assert_eq!(s.param_spec("missing").unwrap().kind, ParamKind::Choice(&["Unmatched", "Exclude"]));
         assert_eq!(s.params().len(), 2);
         assert!(NodeKind::ALL.contains(&c) && NodeKind::ALL.contains(&b) && NodeKind::ALL.contains(&s));
-        assert_eq!(NodeKind::ALL.len(), 31);
+        assert_eq!(NodeKind::ALL.len(), 32);
     }
 
     #[test]

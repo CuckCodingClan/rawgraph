@@ -1086,3 +1086,39 @@ fn quick_export_never_overwrites_unselected_original() {
     assert_eq!(report.failed(), 1);
     assert_eq!(fs::read(&f.catalog[1].source).unwrap(), before);
 }
+
+#[test]
+fn an_unreadable_lut_fails_only_its_own_images() {
+    let mut r = Rig::new(&[("a.png", 8, 8, [10, 20, 30]), ("b.png", 8, 8, [40, 50, 60])]);
+    let good = r.t.path("good.cube");
+    let bad = r.t.path("bad.cube");
+    let mut cube = String::from("LUT_3D_SIZE 2\n");
+    for b in 0..2 {
+        for g in 0..2 {
+            for rr in 0..2 {
+                cube.push_str(&format!("{rr} {g} {b}\n"));
+            }
+        }
+    }
+    fs::write(&good, cube).unwrap();
+    fs::write(&bad, "LUT_3D_SIZE 2\n0 0 0\nbroken\n").unwrap();
+    let lut = r.g.add_node(NodeKind::Lut, [0.0; 2]);
+    r.g.connect(r.src, lut, 0).expect("connect");
+    r.g.connect(lut, r.exp, 0).expect("connect");
+    let ids = r.ids();
+    let n = r.g.node_mut(lut).expect("lut");
+    assert!(n.set_param("input_space", A, 3.0));
+    assert!(n.set_data(A, Some(NodeData::LutFile(good.to_string_lossy().into_owned()))));
+    n.mode = Mode::Individual;
+    assert!(n.set_data(ids[0], Some(NodeData::LutFile(bad.to_string_lossy().into_owned()))));
+    // The viewer passes the broken file through; validate() says so, but it is no reason to stop a run.
+    let _ = rawgraph_core::lut::load_cached(&bad); // validate() only reads what is known
+    assert!(r.g.validate().iter().any(|i| i.per_item && i.message.contains("bad.cube")));
+    let rep = r.run();
+    assert_eq!((rep.written(), rep.failed()), (1, 1), "{:?}", rep.items);
+    match &rep.items[0].1 {
+        ItemStatus::Failed(m) => assert!(m.contains("bad.cube") && m.contains("line 3"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(rep.items[1].1, ItemStatus::Written { .. }));
+}

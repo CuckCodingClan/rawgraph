@@ -210,6 +210,7 @@ fn cpu_apply(img: &ImageBuf, ops_list: &[PointOp]) -> ImageBuf {
             }
             PointOp::WhitesBlacks { whites, blacks } => rawgraph_fx::whites_blacks(&mut out, *whites, *blacks),
             PointOp::Vibrance(a) => rawgraph_fx::vibrance(&mut out, *a),
+            PointOp::Lut { lut, space, strength } => rawgraph_fx::lut_apply(&mut out, lut, *space, *strength),
         }
     }
     out

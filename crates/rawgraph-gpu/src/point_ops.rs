@@ -1,7 +1,8 @@
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
-use rawgraph_core::color::AP1_LUMA;
+use rawgraph_core::color::{acescg_to_rec709, rec709_to_acescg, to_f32, AP1_LUMA};
+use rawgraph_core::{Lut, LutSpace};
 use rawgraph_fx::curve_eval;
 
 use crate::context::GpuContext;
@@ -44,6 +45,10 @@ pub enum PointOp {
     WhitesBlacks { whites: f32, blacks: f32 },
     /// `rawgraph_fx::vibrance`. A non-finite amount counts as 0. Analytic.
     Vibrance(f32),
+    /// `rawgraph_fx::lut_apply`: the table (1D shaper and/or 3D cube, tetrahedral like the CPU) in the
+    /// given space, mixed by `strength`. The tables live in the lookup-table buffer and are rewritten
+    /// only when the table content changes; the shader is built per table size.
+    Lut { lut: Arc<Lut>, space: LutSpace, strength: f32 },
 }
 
 /// The kind of an op, i.e. what is baked into the shader. Parameters are not part of it.
@@ -61,6 +66,8 @@ pub(crate) enum OpKind {
     Vignette,
     WhitesBlacks,
     Vibrance,
+    /// A LUT with a 1D table of `n1` rows (0 = none) and a 3D cube of `n3`^3 rows (0 = none).
+    Lut { n1: u32, n3: u32 },
 }
 
 /// Entries of the tone curve gain table (as the CPU: 1024).
@@ -82,6 +89,7 @@ impl OpKind {
             OpKind::Matrix | OpKind::Cdl => 3,
             OpKind::PointCurve => 2,
             OpKind::HueSaturation => 5,
+            OpKind::Lut { .. } => 6,
             _ => 1,
         }
     }
@@ -91,6 +99,7 @@ impl OpKind {
         match self {
             OpKind::ToneCurve => TONE_LUT,
             OpKind::PointCurve => CURVE_N + 1,
+            OpKind::Lut { n1, n3 } => (n1 as usize + (n3 as usize).pow(3)) * 3,
             _ => 0,
         }
     }
@@ -200,6 +209,10 @@ impl PointOp {
             PointOp::Vignette { .. } => OpKind::Vignette,
             PointOp::WhitesBlacks { .. } => OpKind::WhitesBlacks,
             PointOp::Vibrance(_) => OpKind::Vibrance,
+            PointOp::Lut { lut, .. } => OpKind::Lut {
+                n1: lut.lut1d.as_ref().map_or(0, |t| t.size as u32),
+                n3: lut.lut3d.as_ref().map_or(0, |t| t.size as u32),
+            },
         }
     }
 
@@ -260,6 +273,24 @@ impl PointOp {
                 let a = finite_or(*a, 0.0).clamp(-1.0, 1.0);
                 vec![[a, 0.0, f32::INFINITY, if a == 0.0 { 0.0 } else { 1.0 }]]
             }
+            PointOp::Lut { lut, space, strength } => {
+                let strength = if strength.is_finite() { strength.clamp(0.0, 1.0) } else { 0.0 };
+                let space = match space {
+                    LutSpace::Linear => 0.0,
+                    LutSpace::Srgb709 => 1.0,
+                    LutSpace::AcesCct => 2.0,
+                };
+                let (mn1, inv1) = lut.lut1d.as_ref().map_or(([0.0; 3], [0.0; 3]), |t| (t.domain_min, t.inv_range));
+                let (mn3, inv3) = lut.lut3d.as_ref().map_or(([0.0; 3], [0.0; 3]), |t| (t.domain_min, t.inv_range));
+                vec![
+                    [strength, space, 0.0, 0.0],
+                    [mn1[0], mn1[1], mn1[2], 0.0],
+                    [inv1[0], inv1[1], inv1[2], 0.0],
+                    [mn3[0], mn3[1], mn3[2], 0.0],
+                    [inv3[0], inv3[1], inv3[2], 0.0],
+                    [f32::INFINITY, 0.0, 0.0, 0.0],
+                ]
+            }
         }
     }
 
@@ -278,6 +309,10 @@ impl PointOp {
             PointOp::PointCurve { points, channel } if curve_is_active(points, *channel) => {
                 points.iter().flat_map(|p| [p[0].to_bits(), p[1].to_bits()]).collect()
             }
+            PointOp::Lut { lut, strength, .. } if *strength > 0.0 => {
+                let h = lut.content_hash();
+                vec![h as u32, (h >> 32) as u32]
+            }
             _ => Vec::new(),
         }
     }
@@ -292,6 +327,12 @@ impl PointOp {
             }
             PointOp::PointCurve { points, .. } => {
                 (0..=CURVE_N).map(|i| curve_eval(points, i as f32 / CURVE_N as f32)).collect()
+            }
+            PointOp::Lut { lut, .. } => {
+                let mut v = Vec::new();
+                v.extend(lut.lut1d.iter().flat_map(|t| t.data.iter().copied()));
+                v.extend(lut.lut3d.iter().flat_map(|t| t.data.iter().copied()));
+                v
             }
             _ => Vec::new(),
         }
@@ -539,6 +580,157 @@ const SNIPPET_HUESAT_BODY: &str = r#"        let r = c.x;
         }
 "#;
 
+/// WGSL helpers of the LUT op (needs T, FM and isnanm). The matrices are the f32 ones of the CPU.
+fn lut_helpers() -> String {
+    let (to, from) = (to_f32(&acescg_to_rec709()), to_f32(&rec709_to_acescg()));
+    let row = |m: &[[f32; 3]; 3], i: usize| format!("vec3<f32>({:?}, {:?}, {:?})", m[i][0], m[i][1], m[i][2]);
+    format!(
+        "
+fn lut_nz(x: f32) -> f32 {{
+    // NaN -> 0, infinities -> the largest finite value (as the CPU: `finite` of rawgraph_fx::lut).
+    return clamp(select(x, 0.0, isnanm(x)), -3.4028235e38, 3.4028235e38);
+}}
+
+fn lut_mat(r0: vec3<f32>, r1: vec3<f32>, r2: vec3<f32>, c: vec3<f32>) -> vec3<f32> {{
+    return vec3<f32>(dot(r0, c), dot(r1, c), dot(r2, c));
+}}
+
+fn lut_to709(c: vec3<f32>) -> vec3<f32> {{
+    return lut_mat({t0}, {t1}, {t2}, c);
+}}
+
+fn lut_from709(c: vec3<f32>) -> vec3<f32> {{
+    return lut_mat({f0}, {f1}, {f2}, c);
+}}
+
+fn srgb_oetf1(x: f32) -> f32 {{
+    return select(1.055 * pow(x, 1.0 / 2.4) - 0.055, 12.92 * x, x <= 0.0031308);
+}}
+
+fn srgb_eotf1(x: f32) -> f32 {{
+    let a = abs(x);
+    let v = select(pow((a + 0.055) / 1.055, 2.4), a / 12.92, a <= 0.04045);
+    return select(v, -v, x < 0.0);
+}}
+
+fn cct_enc(x: f32) -> f32 {{
+    return select((log2(x) + 9.72) / 17.52, 10.540238 * x + 0.07290553, x <= 0.0078125);
+}}
+
+fn cct_dec(y: f32) -> f32 {{
+    return select(exp2(y * 17.52 - 9.72), (y - 0.07290553) / 10.540238, y <= 0.15525114);
+}}
+
+fn lut_pos(v: f32, mn: f32, inv: f32, nm1: f32) -> f32 {{
+    return clamp((v - mn) * inv, 0.0, 1.0) * nm1;
+}}
+
+fn lut_row(off: u32, i: u32) -> vec3<f32> {{
+    return vec3<f32>(T[off + i * 3u], T[off + i * 3u + 1u], T[off + i * 3u + 2u]);
+}}
+
+fn lut1_ch(ch: u32, v: f32, mn: f32, inv: f32, off: u32, n: u32) -> f32 {{
+    let t = lut_pos(v, mn, inv, f32(n - 1u));
+    let i = min(u32(t), n - 2u);
+    let f = t - f32(i);
+    let a = T[off + i * 3u + ch];
+    let b = T[off + (i + 1u) * 3u + ch];
+    return a + (b - a) * f;
+}}
+
+fn lut3(v: vec3<f32>, mn: vec3<f32>, inv: vec3<f32>, off: u32, n: u32) -> vec3<f32> {{
+    let nm1 = f32(n - 1u);
+    let t = vec3<f32>(lut_pos(v.x, mn.x, inv.x, nm1), lut_pos(v.y, mn.y, inv.y, nm1), lut_pos(v.z, mn.z, inv.z, nm1));
+    let i0 = vec3<u32>(min(u32(t.x), n - 2u), min(u32(t.y), n - 2u), min(u32(t.z), n - 2u));
+    let f = t - vec3<f32>(i0);
+    let base = i0.x + i0.y * n + i0.z * n * n;
+    let dr = 1u;
+    let dg = n;
+    let db = n * n;
+    let c000 = lut_row(off, base);
+    let c111 = lut_row(off, base + dr + dg + db);
+    var w1 = f.x;
+    var o1 = dr;
+    var w2 = f.y;
+    var o2 = dg;
+    var w3 = f.z;
+    if (f.x >= f.y) {{
+        if (f.y >= f.z) {{
+        }} else if (f.x >= f.z) {{
+            w2 = f.z; o2 = db; w3 = f.y;
+        }} else {{
+            w1 = f.z; o1 = db; w2 = f.x; o2 = dr; w3 = f.y;
+        }}
+    }} else if (f.z >= f.y) {{
+        w1 = f.z; o1 = db; w2 = f.y; o2 = dg; w3 = f.x;
+    }} else if (f.z >= f.x) {{
+        w1 = f.y; o1 = dg; w2 = f.z; o2 = db; w3 = f.x;
+    }} else {{
+        w1 = f.y; o1 = dg; w2 = f.x; o2 = dr; w3 = f.z;
+    }}
+    let v1 = lut_row(off, base + o1);
+    let v2 = lut_row(off, base + o1 + o2);
+    return c000 + w1 * (v1 - c000) + w2 * (v2 - v1) + w3 * (c111 - v2);
+}}
+",
+        t0 = row(&to, 0), t1 = row(&to, 1), t2 = row(&to, 2),
+        f0 = row(&from, 0), f1 = row(&from, 1), f2 = row(&from, 2),
+    )
+}
+
+/// The LUT op body: space in, 1D shaper, 3D cube, mix, space out. off is the first table float.
+fn lut_snippet(b: usize, off: usize, n1: u32, n3: u32) -> String {
+    let mut s = format!(
+        "    if (P[{b}].x > 0.0) {{
+        FM = bitcast<u32>(P[{b5}].x);
+        let sp = u32(P[{b}].y);
+        let w = vec3<f32>(lut_nz(c.x), lut_nz(c.y), lut_nz(c.z));
+        var v = w;
+        if (sp == 1u) {{
+            let lin = lut_to709(v);
+            v = vec3<f32>(srgb_oetf1(clamp(lin.x, 0.0, 1.0)), srgb_oetf1(clamp(lin.y, 0.0, 1.0)), srgb_oetf1(clamp(lin.z, 0.0, 1.0)));
+        }} else if (sp == 2u) {{
+            v = vec3<f32>(cct_enc(v.x), cct_enc(v.y), cct_enc(v.z));
+        }}
+        var s = v;
+",
+        b5 = b + 5,
+    );
+    if n1 > 0 {
+        let _ = write!(
+            s,
+            "        s = vec3<f32>(
+            lut1_ch(0u, s.x, P[{m}].x, P[{i}].x, {off}u, {n1}u),
+            lut1_ch(1u, s.y, P[{m}].y, P[{i}].y, {off}u, {n1}u),
+            lut1_ch(2u, s.z, P[{m}].z, P[{i}].z, {off}u, {n1}u));
+",
+            m = b + 1,
+            i = b + 2,
+        );
+    }
+    if n3 > 0 {
+        let _ = writeln!(s, "        s = lut3(s, P[{}].xyz, P[{}].xyz, {}u, {n3}u);", b + 3, b + 4, off + n1 as usize * 3);
+    }
+    let _ = write!(
+        s,
+        "        var m = s;
+        if (sp == 1u) {{
+            m = lut_from709(vec3<f32>(srgb_eotf1(s.x), srgb_eotf1(s.y), srgb_eotf1(s.z)));
+        }} else if (sp == 2u) {{
+            m = vec3<f32>(cct_dec(s.x), cct_dec(s.y), cct_dec(s.z));
+        }}
+        // The strength mixes in the working space; at 1 the LUT result is returned as it is.
+        if (P[{b}].x >= 1.0) {{
+            c = m;
+        }} else {{
+            c = w + (m - w) * P[{b}].x;
+        }}
+    }}
+"
+    );
+    s
+}
+
 fn wgsl_for(kinds: &[OpKind], offsets: &[Option<usize>]) -> String {
     let slots: usize = kinds.iter().map(|k| k.slot_count()).sum::<usize>().max(1);
     let has_tables = offsets.iter().any(Option::is_some);
@@ -633,6 +825,9 @@ fn cdl1(x: f32, s: f32, o: f32, p: f32) -> f32 {{
         ipi = std::f32::consts::FRAC_1_PI,
         deg = std::f32::consts::PI / 180.0,
     );
+    if kinds.iter().any(|k| matches!(k, OpKind::Lut { .. })) {
+        s.push_str(&lut_helpers());
+    }
     if has_curve {
         let _ = write!(
             s,
@@ -749,6 +944,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
             OpKind::Vignette => s.push_str(&sub(SNIPPET_VIGNETTE)),
             OpKind::WhitesBlacks => s.push_str(&sub(SNIPPET_WHITES_BLACKS)),
             OpKind::Vibrance => s.push_str(&sub(SNIPPET_VIBRANCE)),
+            OpKind::Lut { n1, n3 } => s.push_str(&lut_snippet(b, offsets[k].unwrap_or(0), *n1, *n3)),
             OpKind::HueSaturation => {
                 let _ = writeln!(s, "    if (P[{}].z != 0.0) {{", b + 4);
                 s.push_str("        var bnd: array<f32, 18>;\n");
@@ -765,9 +961,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     s
 }
 
+/// Pipelines with a LUT op that stay cached.
+const MAX_LUT_PIPELINES: usize = 32;
+
 fn pipeline_for(ctx: &GpuContext, kinds: &[OpKind]) -> Result<Arc<PointPipeline>, GpuError> {
     let mut cache = ctx.point_cache.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(p) = cache.get(kinds) {
+    static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some((p, used)) = cache.get_mut(kinds) {
+        *used = tick;
         return Ok(Arc::clone(p));
     }
     let mut table_offsets = Vec::with_capacity(kinds.len());
@@ -803,7 +1005,21 @@ fn pipeline_for(ctx: &GpuContext, kinds: &[OpKind]) -> Result<Arc<PointPipeline>
         table_buf,
         table_keys: Mutex::new(vec![Vec::new(); kinds.len()]),
     });
-    cache.insert(kinds.to_vec(), Arc::clone(&p));
+    // A LUT pipeline pins its table buffer (up to ~4 MB), and every table size is its own
+    // pipeline: keep the most recently used ones and free the rest.
+    let is_lut = |k: &[OpKind]| k.iter().any(|o| matches!(o, OpKind::Lut { .. }));
+    if is_lut(kinds) {
+        while cache.keys().filter(|k| is_lut(k)).count() >= MAX_LUT_PIPELINES {
+            let oldest = cache.iter().filter(|(k, _)| is_lut(k)).min_by_key(|(_, (_, used))| *used).map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    cache.remove(&k);
+                }
+                None => break,
+            }
+        }
+    }
+    cache.insert(kinds.to_vec(), (Arc::clone(&p), tick));
     Ok(p)
 }
 

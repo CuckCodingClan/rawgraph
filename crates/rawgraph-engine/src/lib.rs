@@ -978,6 +978,10 @@ fn hash_node_data(data: Option<&NodeData>, hasher: &mut DefaultHasher) {
             hasher.write_u8(5);
             path.hash(hasher);
         }
+        Some(NodeData::LutFile(path)) => {
+            hasher.write_u8(8);
+            path.hash(hasher);
+        }
         Some(NodeData::Export(text)) => {
             hasher.write_u8(6);
             text.out_dir.hash(hasher);
@@ -1087,6 +1091,19 @@ fn node_fingerprint_inner(
     env.control.hash(&mut hasher);
     if node.kind == NodeKind::Generator && node.choice("output", image) == 0 && !env.control {
         (env.view_tone as u8).hash(&mut hasher);
+    }
+    if node.kind == NodeKind::Lut {
+        // What the file holds (its content hash, or the error: a file that appears or is edited
+        // changes it, even when size and time stamp do not) and, in Display mode, the view transform.
+        if let Some(path) = rawgraph_core::lut_file(node, image) {
+            match rawgraph_core::lut::load_cached(std::path::Path::new(path)) {
+                Ok(lut) => lut.content_hash().hash(&mut hasher),
+                Err(e) => e.to_string().hash(&mut hasher),
+            }
+        }
+        if node.choice("input_space", image) == 0 {
+            (env.view_tone as u8).hash(&mut hasher);
+        }
     }
     if node.kind == NodeKind::DepthMap {
         std::env::var_os("RAWGRAPH_DEPTH_WORKER").hash(&mut hasher);
@@ -1226,6 +1243,37 @@ pub enum TailOp {
     /// because every tail operation keeps the image size, so the base has the same frame as
     /// the image the Vignette node would see.
     Vignette { amount: f32, midpoint: f32, feather: f32 },
+    /// `fx::lut_apply` in `space` (never Display mode: that wraps the view transform, which needs the
+    /// CPU, so such a LUT node is the base of the plan instead).
+    Lut { lut: Arc<rawgraph_core::Lut>, space: rawgraph_core::LutSpace, strength: f32 },
+}
+
+/// The LUT, input space choice and strength a LUT node uses for `image`; `None` when the node
+/// passes its input through (no file, unreadable file, strength 0).
+fn lut_setup(node: &rawgraph_core::Node, image: ImageId) -> Option<(Arc<rawgraph_core::Lut>, usize, f32)> {
+    let strength = node.param("strength", image);
+    if strength.is_nan() || strength <= 0.0 {
+        return None;
+    }
+    let path = rawgraph_core::lut_file(node, image)?;
+    let lut = rawgraph_core::lut::load_cached(std::path::Path::new(path)).ok()?;
+    Some((lut, node.choice("input_space", image), strength.min(1.0)))
+}
+
+fn lut_space(choice: usize) -> Option<rawgraph_core::LutSpace> {
+    match choice {
+        1 => Some(rawgraph_core::LutSpace::Srgb709),
+        2 => Some(rawgraph_core::LutSpace::AcesCct),
+        3 => Some(rawgraph_core::LutSpace::Linear),
+        _ => None,
+    }
+}
+
+/// Display mode: view transform (zero exposure), table, inverse view transform.
+fn lut_display(img: &mut ImageBuf, lut: &rawgraph_core::Lut, strength: f32, tone: ToneMap) {
+    let shown = rawgraph_scopes::DisplayTransform { exposure_ev: 0.0, tone_map: tone }.apply(img);
+    let inverse = InverseDisplayTransform::new(tone);
+    fx::lut_apply_encoded(img, &shown.rgb, lut, strength, &|v| inverse.apply(v));
 }
 
 /// Evaluation of one node split into a CPU part (the base) and a trailing run of
@@ -1426,6 +1474,14 @@ fn tail_step(graph: &Graph, node: &rawgraph_core::Node, image: ImageId, provider
                 vec![TailOp::Vignette { amount, midpoint: param("midpoint"), feather: param("feather") }]
             })
         }
+        NodeKind::Lut => match lut_setup(node, image) {
+            None => TailStep::Through(Vec::new()),
+            Some((lut, choice, strength)) => match lut_space(choice) {
+                Some(space) => TailStep::Through(vec![TailOp::Lut { lut, space, strength }]),
+                // Display mode needs the view transform and its inverse: CPU base.
+                None => TailStep::Base,
+            },
+        },
         NodeKind::BlackWhite => {
             // `fx::black_white` computes `w0*r + w1*g + w2*b` (non-finite weights count as 0)
             // and writes it to all three channels; `ops::apply_matrix` with three identical
@@ -1488,6 +1544,7 @@ fn apply_op(img: &mut ImageBuf, op: &TailOp) {
         TailOp::Vignette { amount, midpoint, feather } => fx::vignette(img, amount, midpoint, feather),
         TailOp::WhitesBlacks { whites, blacks } => fx::whites_blacks(img, whites, blacks),
         TailOp::Vibrance(amount) => fx::vibrance(img, amount),
+        TailOp::Lut { ref lut, space, strength } => fx::lut_apply(img, lut, space, strength),
     }
 }
 
@@ -1684,6 +1741,15 @@ fn compute(
                     let rgb = inverse.apply([px[0], px[1], px[2]]);
                     px[..3].copy_from_slice(&rgb);
                 }
+            }))
+        }
+        NodeKind::Lut => {
+            let src = input_image(inputs, 0, id)?;
+            // No file, an unreadable file or strength 0: the input passes through (validate() reports it).
+            let Some((lut, choice, strength)) = lut_setup(node, image) else { return Ok(Value::Images(src)) };
+            Ok(modified(&src, |img| match lut_space(choice) {
+                Some(space) => fx::lut_apply(img, &lut, space, strength),
+                None => lut_display(img, &lut, strength, env.view_tone),
             }))
         }
         NodeKind::NormalMap => {
@@ -5414,3 +5480,290 @@ mod normals_tests {
 
 #[cfg(test)]
 mod migration_tests;
+
+#[cfg(test)]
+mod lut_tests {
+    use super::*;
+    use rawgraph_core::Mode;
+    use std::path::{Path, PathBuf};
+
+    const A: ImageId = ImageId(1);
+    const B: ImageId = ImageId(2);
+
+    struct Flat;
+    impl ImageProvider for Flat {
+        fn image(&self, id: ImageId) -> Result<Arc<ImageBuf>, String> {
+            let mut img = ImageBuf::new(8, 4);
+            for y in 0..4 {
+                for x in 0..8 {
+                    let t = x as f32 / 7.0;
+                    img.set_pixel(x, y, [0.15 + 0.4 * t, 0.18 * (1.0 + y as f32 * 0.1) + 0.1 * t, 0.12 + 0.2 * t + id.0 as f32 * 0.01, 1.0]);
+                }
+            }
+            Ok(Arc::new(img))
+        }
+    }
+
+    fn cube(n: usize, f: impl Fn([f32; 3]) -> [f32; 3]) -> String {
+        let mut s = format!("LUT_3D_SIZE {n}\n");
+        for b in 0..n {
+            for g in 0..n {
+                for r in 0..n {
+                    let d = (n - 1) as f32;
+                    let o = f([r as f32 / d, g as f32 / d, b as f32 / d]);
+                    s.push_str(&format!("{} {} {}\n", o[0], o[1], o[2]));
+                }
+            }
+        }
+        s
+    }
+
+    /// A temp folder that is removed again when the test ends, also when it fails.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn dir(name: &str) -> TempDir {
+        // A changed file is seen at once in these tests.
+        rawgraph_core::lut::set_refresh_interval(std::time::Duration::ZERO);
+        let d = std::env::temp_dir().join(format!("rawgraph-lut-engine-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        TempDir(d)
+    }
+
+    fn graph(file: Option<&Path>, space: f32, strength: f32) -> (Graph, NodeId) {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0; 2]);
+        let lut = g.add_node(NodeKind::Lut, [1.0, 0.0]);
+        g.connect(src, lut, 0).unwrap();
+        let n = g.node_mut(lut).unwrap();
+        assert!(n.set_param("input_space", A, space));
+        assert!(n.set_param("strength", A, strength));
+        if let Some(f) = file {
+            assert!(n.set_data(A, Some(NodeData::LutFile(f.to_string_lossy().into_owned()))));
+        }
+        (g, lut)
+    }
+
+    fn eval(ev: &mut Evaluator, g: &Graph, n: NodeId, image: ImageId) -> Arc<ImageBuf> {
+        ev.eval_image(g, n, image, &Flat, &CancelToken::new()).unwrap()
+    }
+
+    fn max_diff(a: &ImageBuf, b: &ImageBuf) -> f32 {
+        a.data().iter().zip(b.data()).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn identity_cube_is_a_no_op_in_every_space() {
+        let d = dir("identity");
+        let f = d.join("id.cube");
+        std::fs::write(&f, cube(17, |v| v)).unwrap();
+        let src = Flat.image(A).unwrap();
+        for tone in [ToneMap::Clip, ToneMap::SoftHighlights, ToneMap::AcesFit] {
+            for space in [0.0, 1.0, 2.0, 3.0] {
+                let (g, lut) = graph(Some(&f), space, 1.0);
+                let mut ev = Evaluator::new();
+                ev.set_view_tone(tone);
+                let out = eval(&mut ev, &g, lut, A);
+                let tol = if space == 3.0 { 1e-6 } else { 1e-3 };
+                let diff = max_diff(&src, &out);
+                assert!(diff <= tol, "{tone:?} space {space}: {diff}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn non_identity_cube_changes_pixels_and_strength_zero_passes_through() {
+        let d = dir("swap");
+        let f = d.join("swap.cube");
+        std::fs::write(&f, cube(2, |v| [v[2], v[1], v[0]])).unwrap();
+        let src = Flat.image(A).unwrap();
+        let (g, lut) = graph(Some(&f), 3.0, 1.0);
+        let mut ev = Evaluator::new();
+        let out = eval(&mut ev, &g, lut, A);
+        let (p, o) = (src.pixel(3, 1), out.pixel(3, 1));
+        assert!((o[0] - p[2]).abs() < 1e-6 && (o[2] - p[0]).abs() < 1e-6, "{p:?} {o:?}");
+        let (g0, lut0) = graph(Some(&f), 3.0, 0.0);
+        let same = eval(&mut ev, &g0, lut0, A);
+        assert_eq!(*same, *src);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn missing_file_passes_through_and_is_a_validate_issue() {
+        let d = dir("missing");
+        let f = d.join("nope.cube");
+        let (g, lut) = graph(Some(&f), 0.0, 1.0);
+        let src = Flat.image(A).unwrap();
+        let mut ev = Evaluator::new();
+        assert_eq!(*eval(&mut ev, &g, lut, A), *src, "never a hard evaluation error");
+        let issues: Vec<_> = g.validate().into_iter().filter(|i| i.node == lut).collect();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].message.contains("nope.cube"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn editing_the_file_in_place_invalidates_the_cached_result() {
+        let d = dir("edit");
+        let f = d.join("e.cube");
+        std::fs::write(&f, cube(2, |v| v)).unwrap();
+        let (g, lut) = graph(Some(&f), 3.0, 1.0);
+        let mut ev = Evaluator::new();
+        let first = eval(&mut ev, &g, lut, A);
+        assert!(Arc::ptr_eq(&first, &eval(&mut ev, &g, lut, A)), "unchanged file: cache hit");
+        std::fs::write(&f, cube(3, |v| [v[0] * 0.5, v[1], v[2]])).unwrap();
+        let second = eval(&mut ev, &g, lut, A);
+        assert!(max_diff(&first, &second) > 0.05);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn individual_mode_gives_each_image_its_own_file() {
+        let d = dir("individual");
+        let (fa, fb) = (d.join("a.cube"), d.join("b.cube"));
+        std::fs::write(&fa, cube(2, |v| v)).unwrap();
+        std::fs::write(&fb, cube(2, |v| [v[0] * 0.5, v[1], v[2]])).unwrap();
+        let (mut g, lut) = graph(Some(&fa), 3.0, 1.0);
+        let n = g.node_mut(lut).unwrap();
+        n.mode = Mode::Individual;
+        assert!(n.set_data(B, Some(NodeData::LutFile(fb.to_string_lossy().into_owned()))));
+        let mut ev = Evaluator::new();
+        let (oa, ob) = (eval(&mut ev, &g, lut, A), eval(&mut ev, &g, lut, B));
+        assert!(max_diff(&oa, &Flat.image(A).unwrap()) < 1e-6);
+        let sb = Flat.image(B).unwrap();
+        assert!((ob.pixel(7, 0)[0] - sb.pixel(7, 0)[0] * 0.5).abs() < 1e-6);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn tail_plan_runs_the_direct_spaces_as_tail_ops_and_display_as_the_base() {
+        let d = dir("plan");
+        let f = d.join("id.cube");
+        std::fs::write(&f, cube(2, |v| v)).unwrap();
+        let ev = Evaluator::new();
+        for space in [1.0, 2.0, 3.0] {
+            let (g, lut) = graph(Some(&f), space, 0.7);
+            let plan = ev.plan_tail(&g, lut, A, &Flat).unwrap();
+            assert_eq!(plan.ops.len(), 1, "space {space}");
+            assert!(matches!(&plan.ops[0], TailOp::Lut { strength, .. } if (*strength - 0.7).abs() < 1e-6));
+            let base = ev.plan_tail(&g, lut, A, &Flat).unwrap().base;
+            assert_ne!(base, lut);
+        }
+        let (g, lut) = graph(Some(&f), 0.0, 1.0);
+        let plan = ev.plan_tail(&g, lut, A, &Flat).unwrap();
+        assert_eq!((plan.base, plan.ops.len()), (lut, 0), "Display mode is the CPU base");
+        let (g, lut) = graph(None, 3.0, 1.0);
+        assert!(ev.plan_tail(&g, lut, A, &Flat).unwrap().ops.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn tail_ops_match_the_node_evaluation() {
+        let d = dir("tail");
+        let f = d.join("c.cube");
+        std::fs::write(&f, cube(5, |v| [v[1], v[2] * v[2], v[0].sqrt()])).unwrap();
+        let mut ev = Evaluator::new();
+        for space in [1.0, 2.0, 3.0] {
+            let (g, lut) = graph(Some(&f), space, 0.8);
+            let plan = ev.plan_tail(&g, lut, A, &Flat).unwrap();
+            let base = ev.eval_base(&g, &plan, A, &Flat, &CancelToken::new()).unwrap();
+            let tail = apply_tail_cpu(&base, &plan.ops);
+            let full = eval(&mut ev, &g, lut, A);
+            assert!(max_diff(&tail, &full) < 1e-6, "space {space}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn display_mode_depends_on_the_view_tone() {
+        let d = dir("tone");
+        let f = d.join("c.cube");
+        std::fs::write(&f, cube(9, |v| [v[0] * 0.8, v[1], v[2]])).unwrap();
+        let (g, lut) = graph(Some(&f), 0.0, 1.0);
+        let mut ev = Evaluator::new();
+        ev.set_view_tone(ToneMap::Clip);
+        let a = eval(&mut ev, &g, lut, A);
+        ev.set_view_tone(ToneMap::AcesFit);
+        let b = eval(&mut ev, &g, lut, A);
+        assert!(max_diff(&a, &b) > 1e-3, "a new view tone is a new result");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_file_that_appears_later_is_picked_up() {
+        let d = dir("appears");
+        let f = d.join("late.cube");
+        let (g, lut) = graph(Some(&f), 3.0, 1.0);
+        let mut ev = Evaluator::new();
+        let src = Flat.image(A).unwrap();
+        assert_eq!(*eval(&mut ev, &g, lut, A), *src, "missing: passes through");
+        let before = rawgraph_core::lut::generation();
+        std::fs::write(&f, cube(2, |v| [v[2], v[1], v[0]])).unwrap();
+        let out = eval(&mut ev, &g, lut, A);
+        assert!(max_diff(&out, &src) > 0.01, "the file that appeared is used");
+        assert!(rawgraph_core::lut::generation() > before, "the status change moves the generation");
+    }
+
+    #[test]
+    fn reload_picks_up_an_edit_that_keeps_size_and_time_stamp() {
+        let d = dir("reload");
+        let f = d.join("r.cube");
+        std::fs::write(&f, cube(2, |v| [v[0] * 0.5, v[1], v[2]])).unwrap();
+        let stamp = std::fs::metadata(&f).unwrap().modified().unwrap();
+        let (g, lut) = graph(Some(&f), 3.0, 1.0);
+        let mut ev = Evaluator::new();
+        let first = eval(&mut ev, &g, lut, A);
+        // Same size (same number of characters), same modification time, other numbers.
+        std::fs::write(&f, cube(2, |v| [v[0] * 0.7, v[1], v[2]])).unwrap();
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(stamp).unwrap();
+        let before = rawgraph_core::lut::generation();
+        let stale = eval(&mut ev, &g, lut, A);
+        assert!(Arc::ptr_eq(&first, &stale), "nothing in the file system says it changed");
+        rawgraph_core::lut::forget(&f);
+        assert!(rawgraph_core::lut::generation() > before, "Reload moves the generation");
+        let fresh = eval(&mut ev, &g, lut, A);
+        assert!(max_diff(&first, &fresh) > 0.01, "Reload reads the edited file");
+    }
+
+    #[test]
+    fn strength_is_continuous_in_display_and_srgb_mode() {
+        let d = dir("continuous");
+        let f = d.join("id.cube");
+        std::fs::write(&f, cube(9, |v| v)).unwrap();
+        // A highlight the view transform clips: 1 % strength must not clip it.
+        let mut src = (*Flat.image(A).unwrap()).clone();
+        src.set_pixel(0, 0, [6.0, 4.0, 3.0, 1.0]);
+        for space in [0.0, 1.0] {
+            let (g, lut) = graph(Some(&f), space, 0.01);
+            let mut ev = Evaluator::new();
+            struct One(ImageBuf);
+            impl ImageProvider for One {
+                fn image(&self, _: ImageId) -> Result<Arc<ImageBuf>, String> {
+                    Ok(Arc::new(self.0.clone()))
+                }
+            }
+            let out = ev.eval_image(&g, lut, A, &One(src.clone()), &CancelToken::new()).unwrap();
+            let (s, o) = (src.pixel(0, 0), out.pixel(0, 0));
+            for c in 0..3 {
+                assert!((o[c] - s[c]).abs() < 0.02 * s[c] + 0.05, "space {space}: {} vs {}", o[c], s[c]);
+            }
+        }
+    }
+}

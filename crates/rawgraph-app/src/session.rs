@@ -139,6 +139,8 @@ pub enum UiRequest {
     PickSourceFolder(NodeId),
     /// "Choose..." of an Export node's output folder.
     PickExportFolder(NodeId),
+    /// "Choose..." of a LUT node: pick a `.cube` file.
+    PickLutFile(NodeId),
     /// "Export..." of an Export node: opens the export dialog in node mode.
     OpenNodeExport(NodeId),
 }
