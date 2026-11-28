@@ -63,6 +63,7 @@ mod wave8_tests;
 #[cfg(test)]
 mod wave8b_tests;
 mod windows;
+mod workspace;
 mod xmp_import;
 
 use std::sync::atomic::Ordering;

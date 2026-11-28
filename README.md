@@ -100,7 +100,7 @@ cargo test -p rawgraph-io --test synthetic_raw synthetic_first_draw -- --ignored
 - [ ] Define All/Individual node semantics, with Individual-mode parameters stored per image identity and persistent across selection changes; specify how nodes compose and serialize.
 - [ ] Define RAW/JPEG input behavior and white-balance semantics: absolute settings use RAW capture metadata when available; relative-offset nodes remain composable after absolute WB; JPEG handling accounts for baked-in WB and limited recovery latitude.
 - [ ] Specify ACES configuration, 32-bit float processing, HDR preview/display transforms, scope interpretation, and HDR export targets.
-- [ ] Prototype Resolve-like single-/dual-monitor layouts with optional clean feed and scopes on third/fourth displays; verify display loss/reconnect behavior.
+- [x] Prototype Resolve-like single-/dual-monitor layouts with optional clean feed and scopes on third/fourth displays; verify display loss/reconnect behavior. (Workspaces; the matching and fallback rules are unit-tested, real-hardware checks remain in the release test below.)
 - [ ] Prototype graph interaction in an Xpresso/Fusion-inspired style: navigation, selection, typed ports, previews, inspector, search, grouping, undo/redo.
 
 ### 3. Library and graph MVP
@@ -238,6 +238,31 @@ benchmark. The GPU tail is batched and has no per-node GPU timings; a GPU-reside
 base or Develop pre-tone base may not appear. Turning the option off disables the
 per-node timing clocks. Overlay, histogram, and scope work is not included.
 
+### Workspaces and display layouts
+
+A **workspace** is the layout of the main window (which panels are visible and how large they are) plus the secondary windows with the display each one wants. There are three kinds of secondary window: the **Viewer** of the dual workspace, the **Scopes** window and the **Clean feed**. Choose one under **View → Workspace**:
+
+| Preset | Shortcut | Windows |
+| --- | --- | --- |
+| Single | Ctrl+Alt+1 | Main window only (viewer, graph, inspector, docked scopes) |
+| Dual | Ctrl+Alt+2 | Viewer fullscreen on display 2; graph, filmstrip and inspector on display 1 |
+| Dual + Scopes | Ctrl+Alt+3 | Dual, scopes window on display 3 (the docked scopes give the viewer room back) |
+| Dual + Scopes + Clean Feed | Ctrl+Alt+4 | Dual, scopes on display 3, clean feed fullscreen on display 4 |
+| Clean Feed only | Ctrl+Alt+5 | Single, clean feed fullscreen on display 2 |
+
+Display 1 is the display of the main window; displays 2, 3 and 4 are the other displays from left to right. Ctrl+Alt+digit is checked before Ctrl+digit (Fit/100 %); Ctrl+Shift+D (dual), Ctrl+Shift+K (scopes window) and Ctrl+Shift+C (clean feed) still toggle single windows. Where Ctrl+Alt is AltGr (some Windows keyboard layouts) the digit shortcuts can type characters into a focused text field; use the menu then.
+
+- **Save workspace as...** stores the current panel sizes, panel visibility (View → Workspace → Panels: filmstrip, inspector, node graph) and the open windows with their displays under a name. **Manage workspaces...** renames and deletes saved workspaces and picks the **default** workspace used at start. Without a default, RawGraph starts with the workspace of the last session, including windows opened or closed by hand. Saved workspaces live with the application settings.
+- **View → Workspace → Window displays** sends a window to a specific display or back to "Automatic" (its slot). The same choice is under **View → Clean feed display**; it is remembered for the next time the window opens.
+- `--workspace <name>` starts in a preset (`single`, `dual`, `dual-scopes`, `dual-scopes-clean`, `clean-feed`) or a saved workspace (case-insensitive); an unknown name is reported and the normal start workspace is used. `--clean-feed` and `--scopes` add to the chosen workspace. Screenshot and benchmark runs do not read the settings, so they only know the presets.
+- The **Scopes window** shows the full scope panel (histogram, waveform, parade, vectorscope and all their options) with the same widgets as the docked scopes. It follows the single viewer or the Primary pane in Split Viewer, like the docked scopes and the clean feed. Closing it (Escape, F11 or the close button) docks the scopes again.
+
+**Displays** are identified by name, resolution and position as reported by the window system (winit); there is no hardware serial number. A remembered display is matched in this order: exact (name, resolution and position), same name (same resolution first, then the nearest position), same resolution, otherwise missing. Two identical monitors are told apart by their position, and no display is given to two windows by a loose match. The built-in presets use the display slots above and therefore work on any setup.
+
+**Display loss.** While a workspace has secondary windows RawGraph looks at the display list every 2 seconds (without secondary windows only when the interface is updated anyway). If a window's display is missing at start or disappears, the window moves to the primary display as an ordinary movable window (a fullscreen viewer or feed does not cover the editor), keeps its contents and state, and a status message plus a "display missing" note in the status bar says so. The intended layout is kept: when the display returns, or a matching display appears, the window moves back and becomes fullscreen again. Closing a window removes it from the workspace.
+
+Platform notes: placement uses the monitor list of winit, so it depends on what the window system exposes. Windows and macOS give names, sizes and positions. On Wayland compositors applications cannot set window positions, so windows may open where the compositor decides; fullscreen on a chosen display usually works. X11 behaves like Windows. Only Windows has been verified on a real multi-monitor setup; the matching and fallback rules are unit-tested with simulated monitor lists on every platform.
+
 ### Clean feed
 
 Open **View → Clean feed** for a fullscreen, image-only output. It shows
@@ -245,7 +270,8 @@ the current preview aspect-fitted on black and hides when RawGraph loses focus.
 The Dual Screen viewer stays fullscreen and does not hide on focus loss.
 Neither output adds a Windows taskbar entry. Press
 **Escape** (or F11) while the feed has focus to close it; the editor stays open.
-Choose a display under **View → Clean feed display**, before or while it is open. Placement depends on the
+Choose a display under **View → Clean feed display**, before or while it is open
+(see Workspaces above for how a missing display is handled). Placement depends on the
 OS/window manager; verify it on your display setup, especially on Wayland.
 
 Drop a folder onto the graph to create a Source there and scan that folder. Viewer pinning, resets, and delete actions use icons with descriptive tooltips.

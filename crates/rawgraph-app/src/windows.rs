@@ -1,6 +1,7 @@
-//! Secondary OS windows (egui viewports): clean feed, scopes placeholder and
-//! the detached viewer of the dual workspace. Monitor selection is plain data
-//! so the "monitor vanished" fallback can be unit-tested.
+//! Secondary OS windows (egui viewports): the clean feed, the scopes window and the
+//! detached viewer of the dual workspace, plus the monitor list they are placed on.
+//! Which display a window wants and how it moves when displays change is plain data
+//! in `workspace.rs`; this file turns a decision into viewport commands.
 
 use eframe::egui::{self, Key, Pos2, Vec2, ViewportBuilder, ViewportId};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,11 @@ pub struct MonitorInfo {
 }
 
 impl MonitorInfo {
+    /// The OS name of the monitor (the part of `id` before the first `|`).
+    pub fn name(&self) -> &str {
+        self.id.split('|').next().unwrap_or(&self.id)
+    }
+
     /// Top-left and size in logical points of this monitor.
     pub fn logical(&self) -> (Pos2, Vec2) {
         let s = self.scale.max(0.5) as f32;
@@ -29,52 +35,27 @@ impl MonitorInfo {
     }
 }
 
-/// Picks the monitor a window should use. The remembered monitor wins if it
-/// still exists and is not in `avoid`; otherwise the first free monitor
-/// (primary first); if every monitor is taken, the primary one (the caller
-/// then cascades the window).
-pub fn choose_monitor(monitors: &[MonitorInfo], remembered: Option<&str>, avoid: &[usize]) -> Option<usize> {
-    if monitors.is_empty() {
-        return None;
-    }
-    if let Some(i) = remembered.and_then(|id| monitors.iter().position(|m| m.id == id)) {
-        if !avoid.contains(&i) {
-            return Some(i);
-        }
-    }
-    let primary = monitors.iter().position(|m| m.primary).unwrap_or(0);
-    let order = std::iter::once(primary).chain((0..monitors.len()).filter(|i| *i != primary));
-    for i in order {
-        if !avoid.contains(&i) {
-            return Some(i);
-        }
-    }
-    Some(primary)
-}
-
-/// The monitor after `current`, wrapping around.
-#[cfg(test)]
-pub fn next_monitor(monitors: &[MonitorInfo], current: Option<usize>) -> Option<usize> {
-    if monitors.is_empty() {
-        return None;
-    }
-    Some(current.map_or(0, |c| (c + 1) % monitors.len()))
-}
-
-/// Index of the monitor with this id, falling back to the primary one when it
-/// was disconnected.
-pub fn resolve_monitor(monitors: &[MonitorInfo], id: Option<&str>) -> Option<usize> {
-    id.and_then(|id| monitors.iter().position(|m| m.id == id))
-        .or_else(|| monitors.iter().position(|m| m.primary))
-        .or(if monitors.is_empty() { None } else { Some(0) })
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AuxState {
     pub open: bool,
     pub fullscreen: bool,
     /// Monitor id this window was last placed on.
     pub monitor: Option<String>,
+}
+
+/// Where and how a window is put on a display.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placing {
+    /// Index into the monitor list.
+    pub monitor: usize,
+    /// Cover the whole display (borderless) instead of a movable window.
+    pub fullscreen: bool,
+    /// Window size relative to the display when not fullscreen.
+    pub size_fraction: f32,
+    /// The window's own display is missing: it is shown as a normal, movable window on the
+    /// primary display, shifted by `cascade` steps so it does not hide the main window.
+    pub fallback: bool,
+    pub cascade: u32,
 }
 
 #[derive(Default)]
@@ -84,6 +65,10 @@ pub struct AuxWindow {
     initial: Option<(Pos2, Vec2)>,
     /// True once the OS window exists (placement commands only make sense then).
     created: bool,
+    /// The wanted display is missing; the window is a normal window on the primary display.
+    pub fallback: bool,
+    /// Move the existing OS window after the next `show` (after its mode changed).
+    pending_apply: bool,
     /// Outer rectangle of the OS window in points, as last reported.
     pub last_rect: Option<egui::Rect>,
 }
@@ -94,33 +79,29 @@ pub struct AuxOutput {
 
 impl AuxWindow {
     pub fn from_state(state: AuxState) -> Self {
-        Self { state, initial: None, created: false, last_rect: None }
+        Self { state, ..Self::default() }
     }
 
     pub fn is_open(&self) -> bool {
         self.state.open
     }
 
-    /// Opens the window on a monitor not in `avoid`. If every monitor is taken
-    /// it shares one and is cascaded by `cascade` steps so windows never sit
-    /// exactly on top of each other.
-    pub fn open(&mut self, monitors: &[MonitorInfo], avoid: &[usize], size_fraction: f32, cascade: u32) {
+    #[cfg(test)]
+    pub fn initial_for_test(&self) -> Option<(Pos2, Vec2)> {
+        self.initial
+    }
+
+    /// Marks the window open. Its place comes from `place`, called before it is first shown.
+    pub fn open(&mut self) {
         self.state.open = true;
         self.created = false;
-        let idx = if self.state.fullscreen {
-            resolve_monitor(monitors, self.state.monitor.as_deref())
-        } else {
-            choose_monitor(monitors, self.state.monitor.as_deref(), avoid)
-        };
-        let shared = idx.is_some_and(|i| avoid.contains(&i));
-        self.place_on(idx, monitors, size_fraction);
-        if shared && !self.state.fullscreen {
-            if let Some((pos, size)) = &mut self.initial {
-                let step = 56.0 * cascade.max(1) as f32;
-                *pos += Vec2::splat(step);
-                *size = (*size * 0.85).max(Vec2::new(320.0, 200.0));
-            }
-        }
+        self.pending_apply = false;
+    }
+
+    pub fn close(&mut self) {
+        self.state.open = false;
+        self.created = false;
+        self.pending_apply = false;
     }
 
     /// Index of the monitor this window was placed on.
@@ -131,38 +112,23 @@ impl AuxWindow {
         self.state.monitor.as_deref().and_then(|id| monitors.iter().position(|m| m.id == id))
     }
 
-    pub fn close(&mut self) {
-        self.state.open = false;
-        self.created = false;
-    }
-
-    fn place_on(&mut self, idx: Option<usize>, monitors: &[MonitorInfo], size_fraction: f32) {
-        self.initial = idx.and_then(|i| monitors.get(i)).map(|m| {
-            self.state.monitor = Some(m.id.clone());
-            let (pos, size) = m.logical();
-            let inner = size * size_fraction;
-            (pos + (size - inner) / 2.0, inner)
-        });
-    }
-
-    /// Choose a display even while closed; a running fullscreen feed moves immediately.
-    pub fn select_monitor(&mut self, ctx: &egui::Context, id: ViewportId, monitors: &[MonitorInfo], index: usize) {
-        if index >= monitors.len() { return; }
-        self.place_on(Some(index), monitors, 1.0);
-        if self.state.open && self.created { self.apply_placement(ctx, id, monitors); }
-    }
-
-    /// Re-places the window on the primary monitor if its monitor was unplugged.
-    pub fn ensure_monitor_exists(&mut self, ctx: &egui::Context, id: ViewportId, monitors: &[MonitorInfo], size_fraction: f32) {
-        if !self.state.open || monitors.is_empty() {
-            return;
+    /// Puts the window on a display. A window that is already shown moves there with the next frame
+    /// without being recreated, so its contents and state stay as they are.
+    pub fn place(&mut self, monitors: &[MonitorInfo], placing: Placing) {
+        let Some(m) = monitors.get(placing.monitor) else { return };
+        self.fallback = placing.fallback;
+        self.state.fullscreen = placing.fullscreen && !placing.fallback;
+        self.state.monitor = Some(m.id.clone());
+        let (pos, size) = m.logical();
+        let inner = size * placing.size_fraction;
+        let mut pos = pos + (size - inner) / 2.0;
+        let mut inner = inner;
+        if placing.fallback && placing.cascade > 0 {
+            pos += Vec2::splat(56.0 * placing.cascade as f32);
+            inner = (inner * 0.85).max(Vec2::new(320.0, 200.0));
         }
-        let exists = self.state.monitor.as_deref().is_some_and(|cur| monitors.iter().any(|m| m.id == cur));
-        if !exists && self.created {
-            let idx = resolve_monitor(monitors, None);
-            self.place_on(idx, monitors, size_fraction);
-            self.apply_placement(ctx, id, monitors);
-        }
+        self.initial = Some((pos, inner));
+        self.pending_apply = self.state.open && self.created;
     }
 
     fn apply_placement(&mut self, ctx: &egui::Context, id: ViewportId, monitors: &[MonitorInfo]) {
@@ -222,7 +188,9 @@ impl AuxWindow {
         if !self.state.open {
             return out;
         }
-        if output_visible.is_some() { self.state.fullscreen = true; }
+        // A window on its own display covers it; one that lost its display is a normal window.
+        if output_visible.is_some() { self.state.fullscreen = !self.fallback; }
+        let decorations = decorations || self.fallback;
         let mut builder = self.builder(title, decorations, monitors);
         if let Some(visible) = output_visible {
             builder = builder.with_taskbar(false).with_active(false).with_visible(visible);
@@ -247,6 +215,11 @@ impl AuxWindow {
                 }
             }
         });
+        if self.pending_apply && self.created {
+            // After the mode switch of this frame (fullscreen on/off) so the new position wins.
+            self.pending_apply = false;
+            self.apply_placement(ctx, id, monitors);
+        }
         self.created = true;
         self.last_rect = last_rect;
         if fullscreen_toggle {
@@ -296,45 +269,22 @@ mod tests {
         MonitorInfo { id: id.to_owned(), pos: [x, 0], size: [2560, 1440], scale: 1.25, primary }
     }
 
-    #[test]
-    fn remembered_monitor_is_used_when_present() {
-        let ms = [mon("a", 0, true), mon("b", 2560, false)];
-        assert_eq!(choose_monitor(&ms, Some("b"), &[]), Some(1));
-        assert_eq!(choose_monitor(&ms, Some("b"), &[1]), Some(0), "a taken monitor is not reused");
+    fn on(monitor: usize, fullscreen: bool, size_fraction: f32) -> Placing {
+        Placing { monitor, fullscreen, size_fraction, fallback: false, cascade: 0 }
     }
 
     #[test]
-    fn vanished_monitor_falls_back_to_the_primary_one() {
-        let ms = [mon("a", 0, true)];
-        assert_eq!(choose_monitor(&ms, Some("gone"), &[]), Some(0));
-        assert_eq!(resolve_monitor(&ms, Some("gone")), Some(0));
-        let ms = [mon("x", 0, false), mon("a", 2560, true)];
-        assert_eq!(resolve_monitor(&ms, Some("gone")), Some(1), "primary, not the first monitor");
-    }
-
-    #[test]
-    fn secondary_window_prefers_another_monitor_but_survives_with_one() {
-        let two = [mon("a", 0, true), mon("b", 2560, false)];
-        assert_eq!(choose_monitor(&two, None, &[0]), Some(1));
-        let one = [mon("a", 0, true)];
-        assert_eq!(choose_monitor(&one, None, &[0]), Some(0));
-        assert_eq!(choose_monitor(&[], None, &[]), None);
-        assert_eq!(choose_monitor(&two, None, &[0, 1]), Some(0), "all taken: primary");
-    }
-
-    #[test]
-    fn next_monitor_wraps() {
-        let ms = [mon("a", 0, true), mon("b", 2560, false)];
-        assert_eq!(next_monitor(&ms, Some(0)), Some(1));
-        assert_eq!(next_monitor(&ms, Some(1)), Some(0));
-        assert_eq!(next_monitor(&ms, None), Some(0));
+    fn monitor_name_is_the_part_before_the_separator() {
+        assert_eq!(mon("DELL U2720Q|2560x1440@0,0", 0, true).name(), "DELL U2720Q");
+        assert_eq!(mon("plain", 0, true).name(), "plain");
     }
 
     #[test]
     fn fullscreen_uses_explicit_selected_display_even_if_occupied() {
         let ms = [mon("a", 0, true), mon("b", 2560, false)];
         let mut w = AuxWindow::from_state(AuxState { open: false, fullscreen: true, monitor: Some("b".into()) });
-        w.open(&ms, &[1], 0.6, 1);
+        w.open();
+        w.place(&ms, on(1, true, 0.6));
         assert_eq!(w.monitor_index(&ms), Some(1));
         let builder = w.builder("feed", false, &ms);
         assert_eq!(builder.fullscreen, Some(true));
@@ -351,9 +301,10 @@ mod tests {
         second.scale = 1.0;
         let ms = [mon("a", 0, true), second];
         let mut w = AuxWindow::from_state(AuxState { open: false, fullscreen: true, monitor: Some("a".into()) });
-        w.open(&ms, &[], 1.0, 0);
+        w.open();
+        w.place(&ms, on(0, true, 1.0));
         let mut builder = w.builder("feed", false, &ms);
-        w.place_on(Some(1), &ms, 1.0);
+        w.place(&ms, on(1, true, 1.0));
         let (commands, recreate) = builder.patch(w.builder("feed", false, &ms));
         assert!(!recreate);
         assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::SetMonitor(1))));
@@ -364,31 +315,46 @@ mod tests {
     fn placement_is_inside_the_monitor() {
         let ms = [mon("a", 0, true), mon("b", 2560, false)];
         let mut w = AuxWindow::default();
-        w.open(&ms, &[0], 0.9, 1);
+        w.open();
+        w.place(&ms, on(1, false, 0.9));
         let (pos, size) = w.initial.unwrap();
         let (mpos, msize) = ms[1].logical();
         assert!(pos.x >= mpos.x && pos.x + size.x <= mpos.x + msize.x + 0.01);
         assert!(pos.y >= mpos.y && pos.y + size.y <= mpos.y + msize.y + 0.01);
         assert_eq!(w.state.monitor.as_deref(), Some("b"));
+        assert!(!w.state.fullscreen && !w.fallback);
     }
 
     #[test]
-    fn two_windows_never_sit_on_top_of_each_other() {
+    fn fallback_windows_are_movable_and_cascaded_on_the_primary_display() {
         let ms = [mon("a", 0, true)];
-        let mut viewer = AuxWindow::default();
-        viewer.open(&ms, &[0], 0.9, 1);
+        let mut viewer = AuxWindow::from_state(AuxState { open: false, fullscreen: true, monitor: None });
+        viewer.open();
+        viewer.place(&ms, Placing { monitor: 0, fullscreen: true, size_fraction: 0.9, fallback: true, cascade: 1 });
+        assert!(viewer.fallback);
+        assert!(!viewer.state.fullscreen, "a fullscreen viewer must not cover the editor on the only display");
         let mut clean = AuxWindow::default();
-        clean.open(&ms, &[0, 0], 0.6, 2);
+        clean.open();
+        clean.place(&ms, Placing { monitor: 0, fullscreen: true, size_fraction: 0.6, fallback: true, cascade: 2 });
         let (p1, _) = viewer.initial.unwrap();
         let (p2, _) = clean.initial.unwrap();
         assert!((p1 - p2).length() > 50.0, "cascaded: {p1:?} vs {p2:?}");
-        // With a second monitor they separate completely.
+        let b = viewer.builder("viewer", true, &ms);
+        assert_eq!(b.fullscreen, None);
+        assert_eq!(b.decorations, Some(true));
+        assert!(b.position.is_some());
+    }
+
+    #[test]
+    fn a_shown_window_moves_without_being_recreated() {
         let ms = [mon("a", 0, true), mon("b", 2560, false)];
-        let mut v = AuxWindow::default();
-        v.open(&ms, &[0], 0.9, 1);
-        let mut c = AuxWindow::default();
-        c.open(&ms, &[0, v.monitor_index(&ms).unwrap()], 0.6, 1);
-        assert_eq!(v.state.monitor, Some("b".to_owned()));
-        assert_eq!(c.state.monitor, Some("a".to_owned()), "falls back to the primary monitor, cascaded");
+        let mut w = AuxWindow::default();
+        w.open();
+        w.place(&ms, on(1, true, 1.0));
+        w.created = true; // as if shown once
+        w.place(&ms, Placing { monitor: 0, fullscreen: true, size_fraction: 0.9, fallback: true, cascade: 1 });
+        assert!(w.pending_apply && w.is_open(), "the move is applied after the next show");
+        w.close();
+        assert!(!w.pending_apply);
     }
 }
