@@ -16,6 +16,8 @@ use rawgraph_core::{CaptureInfo, ImageBuf};
 mod avif;
 mod export;
 mod heic;
+// The HEIF box editing is only called by the Windows HEIC encoder; its tests run everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod heif_box;
 mod icc;
 mod lens;
