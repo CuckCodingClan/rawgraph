@@ -344,7 +344,7 @@ fn bench_save_4000_images_100_history_entries() {
     let log = p.log_with_commit(revision, "one more edit");
     let full = t.path("full.rawgraph");
     let started = std::time::Instant::now();
-    store::write_file(&p, &store::Versioning { revision, log: &log }, &full, &[], true).unwrap();
+    store::write_file(&p, &store::Versioning { revision, log: &log }, &full, &[], true, None).unwrap();
     let rewrite = started.elapsed();
     let full_size = fs::metadata(&full).unwrap().len();
 
@@ -409,7 +409,7 @@ fn a_leftover_journal_is_never_replayed_by_a_read_and_recovery_is_explicit() {
 }
 
 #[test]
-fn a_full_write_over_a_file_with_a_hot_journal_settles_the_journal_first() {
+fn a_full_write_over_a_file_with_a_hot_journal_never_replays_the_journal_but_moves_it_aside() {
     let t = Tmp::new();
     let file = t.path("p.rawgraph");
     let mut p = project_with_images(100);
@@ -417,8 +417,11 @@ fn a_full_write_over_a_file_with_a_hot_journal_settles_the_journal_first() {
     let crashed = crashed_copy(&t, &file, "crashed");
     // Another project replaces the file as a whole (commit_overwrite: full write).
     let mut other = project_with_images(7);
+    writemode::TEST_OVERRIDE.with(|o| o.set(Some(WriteMode::FullRewrite)));
     other.commit_overwrite(&crashed, "replace").unwrap();
+    writemode::TEST_OVERRIDE.with(|o| o.set(None));
     assert!(!t.path("crashed.rawgraph-journal").exists(), "no journal may stay next to the new file");
+    assert_eq!(stale_journals(&t).len(), 1, "the old journal is kept aside, not replayed and not deleted");
     assert_eq!(Project::load(&crashed).unwrap(), other);
     integrity_ok(&crashed);
 }
@@ -567,4 +570,173 @@ fn a_half_finished_entry_never_replaces_a_complete_one() {
     done.content_hash = "e".repeat(64);
     assert_eq!(p.merge_found(&[done.clone()]), 1);
     assert_eq!(p.image(ImageId(2)).unwrap(), &done);
+}
+
+fn stale_journals(t: &Tmp) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = fs::read_dir(&t.0)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().contains("-journal.stale-")))
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn an_orphan_journal_next_to_a_new_file_is_moved_aside_never_deleted_or_replayed() {
+    let t = Tmp::new();
+    let file = t.path("new.rawgraph");
+    // Left over from an older file of the same name that is long gone.
+    let junk: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8 | 1).collect();
+    fs::write(t.path("new.rawgraph-journal"), &junk).unwrap();
+    let mut p = project_with_images(20);
+    p.commit(&file, "first").unwrap();
+    assert!(!t.path("new.rawgraph-journal").exists(), "no journal next to the new file");
+    let stale = stale_journals(&t);
+    assert_eq!(stale.len(), 1, "{stale:?}");
+    let name = stale[0].file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with("new.rawgraph-journal.stale-") && name.len() == "new.rawgraph-journal.stale-20260101-000000".len(), "{name}");
+    assert_eq!(fs::read(&stale[0]).unwrap(), junk, "kept as it was");
+    // The next commit (in place) and a load do not see any foreign journal.
+    p.image_mut(ImageId(2)).unwrap().rating = 5;
+    p.commit(&file, "second").unwrap();
+    assert_eq!(Project::load(&file).unwrap(), p);
+    integrity_ok(&file);
+    assert_eq!(stale_journals(&t).len(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_failed_swap_puts_the_journal_back_and_leaves_the_old_file_byte_identical() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let t = Tmp::new();
+    let file = t.path("p.rawgraph");
+    let mut theirs = project_with_images(10);
+    theirs.commit(&file, "theirs").unwrap();
+    let junk = vec![7u8; 1024];
+    fs::write(t.path("p.rawgraph-journal"), &junk).unwrap();
+    let before = fs::read(&file).unwrap();
+    // Somebody holds the target open without allowing it to be replaced (share read+write, not delete).
+    let holder = fs::OpenOptions::new().read(true).share_mode(3).open(&file).unwrap();
+    let mut mine = project_with_images(5);
+    writemode::TEST_OVERRIDE.with(|o| o.set(Some(WriteMode::FullRewrite)));
+    let err = mine.commit_overwrite(&file, "replace").unwrap_err();
+    writemode::TEST_OVERRIDE.with(|o| o.set(None));
+    assert!(matches!(err, ProjectError::Io(_)), "{err}");
+    drop(holder);
+    assert_eq!(fs::read(&file).unwrap(), before, "the old file is byte-identical");
+    assert_eq!(fs::read(t.path("p.rawgraph-journal")).unwrap(), junk, "the journal is back where it was");
+    assert!(stale_journals(&t).is_empty() && !t.path("p.rawgraph.saving").exists());
+    assert_eq!(mine.revision(), 0, "the project is unchanged");
+}
+
+#[test]
+fn a_journal_with_a_zeroed_header_is_stale_and_blocks_neither_recovery_nor_a_full_write() {
+    let t = Tmp::new();
+    let file = t.path("p.rawgraph");
+    let mut p = project_with_images(30);
+    p.commit(&file, "base").unwrap();
+    let bytes = fs::read(&file).unwrap();
+    // A save was killed before the journal header was synced: the file is complete, the journal is zeros.
+    fs::write(t.path("p.rawgraph-journal"), vec![0u8; 512]).unwrap();
+    assert!(Project::recover_unfinished_save(&file).unwrap());
+    assert!(!t.path("p.rawgraph-journal").exists());
+    assert_eq!(fs::read(&file).unwrap(), bytes, "nothing was rolled back or changed");
+    assert!(stale_journals(&t).len() <= 1);
+    assert_eq!(Project::load(&file).unwrap(), p);
+
+    // The same for a full write over it.
+    fs::write(t.path("p.rawgraph-journal"), vec![0u8; 512]).unwrap();
+    let mut other = project_with_images(4);
+    other.commit_overwrite(&file, "replace").unwrap();
+    assert!(!t.path("p.rawgraph-journal").exists());
+    assert_eq!(Project::load(&file).unwrap(), other);
+    assert!(!stale_journals(&t).is_empty());
+}
+
+#[test]
+fn load_recovering_rolls_an_interrupted_save_back_only_where_this_computer_alone_writes() {
+    let t = Tmp::new();
+    let file = t.path("p.rawgraph");
+    let mut p = project_with_images(100);
+    p.commit(&file, "base").unwrap();
+    // In-place place (a local drive): recovered, and said so.
+    let crashed = crashed_copy(&t, &file, "local");
+    let (loaded, recovered) = Project::load_recovering(&crashed).unwrap();
+    assert!(recovered);
+    assert_eq!(loaded, p);
+    assert!(!t.path("local.rawgraph-journal").exists());
+    assert!(!Project::load_recovering(&crashed).unwrap().1, "nothing to recover the second time");
+    // A network or sync place: the error comes back, nothing is touched.
+    let shared = crashed_copy(&t, &file, "shared");
+    let before = (fs::read(&shared).unwrap(), fs::read(t.path("shared.rawgraph-journal")).unwrap());
+    writemode::TEST_OVERRIDE.with(|o| o.set(Some(WriteMode::FullRewrite)));
+    let err = Project::load_recovering(&shared);
+    writemode::TEST_OVERRIDE.with(|o| o.set(None));
+    assert!(matches!(err, Err(ProjectError::UnfinishedSave(ref f)) if f == &shared), "{err:?}");
+    assert_eq!((fs::read(&shared).unwrap(), fs::read(t.path("shared.rawgraph-journal")).unwrap()), before);
+    // A full-rewrite commit on that file also reports the unfinished save and writes nothing.
+    writemode::TEST_OVERRIDE.with(|o| o.set(Some(WriteMode::FullRewrite)));
+    let commit = p.commit(&shared, "x");
+    writemode::TEST_OVERRIDE.with(|o| o.set(None));
+    assert!(matches!(commit, Err(ProjectError::UnfinishedSave(_))), "{commit:?}");
+    assert_eq!(fs::read(&shared).unwrap(), before.0);
+    // After the explicit recovery everything works again.
+    assert!(Project::recover_unfinished_save(&shared).unwrap());
+    assert_eq!(Project::load(&shared).unwrap(), p);
+}
+
+#[test]
+fn the_check_right_before_the_swap_catches_a_commit_that_came_in_late() {
+    let t = Tmp::new();
+    let file = t.path("p.rawgraph");
+    let mut a = project_with_images(10);
+    a.commit(&file, "base").unwrap();
+    let b = Project::load(&file).unwrap();
+    assert!(b.recheck_before_swap(&file, false).is_ok());
+    a.image_mut(ImageId(1)).unwrap().rating = 5;
+    a.commit(&file, "a").unwrap();
+    assert!(matches!(b.recheck_before_swap(&file, false), Err(ProjectError::Conflict { disk_revision: 2, loaded_revision: 1 })));
+    assert!(b.recheck_before_swap(&file, true).is_ok(), "overwrite skips it");
+    // The guard stops a full write: the target is untouched and no temporary file stays.
+    let bytes = fs::read(&file).unwrap();
+    let ver = store::Versioning { revision: 2, log: &b.history };
+    let refuse = || -> Result<(), ProjectError> { Err(ProjectError::Conflict { disk_revision: 9, loaded_revision: 1 }) };
+    assert!(store::write_file(&b, &ver, &file, &[], true, Some(&refuse)).is_err());
+    assert_eq!(fs::read(&file).unwrap(), bytes);
+    assert!(!t.path("p.rawgraph.saving").exists());
+}
+
+#[test]
+fn last_write_tells_how_the_file_was_really_written() {
+    let t = Tmp::new();
+    let file = t.path("p.rawgraph");
+    let mut p = project_with_images(10);
+    assert!(p.last_write().is_none());
+    p.commit(&file, "first").unwrap();
+    let w = p.last_write().unwrap();
+    assert_eq!((w.mode, w.reason.as_str()), (WriteMode::FullRewrite, "new file"), "the first save is a whole file");
+    p.commit(&file, "second").unwrap();
+    assert_eq!(p.last_write().unwrap().mode, WriteMode::InPlace);
+    // Another project's file is replaced as a whole.
+    let mut other = project_with_images(3);
+    other.commit_overwrite(&file, "replace").unwrap();
+    let w = other.last_write().unwrap();
+    assert_eq!(w.mode, WriteMode::FullRewrite);
+    assert!(w.reason.contains("another project"), "{w:?}");
+    // A change that cannot be made row by row falls back, and says so.
+    let (u1, u2) = (other.image(ImageId(1)).unwrap().uuid.clone(), other.image(ImageId(2)).unwrap().uuid.clone());
+    other.image_mut(ImageId(1)).unwrap().uuid = u2;
+    other.image_mut(ImageId(2)).unwrap().uuid = u1;
+    other.commit(&file, "swap").unwrap();
+    let w = other.last_write().unwrap();
+    assert_eq!(w.mode, WriteMode::FullRewrite);
+    assert!(w.reason.contains("row by row"), "{w:?}");
+    // A place that does not allow in place.
+    writemode::TEST_OVERRIDE.with(|o| o.set(Some(WriteMode::FullRewrite)));
+    other.commit(&file, "again").unwrap();
+    writemode::TEST_OVERRIDE.with(|o| o.set(None));
+    assert_eq!(other.last_write().unwrap().mode, WriteMode::FullRewrite);
+    assert_eq!(other.last_write().unwrap().reason, "test");
 }

@@ -104,6 +104,7 @@ impl App {
                 let name = dialogs::recovery_title(&info);
                 self.status.info(format!("Recovered \"{name}\" ({} images, copy of {}); unsaved", info.image_count, local_stamp(info.saved_unix_ms)));
             }
+            Err(rawgraph_project::ProjectError::UnfinishedSave(f)) => self.ask_unfinished(f, Retry::Recovery(file.to_path_buf())),
             Err(e) => self.status.error(format!("Cannot recover {}: {e}", file.display())),
         }
     }
@@ -741,5 +742,72 @@ impl App {
             self.started_at.elapsed().as_secs_f32() * 1000.0,
             hits + misses + replaced
         );
+    }
+}
+
+// ----------------------------------------------------------------------- unfinished saves
+
+/// What to do again once an interrupted save has been rolled back.
+pub(super) enum Retry {
+    Open(PathBuf),
+    Save { target: PathBuf, then: Option<Pending> },
+    Recovery(PathBuf),
+}
+
+/// The open question: the project file, what to retry, and the error of a failed recovery.
+pub(super) struct UnfinishedState {
+    file: PathBuf,
+    retry: Retry,
+    error: Option<String>,
+}
+
+impl App {
+    /// A load or save found the journal of an interrupted save beside `file` (a network drive or
+    /// sync folder, where another computer may be writing): ask before it is rolled back.
+    pub(super) fn ask_unfinished(&mut self, file: PathBuf, retry: Retry) {
+        self.status.error(format!("{} has an unfinished save beside it", file.display()));
+        self.unfinished = Some(UnfinishedState { file, retry, error: None });
+    }
+
+    pub(super) fn unfinished_window(&mut self, ctx: &egui::Context) {
+        let Some(state) = &mut self.unfinished else { return };
+        match dialogs::unfinished_window(ctx, &state.file, state.error.as_deref()) {
+            dialogs::UnfinishedAction::None => {}
+            dialogs::UnfinishedAction::Cancel => self.unfinished = None,
+            dialogs::UnfinishedAction::Recover => match rawgraph_project::Project::recover_unfinished_save(&state.file) {
+                Err(e) => state.error = Some(e.to_string()),
+                Ok(_) => {
+                    let Some(state) = self.unfinished.take() else { return };
+                    self.status.info(format!("Recovered an interrupted save of {}", state.file.display()));
+                    match state.retry {
+                        Retry::Open(path) => self.open_project_path(&path, ctx),
+                        Retry::Save { target, then } => self.save_project(Some(target), then, ctx),
+                        Retry::Recovery(file) => self.recover(&file, ctx),
+                    }
+                }
+            },
+        }
+    }
+
+    /// Opens a project file in the window: the current project stays open if that fails. Asks when an
+    /// interrupted save beside the file needs the user's word.
+    pub(super) fn open_project_path(&mut self, path: &std::path::Path, ctx: &egui::Context) {
+        match crate::revisions::open_project_ex(path) {
+            Ok(opened) => {
+                self.cancel_scan();
+                self.discard_own_recovery();
+                self.session.replace_project(opened.project, Some(path.to_path_buf()));
+                self.after_document_change();
+                self.start_capture_refresh(ctx);
+                self.start_missing_check(ctx);
+                match opened.note {
+                    Some(n) if opened.recovered => self.status.info(format!("{n}; opened {}", path.display())),
+                    Some(n) => self.status.info(n),
+                    None => self.status.info(format!("Opened {}", path.display())),
+                }
+            }
+            Err(crate::revisions::OpenError::Unfinished(file)) => self.ask_unfinished(file, Retry::Open(path.to_path_buf())),
+            Err(e) => self.status.error(format!("Cannot open {}: {e}", path.display())),
+        }
     }
 }

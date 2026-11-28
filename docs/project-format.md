@@ -36,11 +36,19 @@ Two ways, both all-or-nothing. Which one is used is decided per file (see "Which
 - **Full write** (new file, "save as" to a new path, another project's file,
   schema migration, recovery copies, and every file for which in place is not allowed):
   the whole database is written into `<name>.saving` in one transaction and renamed over
-  the target. The target is complete at every instant, and no journal file is involved.
-  A failed write leaves the old file in place. A file of an older schema is first copied
-  to `<name>.v<N>.bak`. A `<name>-journal` next to the old file is settled first
-  (rolled back on the old file; if that is not possible the save is refused), so a stale
-  journal never stays next to the new file.
+  the target. The target is complete at every instant, and the full write never creates,
+  uses or replays a journal. A failed write leaves the old file in place. A file of an older
+  schema is first copied to `<name>.v<N>.bak`. A `<name>-journal` next to the target
+  (belonging to the old file, or to nothing) is **never replayed and never deleted**: right
+  before the rename it is moved to `<name>-journal.stale-<YYYYMMDD-HHMMSS>` (UTC), so it
+  cannot be replayed onto the new file; if the rename fails (for example Windows refuses
+  because another program holds the file open) it is moved back and the old file is
+  byte-identical. Right before the rename the file's identity is read once more and a
+  revision that appeared since the first check gives the conflict. This narrows the
+  window but does not close it: **a full write is not atomic between computers**; a commit by
+  another computer between that last look and the rename is lost (the last writer wins).
+  Only the in-place update is atomic against other writers, and it is not used where
+  other computers or sync clients can touch the file.
 
 ### Which way is used where
 
@@ -48,19 +56,35 @@ In place is used **only on a local fixed drive that is not inside a sync folder*
 whole file is rewritten (full write) when the file is on:
 
 - a **network drive**: UNC paths (`\\server\share`), mapped drives (Windows
-  `GetDriveTypeW` is not "fixed"), removable drives; on Linux a mount of type
-  nfs/nfs4/cifs/smb3/smbfs/9p/afs/ceph/glusterfs/davfs/ncpfs/lustre/sshfs/rclone
-  (`/proc/self/mounts`); on macOS everything under `/Volumes`;
-- a **sync folder**: a folder or any parent that holds a marker of a sync client:
-  `.nextcloudsync.log`, `.owncloudsync.log`, `.sync_*.db` (Nextcloud/ownCloud),
-  `.dropbox`, `.dropbox.cache` (Dropbox), or a path under the folders named by the
-  environment variables `OneDrive`, `OneDriveConsumer`, `OneDriveCommercial`;
+  `GetDriveTypeW` says remote); on Linux a mount of type
+  nfs/nfs4/cifs/smb/smb3/smbfs/9p/afs/ceph/glusterfs/davfs/ncpfs/lustre and the fuse file
+  systems sshfs, rclone, s3fs, davfs, gvfsd-fuse (`/proc/self/mounts`); on macOS everything
+  under `/Volumes`. A drive Windows reports as removable or of another type than fixed also
+  gets the full write. **External USB disks usually report "fixed" on Windows and are not
+  recognised**; the setting below covers them;
+- a **sync or cloud folder**, recognised by any of these on the folder or a parent (both the
+  path as given and the canonical path are looked at): marker files `.nextcloudsync.log`,
+  `.owncloudsync.log`, `.sync_*.db`, `._sync_*.db`, `.csync_journal.db`
+  (Nextcloud/ownCloud, also old clients), `.dropbox`, `.dropbox.cache` (Dropbox),
+  `.stfolder` (Syncthing), `.SynologyDrive` (Synology Drive); a path under the folders named
+  by the environment variables `OneDrive`, `OneDriveConsumer`, `OneDriveCommercial`
+  (canonicalised first); a path segment `My Drive` / `Google Drive` (Google Drive),
+  `iCloudDrive` / `iCloud Drive`, `OneDrive*` (OneDrive business tenants), macOS
+  `Library/Mobile Documents` (iCloud) and `Library/CloudStorage/*`; on Windows a parent that is a
+  "files on demand" placeholder (file attributes RECALL_ON_DATA_ACCESS / RECALL_ON_OPEN or a
+  cloud reparse tag, which also catches OneDrive business and iCloud for Windows);
 - any file when the setting **"Always rewrite the whole project file"** is on
-  (Settings menu, default off, also `RAWGRAPH_ALWAYS_REWRITE=1`).
+  (Settings menu, default off, also `RAWGRAPH_ALWAYS_REWRITE=1`). Use it for anything this
+  list does not recognise, for example an external USB disk, a share mounted in an unusual
+  way or a sync client without a marker.
 
-The choice is made once per 30 s per folder. `rawgraph_project::write_mode(path)` returns
-it with the reason; the application shows it in the status line after a save, e.g.
-"Saved ... (revision 7; whole file rewritten, inside a Nextcloud sync folder)".
+The place is looked at once per 5 minutes per folder, off the UI's locks (marker names are
+probed directly; a folder is listed only to find the `.sync_*.db` patterns, with an early exit).
+`rawgraph_project::write_mode(path)` returns the choice with the reason. What a save **really**
+did is in `Project::last_write()` (a first save, a file of another project or format, or a change
+that cannot be made row by row writes the whole file even where in place is allowed); the
+application shows that in the status line after a save, e.g. "Saved ... (revision 7; whole file
+rewritten, inside a Nextcloud sync folder)" or "(revision 8; in place, local drive)".
 
 Why: in place uses SQLite's rollback journal, a second file `<name>-journal` that exists
 during a save. That is safe on a local disk but not where files are copied or locked by
@@ -84,14 +108,29 @@ writing the whole file (up to about 32 MB of history).
 Reading never writes. A file is opened read-only and everything (identity, images, graph,
 history) is read in **one read transaction**, so a commit by somebody else in between
 cannot give a mixed state. A leftover `<name>-journal` that SQLite would have to replay
-(an interrupted save) is **not** replayed by a read: loading fails with the message "the
-project file has an unfinished save next to it (<name>-journal): open it from the computer
-that saved it ...". `Project::recover_unfinished_save(path)` rolls the file back to its
-last complete state; it is meant for an explicit user action on the computer that saved the
-file, while no program is saving it. The next in-place commit or full write on the saving
-computer also settles the journal. Locks are waited for at most 2 s per request (a save
-asks twice); if the file is still locked the error is "The project file is in use by another
-program or computer; try again." and nothing is changed or rewritten.
+(an interrupted save) is **not** replayed by a read: loading fails with
+`ProjectError::UnfinishedSave`, "the project file has an unfinished save next to it
+(<name>-journal) ...".
+
+What the application does about it:
+
+- **In-place places** (local fixed drive, no sync folder: only this computer writes there):
+  `Project::load_recovering` (used for File > Open and `--project`) rolls the save back
+  through the write path first and the status line says "Recovered an interrupted save".
+- **Other places** (network, sync folder): another computer may be saving right now, so
+  the application shows a window "Unfinished save" on opening (File > Open, `--project`,
+  restoring a recovery copy) and when a save runs into it, in plain words, with "Recover
+  unfinished save" (warning: only if no other computer is saving this project right now) and
+  "Cancel". Recover calls `Project::recover_unfinished_save` and then repeats the open or the
+  save.
+- `recover_unfinished_save` opens the file read-write once and takes the write lock, which
+  makes SQLite roll back a hot journal. A journal that is still there after the lock was
+  granted is not hot (for example a zeroed header after a kill before the sync): it is
+  moved aside to `<name>-journal.stale-<time>`, not treated as an error.
+
+Locks are waited for at most 2 s per request (a save asks twice); if the file is still
+locked the error is "The project file is in use by another program or computer; try again."
+and nothing is changed or rewritten.
 
 Deleted history entries leave free pages inside the file; they are reused by later
 commits, but the file does not shrink until it is written in full (e.g. "save as").

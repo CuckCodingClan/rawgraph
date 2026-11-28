@@ -793,11 +793,12 @@ impl Session {
         Ok(revision)
     }
 
-    /// Opens a project file; the note is set when the file was converted from format 1.
-    pub fn load_project(&mut self, path: &Path) -> Result<Option<&'static str>, String> {
-        let (project, note) = crate::revisions::open_project(path)?;
-        self.replace_project(project, Some(path.to_path_buf()));
-        Ok(note)
+    /// Opens a project file; the note is set when the file was converted from format 1 or an
+    /// interrupted save was rolled back first.
+    pub fn load_project(&mut self, path: &Path) -> Result<Option<&'static str>, crate::revisions::OpenError> {
+        let opened = crate::revisions::open_project_ex(path)?;
+        self.replace_project(opened.project, Some(path.to_path_buf()));
+        Ok(opened.note)
     }
 
     /// Replaces only the graph (import of a `.rawgraph.json`).

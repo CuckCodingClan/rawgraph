@@ -234,14 +234,14 @@ pub(crate) fn save(project: &Project, path: &Path) -> Result<(), ProjectError> {
         }
     }
     let ver = Versioning { revision: project.revision, log: &project.history };
-    write_file(project, &ver, path, &[], true)
+    write_file(project, &ver, path, &[], true, None)
 }
 
 /// Like [`save`] with additional `meta` rows (used by recovery files). An
 /// older file at `path` is not backed up: recovery files are disposable.
 pub(crate) fn save_with_meta(project: &Project, path: &Path, extra: &[(&str, String)]) -> Result<(), ProjectError> {
     let ver = Versioning { revision: project.revision, log: &project.history };
-    write_file(project, &ver, path, extra, false)
+    write_file(project, &ver, path, extra, false, None)
 }
 
 /// Writes a complete new file next to the target and swaps it in, so a
@@ -254,6 +254,7 @@ pub(crate) fn write_file(
     path: &Path,
     extra: &[(&str, String)],
     backup: bool,
+    guard: Option<&dyn Fn() -> Result<(), ProjectError>>,
 ) -> Result<(), ProjectError> {
     let mut tmp_name: OsString = path.as_os_str().to_owned();
     tmp_name.push(".saving");
@@ -264,11 +265,27 @@ pub(crate) fn write_file(
         let mut conn = Connection::open(&tmp).map_err(db_err)?;
         write_all(&mut conn, project, ver, extra)?;
         conn.close().map_err(|(_, e)| db_err(e))?;
-        settle_journal(path)?;
         if backup {
             backup_other_version(path)?;
         }
-        std::fs::rename(&tmp, path).map_err(|e| ProjectError::Io(format!("{}: {e}", path.display())))
+        // Narrow the window for a conflict: look at the file once more right before the swap.
+        if let Some(check) = guard {
+            check()?;
+        }
+        // A journal next to the target belongs to the content that is about to be replaced (or to
+        // nothing): it must never sit next to the new file, where SQLite would replay it. It is
+        // moved aside, not replayed (it may be a live writer's or another computer's) and not
+        // deleted; if the swap fails it goes back.
+        let aside = move_journal_aside(path)?;
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some((journal, stale)) = aside {
+                    let _ = std::fs::rename(&stale, &journal);
+                }
+                Err(ProjectError::Io(format!("{}: {e}", path.display())))
+            }
+        }
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -628,6 +645,7 @@ fn read_current(conn: &Connection) -> Result<Project, ProjectError> {
         folders,
         migrated_from: None,
         scan_threads: crate::DEFAULT_SCAN_THREADS,
+        last_write: None,
     })
 }
 
@@ -673,7 +691,7 @@ pub(crate) enum InPlace {
     Written { revision: u64, log: HistoryLog },
     /// The target is not a current-schema file of this project (or cannot be
     /// updated row by row): the caller writes the whole file instead.
-    NotApplicable,
+    NotApplicable(&'static str),
 }
 
 /// Internal: why a row-by-row update stopped.
@@ -729,26 +747,26 @@ pub(crate) fn update_in_place(
     prepare: &mut Prepare<'_>,
 ) -> Result<InPlace, ProjectError> {
     let Ok(mut conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE) else {
-        return Ok(InPlace::NotApplicable);
+        return Ok(InPlace::NotApplicable("cannot open the file for update"));
     };
     let _ = conn.busy_timeout(BUSY_TIMEOUT);
     let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
         Ok(tx) => tx,
         Err(e) => {
             return match &e {
-                rusqlite::Error::SqliteFailure(f, _) if matches!(f.code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) => Ok(InPlace::NotApplicable),
+                rusqlite::Error::SqliteFailure(f, _) if matches!(f.code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) => Ok(InPlace::NotApplicable("not a project file")),
                 _ => Err(db_err(e)),
             };
         }
     };
-    let Some(identity) = identity_in(&tx) else { return Ok(InPlace::NotApplicable) };
+    let Some(identity) = identity_in(&tx) else { return Ok(InPlace::NotApplicable("older file format")) };
     if identity.uuid.as_deref() != Some(project.uuid.as_str()) {
-        return Ok(InPlace::NotApplicable);
+        return Ok(InPlace::NotApplicable("file of another project"));
     }
     let (revision, log) = prepare(&identity)?;
     match apply_diff(&tx, project, &Versioning { revision, log: &log }) {
         Ok(()) => {}
-        Err(DiffError::Fallback) => return Ok(InPlace::NotApplicable),
+        Err(DiffError::Fallback) => return Ok(InPlace::NotApplicable("update row by row not possible")),
         Err(DiffError::Fatal(e)) => return Err(e),
     }
     #[cfg(test)]
@@ -1014,50 +1032,72 @@ fn open_read(path: &Path) -> Result<Connection, ProjectError> {
         .and_then(|()| conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).map(|_| ()));
     match started {
         Ok(()) => Ok(conn),
-        Err(e) if journal_of(path).exists() && !is_busy(&e) => Err(ProjectError::Io(unfinished_save_text(path))),
+        Err(e) if journal_of(path).exists() && !is_busy(&e) => Err(ProjectError::UnfinishedSave(path.to_path_buf())),
         Err(e) => Err(db_err(e)),
     }
 }
 
-fn unfinished_save_text(path: &Path) -> String {
-    let journal = journal_of(path);
-    format!(
-        "the project file has an unfinished save next to it ({}): open it from the computer that saved it, or, if no program is saving it any more, use \"Recover unfinished save\" (this rolls the file back to its last complete state)",
-        journal.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
-    )
-}
 
 fn is_busy(e: &rusqlite::Error) -> bool {
     matches!(e, rusqlite::Error::SqliteFailure(f, _) if matches!(f.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked))
 }
 
+
 /// Rolls an interrupted save back: opens the file read-write once so SQLite
-/// replays the hot `<name>-journal` onto it, which restores the last complete
-/// state. Only to be called on explicit request of the user, on the computer
-/// that owns the file, when no program is saving it. Returns whether a journal
-/// was there.
+/// replays a hot `<name>-journal` onto it, which restores the last complete
+/// state. A journal that is still there after the write lock was granted is not
+/// hot (for example one whose header was zeroed by a kill before it was synced):
+/// it is moved aside, never deleted. Only to be called when the file is written by
+/// this computer alone (in-place mode), or on explicit request of the user when
+/// no program is saving it. Returns whether a journal was there.
 pub(crate) fn recover_unfinished_save(path: &Path) -> Result<bool, ProjectError> {
-    let had = journal_of(path).exists();
-    if !had {
+    if !journal_of(path).exists() {
         return Ok(false);
     }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(db_err)?;
     let _ = conn.busy_timeout(BUSY_TIMEOUT);
-    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).map_err(db_err)?;
-    drop(conn);
-    if journal_of(path).exists() {
-        return Err(ProjectError::Io(format!("{} is still there after the recovery: another program may be saving the file", journal_of(path).display())));
-    }
+    // The write lock is only given after SQLite has dealt with a hot journal.
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
+    move_journal_aside(path)?;
+    conn.execute_batch("ROLLBACK").map_err(db_err)?;
     Ok(true)
 }
 
-/// Before a full write replaces `path`: a journal beside the old file must not
-/// survive next to the new one (SQLite would replay it onto the new file). It
-/// is rolled back on the old file (this is the write path, so a read-write open
-/// is fine); if it cannot be settled the save is refused.
-fn settle_journal(path: &Path) -> Result<(), ProjectError> {
-    if !path.is_file() || !journal_of(path).exists() {
-        return Ok(());
+/// UTC time as `YYYYMMDD-HHMMSS`.
+fn stamp() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}-{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// Moves `<name>-journal` to `<name>-journal.stale-<YYYYMMDD-HHMMSS>` (never deletes it, never
+/// replays it). Returns `(journal, new name)` when there was one.
+fn move_journal_aside(path: &Path) -> Result<Option<(PathBuf, PathBuf)>, ProjectError> {
+    let journal = journal_of(path);
+    if !journal.exists() {
+        return Ok(None);
     }
-    recover_unfinished_save(path).map(|_| ())
+    let stamp = stamp();
+    for n in 1..=1000u32 {
+        let mut name: OsString = journal.as_os_str().to_owned();
+        name.push(if n == 1 { format!(".stale-{stamp}") } else { format!(".stale-{stamp}-{n}") });
+        let stale = PathBuf::from(name);
+        if stale.exists() {
+            continue;
+        }
+        return std::fs::rename(&journal, &stale)
+            .map(|()| Some((journal.clone(), stale)))
+            .map_err(|e| ProjectError::Io(format!("cannot move the leftover journal {} aside: {e}", journal.display())));
+    }
+    Err(ProjectError::Io(format!("too many leftover journals next to {}", path.display())))
 }

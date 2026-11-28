@@ -493,6 +493,8 @@ pub struct App {
     lock: Option<SessionLock>,
     startup_scan: Option<Receiver<Orphans>>,
     recovery_dialog: Option<RecoveryDialog>,
+    /// A project file with an unfinished save beside it: waiting for the user's decision.
+    unfinished: Option<ext::UnfinishedState>,
     autosave: Scheduler,
     autosave_job: Option<WriteJob>,
     own_recovery: OwnFiles,
@@ -596,6 +598,7 @@ impl App {
             Session::new(crate::session::fresh_project(), provider.clone())
         };
         let mut status = Status::default();
+        let mut startup_unfinished: Option<PathBuf> = None;
         if let Some(path) = &cli.project {
             crate::splash::stage(crate::splash::Stage::OpeningProject);
             match session.load_project(path) {
@@ -603,6 +606,11 @@ impl App {
                     if let Some(n) = note {
                         status.info(n);
                     }
+                }
+                Err(crate::revisions::OpenError::Unfinished(_)) => {
+                    // The dialog opens with the first frame.
+                    startup_unfinished = Some(path.clone());
+                    eprintln!("--project: {} has an unfinished save beside it", path.display());
                 }
                 Err(e) => {
                     status.error(format!("Cannot open {}: {e}", path.display()));
@@ -769,6 +777,7 @@ impl App {
             lock,
             startup_scan,
             recovery_dialog: None,
+            unfinished: None,
             autosave: Scheduler::with_interval(Duration::from_secs(app_autosave_secs)),
             autosave_job: None,
             own_recovery: OwnFiles::default(),
@@ -819,6 +828,9 @@ impl App {
         });
         app.start_capture_refresh(&cc.egui_ctx);
         app.start_missing_check(&cc.egui_ctx);
+        if let Some(path) = startup_unfinished {
+            app.ask_unfinished(path.clone(), ext::Retry::Open(path));
+        }
         if let Some(folder) = app.cli.open_folder.clone() {
             app.start_scan(&cc.egui_ctx, folder);
         }
@@ -1055,22 +1067,8 @@ impl App {
         let Some(d) = self.dialog.take() else { return };
         let Some(path) = result else { return };
         match d.kind {
-            DialogKind::OpenProject => match crate::revisions::open_project(&path) {
-                Ok((p, note)) => {
-                    self.cancel_scan();
-                    self.discard_own_recovery();
-                    self.session.replace_project(p, Some(path.clone()));
-                    self.after_document_change();
-                    self.start_capture_refresh(ctx);
-                    self.start_missing_check(ctx);
-                    match note {
-                        Some(n) => self.status.info(n),
-                        None => self.status.info(format!("Opened {}", path.display())),
-                    }
-                }
-                // The current project stays open.
-                Err(e) => self.status.error(format!("Cannot open {}: {e}", path.display())),
-            },
+            // The current project stays open if that fails.
+            DialogKind::OpenProject => self.open_project_path(&path, ctx),
             DialogKind::OpenFolder => self.start_scan(ctx, path),
             DialogKind::ExportFolder => self.export_ui.out_dir = path.to_string_lossy().into_owned(),
             DialogKind::LocateFile(id) => self.locate_file(id, path),
@@ -3062,6 +3060,7 @@ impl eframe::App for App {
         self.secondary_windows(&ctx);
         self.workspace_windows(&ctx);
         self.recovery_window(&ctx);
+        self.unfinished_window(&ctx);
         self.xmp_window(&ctx);
         self.relink_windows(&ctx);
         self.clear_cache_window(&ctx);

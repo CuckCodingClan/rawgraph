@@ -31,6 +31,9 @@ pub enum Outcome<P> {
     Saved { revision: u64, target: PathBuf, then: Option<P> },
     /// A question is open (see [`SaveFlow::stage`]); nothing was written.
     Asked,
+    /// The project file has an unfinished save beside it (journal of an interrupted save): nothing
+    /// was written; the user decides whether it may be rolled back, then the save is tried again.
+    Unfinished { target: PathBuf, then: Option<P> },
     /// Nothing was written; the text is for the status bar.
     Failed(String),
 }
@@ -69,6 +72,10 @@ impl<P: Clone> SaveFlow<P> {
             Err(ProjectError::Mismatch(m)) if m.contains("belongs to another project") || m.contains("old project file") => {
                 self.stage = Stage::ConfirmReplace { target: target.to_path_buf(), then };
                 Outcome::Asked
+            }
+            Err(ProjectError::UnfinishedSave(_)) => {
+                self.stage = Stage::Idle;
+                Outcome::Unfinished { target: target.to_path_buf(), then }
             }
             Err(ProjectError::TooNew { file_version, supported }) => {
                 self.stage = Stage::Idle;
