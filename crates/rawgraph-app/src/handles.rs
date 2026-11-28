@@ -342,18 +342,11 @@ impl Handles {
                 let provider = session.provider.clone();
                 let tone = session.view.tone.tone_map();
                 let image = f.image;
-                // A Depth Map upstream could keep the pick waiting for the worker: give up after a while.
+                // The pick runs off the UI thread. It is not cancelled on a timer: cancelling a Depth Map
+                // upstream would kill the warm worker; the worker's own timeout bounds the wait.
                 let cancel = rawgraph_engine::CancelToken::new();
-                let (done_tx, done_rx) = channel::<()>();
-                let watchdog = cancel.clone();
-                std::thread::spawn(move || {
-                    if done_rx.recv_timeout(std::time::Duration::from_secs(8)) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                        watchdog.cancel();
-                    }
-                });
                 std::thread::spawn(move || {
                     let result = pick_values(&graph, provider.as_ref(), tone, node, image, at, &cancel);
-                    drop(done_tx);
                     let _ = tx.send(Pick { node, image, result });
                 });
                 self.pick = Some(rx);
