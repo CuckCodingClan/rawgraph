@@ -174,6 +174,11 @@ enum Command {
     SelectAll,
     SaveRecipe,
     ManageRecipes,
+    GroupSelection,
+    Ungroup,
+    OpenGroup,
+    UpOneLevel,
+    SaveMacro,
     ImportXmp,
     Compare,
     ToggleMissingOnly,
@@ -976,6 +981,11 @@ impl App {
             Command::SelectAll => self.editor.request(EditOp::SelectAll),
             Command::SaveRecipe => self.editor.request(EditOp::SaveRecipe),
             Command::ManageRecipes => self.editor.request(EditOp::ManageRecipes),
+            Command::GroupSelection => self.editor.request(EditOp::GroupSelection),
+            Command::Ungroup => self.editor.request(EditOp::Ungroup),
+            Command::OpenGroup => self.editor.request(EditOp::OpenSelected),
+            Command::UpOneLevel => self.editor.request(EditOp::CloseGroup),
+            Command::SaveMacro => self.editor.request(EditOp::SaveMacro),
             Command::ImportXmp => self.open_xmp_dialog(),
             Command::RenameFiles => self.open_rename(),
             Command::UndoRename => self.undo_rename_command(ctx),
@@ -1211,7 +1221,7 @@ impl App {
                 }
             }
             DialogKind::SaveAs(then) => self.save_project(Some(ensure_extension(path, PROJECT_EXT, Some(".json"))), then, ctx),
-            DialogKind::ImportGraph => match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| Graph::from_json_with_notes(&t).map_err(|e| e.to_string())) {
+            DialogKind::ImportGraph => match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| Graph::from_json_repaired(&t).map_err(|e| e.to_string())) {
                 Ok((g, notes)) => {
                     self.session.set_graph(g);
                     self.status.clear_notes();
@@ -2646,6 +2656,12 @@ impl App {
                 item_tip(ui, cmds, "Save selection as recipe...", Command::SaveRecipe, has_nodes, note);
                 item(ui, cmds, "Manage recipes...", Command::ManageRecipes, true);
                 ui.separator();
+                item_tip(ui, cmds, "Group selection  (Ctrl+G)", Command::GroupSelection, has_nodes, "Collapses the selected nodes into one Group node; nothing is evaluated differently");
+                item(ui, cmds, "Ungroup  (Ctrl+Shift+G)", Command::Ungroup, has_nodes);
+                item(ui, cmds, "Open group  (Enter)", Command::OpenGroup, has_nodes);
+                item(ui, cmds, "Up one level  (Esc)", Command::UpOneLevel, true);
+                item_tip(ui, cmds, "Save group as macro...", Command::SaveMacro, has_nodes, crate::macros::COPY_NOTE);
+                ui.separator();
                 item(ui, cmds, "Delete selected nodes", Command::DeleteNode, has_sel);
                 item(ui, cmds, "View selected node", Command::ViewNode, has_sel);
                 item(ui, cmds, "Frame all nodes", Command::FrameAll, true);
@@ -3724,6 +3740,26 @@ pub fn apply_cli_state(session: &mut Session, cli: &Cli) {
         sel.replace(ids);
         session.set_node_selection(sel);
     }
+    if let Some(name) = &cli.group_nodes {
+        let ids: Vec<NodeId> = session.node_sel.ids().to_vec();
+        match session.project.graph.group_nodes(&ids, name) {
+            Ok(group) => session.set_node_selection(crate::selection::NodeSelection::single(group)),
+            Err(e) => eprintln!("--group-nodes: {e}"),
+        }
+    }
+    for (n, param, label) in &cli.publish {
+        let Some(node) = session.node_by_index(*n) else {
+            eprintln!("--publish: there is no node {n}");
+            continue;
+        };
+        let Some(group) = session.project.graph.parent_of(node) else {
+            eprintln!("--publish: node {n} is not inside a group");
+            continue;
+        };
+        if let Err(e) = session.project.graph.publish_param(group, node, param, label.as_deref()) {
+            eprintln!("--publish: {e}");
+        }
+    }
     // Deletions come last, so every index above still means the original numbering.
     let doomed: Vec<NodeId> = cli.delete_node.iter().filter_map(|n| session.node_by_index(*n)).collect();
     for id in doomed {
@@ -4120,17 +4156,19 @@ mod tests {
 
     #[test]
     fn the_mask_overlay_and_new_metadata_trigger_exactly_one_new_request() {
+        // Other tests reload LUTs in parallel, which moves the global LUT generation: not part of this test.
+        let key = |s: &Session, out, prep, overlay| RequestKey { lut_generation: 0, ..RequestKey::new(s, out, prep, overlay) };
         let s = demo_session();
         let out = s.output_node().unwrap();
         let mask = s.project.graph.nodes().find(|n| n.kind == NodeKind::Generator).unwrap().id;
-        let base = RequestKey::new(&s, out, None, None);
-        assert!(base != RequestKey::new(&s, out, None, Some(mask)), "switching the overlay on asks once");
-        assert!(RequestKey::new(&s, out, None, Some(mask)) == RequestKey::new(&s, out, None, Some(mask)));
+        let base = key(&s, out, None, None);
+        assert!(base != key(&s, out, None, Some(mask)), "switching the overlay on asks once");
+        assert!(key(&s, out, None, Some(mask)) == key(&s, out, None, Some(mask)));
         // New capture metadata (background refresh) changes the revision.
         let mut c = s.entry(ImageId(1)).unwrap().capture.clone();
         c.as_shot_kelvin = Some(4200.0);
         s.provider.set_captures([(ImageId(1), c)]);
-        assert!(base != RequestKey::new(&s, out, None, None), "a changed capture must re-render");
+        assert!(base != key(&s, out, None, None), "a changed capture must re-render");
     }
 
     #[test]

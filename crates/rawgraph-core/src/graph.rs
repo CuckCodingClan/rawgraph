@@ -12,6 +12,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+mod group;
+
+pub use group::{GroupDef, GroupPort, MacroFile, Published, LevelEdge, End, MAX_GROUP_DEPTH, MACRO_FORMAT_VERSION};
 pub use crate::capture::path_in_folder;
 use crate::capture::{name_key, CaptureInfo, Measure};
 use crate::color::OUTPUT_SPACES;
@@ -25,8 +28,9 @@ use crate::stack::{group_images, GroupRule, GroupSettings, ImageGroup, Reference
 
 /// Bumped whenever the serialized graph layout changes incompatibly.
 /// Version 2 added the Layer and Export kinds, Source folders, curve sets and
-/// the Develop tone parameters; version 1 files still load.
-pub const GRAPH_FORMAT_VERSION: u32 = 5;
+/// the Develop tone parameters; version 1 files still load. Version 5 added the Export "Keywords"
+/// toggle. Version 6 added node groups (see [`GroupDef`]); version 5 files contain none and load as they are.
+pub const GRAPH_FORMAT_VERSION: u32 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -111,6 +115,10 @@ pub enum NodeKind {
     Lut,
     /// Merges each bracket of exposures (image group) into one HDR image.
     HdrMerge,
+    /// Structural node: a named set of other nodes shown as one box (see [`GroupDef`]).
+    /// It has no ports or parameters of its own kind; the ports and published
+    /// parameters live in its group definition. Never evaluated.
+    Group,
 }
 
 /// How a parameter is edited and which values it accepts.
@@ -704,6 +712,7 @@ impl NodeKind {
             NodeKind::Vignette | NodeKind::PixelSort => "Effects",
             NodeKind::MetadataFilter | NodeKind::Merge | NodeKind::MetadataSplit | NodeKind::Layer | NodeKind::HdrMerge => "Collection",
             NodeKind::Draw | NodeKind::DepthMap | NodeKind::NormalMap | NodeKind::Generator => "Generators",
+            NodeKind::Group => "Structure",
         }
     }
 
@@ -744,6 +753,7 @@ impl NodeKind {
             NodeKind::Generator => "Generator",
             NodeKind::Lut => "LUT",
             NodeKind::HdrMerge => "HDR Merge",
+            NodeKind::Group => "Group",
         }
     }
 
@@ -780,7 +790,7 @@ impl NodeKind {
             NodeKind::Clarity => CLARITY_PARAMS,
             NodeKind::PixelSort => PIXEL_SORT_PARAMS,
             NodeKind::NormalMap => NORMALS_PARAMS,
-            NodeKind::DepthMap => &[],
+            NodeKind::DepthMap | NodeKind::Group => &[],
             NodeKind::Generator => GENERATOR_PARAMS,
             NodeKind::Lut => LUT_PARAMS,
             NodeKind::HdrMerge => HDR_MERGE_PARAMS,
@@ -789,7 +799,7 @@ impl NodeKind {
 
     pub fn inputs(self) -> &'static [InputSpec] {
         match self {
-            NodeKind::Source => &[],
+            NodeKind::Source | NodeKind::Group => &[],
             NodeKind::Generator | NodeKind::Draw => OPTIONAL_IMAGE_INPUTS,
             NodeKind::Merge => MERGE_INPUTS,
             NodeKind::Layer => LAYER_INPUTS,
@@ -800,7 +810,7 @@ impl NodeKind {
     /// All output ports: none for Output and Export, one for most kinds, seven for Split by Metadata.
     pub fn outputs(self) -> &'static [OutputSpec] {
         match self {
-            NodeKind::Output | NodeKind::Export => NO_OUTPUTS,
+            NodeKind::Output | NodeKind::Export | NodeKind::Group => NO_OUTPUTS,
             NodeKind::MetadataSplit => SPLIT_OUTPUTS,
             _ => IMAGE_OUTPUTS,
         }
@@ -1063,18 +1073,34 @@ pub struct Node {
     exposed_outputs: Vec<Option<ExposedOutput>>,
     /// Position in the graph editor.
     pub pos: [f32; 2],
+    /// The definition of a [`NodeKind::Group`] node; `None` for every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<GroupDef>,
 }
 
 impl Node {
+    /// The group definition of a Group node.
+    pub fn group(&self) -> Option<&GroupDef> { self.group.as_ref() }
+    /// Number of input ports of the box (built-in, exposed and group ports).
+    pub fn input_len(&self) -> usize {
+        match &self.group { Some(g) => g.inputs.len(), None => self.kind.inputs().len() + self.exposed_inputs.len() }
+    }
+    /// Number of output ports of the box (built-in, exposed and group ports).
+    pub fn output_len(&self) -> usize {
+        match &self.group { Some(g) => g.outputs.len(), None => self.kind.outputs().len() + self.exposed_outputs.len() }
+    }
+
     pub fn exposed_inputs(&self) -> &[Option<ExposedInput>] { &self.exposed_inputs }
     pub fn exposed_outputs(&self) -> &[Option<ExposedOutput>] { &self.exposed_outputs }
 
     /// Resolves either a built-in or exposed input, preserving its collection role.
     pub fn input_type(&self, port: usize) -> Option<PortType> {
+        if let Some(g) = &self.group { return g.inputs.get(port).map(|_| PortType::Images); }
         if let Some(spec) = self.kind.inputs().get(port) { return Some(spec.ty); }
         self.exposed_inputs.get(port.checked_sub(self.kind.inputs().len())?)?.as_ref().map(|p| p.ty)
     }
     pub fn output_type(&self, port: usize) -> Option<PortType> {
+        if let Some(g) = &self.group { return g.outputs.get(port).map(|_| PortType::Images); }
         self.kind.outputs().get(self.resolve_output(port)?).map(|p| p.ty)
     }
     pub fn resolve_output(&self, port: usize) -> Option<usize> {
@@ -1083,6 +1109,7 @@ impl Node {
         self.kind.outputs().get(alias.source_port).map(|_| alias.source_port)
     }
     pub fn is_collection_input(&self, port: usize) -> bool {
+        if let Some(g) = &self.group { return port < g.inputs.len(); }
         port < self.kind.inputs().len()
     }
     /// Whether this auxiliary input controls a parameter or direction per pixel.
@@ -1266,6 +1293,8 @@ pub enum GraphError {
     /// A sub-graph (clipboard, recipe) of a newer format.
     UnsupportedSubgraphVersion(u32),
     Parse(String),
+    /// A group operation that cannot be done (or a group structure that is not valid).
+    Group(String),
 }
 
 impl std::fmt::Display for GraphError {
@@ -1285,6 +1314,7 @@ impl std::fmt::Display for GraphError {
                 write!(f, "sub-graph format version {v} is newer than this build supports ({SUBGRAPH_FORMAT_VERSION})")
             }
             GraphError::Parse(e) => write!(f, "graph file is not valid: {e}"),
+            GraphError::Group(e) => write!(f, "{e}"),
         }
     }
 }
@@ -1490,6 +1520,7 @@ impl Graph {
                 exposed_inputs: Vec::new(),
                 exposed_outputs: Vec::new(),
                 pos,
+                group: None,
             }),
         );
         id
@@ -1539,6 +1570,7 @@ impl Graph {
         let Some(slot) = port.checked_sub(node.kind.inputs().len()).and_then(|i| node.exposed_inputs.get_mut(i)) else { return false };
         if slot.take().is_none() { return false; }
         self.edges.retain(|e| e.to != id || e.to_port != port);
+        self.drop_group_ports_of(id, true, port);
         true
     }
     pub fn remove_exposed_output(&mut self, id: NodeId, port: usize) -> bool {
@@ -1546,12 +1578,13 @@ impl Graph {
         let Some(slot) = port.checked_sub(node.kind.outputs().len()).and_then(|i| node.exposed_outputs.get_mut(i)) else { return false };
         if slot.take().is_none() { return false; }
         self.edges.retain(|e| e.from != id || e.from_port != port);
+        self.drop_group_ports_of(id, false, port);
         true
     }
 
+    /// Removes a node and its wires. Removing a group removes everything inside it.
     pub fn remove_node(&mut self, id: NodeId) {
-        self.nodes.remove(&id);
-        self.edges.retain(|e| e.from != id && e.to != id);
+        self.remove_node_tree(id);
     }
 
     pub fn node(&self, id: NodeId) -> Option<&Node> {
@@ -1580,6 +1613,7 @@ impl Graph {
 
     /// The node feeding input `port` of `node`, if connected.
     pub fn input_of(&self, node: NodeId, port: usize) -> Option<NodeId> {
+        let (node, port) = self.resolve_input(node, port);
         self.edges.iter().find(|e| e.to == node && e.to_port == port).map(|e| e.from)
     }
 
@@ -1590,11 +1624,13 @@ impl Graph {
 
     /// The node feeding input `port` of `node` and the output port it leaves through.
     pub fn input_edge(&self, node: NodeId, port: usize) -> Option<(NodeId, usize)> {
+        let (node, port) = self.resolve_input(node, port);
         self.edges.iter().find(|e| e.to == node && e.to_port == port).map(|e| (e.from, e.from_port))
     }
 
     /// All wires feeding an input, in graph insertion order.
     pub fn input_edges(&self, node: NodeId, port: usize) -> impl Iterator<Item = &Edge> {
+        let (node, port) = self.resolve_input(node, port);
         self.edges.iter().filter(move |e| e.to == node && e.to_port == port)
     }
 
@@ -1615,10 +1651,13 @@ impl Graph {
         to: NodeId,
         to_port: usize,
     ) -> Result<(), GraphError> {
+        // Group ports stand for the inner ports behind them: wires are always stored between real nodes.
+        let (from, from_port) = self.resolve_output(from, from_port);
+        let (to, to_port) = self.resolve_input(to, to_port);
         let src = self.node(from).ok_or(GraphError::UnknownNode(from))?;
         let dst = self.node(to).ok_or(GraphError::UnknownNode(to))?;
         let outputs = src.kind.outputs();
-        if outputs.is_empty() && src.exposed_outputs.iter().all(Option::is_none) {
+        if outputs.is_empty() && src.exposed_outputs.iter().all(Option::is_none) && src.group.is_none() {
             return Err(GraphError::NoOutput(from));
         }
         let found = src.output_type(from_port).ok_or(GraphError::NoSuchPort { node: from, port: from_port })?;
@@ -1635,7 +1674,9 @@ impl Graph {
         } else {
             self.edges.retain(|e| !(e.to == to && e.to_port == to_port));
         }
-        self.edges.push(Edge { from, from_port, to, to_port });
+        let edge = Edge { from, from_port, to, to_port };
+        self.edges.push(edge);
+        self.ensure_boundary_ports(edge);
         Ok(())
     }
 
@@ -1644,6 +1685,7 @@ impl Graph {
     /// Individual mode) and "Unmatched" for the last port. Empty for unknown ports.
     pub fn output_label(&self, node: NodeId, port: usize, image: ImageId) -> String {
         let Some(n) = self.node(node) else { return String::new() };
+        if let Some(g) = n.group() { return g.outputs.get(port).map(|p| p.label.clone()).unwrap_or_default(); }
         if let Some(Some(alias)) = port.checked_sub(n.kind.outputs().len()).and_then(|i| n.exposed_outputs.get(i)) { return alias.label.clone(); }
         let Some(spec) = n.kind.outputs().get(port) else { return String::new() };
         if n.kind == NodeKind::MetadataSplit && port < SPLIT_RANGES {
@@ -1657,6 +1699,7 @@ impl Graph {
     }
 
     pub fn disconnect(&mut self, to: NodeId, port: usize) {
+        let (to, port) = self.resolve_input(to, port);
         self.edges.retain(|e| !(e.to == to && e.to_port == port));
     }
 
@@ -2257,15 +2300,31 @@ impl Graph {
     /// nodes first, see `migrate`. Each note names a node and what could not be carried over exactly.
     /// The list is empty for a graph that needed no changes.
     pub fn from_json_with_notes(text: &str) -> Result<(Self, Vec<String>), GraphError> {
+        Self::parse_json(text, false)
+    }
+
+    /// Like [`Graph::from_json_with_notes`] for graphs the user must be able to open (project files and
+    /// their history snapshots): a damaged group structure is repaired instead of refused (dangling
+    /// members and ports dropped, missing ports added, bad names cleaned, empty, cyclic or too deeply
+    /// nested groups dissolved) and every repair adds a note. Everything else is checked as strictly
+    /// as before.
+    pub fn from_json_repaired(text: &str) -> Result<(Self, Vec<String>), GraphError> {
+        Self::parse_json(text, true)
+    }
+
+    fn parse_json(text: &str, repair: bool) -> Result<(Self, Vec<String>), GraphError> {
         let mut value: serde_json::Value = serde_json::from_str(text).map_err(|e| GraphError::Parse(e.to_string()))?;
         // Before anything is parsed: a newer file may hold node kinds or data this build does not know.
         if let Some(v) = value.get("format_version").and_then(serde_json::Value::as_u64).filter(|v| *v > u64::from(GRAPH_FORMAT_VERSION)) {
             return Err(GraphError::UnsupportedVersion(u32::try_from(v).unwrap_or(u32::MAX)));
         }
-        let notes = crate::migrate::migrate_graph(&mut value)?;
+        let mut notes = crate::migrate::migrate_graph(&mut value)?;
         let mut graph: Graph = serde_json::from_value(value).map_err(|e| GraphError::Parse(e.to_string()))?;
         if graph.format_version > GRAPH_FORMAT_VERSION {
             return Err(GraphError::UnsupportedVersion(graph.format_version));
+        }
+        if repair {
+            notes.extend(graph.repair_groups());
         }
         graph.check_consistency()?;
         // Save successfully validated graphs using the current format.
@@ -2284,6 +2343,9 @@ impl Graph {
             }
             if node.id.0 >= self.next_id {
                 return bad(format!("next_id {} is not greater than node id {}", self.next_id, node.id.0));
+            }
+            if (node.kind == NodeKind::Group) != node.group.is_some() {
+                return bad(format!("node {}: a group definition belongs to Group nodes and only to them", node.id.0));
             }
             let mut exposed = BTreeSet::new();
             for input in node.exposed_inputs.iter().flatten() {
@@ -2340,6 +2402,9 @@ impl Graph {
             let Some(dst) = self.nodes.get(&e.to) else {
                 return bad(format!("{what}: target node {} does not exist", e.to.0));
             };
+            if src.kind == NodeKind::Group || dst.kind == NodeKind::Group {
+                return bad(format!("{what}: wires connect real nodes, never a group node"));
+            }
             let outputs = src.kind.outputs();
             if outputs.is_empty() {
                 return bad(format!("{what}: node {} ({}) has no output", e.from.0, src.kind.label()));
@@ -2381,12 +2446,13 @@ impl Graph {
                 indegree.iter().filter(|(_, d)| **d > 0).map(|(id, _)| id.0.to_string()).collect();
             return bad(format!("the connections form a cycle (nodes {})", stuck.join(", ")));
         }
+        self.check_groups().map_err(GraphError::Parse)?;
         Ok(())
     }
 }
 
 /// Bumped whenever the serialized sub-graph layout changes incompatibly.
-pub const SUBGRAPH_FORMAT_VERSION: u32 = 4;
+pub const SUBGRAPH_FORMAT_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SubNode {
@@ -2402,6 +2468,79 @@ struct SubNode {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     exposed_outputs: Vec<Option<ExposedOutput>>,
     pos: [f32; 2],
+    /// The definition of a Group node, with members and ports as indices into the node list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<SubGroup>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SubPort {
+    label: String,
+    node: usize,
+    port: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SubPublished {
+    label: String,
+    node: usize,
+    param: String,
+}
+
+/// [`GroupDef`] of a sub-graph: node references are indices into the sub-graph's node list.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SubGroup {
+    label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<[u8; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
+    members: Vec<usize>,
+    inputs: Vec<SubPort>,
+    outputs: Vec<SubPort>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    published: Vec<SubPublished>,
+}
+
+impl SubGroup {
+    /// Converts with `map` (sub-graph index to node id); `None` when a reference does not resolve.
+    fn to_def(&self, map: &dyn Fn(usize) -> Option<NodeId>) -> Option<GroupDef> {
+        let ports = |list: &[SubPort]| -> Option<Vec<GroupPort>> {
+            list.iter().map(|p| Some(GroupPort { label: p.label.clone(), node: map(p.node)?, port: p.port })).collect()
+        };
+        Some(GroupDef {
+            label: self.label.clone(),
+            color: self.color,
+            origin: self.origin.clone(),
+            members: self.members.iter().map(|m| map(*m)).collect::<Option<Vec<_>>>()?,
+            inputs: ports(&self.inputs)?,
+            outputs: ports(&self.outputs)?,
+            published: self
+                .published
+                .iter()
+                .map(|p| Some(Published { label: p.label.clone(), node: map(p.node)?, param: p.param.clone() }))
+                .collect::<Option<Vec<_>>>()?,
+        })
+    }
+
+    fn from_def(def: &GroupDef, index: &dyn Fn(NodeId) -> Option<usize>) -> Option<SubGroup> {
+        let ports = |list: &[GroupPort]| -> Option<Vec<SubPort>> {
+            list.iter().map(|p| Some(SubPort { label: p.label.clone(), node: index(p.node)?, port: p.port })).collect()
+        };
+        Some(SubGroup {
+            label: def.label.clone(),
+            color: def.color,
+            origin: def.origin.clone(),
+            members: def.members.iter().map(|m| index(*m)).collect::<Option<Vec<_>>>()?,
+            inputs: ports(&def.inputs)?,
+            outputs: ports(&def.outputs)?,
+            published: def
+                .published
+                .iter()
+                .map(|p| Some(SubPublished { label: p.label.clone(), node: index(p.node)?, param: p.param.clone() }))
+                .collect::<Option<Vec<_>>>()?,
+        })
+    }
 }
 
 /// Edge between two nodes of a sub-graph, by index into [`Subgraph`]'s node list.
@@ -2444,6 +2583,74 @@ impl Subgraph {
         serde_json::to_string_pretty(self).expect("sub-graph serializes to JSON")
     }
 
+    /// Group definition of node 0 when that node is a group nothing else of the sub-graph contains.
+    fn root_group(&self) -> Option<&SubGroup> {
+        let first = self.nodes.first()?;
+        let g = first.group.as_ref()?;
+        let contained = self.nodes.iter().filter_map(|n| n.group.as_ref()).any(|d| d.members.contains(&0));
+        (first.kind == NodeKind::Group && !contained).then_some(g)
+    }
+
+    /// Moves the sub-graph so its first node sits at the origin (macros are stored position independent).
+    fn normalize_origin(&mut self) {
+        let Some(first) = self.nodes.first() else { return };
+        let [ox, oy] = first.pos;
+        for n in &mut self.nodes {
+            n.pos = [n.pos[0] - ox, n.pos[1] - oy];
+        }
+    }
+
+    /// The checks of [`Subgraph::from_json`]: edge indices, the graph rules and the group rules.
+    fn validate(&self) -> Result<(), GraphError> {
+        let sub = self;
+        for (i, e) in sub.edges.iter().enumerate() {
+            if e.from >= sub.nodes.len() || e.to >= sub.nodes.len() {
+                return Err(GraphError::Parse(format!(
+                    "edge {i} refers to node {} or {} but the sub-graph has {} nodes",
+                    e.from,
+                    e.to,
+                    sub.nodes.len()
+                )));
+            }
+        }
+        // Reuse the graph checks on a scratch graph whose ids are index + 1.
+        let map = |i: usize| (i < sub.nodes.len()).then(|| NodeId(i as u64 + 1));
+        let mut nodes = BTreeMap::new();
+        for (i, n) in sub.nodes.iter().enumerate() {
+            let id = NodeId(i as u64 + 1);
+            let group = match &n.group {
+                Some(g) => Some(g.to_def(&map).ok_or_else(|| GraphError::Parse(format!("node {i}: the group refers to a node that does not exist")))?),
+                None => None,
+            };
+            let node = Node {
+                id,
+                kind: n.kind,
+                mode: n.mode,
+                all: n.all.clone(),
+                individual: BTreeMap::new(),
+                data: n.data.clone(),
+                individual_data: BTreeMap::new(),
+                exposed_inputs: n.exposed_inputs.clone(),
+                exposed_outputs: n.exposed_outputs.clone(),
+                pos: n.pos,
+                group,
+            };
+            nodes.insert(id, Arc::new(node));
+        }
+        let edges = sub
+            .edges
+            .iter()
+            .map(|e| Edge {
+                from: NodeId(e.from as u64 + 1),
+                from_port: e.from_port,
+                to: NodeId(e.to as u64 + 1),
+                to_port: e.to_port,
+            })
+            .collect();
+        let scratch = Graph { format_version: GRAPH_FORMAT_VERSION, nodes, edges, next_id: sub.nodes.len() as u64 + 1 };
+        scratch.check_consistency()
+    }
+
     /// Parses and validates like [`Graph::from_json`]: node kinds, parameter
     /// ranges, data limits, edge ports and types, and no cycles.
     pub fn from_json(text: &str) -> Result<Subgraph, GraphError> {
@@ -2462,50 +2669,7 @@ impl Subgraph {
         if sub.format_version > SUBGRAPH_FORMAT_VERSION {
             return Err(GraphError::UnsupportedSubgraphVersion(sub.format_version));
         }
-        for (i, e) in sub.edges.iter().enumerate() {
-            if e.from >= sub.nodes.len() || e.to >= sub.nodes.len() {
-                return Err(GraphError::Parse(format!(
-                    "edge {i} refers to node {} or {} but the sub-graph has {} nodes",
-                    e.from,
-                    e.to,
-                    sub.nodes.len()
-                )));
-            }
-        }
-        // Reuse the graph checks on a scratch graph whose ids are index + 1.
-        let nodes = sub
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(i, n)| {
-                let id = NodeId(i as u64 + 1);
-                let node = Node {
-                    id,
-                    kind: n.kind,
-                    mode: n.mode,
-                    all: n.all.clone(),
-                    individual: BTreeMap::new(),
-                    data: n.data.clone(),
-                    individual_data: BTreeMap::new(),
-                    exposed_inputs: n.exposed_inputs.clone(),
-                    exposed_outputs: n.exposed_outputs.clone(),
-                    pos: n.pos,
-                };
-                (id, Arc::new(node))
-            })
-            .collect();
-        let edges = sub
-            .edges
-            .iter()
-            .map(|e| Edge {
-                from: NodeId(e.from as u64 + 1),
-                from_port: e.from_port,
-                to: NodeId(e.to as u64 + 1),
-                to_port: e.to_port,
-            })
-            .collect();
-        let scratch = Graph { format_version: GRAPH_FORMAT_VERSION, nodes, edges, next_id: sub.nodes.len() as u64 + 1 };
-        scratch.check_consistency()?;
+        sub.validate()?;
         Ok((sub, notes))
     }
 }
@@ -2521,12 +2685,24 @@ impl Graph {
                 ids.push(*id);
             }
         }
+        // A group is copied with everything inside it.
+        let mut at = 0;
+        while at < ids.len() {
+            if let Some(g) = self.nodes[&ids[at]].group.as_ref() {
+                for m in &g.members {
+                    if self.nodes.contains_key(m) && !ids.contains(m) {
+                        ids.push(*m);
+                    }
+                }
+            }
+            at += 1;
+        }
         let index = |id: NodeId| ids.iter().position(|x| *x == id);
         let sub_nodes = ids
             .iter()
             .map(|id| {
                 let n = &self.nodes[id];
-                SubNode { kind: n.kind, mode: n.mode, all: n.all.clone(), data: n.data.clone(), exposed_inputs: n.exposed_inputs.clone(), exposed_outputs: n.exposed_outputs.clone(), pos: n.pos }
+                SubNode { kind: n.kind, mode: n.mode, all: n.all.clone(), data: n.data.clone(), exposed_inputs: n.exposed_inputs.clone(), exposed_outputs: n.exposed_outputs.clone(), pos: n.pos, group: n.group.as_ref().and_then(|g| SubGroup::from_def(g, &index)) }
             })
             .collect();
         let sub_edges = self
@@ -2561,6 +2737,15 @@ impl Graph {
             if let (Some(&from), Some(&to)) = (ids.get(e.from), ids.get(e.to)) {
                 // A sub-graph from `from_json` is valid; hand-built ones may lose a bad edge here.
                 let _ = self.connect_ports(from, e.from_port, to, e.to_port);
+            }
+        }
+        // Groups last: the wires between their members were made while they were still plain nodes.
+        let map = |i: usize| ids.get(i).copied();
+        for (i, n) in sub.nodes.iter().enumerate() {
+            if let Some(def) = n.group.as_ref().and_then(|g| g.to_def(&map)) {
+                if let Some(node) = self.nodes.get_mut(&ids[i]).map(Arc::make_mut) {
+                    node.group = Some(def);
+                }
             }
         }
         ids
@@ -2707,7 +2892,7 @@ mod tests {
 
     #[test]
     fn newer_format_versions_are_refused() {
-        let text = Graph::new().to_json().replace("\"format_version\": 5", "\"format_version\": 999");
+        let text = Graph::new().to_json().replace(&format!("\"format_version\": {GRAPH_FORMAT_VERSION}"), "\"format_version\": 999");
         assert_eq!(Graph::from_json(&text), Err(GraphError::UnsupportedVersion(999)));
         assert!(matches!(Graph::from_json("not json"), Err(GraphError::Parse(_))));
     }

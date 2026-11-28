@@ -10,7 +10,7 @@ use eframe::egui::{
     self, epaint::CubicBezierShape, Align2, Color32, CornerRadius, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke,
     StrokeKind, Vec2,
 };
-use rawgraph_core::{Graph, ImageId, Mode, Node, NodeId, NodeKind, PortType};
+use rawgraph_core::{End, Graph, ImageId, Mode, Node, NodeId, NodeKind, PortType};
 
 use crate::groups::{all_rows, box_row_count, limit_rows, parameter_row, MAX_BOX_ROWS};
 use crate::selection::{band_hits, NodeSelection};
@@ -18,7 +18,9 @@ use crate::session::Session;
 use crate::status::Status;
 
 mod editing;
+mod groups_ui;
 pub use editing::{EditOp, PER_IMAGE_NOTE};
+pub use groups_ui::GroupState;
 use editing::{cached_list, Band, EditState};
 
 // Geometry in graph units (one unit is one point at zoom 1).
@@ -66,6 +68,7 @@ pub fn category_color(category: &str) -> Color32 {
         "Effects" => Color32::from_rgb(100, 84, 56),
         "Collection" => Color32::from_rgb(40, 110, 104),
         "Generators" => Color32::from_rgb(128, 90, 34),
+        "Structure" => groups_ui::GROUP_COLOR,
         _ => Color32::from_rgb(70, 76, 90),
     }
 }
@@ -97,6 +100,20 @@ pub fn group_of(kind: NodeKind) -> &'static str {
 }
 
 const COUNT_H: f32 = 15.0;
+
+/// Rows a group box shows for its published parameters: (published label, value of the inner parameter).
+pub fn group_rows(graph: &Graph, node: &Node, image: ImageId) -> Vec<(String, String)> {
+    let Some(g) = node.group() else { return Vec::new() };
+    g.published
+        .iter()
+        .take(MAX_BOX_ROWS)
+        .filter_map(|p| {
+            let inner = graph.node(p.node)?;
+            let spec = inner.kind.param_spec(&p.param)?;
+            Some((p.label.clone(), parameter_row(inner, image, spec).value))
+        })
+        .collect()
+}
 
 /// Number of parameter summary rows in the node box (at most four, plus a
 /// "... +n" row when more parameters exist).
@@ -169,6 +186,7 @@ pub fn summary_rows(node: &rawgraph_core::Node, image: ImageId) -> Vec<(String, 
 /// node's own values).
 pub fn box_rows(graph: &Graph, node: &rawgraph_core::Node, image: ImageId) -> Vec<(String, String)> {
     match node.kind {
+        NodeKind::Group => group_rows(graph, node, image),
         NodeKind::Source => vec![("Folder".to_owned(), crate::export::elide_middle(&crate::node_ui::source_label(node), 20))],
         NodeKind::Layer => vec![(String::new(), crate::node_ui::layer_summary(graph, node))],
         NodeKind::Export => crate::node_ui::export_box_rows(node, image).into_iter().map(|(l, v)| (l, crate::export::elide_middle(&v, 20))).collect(),
@@ -191,12 +209,23 @@ pub fn port_rows(kind: NodeKind) -> usize {
 }
 
 fn node_port_rows(node: &rawgraph_core::Node) -> usize {
+    if let Some(g) = node.group() {
+        return g.inputs.len().max(g.outputs.len()).max(1);
+    }
     node.kind.inputs().len().max(node.kind.outputs().len() + node.exposed_outputs().len()).max(1)
 }
 
 #[cfg(test)]
 fn record_port_control(response: &egui::Response, id: NodeId, name: &'static str) {
     response.ctx.data_mut(|data| data.insert_temp(egui::Id::unique(("port_control", id, name)), response.rect));
+}
+
+/// The macro list of the add-node menu, read again when the cached one is older than a moment.
+fn cached_macros(slot: &mut Option<(std::time::Instant, Vec<crate::macros::MacroInfo>)>, dir: Option<&std::path::Path>) -> Vec<crate::macros::MacroInfo> {
+    match dir {
+        Some(dir) => groups_ui::cached_macro_list(slot, dir),
+        None => Vec::new(),
+    }
 }
 
 fn input_menu(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions: &mut Vec<Action>) {
@@ -240,6 +269,11 @@ fn exposed_port_menus(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId,
 }
 
 fn actual_node_size(node: &Node) -> Vec2 {
+    if let Some(g) = node.group() {
+        let rows = g.published.len().min(MAX_BOX_ROWS);
+        let params = if rows > 0 { rows as f32 * PARAM_H + 4.0 } else { 0.0 };
+        return Vec2::new(NODE_W, TITLE_H + 6.0 + node_port_rows(node) as f32 * ROW_H + params + COUNT_H + PAD);
+    }
     let extra_port_rows = node_port_rows(node) - port_rows(node.kind);
     let extra_param_rows = node.exposed_inputs().iter().flatten().count().saturating_sub(MAX_BOX_ROWS);
     node_size(node.kind) + Vec2::new(0.0, extra_port_rows as f32 * ROW_H + extra_param_rows as f32 * PARAM_H)
@@ -255,6 +289,9 @@ fn builtin_input_port(pos: [f32; 2], port: usize) -> Pos2 {
 
 /// Centre of an input in graph units, including parameter inputs on summary rows.
 fn input_port(node: &Node, port: usize) -> Pos2 {
+    if node.group().is_some() {
+        return builtin_input_port(node.pos, port);
+    }
     if let Some(i) = port.checked_sub(node.kind.inputs().len()) {
         // Removed inputs leave holes in their port indices, not in the layout.
         let row = node.exposed_inputs()[..i].iter().flatten().count();
@@ -338,7 +375,7 @@ impl Xform {
 #[derive(Clone, Copy)]
 enum ConnDrag {
     /// Dragging from an output port towards an input.
-    FromOutput(NodeId, usize, Option<(NodeId, usize)>),
+    FromOutput(NodeId, usize, Option<rawgraph_core::graph::Edge>),
     /// Dragging from an unconnected input towards an output.
     FromInput { node: NodeId, port: usize },
 }
@@ -377,6 +414,8 @@ pub struct GraphEditor {
     edit: EditState,
     /// Debug > Per-node CPU timing: the last profiled preview, drawn under each node.
     pub timings: Option<NodeTimings>,
+    /// Open groups, pan per level, and the group prompts.
+    pub groups: GroupState,
 }
 
 /// Per-node CPU timing of the last profiled preview, for the on-node debug labels.
@@ -438,14 +477,20 @@ impl Default for GraphEditor {
             manage_open: false,
             edit: EditState::default(),
             timings: None,
+            groups: GroupState::default(),
         }
     }
 }
 
 /// Graph-space bounding rectangle of all nodes.
 pub fn bounds(graph: &Graph) -> Option<Rect> {
+    bounds_in(graph, None)
+}
+
+/// Graph-space bounding rectangle of the nodes shown at one level (`None`: the top level).
+pub fn bounds_in(graph: &Graph, level: Option<NodeId>) -> Option<Rect> {
     let mut rect: Option<Rect> = None;
-    for n in graph.nodes() {
+    for n in graph.children(level).into_iter().filter_map(|id| graph.node(id)) {
         let r = Rect::from_min_size(Pos2::new(n.pos[0], n.pos[1]), actual_node_size(n));
         rect = Some(rect.map_or(r, |acc| acc.union(r)));
     }
@@ -544,6 +589,12 @@ impl GraphEditor {
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, Color32::from_rgb(26, 28, 32));
 
+        self.groups.reconcile(&session.project.graph);
+        self.enter_level_if_changed(session);
+        let level = self.groups.level();
+        let visible: Vec<NodeId> = session.project.graph.children(level);
+        let stubs = level.map(|l| groups_ui::stubs_for(&session.project.graph, l));
+
         if self.auto_framed && !self.frame_all_pending && (rect.size() - self.framed_size).abs().max_elem() > 2.0 {
             self.request_frame_all();
         }
@@ -551,7 +602,7 @@ impl GraphEditor {
             self.frame_all_delay -= 1;
             ui.ctx().request_repaint();
         } else if self.frame_all_pending && rect.width() > 120.0 && rect.height() > 80.0 {
-            if let Some(b) = bounds(&session.project.graph) {
+            if let Some(b) = bounds_in(&session.project.graph, level).map(|b| stubs.map_or(b, |s| b.union(s.in_rect()).union(s.out_rect()))).or_else(|| stubs.map(|s| s.in_rect().union(s.out_rect()))) {
                 let focus = session
                     .selected_node
                     .and_then(|id| session.project.graph.node(id))
@@ -579,7 +630,14 @@ impl GraphEditor {
                 } else {
                     let xf = Xform { origin: rect.min, pan: self.pan, zoom: self.zoom };
                     let graph_pos = xf.to_graph(pos);
+                    let known: std::collections::HashSet<NodeId> = session.project.graph.nodes().map(|n| n.id).collect();
                     add_dropped_folders(session, graph_pos, &paths);
+                    if let Some(open) = level {
+                        let fresh: Vec<NodeId> = session.project.graph.nodes().map(|n| n.id).filter(|id| !known.contains(id)).collect();
+                        if let Err(e) = session.project.graph.adopt(open, &fresh) {
+                            status.error(e.to_string());
+                        }
+                    }
                     status.info(format!("Added {} Source node(s)", paths.len()));
                 }
             }
@@ -632,8 +690,8 @@ impl GraphEditor {
         let focused = ctx.memory(|m| m.focused());
         let graph_focus = focused.is_none() || focused == Some(bg.id) || session.project.graph.nodes().any(|n| {
             focused == Some(ui.scope_id().with(("node", n.id.0)))
-                || (0..n.kind.inputs().len() + n.exposed_inputs().len()).any(|i| focused == Some(ui.scope_id().with(("in", n.id.0, i))))
-                || (0..n.kind.outputs().len() + n.exposed_outputs().len()).any(|i| focused == Some(ui.scope_id().with(("out", n.id.0, i))))
+                || (0..n.input_len()).any(|i| focused == Some(ui.scope_id().with(("in", n.id.0, i))))
+                || (0..n.output_len()).any(|i| focused == Some(ui.scope_id().with(("out", n.id.0, i))))
         });
         if graph_focus && self.search.is_none() && !session.node_sel.is_empty()
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace))
@@ -657,7 +715,7 @@ impl GraphEditor {
             let now = pointer.or_else(|| ctx.input(|i| i.pointer.latest_pos()));
             if let Some(now) = now {
                 let r = Rect::from_two_pos(band.start, now);
-                let boxes = session.project.graph.nodes().map(|n| (n.id, Rect::from_min_size(xf.to_screen(Pos2::new(n.pos[0], n.pos[1])), actual_node_size(n) * self.zoom)));
+                let boxes = visible.iter().filter_map(|id| session.project.graph.node(*id)).map(|n| (n.id, Rect::from_min_size(xf.to_screen(Pos2::new(n.pos[0], n.pos[1])), actual_node_size(n) * self.zoom)));
                 let hits = band_hits(boxes, r);
                 let mut sel = NodeSelection::default();
                 sel.replace(band.base.iter().copied().chain(hits));
@@ -677,23 +735,52 @@ impl GraphEditor {
         let issues: HashMap<NodeId, String> = {
             let mut m: HashMap<NodeId, String> = HashMap::new();
             for issue in session.project.graph.validate() {
-                m.entry(issue.node).and_modify(|t| {
+                // A problem inside a closed group shows on the group; problems outside the open group are not shown here.
+                let Some(shown) = session.project.graph.visible_at(level, issue.node) else { continue };
+                let message = if shown == issue.node {
+                    issue.message
+                } else {
+                    let inner = session.project.graph.node(issue.node).map_or("node", |n| n.kind.label());
+                    format!("Inside the group, {inner}: {}", issue.message)
+                };
+                m.entry(shown).and_modify(|t| {
                     t.push('\n');
-                    t.push_str(&issue.message);
-                }).or_insert(issue.message);
+                    t.push_str(&message);
+                }).or_insert(message);
             }
             m
         };
 
         // Draw order: unselected nodes first, the selected one on top.
-        let mut order: Vec<NodeId> = session.project.graph.nodes().map(|n| n.id).collect();
+        let mut order: Vec<NodeId> = visible.clone();
         order.sort_by_key(|id| (session.node_sel.contains(*id), Some(*id) == session.selected_node));
 
-        // Wires sit behind the nodes.
-        for e in session.project.graph.edges() {
-            let (Some(from), Some(to)) = (session.project.graph.node(e.from), session.project.graph.node(e.to)) else { continue };
-            let color = from.output_type(e.from_port).map_or(Color32::GRAY, port_color);
-            draw_wire(&painter, xf.to_screen(output_port(from.pos, e.from_port)), xf.to_screen(input_port(to, e.to_port)), color, self.zoom);
+        // Wires sit behind the nodes: the stored wires as this level shows them.
+        let level_edges = session.project.graph.level_edges(level);
+        let mut remove_boundary: Vec<(bool, usize)> = Vec::new();
+        if let (Some(open), Some(st)) = (level, stubs) {
+            let (mut edges_in, mut edges_out) = (Vec::new(), Vec::new());
+            for le in &level_edges {
+                if let End::Boundary { port } = le.from { if edges_in.len() <= port { edges_in.resize(port + 1, false); } edges_in[port] = true; }
+                if let End::Boundary { port } = le.to { if edges_out.len() <= port { edges_out.resize(port + 1, false); } edges_out[port] = true; }
+            }
+            self.paint_stubs(ui, &painter, &xf, &session.project.graph, open, &edges_in, &edges_out, &mut remove_boundary);
+            let _ = st;
+        }
+        for le in &level_edges {
+            let graph = &session.project.graph;
+            let pos_of = |end: End, output: bool| -> Option<Pos2> {
+                match end {
+                    End::Node { node, port } => graph.node(node).map(|n| if output { output_port(n.pos, port) } else { input_port(n, port) }),
+                    End::Boundary { port } => stubs.map(|s| if output { s.in_port(port) } else { s.out_port(port) }),
+                }
+            };
+            let (Some(a), Some(b)) = (pos_of(le.from, true), pos_of(le.to, false)) else { continue };
+            let color = match le.from {
+                End::Node { node, port } => graph.node(node).and_then(|n| n.output_type(port)).map_or(Color32::GRAY, port_color),
+                End::Boundary { .. } => port_color(PortType::Images),
+            };
+            draw_wire(&painter, xf.to_screen(a), xf.to_screen(b), color, self.zoom);
         }
 
         // Port screen positions for the drop test, filled while drawing.
@@ -718,7 +805,8 @@ impl GraphEditor {
             } else {
                 Sel::No
             };
-            let viewed = session.target_node() == Some(id);
+            let viewed = session.target_node() == Some(id)
+                || (node.group().is_some() && session.project.graph.view_target(id).map(|t| t.0) == session.target_node());
             let sense = if space { Sense::hover() } else { Sense::click_and_drag() };
             let resp = ui.interact(node_rect.intersect(rect), ui.scope_id().with(("node", id.0)), sense);
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Node {}", kind.label())));
@@ -755,12 +843,20 @@ impl GraphEditor {
 
             // Ports.
             if self.zoom > 0.0 {
-                for i in 0..kind.inputs().len() + node.exposed_inputs().len() {
+                for i in 0..node.input_len() {
                     let Some(ty) = node.input_type(i) else { continue };
                     let builtin = kind.inputs().get(i);
-                    let label = builtin.map(|s| s.label).unwrap_or_else(|| Graph::parameter_input_label(kind, &node.exposed_inputs()[i - kind.inputs().len()].as_ref().unwrap().parameter).unwrap_or("Input"));
+                    let label: String = if let Some(p) = node.group().and_then(|g| g.inputs.get(i)) {
+                        p.label.clone()
+                    } else if let Some(s) = builtin {
+                        s.label.to_owned()
+                    } else {
+                        node.exposed_inputs().get(i - kind.inputs().len()).and_then(Option::as_ref)
+                            .and_then(|p| Graph::parameter_input_label(kind, &p.parameter)).unwrap_or("Input").to_owned()
+                    };
                     let c = xf.to_screen(input_port(&node, i));
-                    let connected = session.project.graph.input_of(id, i).is_some();
+                    let feeding = level_edges.iter().find(|e| e.to == End::Node { node: id, port: i }).copied();
+                    let connected = feeding.is_some();
                     inputs.push((id, i, c, ty));
                     let hover_rect = Rect::from_center_size(c, Vec2::splat((PORT_R * 2.6 * self.zoom).max(14.0)));
                     let pr = ui.interact(hover_rect, ui.scope_id().with(("in", id.0, i)), if space { Sense::hover() } else { Sense::click_and_drag() });
@@ -774,17 +870,31 @@ impl GraphEditor {
                         ty,
                         if builtin.is_some_and(|s| s.required) { ", required" } else { ", optional" }
                     ));
-                    if builtin.is_none() { pr.context_menu(|ui| { if ui.button("Remove port").clicked() { actions.push(Action::RemoveInput(id, i)); ui.close(); } }); }
+                    let is_group = node.group().is_some();
+                    if builtin.is_none() || level.is_some() {
+                        pr.context_menu(|ui| {
+                            if is_group {
+                                if ui.button("Remove port").clicked() { actions.push(Action::RemoveGroupPort(id, true, i)); ui.close(); }
+                            } else {
+                                if builtin.is_none() && ui.button("Remove port").clicked() { actions.push(Action::RemoveInput(id, i)); ui.close(); }
+                                if level.is_some() && ui.button("Expose as group input").clicked() { actions.push(Action::ExposeGroupPort(id, true, i)); ui.close(); }
+                            }
+                        });
+                    }
                     if pr.drag_started() {
-                        if let Some((src, src_port)) = session.project.graph.input_edge(id, i) {
-                            self.conn = Some(ConnDrag::FromOutput(src, src_port, Some((id, i))));
-                        } else {
-                            self.conn = Some(ConnDrag::FromInput { node: id, port: i });
+                        match feeding {
+                            Some(le) => {
+                                // A wire that comes from outside the open group cannot be picked up from inside.
+                                if let End::Node { node: src, port: src_port } = le.from {
+                                    self.conn = Some(ConnDrag::FromOutput(src, src_port, Some(le.edge)));
+                                }
+                            }
+                            None => self.conn = Some(ConnDrag::FromInput { node: id, port: i }),
                         }
                     }
                     draw_port(&painter, c, ty, connected, pr.hovered() || pr.dragged(), self.zoom);
                 }
-                for port in 0..kind.outputs().len() + node.exposed_outputs().len() {
+                for port in 0..node.output_len() {
                     let Some(ty) = node.output_type(port) else { continue };
                     let c = xf.to_screen(output_port(pos, port));
                     outputs.push((id, port, c, ty));
@@ -797,11 +907,21 @@ impl GraphEditor {
                         None => format!("Output ({ty:?}): drag to an input to connect"),
                     };
                     let pr = pr.on_hover_text(tip);
-                    if port >= kind.outputs().len() { pr.context_menu(|ui| { if ui.button("Remove port").clicked() { actions.push(Action::RemoveOutput(id, port)); ui.close(); } }); }
+                    let is_group = node.group().is_some();
+                    if port >= kind.outputs().len() || level.is_some() {
+                        pr.context_menu(|ui| {
+                            if is_group {
+                                if ui.button("Remove port").clicked() { actions.push(Action::RemoveGroupPort(id, false, port)); ui.close(); }
+                            } else {
+                                if port >= kind.outputs().len() && ui.button("Remove port").clicked() { actions.push(Action::RemoveOutput(id, port)); ui.close(); }
+                                if level.is_some() && ui.button("Expose as group output").clicked() { actions.push(Action::ExposeGroupPort(id, false, port)); ui.close(); }
+                            }
+                        });
+                    }
                     if pr.drag_started() {
                         self.conn = Some(ConnDrag::FromOutput(id, port, None));
                     }
-                    let connected = session.project.graph.edges().iter().any(|e| e.from == id && e.from_port == port);
+                    let connected = level_edges.iter().any(|e| e.from == End::Node { node: id, port });
                     draw_port(&painter, c, ty, connected, pr.hovered() || pr.dragged(), self.zoom);
                 }
             }
@@ -832,17 +952,33 @@ impl GraphEditor {
                     let d = resp.drag_delta() / self.zoom;
                     actions.push(Action::Move(id, d));
                 }
+                if resp.double_clicked() && node.group().is_some() {
+                    actions.push(Action::Edit(EditOp::OpenGroup(id)));
+                }
             }
             resp.context_menu(|ui| {
-                exposed_port_menus(ui, &node, id, &mut actions);
-                ui.menu_button("Remove exposed port", |ui| {
-                    for (i, port) in node.exposed_inputs().iter().enumerate() {
-                        if let Some(port) = port { if ui.button(format!("Input {}", port.parameter)).clicked() { actions.push(Action::RemoveInput(id, kind.inputs().len() + i)); ui.close(); } }
-                    }
-                    for (i, port) in node.exposed_outputs().iter().enumerate() {
-                        if let Some(port) = port { if ui.button(format!("Output {}", port.label)).clicked() { actions.push(Action::RemoveOutput(id, kind.outputs().len() + i)); ui.close(); } }
-                    }
-                });
+                if node.group().is_some() {
+                    if ui.button("Open group  (Enter)").clicked() { actions.push(Action::Edit(EditOp::OpenGroup(id))); ui.close(); }
+                    if ui.button("Ungroup  (Ctrl+Shift+G)").clicked() { actions.push(Action::Edit(EditOp::Ungroup)); ui.close(); }
+                    if ui.button("Rename group...").clicked() { actions.push(Action::Edit(EditOp::RenameGroup(id))); ui.close(); }
+                    ui.menu_button("Group colour", |ui| {
+                        for (name, color) in [("Default", None), ("Blue", Some([52, 92, 150])), ("Green", Some([48, 116, 84])), ("Orange", Some([160, 98, 40])), ("Red", Some([150, 62, 62])), ("Purple", Some([110, 72, 150]))] {
+                            if ui.button(name).clicked() { actions.push(Action::GroupColor(id, color)); ui.close(); }
+                        }
+                    });
+                    if ui.button("Save group as macro...").on_hover_text(crate::macros::COPY_NOTE).clicked() { actions.push(Action::Edit(EditOp::SaveMacro)); ui.close(); }
+                } else {
+                    exposed_port_menus(ui, &node, id, &mut actions);
+                    ui.menu_button("Remove exposed port", |ui| {
+                        for (i, port) in node.exposed_inputs().iter().enumerate() {
+                            if let Some(port) = port { if ui.button(format!("Input {}", port.parameter)).clicked() { actions.push(Action::RemoveInput(id, kind.inputs().len() + i)); ui.close(); } }
+                        }
+                        for (i, port) in node.exposed_outputs().iter().enumerate() {
+                            if let Some(port) = port { if ui.button(format!("Output {}", port.label)).clicked() { actions.push(Action::RemoveOutput(id, kind.outputs().len() + i)); ui.close(); } }
+                        }
+                    });
+                }
+                if ui.button("Group selection  (Ctrl+G)").clicked() { actions.push(Action::Edit(EditOp::GroupSelection)); ui.close(); }
                 ui.separator();
                 if ui.button("Copy  (Ctrl+C)").on_hover_text(PER_IMAGE_NOTE).clicked() {
                     actions.push(Action::Edit(EditOp::Copy));
@@ -882,6 +1018,7 @@ impl GraphEditor {
         let menu_pos = self.menu_graph_pos;
         let recipes_dir = self.recipes_dir.clone();
         let mut list_slot = self.edit.list.take();
+        let mut macro_slot = self.groups.macro_list.take();
         bg.context_menu(|ui| {
             if ui.button("Paste here  (Ctrl+V)").on_hover_text(PER_IMAGE_NOTE).clicked() {
                 actions.push(Action::Edit(EditOp::PasteAt(menu_pos)));
@@ -889,6 +1026,14 @@ impl GraphEditor {
             }
             if ui.button("Select all  (Ctrl+A)").clicked() {
                 actions.push(Action::Edit(EditOp::SelectAll));
+                ui.close();
+            }
+            if ui.button("Group selection  (Ctrl+G)").clicked() {
+                actions.push(Action::Edit(EditOp::GroupSelection));
+                ui.close();
+            }
+            if level.is_some() && ui.button("Up one level  (Esc)").clicked() {
+                actions.push(Action::Edit(EditOp::CloseGroup));
                 ui.close();
             }
             ui.separator();
@@ -904,6 +1049,29 @@ impl GraphEditor {
                 });
             }
             ui.separator();
+            ui.menu_button("Macros", |ui| {
+                let has_dir = recipes_dir.is_some();
+                let list = cached_macros(&mut macro_slot, recipes_dir.as_deref());
+                ui.label(egui::RichText::new("Inserting makes a copy; later edits of the file do not update it.").weak().small());
+                if !has_dir {
+                    ui.label(egui::RichText::new("Macros are not available").weak());
+                } else if list.is_empty() {
+                    ui.label(egui::RichText::new("No macros yet: right-click a group and choose \"Save group as macro...\"").weak());
+                }
+                for m in &list {
+                    let label = if m.usable { m.stem.clone() } else { format!("{} (unusable)", m.stem) };
+                    let hover = if m.usable { format!("{}\n{} input(s), {} output(s), {} published parameter(s)", m.description, m.inputs, m.outputs, m.published) } else { m.note.clone() };
+                    if ui.add_enabled(m.usable, egui::Button::new(label)).on_hover_text(hover).clicked() {
+                        actions.push(Action::Edit(EditOp::InsertMacro(m.stem.clone(), Some(menu_pos))));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui.add_enabled(has_dir, egui::Button::new("Import macro file...")).clicked() {
+                    actions.push(Action::Edit(EditOp::ImportMacroFile));
+                    ui.close();
+                }
+            });
             ui.menu_button("Recipes", |ui| {
                 let has_dir = recipes_dir.is_some();
                 let list = cached_list(&mut list_slot, recipes_dir.as_deref());
@@ -932,9 +1100,10 @@ impl GraphEditor {
             });
         });
         self.edit.list = list_slot;
+        self.groups.macro_list = macro_slot;
         if bg.double_clicked() && !space && self.conn.is_none() && self.search.is_none() {
             if let Some(p) = pointer {
-                if let Some(edge) = nearest_wire(&session.project.graph, &xf, p) {
+                if let Some(edge) = nearest_wire(&session.project.graph, &level_edges, stubs, &xf, p) {
                     session.project.graph.disconnect_edge(edge);
                 }
             }
@@ -976,7 +1145,7 @@ impl GraphEditor {
                 let conn = self.conn.take();
                 if let (Some(conn), Some(p)) = (conn, release) {
                     let over_port = nearest_input(&inputs, p, self.zoom, None).is_some() || nearest_output(&outputs, p, self.zoom, None).is_some();
-                    let over_node = session.project.graph.nodes().any(|n| Rect::from_min_size(xf.to_screen(Pos2::new(n.pos[0], n.pos[1])), actual_node_size(n) * self.zoom).contains(p));
+                    let over_node = visible.iter().filter_map(|id| session.project.graph.node(*id)).any(|n| Rect::from_min_size(xf.to_screen(Pos2::new(n.pos[0], n.pos[1])), actual_node_size(n) * self.zoom).contains(p));
                     if rect.contains(p) && !over_port && !over_node {
                         let g = xf.to_graph(p);
                         self.search = Some(Search { graph_pos: [g.x, g.y], screen_pos: p, query: String::new(), selected: 0, connection: Some(conn) });
@@ -997,12 +1166,19 @@ impl GraphEditor {
             ctx.request_repaint();
         }
 
+        for (input, k) in remove_boundary {
+            if let Some(open) = level { actions.push(Action::RemoveGroupPort(open, input, k)); }
+        }
         self.apply(actions, session, status);
         self.search_popup(&ctx, session, status);
         self.recipe_windows(&ctx, session, status, rect, &xf);
+        self.group_windows(&ctx, session, status);
+        let mut crumb_ops = Vec::new();
+        self.breadcrumb(ui, &painter, rect, &session.project.graph, &mut crumb_ops);
+        self.edit.ops.extend(crumb_ops);
 
         // Empty-graph hint.
-        if session.project.graph.nodes().next().is_none() {
+        if visible.is_empty() && level.is_none() {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -1061,15 +1237,25 @@ impl GraphEditor {
         let Some(node) = session.project.graph.node(id) else { return };
         let z = self.zoom;
         let r = self.node_radius();
+        if node.group().is_some() {
+            // A second outline behind the box: a group stands for several nodes.
+            painter.rect_filled(node_rect.translate(Vec2::new(5.0, 5.0) * z), r, Color32::from_rgb(36, 38, 46));
+            painter.rect_stroke(node_rect.translate(Vec2::new(5.0, 5.0) * z), r, Stroke::new(1.0, Color32::from_rgb(88, 92, 112)), StrokeKind::Inside);
+        }
         painter.rect_filled(node_rect.translate(Vec2::new(2.0, 3.0) * z), r, Color32::from_black_alpha(70));
         painter.rect_filled(node_rect, r, Color32::from_rgb(44, 47, 54));
-        painter.rect_filled(title.rect, CornerRadius { nw: r, ne: r, sw: 0, se: 0 }, title_color(node.kind));
+        let head = match node.group() {
+            Some(g) => g.color.map_or(groups_ui::GROUP_COLOR, |c| Color32::from_rgb(c[0], c[1], c[2])),
+            None => title_color(node.kind),
+        };
+        painter.rect_filled(title.rect, CornerRadius { nw: r, ne: r, sw: 0, se: 0 }, head);
 
         if z < 0.35 {
             return;
         }
         let color = Color32::from_gray(240);
-        let mut job = egui::text::LayoutJob::simple_singleline(node.kind.label().to_owned(), FontId::proportional(13.0 * z), color);
+        let title_text = node.group().map_or_else(|| node.kind.label().to_owned(), |g| g.label.clone());
+        let mut job = egui::text::LayoutJob::simple_singleline(title_text, FontId::proportional(13.0 * z), color);
         job.wrap.max_width = title.text.width();
         job.wrap.max_rows = 1;
         job.wrap.break_anywhere = true;
@@ -1084,6 +1270,16 @@ impl GraphEditor {
         for (i, spec) in node.kind.inputs().iter().enumerate() {
             let p = node_rect.min + (builtin_input_port([0.0, 0.0], i).to_vec2()) * z;
             painter.text(p + Vec2::new(11.0 * z, 0.0), Align2::LEFT_CENTER, spec.label, label_font.clone(), label_color);
+        }
+        if let Some(g) = node.group() {
+            for (i, p) in g.inputs.iter().enumerate() {
+                let at = node_rect.min + (builtin_input_port([0.0, 0.0], i).to_vec2()) * z;
+                painter.text(at + Vec2::new(11.0 * z, 0.0), Align2::LEFT_CENTER, crate::export::elide_middle(&p.label, 12), label_font.clone(), label_color);
+            }
+            for (i, p) in g.outputs.iter().enumerate() {
+                let at = node_rect.min + output_port([0.0, 0.0], i).to_vec2() * z;
+                painter.text(at - Vec2::new(11.0 * z, 0.0), Align2::RIGHT_CENTER, crate::export::elide_middle(&p.label, 12), label_font.clone(), label_color);
+            }
         }
         for (i, output) in node.exposed_outputs().iter().enumerate() {
             if let Some(output) = output {
@@ -1201,9 +1397,18 @@ impl GraphEditor {
                         }
                     }
                 }
+                Action::RemoveGroupPort(id, input, k) => {
+                    if let Err(e) = session.project.graph.remove_group_port(id, input, k) { status.error(e.to_string()); }
+                }
+                Action::ExposeGroupPort(node, input, port) => {
+                    if let Some(open) = self.groups.level() {
+                        if let Err(e) = session.project.graph.expose_group_port(open, input, node, port) { status.error(e.to_string()); }
+                    }
+                }
+                Action::GroupColor(id, color) => { let _ = session.project.graph.set_group_color(id, color); }
                 Action::Connect { from, from_port, to, port, old } => {
                     let mut graph = session.project.graph.clone();
-                    if let Some((node, input)) = old { graph.disconnect_edge(rawgraph_core::graph::Edge { from, from_port, to: node, to_port: input }); }
+                    if let Some(edge) = old { graph.disconnect_edge(edge); }
                     match graph.connect_ports(from, from_port, to, port) {
                         Ok(()) => session.project.graph = graph,
                         Err(e) => status.error(format!("Cannot connect: {e}")),
@@ -1212,6 +1417,9 @@ impl GraphEditor {
                 Action::Add(kind, pos) => {
                     let id = session.project.graph.add_node(kind, pos);
                     if kind == NodeKind::Source { crate::node_ui::set_source_folder(&mut session.project.graph, id, None); }
+                    if let Some(open) = self.groups.level() {
+                        if let Err(e) = session.project.graph.adopt(open, &[id]) { status.error(e.to_string()); }
+                    }
                     session.set_node_selection(NodeSelection::single(id));
                 }
                 Action::View(id) => { session.viewed_node = None; session.set_node_selection(NodeSelection::single(id)); },
@@ -1230,9 +1438,18 @@ impl GraphEditor {
         let Some(search) = &mut self.search else { return };
         let mut close = false;
         let mut add: Option<NodeKind> = None;
+        let mut add_macro: Option<String> = None;
         let q = search.query.to_lowercase();
+        let macro_matches: Vec<crate::macros::MacroInfo> = match (&self.recipes_dir, search.connection) {
+            (Some(dir), None) => groups_ui::cached_macro_list(&mut self.groups.macro_list, dir)
+                .into_iter()
+                .filter(|m| m.usable && (m.stem.to_lowercase().contains(&q) || "macros".contains(&q) && !q.is_empty() || q.is_empty()))
+                .collect(),
+            _ => Vec::new(),
+        };
         let matches: Vec<NodeKind> = node_groups().into_iter().flat_map(|(_, kinds)| kinds).filter(|k| (k.label().to_lowercase().contains(&q) || group_of(*k).to_lowercase().contains(&q)) && search.connection.is_none_or(|c| compatible_port(&session.project.graph, c, *k).is_some())).collect();
-        search.selected = search.selected.min(matches.len().saturating_sub(1));
+        let total = matches.len() + macro_matches.len();
+        search.selected = search.selected.min(total.saturating_sub(1));
 
         let (down, up, enter, esc) = ctx.input_mut(|i| {
             (
@@ -1242,14 +1459,15 @@ impl GraphEditor {
                 i.consume_key(Modifiers::NONE, Key::Escape),
             )
         });
-        if down && !matches.is_empty() {
-            search.selected = (search.selected + 1) % matches.len();
+        if down && total > 0 {
+            search.selected = (search.selected + 1) % total;
         }
-        if up && !matches.is_empty() {
-            search.selected = (search.selected + matches.len() - 1) % matches.len();
+        if up && total > 0 {
+            search.selected = (search.selected + total - 1) % total;
         }
         if enter {
             add = matches.get(search.selected).copied();
+            add_macro = search.selected.checked_sub(matches.len()).and_then(|i| macro_matches.get(i)).map(|m| m.stem.clone());
             close = true;
         }
         if esc {
@@ -1268,12 +1486,19 @@ impl GraphEditor {
                     ui.memory_mut(|memory| memory.request_focus(input_id));
                     ui.add(egui::TextEdit::singleline(&mut search.query).id(input_id).hint_text("Add node...").desired_width(f32::INFINITY));
                     ui.add_space(4.0);
-                    if matches.is_empty() {
+                    if total == 0 {
                         ui.label(egui::RichText::new("No matching node").weak());
                     }
                     for (i, kind) in matches.iter().enumerate() {
                         if ui.selectable_label(i == search.selected, format!("{}    ({})", kind.label(), group_of(*kind))).clicked() {
                             add = Some(*kind);
+                            close = true;
+                        }
+                    }
+                    for (j, m) in macro_matches.iter().enumerate() {
+                        let resp = ui.selectable_label(matches.len() + j == search.selected, format!("{}    (Macros)", m.stem)).on_hover_text(format!("{}\n{}", m.description, crate::macros::COPY_NOTE));
+                        if resp.clicked() {
+                            add_macro = Some(m.stem.clone());
                             close = true;
                         }
                     }
@@ -1284,15 +1509,22 @@ impl GraphEditor {
         if clicked_outside {
             close = true;
         }
+        if let Some(stem) = add_macro {
+            let pos = search.graph_pos;
+            self.edit.ops.push(EditOp::InsertMacro(stem, Some(pos)));
+        }
         if let Some(kind) = add {
             let pos = search.graph_pos;
             let mut graph = session.project.graph.clone();
             let port = search.connection.and_then(|c| compatible_port(&graph, c, kind));
             let id = graph.add_node(kind, pos);
             if kind == NodeKind::Source { crate::node_ui::set_source_folder(&mut graph, id, None); }
+            if let Some(open) = self.groups.level() {
+                if let Err(e) = graph.adopt(open, &[id]) { status.error(e.to_string()); }
+            }
             let result = match (search.connection, port) {
                 (Some(ConnDrag::FromOutput(src, src_port, old)), Some(port)) => {
-                    if let Some((node, input)) = old { graph.disconnect_edge(rawgraph_core::graph::Edge { from: src, from_port: src_port, to: node, to_port: input }); }
+                    if let Some(edge) = old { graph.disconnect_edge(edge); }
                     graph.connect_ports(src, src_port, id, port)
                 }
                 (Some(ConnDrag::FromInput { node, port }), Some(from_port)) => graph.connect_ports(id, from_port, node, port),
@@ -1317,7 +1549,10 @@ enum Action {
     RemoveInput(NodeId, usize),
     RemoveOutput(NodeId, usize),
     Move(NodeId, Vec2),
-    Connect { from: NodeId, from_port: usize, to: NodeId, port: usize, old: Option<(NodeId, usize)> },
+    Connect { from: NodeId, from_port: usize, to: NodeId, port: usize, old: Option<rawgraph_core::graph::Edge> },
+    RemoveGroupPort(NodeId, bool, usize),
+    ExposeGroupPort(NodeId, bool, usize),
+    GroupColor(NodeId, Option<[u8; 3]>),
     Add(NodeKind, [f32; 2]),
     View(NodeId),
     Delete(NodeId),
@@ -1370,12 +1605,21 @@ fn wire_points(from: Pos2, to: Pos2, zoom: f32) -> [Pos2; 4] {
     [from, from + Vec2::new(dx, 0.0), to - Vec2::new(dx, 0.0), to]
 }
 
-fn nearest_wire(graph: &Graph, xf: &Xform, p: Pos2) -> Option<rawgraph_core::graph::Edge> {
+fn nearest_wire(graph: &Graph, edges: &[rawgraph_core::LevelEdge], stubs: Option<groups_ui::Stubs>, xf: &Xform, p: Pos2) -> Option<rawgraph_core::graph::Edge> {
     let mut best = 8.0_f32;
     let mut hit = None;
-    for edge in graph.edges() {
-        let (Some(from), Some(to)) = (graph.node(edge.from), graph.node(edge.to)) else { continue };
-        let pts = wire_points(xf.to_screen(output_port(from.pos, edge.from_port)), xf.to_screen(input_port(to, edge.to_port)), xf.zoom);
+    for le in edges {
+        let edge = &le.edge;
+        let start = match le.from {
+            End::Node { node, port } => graph.node(node).map(|n| output_port(n.pos, port)),
+            End::Boundary { port } => stubs.map(|s| s.in_port(port)),
+        };
+        let end = match le.to {
+            End::Node { node, port } => graph.node(node).map(|n| input_port(n, port)),
+            End::Boundary { port } => stubs.map(|s| s.out_port(port)),
+        };
+        let (Some(start), Some(end)) = (start, end) else { continue };
+        let pts = wire_points(xf.to_screen(start), xf.to_screen(end), xf.zoom);
         let mut prev = pts[0];
         for i in 1..=64 {
             let t = i as f32 / 64.0;
@@ -1721,6 +1965,16 @@ mod tests {
             out.drop_without_applying_deltas();
             let gesture = self.ctx.input(|i| i.pointer.any_down());
             self.hist.commit_if_changed(&self.s.project.graph, gesture);
+            // After every frame (every edit the editor made): the group rules hold and the saved graph opens again.
+            let graph = &self.s.project.graph;
+            if graph.has_groups() {
+                if let Err(e) = graph.check_group_structure() {
+                    panic!("the editor broke the group rules: {e}");
+                }
+                if let Err(e) = Graph::from_json(&graph.to_json()) {
+                    panic!("the graph the editor left cannot be opened again: {e}");
+                }
+            }
         }
 
         fn settle(&mut self) {
@@ -2398,5 +2652,312 @@ mod tests {
         }).collect::<Vec<_>>().join("\n");
         assert!(text.contains("3 nodes selected"), "{text}");
         assert!(text.contains("Contrast"), "the primary node (clicked last, before Ctrl+A) is shown: {text}");
+    }
+
+    // ------------------------------------------------------------ groups
+
+    /// Source -> Exposure -> Contrast -> Saturation -> Output in a row, 300 apart.
+    fn chain_graph() -> (Graph, [NodeId; 5]) {
+        let mut g = Graph::new();
+        let kinds = [NodeKind::Source, NodeKind::Exposure, NodeKind::Contrast, NodeKind::Saturation, NodeKind::Output];
+        let ids: Vec<NodeId> = kinds.iter().enumerate().map(|(i, k)| g.add_node(*k, [i as f32 * 300.0, 40.0 + i as f32 * 8.0])).collect();
+        for w in ids.windows(2) {
+            g.connect(w[0], w[1], 0).unwrap();
+        }
+        g.node_mut(ids[1]).unwrap().set_param("ev", ImageId(0), 0.5);
+        (g, [ids[0], ids[1], ids[2], ids[3], ids[4]])
+    }
+
+    fn select_two(h: &mut Harness, a: NodeId, b: NodeId) {
+        h.click(h.node_title_pos(a));
+        h.click_with(h.node_title_pos(b), Modifiers::SHIFT);
+    }
+
+    #[test]
+    fn ctrl_g_groups_the_selection_ctrl_shift_g_ungroups_and_each_is_one_undo_step() {
+        let (g, [_, exp, con, _, _]) = chain_graph();
+        let original = g.clone();
+        let mut h = Harness::new(g);
+        select_two(&mut h, exp, con);
+        let steps = h.undo_steps();
+        h.key_with(Key::G, Modifiers::COMMAND);
+        let grouped = h.sel();
+        assert_eq!(grouped.len(), 1);
+        let group = grouped[0];
+        assert_eq!(h.s.project.graph.node(group).unwrap().kind, NodeKind::Group);
+        assert_eq!(h.undo_steps(), steps + 1, "grouping is one step");
+        assert_eq!(h.s.project.graph.children(None).len(), 4);
+        // Undo and redo cover it as one step each.
+        let back = h.hist.undo().unwrap();
+        assert_eq!(back, original);
+        let again = h.hist.redo().unwrap();
+        assert_eq!(again.node(group).map(|n| n.kind), Some(NodeKind::Group));
+        // Ungroup with the group selected.
+        let steps = h.undo_steps();
+        h.key_with(Key::G, Modifiers::COMMAND | Modifiers::SHIFT);
+        assert!(h.s.project.graph.node(group).is_none());
+        assert_eq!(h.s.project.graph.edges(), original.edges());
+        assert_eq!(h.sel(), vec![exp, con], "the freed nodes are selected");
+        assert_eq!(h.undo_steps(), steps + 1);
+    }
+
+    #[test]
+    fn enter_and_a_double_click_open_a_group_escape_and_the_breadcrumb_go_back() {
+        let (g, [_, exp, con, _, _]) = chain_graph();
+        let mut h = Harness::new(g);
+        select_two(&mut h, exp, con);
+        h.key_with(Key::G, Modifiers::COMMAND);
+        let group = h.sel()[0];
+        assert!(h.ed.groups.path.is_empty());
+        h.key(Key::Enter);
+        h.settle();
+        assert_eq!(h.ed.groups.path, vec![group]);
+        assert!(h.sel().is_empty(), "nothing is selected after opening");
+        // Inside, the inner nodes are what can be clicked.
+        h.click(h.node_title_pos(exp));
+        assert_eq!(h.sel(), vec![exp]);
+        // Select-all inside selects the inner nodes only.
+        h.key_with(Key::A, Modifiers::COMMAND);
+        let mut all = h.sel();
+        all.sort();
+        assert_eq!(all, vec![exp, con]);
+        h.key(Key::Escape);
+        h.settle();
+        assert!(h.ed.groups.path.is_empty());
+        assert_eq!(h.sel(), vec![group], "the group just left is selected");
+        // Double-click on the closed box opens it again.
+        h.move_to(h.node_title_pos(group));
+        for _ in 0..2 {
+            h.button(true);
+            h.button(false);
+        }
+        h.settle();
+        assert_eq!(h.ed.groups.path, vec![group]);
+        // The breadcrumb bar goes back with a click on "Graph".
+        h.click(Pos2::new(24.0, 13.0));
+        assert!(h.ed.groups.path.is_empty());
+    }
+
+    #[test]
+    fn nested_groups_open_level_by_level_and_a_deleted_level_closes() {
+        let (g, [_, exp, con, sat, _]) = chain_graph();
+        let mut h = Harness::new(g);
+        select_two(&mut h, exp, con);
+        h.key_with(Key::G, Modifiers::COMMAND);
+        let inner = h.sel()[0];
+        h.click(h.node_title_pos(inner));
+        h.click_with(h.node_title_pos(sat), Modifiers::SHIFT);
+        h.key_with(Key::G, Modifiers::COMMAND);
+        let outer = h.sel()[0];
+        assert_eq!(h.s.project.graph.parent_of(inner), Some(outer));
+        h.key(Key::Enter);
+        h.settle();
+        h.click(h.node_title_pos(inner));
+        h.key(Key::Enter);
+        h.settle();
+        assert_eq!(h.ed.groups.path, vec![outer, inner]);
+        // Undo that removes the groups closes the levels instead of showing a stale view.
+        h.s.project.graph = Graph::new();
+        h.settle();
+        assert!(h.ed.groups.path.is_empty());
+    }
+
+    #[test]
+    fn viewing_a_closed_group_shows_the_node_behind_its_first_output() {
+        let (g, [_, exp, con, _, _]) = chain_graph();
+        let mut h = Harness::new(g);
+        select_two(&mut h, exp, con);
+        h.key_with(Key::G, Modifiers::COMMAND);
+        let group = h.sel()[0];
+        assert_eq!(h.s.selected_node, Some(group));
+        assert_eq!(h.s.target_node(), Some(con));
+        // Inside the group an inner node can be viewed and pinned like any other.
+        h.key(Key::Enter);
+        h.settle();
+        h.click(h.node_title_pos(exp));
+        assert_eq!(h.s.target_node(), Some(exp));
+    }
+
+    #[test]
+    fn copy_paste_duplicate_and_delete_of_a_group_work_with_its_insides() {
+        let (g, [_, exp, con, _, _]) = chain_graph();
+        let mut h = Harness::new(g);
+        select_two(&mut h, exp, con);
+        h.key_with(Key::G, Modifiers::COMMAND);
+        let group = h.sel()[0];
+        h.ed.groups.path.clear();
+        let nodes = h.s.project.graph.nodes().count();
+        h.frame(vec![Event::Copy]);
+        let text = h.ed.last_copy().expect("copied").to_owned();
+        h.move_to(Pos2::new(300.0, 350.0));
+        let steps = h.undo_steps();
+        h.frame(vec![Event::Paste(text)]);
+        h.settle();
+        assert_eq!(h.undo_steps(), steps + 1);
+        assert_eq!(h.s.project.graph.nodes().count(), nodes + 3, "group plus two inner nodes");
+        let pasted = h.sel();
+        assert_eq!(pasted.len(), 1, "only the group box is selected");
+        assert_ne!(pasted[0], group);
+        let copy = h.s.project.graph.node(pasted[0]).unwrap().group().unwrap();
+        assert!(copy.members.iter().all(|m| *m != exp && *m != con));
+        // Ctrl+D duplicates the selected group too.
+        h.key_with(Key::D, Modifiers::COMMAND);
+        assert_eq!(h.s.project.graph.nodes().count(), nodes + 6);
+        h.s.project.graph.check_group_structure().unwrap();
+        // Delete removes the group and what is inside it, one undo step.
+        let steps = h.undo_steps();
+        let before = h.s.project.graph.clone();
+        h.click(h.node_title_pos(group));
+        h.key(Key::Delete);
+        h.settle();
+        assert!(h.s.project.graph.node(group).is_none() && h.s.project.graph.node(exp).is_none() && h.s.project.graph.node(con).is_none());
+        assert_eq!(h.undo_steps(), steps + 1);
+        assert_eq!(h.hist.undo().unwrap(), before);
+    }
+
+    #[test]
+    fn removing_a_parameter_port_of_a_grouped_node_leaves_a_project_that_opens() {
+        let (mut g, [_, exp, con, _, _]) = chain_graph();
+        let group = g.group_nodes(&[exp, con], "Tone").unwrap();
+        let port = g.expose_parameter(exp, "ev", PortType::Images).unwrap();
+        g.expose_group_port(group, true, exp, port).unwrap();
+        let alias = g.expose_output(con, 0, "Copy").unwrap();
+        g.expose_group_port(group, false, con, alias).unwrap();
+        let mut h = Harness::new(g);
+        h.settle();
+        h.ed.apply(vec![Action::RemoveInput(exp, port), Action::RemoveOutput(con, alias)], &mut h.s, &mut h.st);
+        h.settle();
+        let def = h.s.project.graph.node(group).unwrap().group().unwrap();
+        assert!(!def.inputs.iter().any(|p| p.port == port) && !def.outputs.iter().any(|p| p.port == alias));
+        // The frame check ran check_group_structure and a save/load round trip; do it once more explicitly.
+        Graph::from_json_repaired(&h.s.project.graph.to_json()).unwrap();
+        Graph::from_json(&h.s.project.graph.to_json()).unwrap();
+    }
+
+    #[test]
+    fn pasting_a_group_too_deep_into_an_open_group_is_refused_and_changes_nothing() {
+        let mut g = Graph::new();
+        let leaf = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
+        let mut path = vec![g.group_nodes(&[leaf], "G").unwrap()];
+        for _ in 1..rawgraph_core::MAX_GROUP_DEPTH {
+            let next = g.group_nodes(&[*path.last().unwrap()], "G").unwrap();
+            path.push(next);
+        }
+        path.reverse(); // outermost first
+        let loose = g.add_node(NodeKind::Contrast, [0.0, 300.0]);
+        let other = g.group_nodes(&[loose], "Other").unwrap();
+        let mut h = Harness::new(g);
+        h.ed.groups.path = path;
+        let text = crate::graph_clip::copy_text(&h.s.project.graph, &[other]).unwrap();
+        let before = h.s.project.graph.clone();
+        assert!(!h.ed.paste_text(Some(&text), None, &mut h.s, &mut h.st));
+        assert_eq!(h.s.project.graph, before, "the paste was rolled back");
+        assert!(h.st.current().map(|c| c.0).unwrap_or("").contains("Nothing was pasted"), "{}", h.st.current().map(|c| c.0).unwrap_or(""));
+        // A plain node still fits at that depth.
+        let text = crate::graph_clip::copy_text(&h.s.project.graph, &[loose]).unwrap();
+        assert!(h.ed.paste_text(Some(&text), None, &mut h.s, &mut h.st));
+    }
+
+    #[test]
+    fn escape_goes_up_a_level_only_when_no_window_has_its_own_use_for_it() {
+        let (mut g, [_, exp, con, _, _]) = chain_graph();
+        let group = g.group_nodes(&[exp, con], "Tone").unwrap();
+        let mut h = Harness::new(g);
+        assert!(h.ed.open_group(&h.s.project.graph, group));
+        h.settle();
+        // The manage window is open: Escape does not leave the group.
+        h.ed.manage_open = true;
+        h.key(Key::Escape);
+        h.settle();
+        assert_eq!(h.ed.groups.path, vec![group]);
+        h.ed.manage_open = false;
+        // The rename window takes Escape and closes; the group stays open.
+        h.ed.rename_group_prompt(&h.s, group);
+        h.settle();
+        assert!(h.ed.groups.rename.is_some());
+        h.key(Key::Escape);
+        h.settle();
+        assert!(h.ed.groups.rename.is_none(), "Escape cancels the rename window");
+        assert_eq!(h.ed.groups.path, vec![group]);
+        // With nothing open it still goes up one level.
+        h.key(Key::Escape);
+        h.settle();
+        assert!(h.ed.groups.path.is_empty());
+    }
+
+    #[test]
+    fn the_group_inspector_lists_published_parameters_and_edits_the_inner_node() {
+        let (mut g, [_, exp, con, _, _]) = chain_graph();
+        let group = g.group_nodes(&[exp, con], "Tone").unwrap();
+        g.publish_param(group, exp, "ev", Some("Brightness")).unwrap();
+        let mut h = Harness::new(g);
+        h.click(h.node_title_pos(group));
+        assert_eq!(h.s.selected_node, Some(group));
+        let ctx = egui::Context::default();
+        let show = |h: &mut Harness| {
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 800.0))), ..Default::default() }, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| crate::inspector::show(ui, &mut h.s));
+            });
+            out.textures_delta.clear();
+            out.shapes.iter().filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            }).collect::<Vec<_>>().join("\n")
+        };
+        let text = show(&mut h);
+        assert!(text.contains("Tone") && text.contains("Published parameters") && text.contains("Unpublish"), "{text}");
+        assert!(text.contains("Exposure (node") && text.contains("Inputs") && text.contains("Outputs"), "{text}");
+        // The published box row on the group shows the inner value.
+        let rows = group_rows(&h.s.project.graph, h.s.project.graph.node(group).unwrap(), ImageId(0));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "Brightness");
+        // The slider of the inspector writes the inner node's own value.
+        h.s.project.graph.node_mut(exp).unwrap().set_param("ev", ImageId(0), 1.25);
+        assert!(show(&mut h).contains("Brightness"));
+        let rows = group_rows(&h.s.project.graph, h.s.project.graph.node(group).unwrap(), ImageId(0));
+        assert!(rows[0].1.contains("1.25"), "{rows:?}");
+    }
+
+    #[test]
+    fn dragging_a_wire_onto_a_group_port_wires_the_inner_node_and_the_open_view_shows_stubs() {
+        let (mut g, [src, exp, con, _, _]) = chain_graph();
+        let group = g.group_nodes(&[exp, con], "Tone").unwrap();
+        let extra = g.add_node(NodeKind::Source, [0.0, 300.0]);
+        let mut h = Harness::new(g);
+        let from = h.out_port(extra);
+        let to = h.in_port(group, 0);
+        h.drag(from, to);
+        assert!(h.s.project.graph.input_edges(exp, 0).any(|e| e.from == extra), "the wire reaches the inner node");
+        assert_eq!(h.s.project.graph.level_edges(None).iter().filter(|e| e.to == End::Node { node: group, port: 0 }).count(), 2);
+        let _ = src;
+        // Opened, the wires into the group end at the Group inputs stub.
+        assert!(h.ed.open_group(&h.s.project.graph, group));
+        h.settle();
+        let inside = h.s.project.graph.level_edges(Some(group));
+        assert!(inside.iter().any(|e| matches!(e.from, End::Boundary { .. })));
+        assert!(inside.iter().any(|e| matches!(e.to, End::Boundary { .. })));
+    }
+
+    #[test]
+    fn nodes_added_while_a_group_is_open_belong_to_it() {
+        let (mut g, [_, exp, con, _, _]) = chain_graph();
+        let group = g.group_nodes(&[exp, con], "Tone").unwrap();
+        let mut h = Harness::new(g);
+        assert!(h.ed.open_group(&h.s.project.graph, group));
+        h.settle();
+        let mut graph = h.s.project.graph.clone();
+        let id = graph.add_node(NodeKind::Blur, [10.0, 300.0]);
+        graph.adopt(group, &[id]).unwrap();
+        assert_eq!(graph.parent_of(id), Some(group));
+        // Through the editor's own commands: paste goes into the open group.
+        h.frame(vec![Event::Copy]);
+        h.click(h.node_title_pos(exp));
+        h.frame(vec![Event::Copy]);
+        let text = h.ed.last_copy().unwrap().to_owned();
+        h.frame(vec![Event::Paste(text)]);
+        h.settle();
+        let pasted = h.sel();
+        assert_eq!(pasted.len(), 1);
+        assert_eq!(h.s.project.graph.parent_of(pasted[0]), Some(group), "pasted into the open group");
     }
 }

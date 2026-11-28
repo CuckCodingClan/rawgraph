@@ -42,6 +42,7 @@ mod prefetch;
 mod quick_preview;
 mod provider;
 mod ranges_logic;
+mod macros;
 mod recipes;
 mod recovery_guard;
 mod relink;

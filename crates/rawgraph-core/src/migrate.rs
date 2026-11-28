@@ -34,6 +34,23 @@ const TONE_TOGGLE_SUBGRAPH_FORMAT: u64 = 3;
 /// First graph / sub-graph format with the Export "Keywords" toggle (`meta_keywords`).
 const KEYWORD_GRAPH_FORMAT: u64 = 5;
 const KEYWORD_SUBGRAPH_FORMAT: u64 = 4;
+/// First graph / sub-graph format with node groups. Older files contain none and need no rewrite, just the new number.
+const GROUPS_GRAPH_FORMAT: u64 = 6;
+const GROUPS_SUBGRAPH_FORMAT: u64 = 5;
+
+// ===== Groups format step =====================================================================
+// The only place of the node-group format change (graph 6 / sub-graph 5, constants in `graph.rs`:
+// GRAPH_FORMAT_VERSION and SUBGRAPH_FORMAT_VERSION). To renumber after a rebase change those two
+// constants and the GROUPS_* ones; this step and its tests (`groups_step_*` in migrate_tests.rs) follow them.
+
+/// Older files contain no groups, so the step only re-labels the document with the current number.
+/// Runs after `keyword_step`, so a keyword-era file (format 5) ends up as format 6 unchanged otherwise.
+fn groups_step(obj: &mut Obj, version: u64, first_groups: u64, current: u32) {
+    if version < first_groups {
+        obj.insert("format_version".into(), json!(current));
+    }
+}
+// ===========================================================================================
 
 type Obj = Map<String, Value>;
 
@@ -1285,9 +1302,7 @@ pub(crate) fn migrate_graph(root: &mut Value) -> Result<Vec<String>, GraphError>
         }
     }
     if version >= MASK_FREE_GRAPH_FORMAT {
-        if version < u64::from(GRAPH_FORMAT_VERSION) {
-            obj.insert("format_version".into(), json!(GRAPH_FORMAT_VERSION));
-        }
+        groups_step(obj, version, GROUPS_GRAPH_FORMAT, GRAPH_FORMAT_VERSION);
         return Ok(tone_notes);
     }
     let (Some(nodes_v), Some(edges_v)) = (obj.get("nodes"), obj.get("edges")) else { return Ok(tone_notes) };
@@ -1338,9 +1353,7 @@ pub(crate) fn migrate_subgraph(root: &mut Value) -> Result<Vec<String>, GraphErr
         }
     }
     if version >= MASK_FREE_SUBGRAPH_FORMAT {
-        if version < u64::from(SUBGRAPH_FORMAT_VERSION) {
-            obj.insert("format_version".into(), json!(SUBGRAPH_FORMAT_VERSION));
-        }
+        groups_step(obj, version, GROUPS_SUBGRAPH_FORMAT, SUBGRAPH_FORMAT_VERSION);
         return Ok(tone_notes);
     }
     let (Some(nodes_v), Some(edges_v)) = (obj.get("nodes"), obj.get("edges")) else { return Ok(tone_notes) };

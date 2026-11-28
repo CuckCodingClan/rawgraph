@@ -71,8 +71,14 @@ impl NodeSelection {
     }
 
     /// Ctrl+A: every node, in graph order.
+    #[cfg(test)]
     pub fn select_all(&mut self, graph: &Graph) {
         self.ids = graph.nodes().map(|n| n.id).collect();
+    }
+
+    /// Ctrl+A inside a group (or at the top level): every node shown on that level.
+    pub fn select_level(&mut self, graph: &Graph, level: Option<NodeId>) {
+        self.ids = graph.children(level);
     }
 
     /// Drops ids of nodes that no longer exist.

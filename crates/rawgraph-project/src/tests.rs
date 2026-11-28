@@ -768,7 +768,7 @@ fn a_project_with_an_old_mask_graph_opens_migrated_and_saves_format_3() {
     p.commit(&out, "migrated").unwrap();
     let conn = rusqlite::Connection::open(&out).unwrap();
     let json: String = conn.query_row("SELECT json FROM graph WHERE id = 1", [], |r| r.get(0)).unwrap();
-    assert!(json.contains("\"format_version\": 5") && json.contains("\"Draw\""));
+    assert!(json.contains(&format!("\"format_version\": {}", rawgraph_core::GRAPH_FORMAT_VERSION)) && json.contains("\"Draw\""));
     assert_eq!(Project::load(&out).unwrap().graph, p.graph);
 }
 
@@ -812,4 +812,44 @@ fn migration_notes_of_an_old_graph_reach_the_project_and_its_history() {
     p.history = log;
     let (_, notes) = p.graph_at_with_notes(1).expect("old snapshot");
     assert_eq!(notes.len(), 2);
+}
+
+#[test]
+fn a_project_with_a_damaged_group_opens_repaired_with_a_note_and_history_snapshots_too() {
+    let t = Tmp::new();
+    let file = t.path("groups.rawgraph");
+    let mut g = Graph::new();
+    let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
+    let exp = g.add_node(NodeKind::Exposure, [100.0, 0.0]);
+    let out = g.add_node(NodeKind::Output, [200.0, 0.0]);
+    g.connect(src, exp, 0).unwrap();
+    g.connect(exp, out, 0).unwrap();
+    let grp = g.group_nodes(&[exp], "Tone").unwrap();
+    let mut p = Project::new();
+    p.graph = g.clone();
+    p.save(&file).unwrap();
+    // A group port that points at a port which no longer exists: what removing an exposed parameter input used to leave behind.
+    let mut doc: serde_json::Value = serde_json::from_str(&g.to_json()).unwrap();
+    doc["nodes"][grp.0.to_string()]["group"]["inputs"][0]["port"] = 9.into();
+    let damaged = doc.to_string();
+    {
+        let conn = rusqlite::Connection::open(&file).unwrap();
+        conn.execute("UPDATE graph SET json = ?1 WHERE id = 1", [damaged.clone()]).unwrap();
+    }
+    let mut loaded = Project::load(&file).expect("the project opens");
+    assert!(loaded.migration_notes().iter().any(|n| n.contains("repaired")), "{:?}", loaded.migration_notes());
+    loaded.graph.check_group_structure().unwrap();
+    assert_eq!(loaded.graph.edges(), g.edges(), "same wires, so the same render");
+    // A history snapshot with the same damage is repaired too instead of being dropped.
+    let mut log = history::HistoryLog::default();
+    log.push(
+        HistoryEntry { revision: 1, time_unix_ms: 0, author: String::new(), device: String::new(), summary: String::new(), has_graph: true },
+        damaged,
+        10,
+        1 << 20,
+    );
+    loaded.history = log;
+    let (snap, notes) = loaded.graph_at_with_notes(1).expect("repaired snapshot");
+    assert!(notes.iter().any(|n| n.contains("repaired")));
+    snap.check_group_structure().unwrap();
 }

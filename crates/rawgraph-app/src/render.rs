@@ -1127,6 +1127,7 @@ pub fn describe_error(graph: &Graph, e: &EvalError) -> String {
         }
         EvalError::NotInCollection { node } => excluded_message(graph, *node),
         EvalError::UnknownNode(n) => format!("Node {} does not exist", n.0),
+        EvalError::GroupWithoutOutput(_) => "This group has no output: right-click a node inside and add an output port".to_owned(),
         EvalError::Provider(msg) if msg.starts_with("File not found") => msg.clone(),
         EvalError::Provider(msg) => format!("Could not load the image: {msg}"),
         EvalError::Failed { message, .. } => message.clone(),
