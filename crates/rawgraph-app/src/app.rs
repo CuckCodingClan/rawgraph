@@ -1759,7 +1759,10 @@ impl App {
     /// The scopes are computed after the picture; a screenshot waits until their data was uploaded.
     fn scopes_ready(&self) -> bool {
         let wanted = self.single_viewer_request().is_some() && !self.compare.active() && self.scopes_pos != ScopesPos::Hidden;
-        !wanted || !self.scope_panel.needs_refresh()
+        // No scopes come after an error or an excluded image (stale), and a failed GPU readback
+        // keeps the old ones: wait a few seconds after the last frame at most.
+        let waited_long = self.last_frame_at.is_some_and(|t| t.elapsed() > Duration::from_secs(5));
+        !wanted || self.scopes_stale || waited_long || !self.scope_panel.needs_refresh()
     }
 
     /// A selected Curve node gets its histogram a moment after the frame: screenshots wait for it.

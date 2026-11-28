@@ -43,7 +43,7 @@ pub(super) enum WsDialog {
 impl Workspaces {
     pub fn new(mut store: WorkspaceStore, spec: &WorkspaceSpec) -> Self {
         store.sanitize();
-        Self { store, intent: Intent::from_spec(spec), layout: spec.layout.clone().sanitized(), watch: DisplayWatch::default(), reset_panels: false, pending: Vec::new(), dialog: None }
+        Self { store, intent: Intent::from_spec(spec), layout: spec.layout.clone().sanitized(), watch: DisplayWatch::default(), reset_panels: true, pending: Vec::new(), dialog: None }
     }
 }
 
@@ -194,7 +194,9 @@ impl App {
                 // a normal window stays where it is.
                 if let Some(index) = a.placement.monitor() {
                     if self.aux(a.role).state.fullscreen {
-                        let placing = self.placing_for(a, primary);
+                        // Keep the mode: a Scopes window the user put into fullscreen (F11) stays so.
+                        let mut placing = self.placing_for(a, primary);
+                        placing.fullscreen = true;
                         self.aux_mut(a.role).place(&monitors, placing);
                     } else {
                         self.aux_mut(a.role).retarget_monitor(&monitors, index);

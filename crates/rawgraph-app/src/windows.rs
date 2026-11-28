@@ -85,6 +85,9 @@ pub struct AuxWindow {
     pub fallback: bool,
     /// Frames left until the window is moved to `target` (0 = nothing to do).
     settle: u8,
+    /// The position was sent; the size follows one frame later, with the scale of the display the
+    /// window then sits on (a move across displays of different scale changes it).
+    resize_pending: bool,
     /// Outer rectangle of the OS window in points, as last reported.
     pub last_rect: Option<egui::Rect>,
 }
@@ -112,12 +115,14 @@ impl AuxWindow {
         self.state.open = true;
         self.created = false;
         self.settle = 0;
+        self.resize_pending = false;
     }
 
     pub fn close(&mut self) {
         self.state.open = false;
         self.created = false;
         self.settle = 0;
+        self.resize_pending = false;
     }
 
     /// Index of the monitor this window was placed on.
@@ -147,7 +152,14 @@ impl AuxWindow {
         }
         self.target = Some(PhysRect { pos, size });
         self.target_scale = f64::from(scale);
-        self.settle = if self.state.open && self.created { SETTLE_FRAMES } else { 0 };
+        // Leaving fullscreen needs a few frames before the move; entering it (SetMonitor) does not,
+        // so a returning output does not flash on the wrong display.
+        self.settle = match (self.state.open && self.created, self.state.fullscreen) {
+            (false, _) => 0,
+            (true, true) => 1,
+            (true, false) => SETTLE_FRAMES,
+        };
+        self.resize_pending = false;
     }
 
     /// Just rewrites which monitor the window is remembered on (the display changed its place or
@@ -258,12 +270,27 @@ impl AuxWindow {
             self.settle = SETTLE_FRAMES;
         }
         self.created = true;
+        if self.settle == 0 && self.resize_pending {
+            // Second step of a move: the window now sits on its target display, so its own
+            // pixels per point are the right ones for the size.
+            self.resize_pending = false;
+            if let (false, Some(rect)) = (self.state.fullscreen, self.target) {
+                let ppp = ctx.input_for(id, |i| i.pixels_per_point());
+                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::InnerSize(rect.in_points(ppp).1));
+            }
+        }
         if self.settle > 0 {
             self.settle -= 1;
             if self.settle == 0 {
                 let ppp = ctx.input_for(id, |i| i.pixels_per_point());
-                for command in self.commands(ppp, monitors) {
-                    ctx.send_viewport_cmd_to(id, command);
+                if self.state.fullscreen {
+                    for command in self.commands(ppp, monitors) {
+                        ctx.send_viewport_cmd_to(id, command);
+                    }
+                } else if let Some(rect) = self.target {
+                    ctx.send_viewport_cmd_to(id, egui::ViewportCommand::OuterPosition(rect.in_points(ppp).0));
+                    self.resize_pending = true;
+                    ctx.request_repaint();
                 }
             } else {
                 ctx.request_repaint();
@@ -281,6 +308,7 @@ impl AuxWindow {
 }
 
 /// What the platform knows about the physical monitor behind a winit monitor.
+#[derive(Clone)]
 struct DeviceIdentity {
     /// The OS name winit reports for the monitor (Windows: the GDI name `\\.\DISPLAYn`).
     os_name: String,
@@ -304,21 +332,37 @@ fn device_identities() -> Vec<DeviceIdentity> {
         let n = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
         String::from_utf16_lossy(&buf[..n])
     }
+    use std::sync::Mutex;
+    // The last complete answer: a failed query (it races with hot-plugging) keeps the identities
+    // instead of renaming every monitor for one poll.
+    static LAST: Mutex<Vec<DeviceIdentity>> = Mutex::new(Vec::new());
+    const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
     let mut out = Vec::new();
+    let mut complete = false;
     // SAFETY: plain calls of the display configuration API with buffers sized by the API itself;
     // the structures are zero-initialised C structs whose header (type, size, adapter, id) is
     // filled in as the API requires.
     unsafe {
-        let (mut path_count, mut mode_count) = (0u32, 0u32);
-        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count) != 0 {
-            return out;
+        let mut paths = Vec::new();
+        // The configuration can change between sizing and query (hot-plug): retry a few times.
+        for _ in 0..5 {
+            let (mut path_count, mut mode_count) = (0u32, 0u32);
+            if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count) != 0 {
+                break;
+            }
+            let mut found = vec![std::mem::zeroed::<DISPLAYCONFIG_PATH_INFO>(); path_count as usize];
+            let mut modes = vec![std::mem::zeroed::<DISPLAYCONFIG_MODE_INFO>(); mode_count as usize];
+            let result = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut path_count, found.as_mut_ptr(), &mut mode_count, modes.as_mut_ptr(), std::ptr::null_mut());
+            if result == 0 {
+                found.truncate(path_count as usize);
+                paths = found;
+                complete = true;
+                break;
+            }
+            if result as i32 != ERROR_INSUFFICIENT_BUFFER {
+                break;
+            }
         }
-        let mut paths = vec![std::mem::zeroed::<DISPLAYCONFIG_PATH_INFO>(); path_count as usize];
-        let mut modes = vec![std::mem::zeroed::<DISPLAYCONFIG_MODE_INFO>(); mode_count as usize];
-        if QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut path_count, paths.as_mut_ptr(), &mut mode_count, modes.as_mut_ptr(), std::ptr::null_mut()) != 0 {
-            return out;
-        }
-        paths.truncate(path_count as usize);
         for p in &paths {
             let mut source: DISPLAYCONFIG_SOURCE_DEVICE_NAME = std::mem::zeroed();
             source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
@@ -326,6 +370,7 @@ fn device_identities() -> Vec<DeviceIdentity> {
             source.header.adapterId = p.sourceInfo.adapterId;
             source.header.id = p.sourceInfo.id;
             if DisplayConfigGetDeviceInfo(&mut source.header) != 0 {
+                complete = false;
                 continue;
             }
             let mut target: DISPLAYCONFIG_TARGET_DEVICE_NAME = std::mem::zeroed();
@@ -334,9 +379,21 @@ fn device_identities() -> Vec<DeviceIdentity> {
             target.header.adapterId = p.targetInfo.adapterId;
             target.header.id = p.targetInfo.id;
             if DisplayConfigGetDeviceInfo(&mut target.header) != 0 {
+                complete = false;
                 continue;
             }
             out.push(DeviceIdentity { os_name: text(&source.viewGdiDeviceName), friendly: text(&target.monitorFriendlyDeviceName), path: text(&target.monitorDevicePath) });
+        }
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if complete {
+        last.clone_from(&out);
+        return out;
+    }
+    // Incomplete answer: fill the gaps from the last complete one (same GDI name).
+    for old in last.iter() {
+        if !out.iter().any(|d| d.os_name.eq_ignore_ascii_case(&old.os_name)) {
+            out.push(old.clone());
         }
     }
     out
@@ -466,8 +523,9 @@ mod tests {
         assert!(!w.fallback && w.state.fullscreen);
         let (back, _) = builder.patch(w.builder("viewer", false, &ms));
         assert!(back.iter().any(|c| matches!(c, Cmd::Fullscreen(true))), "{back:?}");
-        // The builder alone would put it on the display it is on now; the explicit move follows.
-        assert_eq!(w.settle, SETTLE_FRAMES);
+        // The builder alone would put it on the display it is on now; the explicit move follows in
+        // the same frame (entering fullscreen needs no settling), so it never flashes elsewhere.
+        assert_eq!(w.settle, 1);
         assert_eq!(w.commands(1.25, &ms), vec![Cmd::SetMonitor(1)]);
     }
 
