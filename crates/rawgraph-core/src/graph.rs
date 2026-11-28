@@ -2025,14 +2025,24 @@ impl Graph {
     }
 
     pub fn from_json(text: &str) -> Result<Self, GraphError> {
-        let mut graph: Graph = serde_json::from_str(text).map_err(|e| GraphError::Parse(e.to_string()))?;
+        Self::from_json_with_notes(text).map(|(graph, _)| graph)
+    }
+
+    /// Like [`Graph::from_json`], and also returns the notes of the migration: graphs of format 1 and 2
+    /// (before the Mask category and the fixed mask ports were removed) are rewritten to the format-3
+    /// nodes first, see `migrate`. Each note names a node and what could not be carried over exactly.
+    /// The list is empty for a graph that needed no changes.
+    pub fn from_json_with_notes(text: &str) -> Result<(Self, Vec<String>), GraphError> {
+        let mut value: serde_json::Value = serde_json::from_str(text).map_err(|e| GraphError::Parse(e.to_string()))?;
+        let notes = crate::migrate::migrate_graph(&mut value)?;
+        let mut graph: Graph = serde_json::from_value(value).map_err(|e| GraphError::Parse(e.to_string()))?;
         if graph.format_version > GRAPH_FORMAT_VERSION {
             return Err(GraphError::UnsupportedVersion(graph.format_version));
         }
         graph.check_consistency()?;
         // Save successfully validated graphs using the current format.
         graph.format_version = GRAPH_FORMAT_VERSION;
-        Ok(graph)
+        Ok((graph, notes))
     }
 
     /// Verifies everything the public API guarantees by construction, so a
@@ -2209,7 +2219,15 @@ impl Subgraph {
     /// Parses and validates like [`Graph::from_json`]: node kinds, parameter
     /// ranges, data limits, edge ports and types, and no cycles.
     pub fn from_json(text: &str) -> Result<Subgraph, GraphError> {
-        let sub: Subgraph = serde_json::from_str(text).map_err(|e| GraphError::Parse(e.to_string()))?;
+        Self::from_json_with_notes(text).map(|(sub, _)| sub)
+    }
+
+    /// Like [`Subgraph::from_json`], and also returns the migration notes of a sub-graph of format 1
+    /// (copied or saved as a recipe before the mask nodes were removed).
+    pub fn from_json_with_notes(text: &str) -> Result<(Subgraph, Vec<String>), GraphError> {
+        let mut value: serde_json::Value = serde_json::from_str(text).map_err(|e| GraphError::Parse(e.to_string()))?;
+        let notes = crate::migrate::migrate_subgraph(&mut value)?;
+        let sub: Subgraph = serde_json::from_value(value).map_err(|e| GraphError::Parse(e.to_string()))?;
         if sub.format_version > SUBGRAPH_FORMAT_VERSION {
             return Err(GraphError::UnsupportedVersion(sub.format_version));
         }
@@ -2257,7 +2275,7 @@ impl Subgraph {
             .collect();
         let scratch = Graph { format_version: GRAPH_FORMAT_VERSION, nodes, edges, next_id: sub.nodes.len() as u64 + 1 };
         scratch.check_consistency()?;
-        Ok(sub)
+        Ok((sub, notes))
     }
 }
 

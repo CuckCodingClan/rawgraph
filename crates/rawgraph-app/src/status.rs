@@ -7,6 +7,8 @@ const SHOW_FOR: Duration = Duration::from_secs(6);
 #[derive(Default)]
 pub struct Status {
     notice: Option<Notice>,
+    /// Migration notes of the last opened older graph; shown in the status bar until dismissed.
+    notes: Vec<String>,
 }
 
 struct Notice {
@@ -18,6 +20,24 @@ struct Notice {
 impl Status {
     pub fn info(&mut self, text: impl Into<String>) {
         self.notice = Some(Notice { text: text.into(), error: false, at: Instant::now() });
+    }
+
+    /// Keeps the notes of a graph migration for the status bar and announces them once.
+    pub fn migration(&mut self, what: &str, notes: Vec<String>) {
+        if notes.is_empty() {
+            return;
+        }
+        let n = notes.len();
+        self.info(format!("{what}: older graph updated, {n} note{}", if n == 1 { "" } else { "s" }));
+        self.notes = notes;
+    }
+
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
+    pub fn clear_notes(&mut self) {
+        self.notes.clear();
     }
 
     pub fn error(&mut self, text: impl Into<String>) {

@@ -316,7 +316,21 @@ Click the blue title-bar **+** tab to add a control input. Develop exposes Expos
 
 Intensity maps are resized to the photo. A control uses the matching photo when present; otherwise a single-image output such as a standalone Generator or Draw applies to every photo. A disjoint multi-image output is ignored. Control images do not enter the main gallery. **View → Show mask overlay** (M) tints the first connected intensity control red without affecting the render, scopes or export.
 
-Graph format 3 removes the Mask category and all fixed mask ports. Use Generator for gradients or radial maps, Draw for painted images, and the image/channel outputs of ordinary nodes for other control maps. Old graphs using removed kinds or ports must be rebuilt; there is no migration.
+Graph format 3 removes the Mask category and all fixed mask ports. Use Generator for gradients or radial maps, Draw for painted images, and the image/channel outputs of ordinary nodes for other control maps. Graphs, projects, recipes and copied nodes saved before format 3 are migrated automatically when they are opened; the next save writes format 3. Each change that is not exact is reported once in the status bar (hover for the full list, click to dismiss).
+
+| Old | Format 3 |
+|---|---|
+| Gradient Mask | Generator, Linear gradient, Output Data (angle, centre and width kept; a hard edge becomes a 1 % transition) |
+| Radial Mask | Generator, Radial gradient with a smooth three-stop ramp (centre, radius, feather, invert); unequal Radius X/Y use their geometric mean and the angle is dropped |
+| Brush Mask | Draw with the same strokes per photo; an inverted brush gets a Curves node behind it |
+| Luminance Mask | Black & White (AP1 luminance) followed by Curves on Red, Green and Blue |
+| Mask Adjust | Curves on Red, Green and Blue |
+| Mask Combine | Layer (layer 2 stretched, Multiply / Add / Subtract / Lighten / Darken) |
+| Hue Mask | no equivalent: removed with the nodes that depended on it; the consumer's slider then applies everywhere |
+| Depth Estimate, Normals | Depth Map, Normal Map (the chosen input becomes the image input) |
+| Exposure mask, Amount mask, Radius mask, Direction normal | the same parameter exposed as a control input, wired from the migrated node |
+
+Generated maps take the frame of the first node that uses them, as the old masks did. Limits: curves are sampled with at most 32 points (errors of a few percent at steep edges), pixels of exactly zero luminance are not remapped by a luminance range, per-image choices of Normals are not kept, and an exposed Develop or Exposure input that used to map the whole parameter range now scales the slider (a note says so). The original graph stays in the project history until it is pruned.
 
 Click the blue title-bar **+** tab on a Filter node and choose **Radius** to drive radius per pixel from image luminance. Black gives no blur and white gives the slider radius, so the slider still sets the maximum radius. Gaussian and Box use the existing multi-level radius approximation; other kernels use the existing bounded spatial sampler. Unsupported controls are not listed.
 

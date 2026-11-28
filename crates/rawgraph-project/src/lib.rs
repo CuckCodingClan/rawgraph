@@ -287,6 +287,10 @@ pub struct Project {
     /// Schema version of the file this project was migrated from; not persisted
     /// and not part of equality.
     pub(crate) migrated_from: Option<u32>,
+    /// What the graph migration of an older file could not carry over exactly (graph format 1 and 2:
+    /// removed mask nodes and ports); empty for a current file. Not persisted and not part of
+    /// equality: the next save writes the migrated graph in the current format.
+    pub(crate) migration_notes: Vec<String>,
     /// Not persisted and not part of equality.
     pub(crate) scan_threads: usize,
     /// How the last commit really wrote its file; not persisted, not part of equality.
@@ -328,6 +332,7 @@ impl Project {
             history: history::HistoryLog::default(),
             folders: Vec::new(),
             migrated_from: None,
+            migration_notes: Vec::new(),
             scan_threads: DEFAULT_SCAN_THREADS,
             last_write: None,
         }
@@ -345,6 +350,11 @@ impl Project {
     /// revision it was loaded with or last committed.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Notes of the graph migration done while loading this project (empty when the graph needed none).
+    pub fn migration_notes(&self) -> &[String] {
+        &self.migration_notes
     }
 
     /// Commit history, oldest first (at most 100 entries).

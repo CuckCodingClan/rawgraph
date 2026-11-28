@@ -15,7 +15,13 @@ pub fn copy_text(graph: &Graph, ids: &[NodeId]) -> Option<String> {
 }
 
 /// Parses clipboard text. The error is one line for the status bar.
+#[cfg(test)]
 pub fn parse_clip(text: &str) -> Result<Subgraph, String> {
+    parse_clip_notes(text).map(|(s, _)| s)
+}
+
+/// Like [`parse_clip`], with the notes of the migration of an older group of nodes.
+pub fn parse_clip_notes(text: &str) -> Result<(Subgraph, Vec<String>), String> {
     if text.len() > MAX_CLIP_BYTES {
         return Err("The clipboard text is too large to be nodes".to_owned());
     }
@@ -23,8 +29,8 @@ pub fn parse_clip(text: &str) -> Result<Subgraph, String> {
     if !t.starts_with('{') {
         return Err("The clipboard does not contain RawGraph nodes".to_owned());
     }
-    match Subgraph::from_json(text) {
-        Ok(s) if s.is_empty() => Err("The clipboard holds no nodes".to_owned()),
+    match Subgraph::from_json_with_notes(text) {
+        Ok((s, _)) if s.is_empty() => Err("The clipboard holds no nodes".to_owned()),
         Ok(s) => Ok(s),
         Err(e) => Err(format!("The clipboard does not contain RawGraph nodes ({e})")),
     }

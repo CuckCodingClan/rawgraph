@@ -606,6 +606,7 @@ impl App {
                     if let Some(n) = note {
                         status.info(n);
                     }
+                    status.migration("Project", session.project.migration_notes().to_vec());
                 }
                 Err(crate::revisions::OpenError::Unfinished(_)) => {
                     // The dialog opens with the first frame.
@@ -1091,11 +1092,13 @@ impl App {
                 }
             }
             DialogKind::SaveAs(then) => self.save_project(Some(ensure_extension(path, PROJECT_EXT, Some(".json"))), then, ctx),
-            DialogKind::ImportGraph => match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| Graph::from_json(&t).map_err(|e| e.to_string())) {
-                Ok(g) => {
+            DialogKind::ImportGraph => match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| Graph::from_json_with_notes(&t).map_err(|e| e.to_string())) {
+                Ok((g, notes)) => {
                     self.session.set_graph(g);
+                    self.status.clear_notes();
                     self.editor.request_frame_all();
                     self.status.info(format!("Imported graph from {}", path.display()));
+                    self.status.migration("Import", notes);
                 }
                 Err(e) => self.status.error(format!("Cannot import {}: {e}", path.display())),
             },
@@ -2587,16 +2590,29 @@ impl App {
                 }
             }
             // Right side: transient notice, else the first problem.
+            let mut dismiss_notes = false;
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some((text, is_error)) = self.status.current() {
                     let color = if is_error { egui::Color32::from_rgb(255, 150, 120) } else { egui::Color32::from_gray(210) };
                     ui.label(RichText::new(text).color(color));
                 } else if let Some(err) = &self.last_error {
                     ui.label(RichText::new(err).color(egui::Color32::from_rgb(255, 150, 120)));
+                } else if let Some(first) = self.status.notes().first() {
+                    let more = self.status.notes().len() - 1;
+                    let text = if more > 0 { format!("Migrated graph: {first} (+{more} more)") } else { format!("Migrated graph: {first}") };
+                    let all = self.status.notes().join("
+");
+                    let r = ui.add(egui::Label::new(RichText::new(text).color(egui::Color32::from_rgb(255, 190, 90))).sense(egui::Sense::click()));
+                    dismiss_notes = r.on_hover_text(format!("{all}
+
+Click to dismiss")).clicked();
                 } else if let Some(issue) = self.session.project.graph.validate().first() {
                     ui.label(RichText::new(format!("Warning: {}", issue.message)).color(egui::Color32::from_rgb(255, 190, 90)));
                 }
             });
+            if dismiss_notes {
+                self.status.clear_notes();
+            }
         });
     }
 

@@ -750,3 +750,24 @@ fn manual_relink_of_a_pending_entry_checks_size_and_fills_the_hash() {
     project.relink(id, &to, false).unwrap();
     assert_eq!(project.image(id).unwrap().content_hash, content_hash(&to).unwrap().0);
 }
+
+#[test]
+fn a_project_with_an_old_mask_graph_opens_migrated_and_saves_format_3() {
+    let t = Tmp::new();
+    let file = t.path("old.rawgraph");
+    Project::new().save(&file).unwrap();
+    let old = include_str!("../../rawgraph-core/tests/fixtures/graph_v1.json");
+    {
+        let conn = rusqlite::Connection::open(&file).unwrap();
+        conn.execute("UPDATE graph SET json = ?1 WHERE id = 1", [old]).unwrap();
+    }
+    let mut p = Project::load(&file).unwrap();
+    assert!(p.graph.nodes().any(|n| n.kind == NodeKind::Draw) && !p.graph.nodes().any(|n| n.kind.label() == "Brush Mask"));
+    assert!(p.migration_notes().is_empty());
+    let out = t.path("new.rawgraph");
+    p.commit(&out, "migrated").unwrap();
+    let conn = rusqlite::Connection::open(&out).unwrap();
+    let json: String = conn.query_row("SELECT json FROM graph WHERE id = 1", [], |r| r.get(0)).unwrap();
+    assert!(json.contains("\"format_version\": 3") && json.contains("\"Draw\""));
+    assert_eq!(Project::load(&out).unwrap().graph, p.graph);
+}

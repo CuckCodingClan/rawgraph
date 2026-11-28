@@ -2,6 +2,8 @@
 
 Current inventory for graph format 3, not a list of what shipped in `2611.001`. Node labels, stable keys, port types, choice order and defaults come from the core graph definitions. Tables describe stored settings; the inspector may group settings or hide ones that do not apply.
 
+Graphs of format 1 and 2 (and sub-graphs of format 1) are rewritten to these nodes when loaded; see the README section "Per-pixel image controls" for the mapping of the removed mask kinds and ports.
+
 ## Propose changes here
 
 Edit the relevant node section in Git. To distinguish a request from an implemented setting, add a `**Requested changes:**` block under the node. For a new node, give its category, input and output types, defaults, and expected behavior. Keep the node ID and setting keys when proposing a display-name change. Git diffs will then show exactly what to implement.
