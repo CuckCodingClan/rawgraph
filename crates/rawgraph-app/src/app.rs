@@ -455,8 +455,6 @@ pub struct App {
     show_mask_overlay: bool,
     /// Re-reading capture metadata of an old project in the background.
     capture_job: Option<CaptureRefresh>,
-    /// Last collection request during a scan: (found images, time).
-    scan_collection_at: Option<(usize, Instant)>,
     /// The last reply was an error or an excluded image: the scopes show older data.
     scopes_stale: bool,
     /// Number of render requests sent (screenshot diagnostics).
@@ -727,7 +725,6 @@ impl App {
             finished_export: None,
             show_mask_overlay: cli_mask_overlay,
             capture_job: None,
-            scan_collection_at: None,
             scopes_stale: false,
             submits: 0,
             window_area: egui::Rect::NOTHING,
@@ -963,7 +960,6 @@ impl App {
         self.viewer = Viewer::with_preferences(self.viewer.click_zoom, self.viewer.wheel_navigates);
         self.scan_report = None;
         self.capture_job = None;
-        self.scan_collection_at = None;
         self.scopes_stale = false;
         self.prefetch.forget();
         self.xmp_offer = None;
@@ -1283,8 +1279,11 @@ impl App {
         }
         self.xmp_offer = None;
         self.xmp_probe = None;
+        self.capture_job = None;
         self.scan_done_at = None;
         self.session.begin_scan();
+        let absolute = std::path::absolute(&folder).unwrap_or_else(|_| folder.clone());
+        self.session.scan_count = Some((crate::session::folder_key(&absolute.to_string_lossy()), recursive, 0));
         self.scan = Some(ScanJob::start(ctx.clone(), self.session.project.clone(), folder.clone(), recursive));
         self.status.info(format!("Scanning {}", folder.display()));
     }
@@ -1296,19 +1295,40 @@ impl App {
         }
     }
 
-    fn poll_scan(&mut self) {
+    fn poll_scan(&mut self, ctx: &egui::Context) {
         let Some(job) = &mut self.scan else { return };
         let mut finished = None;
         let mut disconnected = false;
-        loop {
+        for index in 0..512 {
+            if index == 511 { ctx.request_repaint(); }
             match job.rx.try_recv() {
-                Ok(ScanMsg::Progress { done, total, current, entry }) => {
-                    job.done = done;
-                    job.total = total;
-                    job.current = current.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    if let Some(e) = entry {
-                        self.session.scan_entry(e);
+                Ok(ScanMsg::Listing(event)) => {
+                    use rawgraph_project::staged::Listing;
+                    let count = match event {
+                        Listing::Counting(n) => { job.counting = n; n }
+                        Listing::Count(n) => { job.count = Some(n); n }
+                    };
+                    if let Some((_, _, current)) = &mut self.session.scan_count { *current = count; }
+                }
+                Ok(ScanMsg::Catalog(entries)) => {
+                    job.listed = true;
+                    let stale: Vec<_> = entries.iter().filter(|e| e.content_hash.is_empty() && self.session.project.image(e.id).is_some()).map(|e| e.id).collect();
+                    if !stale.is_empty() {
+                        self.filmstrip.thumbs.invalidate(&stale);
+                        self.session.provider.clear_cache();
                     }
+                    self.session.scan_catalog(entries);
+                    ctx.request_repaint();
+                    break; // Paint the full placeholder list before applying file results.
+                }
+                Ok(ScanMsg::Hashed(entries)) => {
+                    let moved: Vec<_> = entries.iter().filter(|entry| self.session.entry(entry.id).is_some_and(|e| e.path != entry.path)).map(|entry| entry.id).collect();
+                    if !moved.is_empty() { self.filmstrip.thumbs.invalidate(&moved); }
+                    self.session.scan_entries(entries);
+                }
+                Ok(ScanMsg::Metadata { done, total, entries }) => {
+                    job.metadata = Some((done, total));
+                    self.session.scan_metadata(entries);
                 }
                 Ok(ScanMsg::Done { project, report }) => {
                     finished = Some((*project, report));
@@ -1322,7 +1342,7 @@ impl App {
             }
         }
         if let Some((project, report)) = finished {
-            let changed = !report.added.is_empty() || !report.relinked.is_empty() || !report.updated.is_empty();
+            let changed = project != self.session.project;
             self.session.finish_scan(project, changed);
             let text = summarize(&report);
             if report.failed.is_empty() {
@@ -1529,29 +1549,11 @@ impl App {
     }
 
     /// Re-computes the collection info when the graph, the viewed node or the
-    /// image set changed (never while a scan is still adding images).
+    /// image set or a capture metadata batch changed.
     fn refresh_collection(&mut self) {
         if let Some(r) = self.collection.poll() {
             self.session.collection = r;
         }
-        if self.session.scanning {
-            // Counts follow the scan: at most twice a second, whenever new images arrived.
-            let found = self.session.scan_found();
-            let due = match self.scan_collection_at {
-                Some((n, at)) => n != found && at.elapsed() >= Duration::from_millis(500),
-                None => found > 0,
-            };
-            if !due {
-                return;
-            }
-            let (ids, caps) = self.session.id_captures();
-            let g = self.neutral_graph();
-            self.collection.request(g, ids, caps, self.session.target_node());
-            self.scan_collection_at = Some((found, Instant::now()));
-            self.collection_key = None;
-            return;
-        }
-        self.scan_collection_at = None;
         let g = self.neutral_graph();
         let key = (g, self.session.target_node(), self.session.images_gen);
         if self.collection_key.as_ref() != Some(&key) {
@@ -1570,7 +1572,9 @@ impl App {
         let node = self.primary_target().node;
         let key = (self.neutral_graph(), node, self.session.images_gen, self.session.scan_found());
         if self.gallery_key.as_ref() != Some(&key) {
-            self.gallery_result = None;
+            if !self.session.scanning || self.gallery_key.as_ref().is_none_or(|old| old.0 != key.0 || old.1 != key.1) {
+                self.gallery_result = None;
+            }
             if node.is_some() {
                 let (ids, caps) = self.session.id_captures();
                 self.gallery_collection.request(key.0.clone(), ids, caps, node);
@@ -2575,8 +2579,13 @@ impl App {
             let mut cancel = false;
             if let Some(job) = &self.scan {
                 ui.separator();
-                let text = if job.total == 0 { "Scanning...".to_owned() } else { format!("Scanning {}/{}", job.done, job.total) };
-                ui.add(egui::ProgressBar::new(job.fraction()).desired_width(170.0).text(text));
+                let n = crate::collection::with_thousands(job.count.unwrap_or(job.counting));
+                let detail = match (job.count, job.metadata) {
+                    (None, _) => "counting…".to_owned(),
+                    (_, Some((done, total))) => format!("metadata {done}/{total}"),
+                    (_, None) => "preparing thumbnails…".to_owned(),
+                };
+                ui.label(format!("{n} images")).on_hover_text(detail);
                 cancel = ui.button("Cancel").clicked();
             }
             if cancel {
@@ -2825,8 +2834,21 @@ impl App {
                 Filmstrip::capture_info(ui, &self.session, target.image);
                 ui.add_space(4.0);
             });
-            let members = Self::gallery_members(self.gallery_result.as_ref(), target);
+            // A Source is just folder membership. Don't hold its newly listed
+            // placeholders behind an asynchronous graph collection query.
+            let immediate = self.scan.as_ref().filter(|job| job.listed)
+                .and(target.node)
+                .and_then(|id| self.session.project.graph.node(id))
+                .filter(|node| node.kind == NodeKind::Source)
+                .and_then(|node| node_ui::source_folder(node).map(|folder| (folder, node_ui::source_subfolders(node))))
+                .map(|(folder, recursive)| self.session.visible().iter().copied().filter(|&id| {
+                    self.session.entry(id).is_some_and(|e| rawgraph_core::path_in_folder(&e.path.to_string_lossy(), &folder, recursive))
+                }).collect::<std::collections::HashSet<_>>());
+            let members = immediate.as_ref().or_else(|| Self::gallery_members(self.gallery_result.as_ref(), target));
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.filmstrip.show(ui, &mut self.session, target, members));
+            if let Some(job) = self.scan.as_ref().filter(|j| j.listed && (members.is_some() || target.node.is_none())) {
+                job.prioritize(self.filmstrip.scan_wanted(), self.filmstrip.scan_thumbs_ready());
+            }
         });
     }
 
@@ -2972,7 +2994,7 @@ impl eframe::App for App {
                 } else { ui.label("Waiting for a profiled preview."); }
             });
         }
-        self.poll_scan();
+        self.poll_scan(&ctx);
         self.poll_capture_refresh();
         self.poll_export();
         self.advance_export_queue(&ctx);

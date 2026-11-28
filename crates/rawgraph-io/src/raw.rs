@@ -514,6 +514,7 @@ fn capture_from(md: &RawMetadata, header: impl FnOnce() -> Option<WbSource>, pat
         aperture: positive(e.fnumber),
         flash_fired: e.flash.map(|v| v & 1 == 1),
         raw: Some(true),
+        captured_unix_ms: e.date_time_original.as_deref().and_then(crate::exif_date),
         as_shot_kelvin: white.map(|w| w.0),
         as_shot_tint: white.map(|w| w.1),
         baseline_exposure: dng.as_ref().and_then(|d| d.baseline),

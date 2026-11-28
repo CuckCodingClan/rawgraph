@@ -3389,6 +3389,7 @@ name = "rawgraph-io"
 version = "26.11.1"
 dependencies = [
  "avif-serialize",
+ "chrono",
  "exr",
  "image",
  "kamadak-exif",

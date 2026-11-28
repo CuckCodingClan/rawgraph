@@ -643,3 +643,110 @@ fn failed_file_yields_no_entry() {
     assert_eq!(r.failed.len(), 1);
     assert_eq!(entries, vec![Some("a.raw".to_string()), None, Some("z.raw".to_string())]);
 }
+
+#[test]
+fn staged_catalog_never_hashes_before_count_or_list_and_resumes_from_disk() {
+    use crate::staged::Listing;
+    let t = Tmp::new();
+    let path = t.write("p.raw", "photo");
+    let mut project = Project::new();
+    let mut count = false;
+    let scan = project.list_catalog(&t.0, false, &supported, &mut |event| {
+        assert!(!util::HASHED.lock().unwrap().contains(&path));
+        if let Listing::Count(n) = event { assert_eq!(n, 1); count = true; }
+        true
+    });
+    assert!(count);
+    assert!(!util::HASHED.lock().unwrap().contains(&path));
+    let id = scan.entries[0].id;
+    assert_eq!(project.image(id).unwrap().content_hash, "");
+    assert!(project.image(id).unwrap().capture.scan_pending);
+    let recovery = project.save_recovery(&t.path("recovery"), None, "pending").unwrap();
+    assert_eq!(load_recovery(&recovery).unwrap().0, project);
+    let saved = t.path("pending.rawgraph");
+    project.save(&saved).unwrap();
+    let mut project = Project::load(&saved).unwrap();
+    let mut scan = project.list_catalog(&t.0, false, &supported, &mut |_| true);
+    assert_eq!(scan.hashes[0].id, Some(id));
+    scan.finish_hash(&mut project, 0, content_hash(&path)).unwrap();
+    project.save(&saved).unwrap();
+    let mut project = Project::load(&saved).unwrap();
+    let scan = project.list_catalog(&t.0, false, &supported, &mut |_| true);
+    assert!(scan.hashes.is_empty());
+    assert_eq!(scan.metadata, [id]);
+    project.finish_capture(id, None).unwrap();
+    let scan = project.list_catalog(&t.0, false, &supported, &mut |_| true);
+    assert!(scan.hashes.is_empty() && scan.metadata.is_empty());
+    assert_eq!(scan.report.unchanged, 1);
+}
+
+#[test]
+fn staged_relink_defers_identity_and_preserves_edits_and_graph() {
+    let t = Tmp::new();
+    let from = t.write("a.raw", "photo");
+    let to = t.path("b.raw");
+    let mut project = Project::new();
+    project.scan_folder(&t.0, false, &supported, &no_capture);
+    let id = project.images()[0].id;
+    let entry = project.image_mut(id).unwrap();
+    entry.rating = 5;
+    entry.flag = Flag::Pick;
+    entry.color_label = Some(ColorLabel::Blue);
+    let uuid = entry.uuid.clone();
+    let node = project.graph.add_node(NodeKind::Exposure, [0.0; 2]);
+    let exposure = project.graph.node_mut(node).unwrap();
+    exposure.mode = Mode::Individual;
+    exposure.set_param("ev", id, 1.5);
+    fs::rename(from, &to).unwrap();
+    let mut scan = project.list_catalog(&t.0, false, &supported, &mut |_| true);
+    assert!(scan.entries.is_empty());
+    assert!(scan.hashes[0].id.is_none());
+    let relinked = scan.finish_hash(&mut project, 0, content_hash(&to)).unwrap();
+    assert_eq!((relinked.id, relinked.uuid, relinked.rating, relinked.flag, relinked.color_label), (id, uuid, 5, Flag::Pick, Some(ColorLabel::Blue)));
+    assert_eq!(relinked.path, to);
+    assert_eq!(scan.report.relinked, [id]);
+    assert_eq!(project.graph.node(node).unwrap().param("ev", id), 1.5);
+    assert_eq!(project.images().len(), 1);
+}
+
+#[test]
+fn staged_capture_date_uses_mtime_until_exif_is_available() {
+    let t = Tmp::new();
+    t.write("a.raw", "a");
+    t.write("b.raw", "b");
+    let mut project = Project::new();
+    let scan = project.list_catalog(&t.0, false, &supported, &mut |_| true);
+    let [a, b] = [scan.entries[0].id, scan.entries[1].id];
+    project.image_mut(a).unwrap().modified_unix_ms = Some(200);
+    project.image_mut(b).unwrap().modified_unix_ms = Some(100);
+    assert_eq!(project.sorted(&[a, b], SortKey::CaptureDate, false), [b, a]);
+    project.finish_capture(a, Some(CaptureInfo { captured_unix_ms: Some(50), ..Default::default() }));
+    assert_eq!(project.sorted(&[a, b], SortKey::CaptureDate, false), [a, b]);
+    assert_eq!(project.sorted(&[a, b], SortKey::ModifiedDate, false), [b, a]);
+}
+
+#[test]
+fn listing_sort_matches_natural_path_order() {
+    let root = Path::new("/photos");
+    let names = ["b/img10.raw", "b/img2.raw", "a.raw", "B/x.raw", "a/z.raw", "img007.raw", "img7.raw", "Ä/1.raw", "a10/1.raw", "a9/1.raw"];
+    let mut files: Vec<(PathBuf, ())> = names.iter().map(|n| (root.join(n), ())).collect();
+    let mut expected: Vec<PathBuf> = files.iter().map(|f| f.0.clone()).collect();
+    expected.sort_by(|a, b| util::path_cmp(a, b));
+    util::sort_under(root, &mut files);
+    assert_eq!(files.into_iter().map(|f| f.0).collect::<Vec<_>>(), expected);
+}
+
+#[test]
+fn manual_relink_of_a_pending_entry_checks_size_and_fills_the_hash() {
+    let t = Tmp::new();
+    let from = t.write("a.raw", "photo");
+    let mut project = Project::new();
+    let scan = project.list_catalog(&t.0, false, &supported, &mut |_| true);
+    let id = scan.entries[0].id;
+    let to = t.path("moved.raw");
+    fs::rename(&from, &to).unwrap();
+    let other = t.write("other.raw", "different size");
+    assert!(project.relink(id, &other, false).is_err(), "size still guards a pending entry");
+    project.relink(id, &to, false).unwrap();
+    assert_eq!(project.image(id).unwrap().content_hash, content_hash(&to).unwrap().0);
+}

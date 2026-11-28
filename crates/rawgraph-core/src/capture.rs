@@ -15,6 +15,12 @@ pub struct CaptureInfo {
     /// Aperture as f-number.
     pub aperture: Option<f32>,
     pub flash_fired: Option<bool>,
+    /// EXIF camera-local time on the Unix timeline (no assumed timezone offset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_unix_ms: Option<i64>,
+    /// The catalog has not tried to extract capture metadata yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scan_pending: bool,
     /// `Some(true)` = RAW/DNG sensor data, `Some(false)` = rendered file
     /// (JPEG/PNG/TIFF), `None` = unknown.
     #[serde(default)]
