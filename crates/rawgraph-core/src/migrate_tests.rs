@@ -39,7 +39,7 @@ fn doc(nodes: Vec<Value>, edges: &[(u64, u64, u64, u64)]) -> String {
 
 fn load(text: &str) -> (Graph, Vec<String>) {
     let (g, notes) = Graph::from_json_with_notes(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
-    assert_eq!(g.to_json().matches("\"format_version\": 4").count(), 1, "saved as the current format");
+    assert_eq!(g.to_json().matches("\"format_version\": 5").count(), 1, "saved as the current format");
     (g, notes)
 }
 
@@ -717,7 +717,7 @@ fn version_1_sub_graphs_with_masks_migrate_and_paste() {
     assert_eq!(ids.len(), 3);
     assert_eq!(g.node(ids[0]).unwrap().exposed_inputs().iter().flatten().count(), 1);
     assert!(g.edges().iter().any(|e| e.from == ids[1] && e.to == ids[0] && e.to_port == 1));
-    assert!(sub.to_json().contains("\"format_version\": 3"));
+    assert!(sub.to_json().contains("\"format_version\": 4"));
 }
 
 #[test]
@@ -732,3 +732,72 @@ fn format_2_sub_graphs_load_unchanged() {
     assert!(notes.is_empty());
     assert_eq!(back, sub);
 }
+
+// ---------------------------------------------------------------- keywords (graph format 5)
+
+fn meta_keywords(g: &Graph, id: u64, image: u64) -> bool {
+    n(g, id).toggle("meta_keywords", ImageId(image))
+}
+
+#[test]
+fn old_exports_keep_their_metadata_choice_for_keywords() {
+    let off = json!({"meta_camera": 0.0, "meta_exposure": 0.0, "meta_date": 0.0, "meta_author": 0.0, "meta_software": 0.0});
+    let mut some = off.clone();
+    some["meta_date"] = json!(1.0);
+    let mut gps_only = off.clone();
+    gps_only["meta_gps"] = json!(1.0);
+    for (all, want, what) in [
+        (json!({}), true, "defaults copy metadata"),
+        (off.clone(), false, "all old toggles off"),
+        (some, true, "one toggle on"),
+        (gps_only, true, "GPS only still copied metadata"),
+    ] {
+        for version in [2, 4] {
+            let text = doc_v(version, vec![node(1, "Source", json!({})), node(2, "Export", all.clone())], &[(1, 0, 2, 0)]);
+            let (g, _) = load(&text);
+            assert_eq!(meta_keywords(&g, 2, 1), want, "{what} (format {version})");
+        }
+    }
+    // A per-image override that differs from the node-wide choice is carried over.
+    let mut text: Value = serde_json::from_str(&doc_v(4, vec![node(1, "Source", json!({})), node(2, "Export", off)], &[(1, 0, 2, 0)])).unwrap();
+    text["nodes"]["2"]["mode"] = json!("Individual");
+    text["nodes"]["2"]["individual"] = json!({"7": {"meta_camera": 1.0}});
+    let (g, _) = load(&text.to_string());
+    assert!(!meta_keywords(&g, 2, 1));
+    assert!(meta_keywords(&g, 2, 7));
+    // Format 5 files are not touched: an absent toggle stays on.
+    let off5 = json!({"meta_camera": 0.0, "meta_exposure": 0.0, "meta_date": 0.0, "meta_author": 0.0, "meta_software": 0.0});
+    let (g, _) = load(&doc_v(5, vec![node(1, "Source", json!({})), node(2, "Export", off5)], &[(1, 0, 2, 0)]));
+    assert!(meta_keywords(&g, 2, 1));
+}
+
+#[test]
+fn old_sub_graph_exports_keep_their_metadata_choice_for_keywords() {
+    for (all, want) in [(json!({}), true), (json!({"meta_camera": 0.0, "meta_exposure": 0.0, "meta_date": 0.0, "meta_author": 0.0, "meta_software": 0.0}), false)] {
+        let text = json!({"format_version": 3, "nodes": [sub_node("Export", all.clone())], "edges": []}).to_string();
+        let sub = Subgraph::from_json(&text).unwrap();
+        let mut g = Graph::new();
+        let ids = g.insert_subgraph(&sub, [0.0, 0.0]);
+        assert_eq!(g.node(ids[0]).unwrap().toggle("meta_keywords", A), want, "{all}");
+    }
+}
+
+#[test]
+fn a_build_before_keywords_reports_this_format_as_newer() {
+    // Main (format 4) refuses what this build (format 5) writes: simulate the check with the numbers.
+    assert_eq!((GRAPH_FORMAT_VERSION, crate::graph::SUBGRAPH_FORMAT_VERSION), (5, 4));
+    let text = Graph::new().to_json().replace("\"format_version\": 5", "\"format_version\": 6");
+    assert!(matches!(Graph::from_json(&text), Err(GraphError::UnsupportedVersion(6))));
+}
+
+#[test]
+fn a_newer_file_is_refused_before_its_contents_are_read() {
+    // A future node kind or data variant must give "newer", not "not valid".
+    let g = format!(r#"{{"format_version": {}, "nodes": {{"1": {{"kind": "SomethingFromTheFuture"}}}}, "edges": []}}"#, crate::GRAPH_FORMAT_VERSION + 1);
+    assert_eq!(Graph::from_json(&g), Err(GraphError::UnsupportedVersion(crate::GRAPH_FORMAT_VERSION + 1)));
+    let sub = format!(r#"{{"format_version": {}, "nodes": [{{"kind": "SomethingFromTheFuture"}}], "edges": []}}"#, crate::graph::SUBGRAPH_FORMAT_VERSION + 1);
+    let err = crate::Subgraph::from_json(&sub).unwrap_err();
+    assert_eq!(err, GraphError::UnsupportedSubgraphVersion(crate::graph::SUBGRAPH_FORMAT_VERSION + 1));
+    assert!(err.to_string().contains(&format!("({})", crate::graph::SUBGRAPH_FORMAT_VERSION)), "{err}");
+}
+

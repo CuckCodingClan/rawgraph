@@ -125,6 +125,14 @@ fn compact(v: f32) -> String {
 pub fn summary_rows(node: &rawgraph_core::Node, image: ImageId) -> Vec<(String, String)> {
     if node.kind == NodeKind::MetadataFilter {
         let measure = node.choice("measure", image);
+        if measure == rawgraph_core::Measure::Keyword as usize {
+            let text = match node.data(image) {
+                Some(rawgraph_core::NodeData::Keyword(t)) if !t.is_empty() => format!("\"{t}\""),
+                _ => "any keyword".to_owned(),
+            };
+            let op = ["contains", "does not contain"].get(node.choice("keyword_op", image)).copied().unwrap_or("contains");
+            return vec![("Keyword".to_owned(), format!("{op} {text}")), (String::new(), if node.toggle("invert", image) { "inverted".to_owned() } else { String::new() })];
+        }
         let name = ["ISO", "Shutter", "Aperture", "EV100", "Flash"].get(measure).copied().unwrap_or("Value");
         let (lo, hi) = (node.param("min", image), node.param("max", image));
         let lo_t = if lo <= 0.0 { "0".to_owned() } else { compact(lo) };

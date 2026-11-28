@@ -583,6 +583,7 @@ pub(crate) fn export_metadata_fallback(path: &Path) -> crate::ExportMetadata {
                 )
             }),
             description: None,
+            keywords: Vec::new(),
         })
     })
     .unwrap_or_default()

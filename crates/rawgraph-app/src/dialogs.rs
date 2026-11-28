@@ -98,16 +98,17 @@ pub enum XmpAction {
 pub fn xmp_window(ctx: &egui::Context, area: egui::Rect, d: &mut XmpDialog, running: Option<(usize, usize)>) -> XmpAction {
     let mut action = XmpAction::None;
     let mut open = true;
-    egui::Window::new("Import ratings from XMP").open(&mut open).collapsible(false).resizable(false).constrain_to(area).default_pos(area.center() - egui::vec2(220.0, 150.0)).show(ctx, |ui| {
+    egui::Window::new("Import ratings and keywords from XMP").open(&mut open).collapsible(false).resizable(false).constrain_to(area).default_pos(area.center() - egui::vec2(220.0, 150.0)).show(ctx, |ui| {
         ui.set_min_width(440.0);
-        ui.label("Reads star ratings, reject marks and colour labels. The image files and their XMP sidecars are only read, never changed.");
+        ui.label("Reads star ratings, reject marks, colour labels and keywords. The image files and their XMP sidecars are only read, never changed.");
         ui.add_space(4.0);
         ui.add_enabled_ui(running.is_none(), |ui| {
             ui.checkbox(&mut d.opts.sidecars, "Sidecar files (.xmp)");
             ui.checkbox(&mut d.opts.embedded, "Embedded in the files");
             ui.checkbox(&mut d.opts.only_unrated, "Only images I have not rated here");
+            ui.checkbox(&mut d.opts.merge_keywords, "Merge keywords").on_hover_text("Adds the keywords of dc:subject and lr:hierarchicalSubject to the images; keywords already there stay");
         });
-        ui.label(RichText::new("When an image has both, the sidecar wins.").weak().small());
+        ui.label(RichText::new("When an image has both, the sidecar wins for the rating; keywords of both are merged.").weak().small());
         ui.add_space(6.0);
         match running {
             Some((done, total)) => {

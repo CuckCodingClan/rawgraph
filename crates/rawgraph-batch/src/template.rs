@@ -1,4 +1,4 @@
-//! File-name templates: `{name}`, `{index}`, `{index:04}`, `{id}`, and the caption-sheet tokens
+//! File-name templates: `{name}`, `{index}`, `{index:04}`, `{id}`, `{keywords}`, and the caption-sheet tokens
 //! `{sheet_name}` (sheet column B), `{caption}` (column C) and `{no}` / `{no:03}` (photo number).
 
 use rawgraph_rename::SheetBinding;
@@ -14,6 +14,8 @@ pub(crate) enum Token {
     Caption,
     /// Photo number found in the file name, zero-padded to this width.
     No(usize),
+    /// The keywords of the image, file-name safe (see `rawgraph_core::keywords::keywords_file_token`).
+    Keywords,
 }
 
 const INVALID_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
@@ -58,6 +60,7 @@ pub(crate) fn parse(template: &str) -> Result<Vec<Token>, String> {
                 tokens.push(match body.as_str() {
                     "name" => Token::Name,
                     "id" => Token::Id,
+                    "keywords" => Token::Keywords,
                     "index" => Token::Index(0),
                     "sheet_name" => Token::SheetName,
                     "caption" => Token::Caption,
@@ -96,9 +99,22 @@ pub(crate) fn needs_sheet(tokens: &[Token]) -> bool {
     tokens.iter().any(|t| matches!(t, Token::SheetName | Token::Caption))
 }
 
+/// Stem used for `{keywords}` when an image has no keywords or they give no usable name (only dots,
+/// a reserved Windows device name, ...): the export never fails because of a keyword.
+pub(crate) const UNTAGGED: &str = "untagged";
+
+fn keywords_token(keywords: &[String]) -> String {
+    let token = rawgraph_core::keywords::keywords_file_token(keywords);
+    if check_stem(&token).is_ok() {
+        token
+    } else {
+        UNTAGGED.to_owned()
+    }
+}
+
 /// Fills the template. The sheet tokens fail with a plain sentence when the image has no photo number
 /// or no row in the sheet: the caller reports that for this image only.
-pub(crate) fn expand(tokens: &[Token], stem: &str, index: usize, id: u64, sheet: Option<&SheetBinding>) -> Result<String, String> {
+pub(crate) fn expand(tokens: &[Token], stem: &str, index: usize, id: u64, sheet: Option<&SheetBinding>, keywords: &[String]) -> Result<String, String> {
     let mut out = String::new();
     for t in tokens {
         match t {
@@ -116,6 +132,7 @@ pub(crate) fn expand(tokens: &[Token], stem: &str, index: usize, id: u64, sheet:
                 let n = pattern.extract(stem).ok_or_else(|| format!("no photo number found in the file name {stem:?}"))?;
                 out.push_str(&format!("{n:0w$}", w = *w));
             }
+            Token::Keywords => out.push_str(&keywords_token(keywords)),
         }
     }
     Ok(out)
@@ -143,9 +160,9 @@ mod tests {
     #[test]
     fn parses_and_expands() {
         let t = parse("{name}_{index:04}-{id}").unwrap_or_default();
-        assert_eq!(expand(&t, "IMG", 7, 42, None).unwrap(), "IMG_0007-42");
+        assert_eq!(expand(&t, "IMG", 7, 42, None, &[]).unwrap(), "IMG_0007-42");
         let t = parse("x{index}").unwrap_or_default();
-        assert_eq!(expand(&t, "a", 12, 1, None).unwrap(), "x12");
+        assert_eq!(expand(&t, "a", 12, 1, None, &[]).unwrap(), "x12");
     }
 
     #[test]
@@ -155,15 +172,33 @@ mod tests {
         let b = SheetBinding { sheet: CaptionSheet::from_cells(&cells, &SheetColumns::default()).unwrap(), pattern: NumberPattern::default() };
         let t = parse("{sheet_name}_{caption}_{no:04}_{no}").unwrap();
         assert!(needs_sheet(&t));
-        assert_eq!(expand(&t, "Job-0076", 1, 1, Some(&b)).unwrap(), "076_Anna_Anna Berger_0076_76");
+        assert_eq!(expand(&t, "Job-0076", 1, 1, Some(&b), &[]).unwrap(), "076_Anna_Anna Berger_0076_76");
         // No row, no number, no sheet: a plain error per image, never a fallback name.
-        assert!(expand(&t, "Job-0077", 1, 1, Some(&b)).unwrap_err().contains("no row"));
-        assert!(expand(&t, "Job", 1, 1, Some(&b)).unwrap_err().contains("no photo number"));
-        assert!(expand(&t, "Job-0076", 1, 1, None).unwrap_err().contains("caption sheet"));
+        assert!(expand(&t, "Job-0077", 1, 1, Some(&b), &[]).unwrap_err().contains("no row"));
+        assert!(expand(&t, "Job", 1, 1, Some(&b), &[]).unwrap_err().contains("no photo number"));
+        assert!(expand(&t, "Job-0076", 1, 1, None, &[]).unwrap_err().contains("caption sheet"));
         // {no} alone needs no sheet.
-        assert_eq!(expand(&parse("x{no:03}").unwrap(), "IMG_5", 1, 1, None).unwrap(), "x005");
+        assert_eq!(expand(&parse("x{no:03}").unwrap(), "IMG_5", 1, 1, None, &[]).unwrap(), "x005");
         assert!(!needs_sheet(&parse("{no}").unwrap()));
         assert!(parse("{no:}").is_err() && parse("{no:99}").is_err());
+        // The keyword token combines with the sheet tokens in one template.
+        let t = parse("{sheet_name}_{keywords}").unwrap();
+        assert_eq!(expand(&t, "Job-0076", 1, 1, Some(&b), &["Rome".to_owned()]).unwrap(), "076_Anna_Rome");
+    }
+
+    #[test]
+    fn keywords_token_expands_file_name_safe() {
+        let kw = ["Travel|Italy|Rome".to_owned(), "a/b: c".to_owned(), "Ärger".to_owned()];
+        let t = parse("{name}_{keywords}").unwrap_or_default();
+        assert_eq!(expand(&t, "IMG", 1, 1, None, &kw).unwrap(), "IMG_Rome-a_b_ c-Ärger", "last levels, joined by -, unsafe characters replaced");
+        assert_eq!(expand(&t, "IMG", 1, 1, None, &[]).unwrap(), "IMG_untagged");
+        for odd in [["..."], ["CON"], ["con"], ["  "]] {
+            let kw = odd.map(str::to_owned);
+            assert_eq!(expand(&t, "IMG", 1, 1, None, &kw).unwrap(), "IMG_untagged", "{odd:?}");
+        }
+        assert_eq!(expand(&parse("{keywords}").unwrap_or_default(), "IMG", 1, 1, None, &["Nul".to_owned()]).unwrap(), "untagged");
+        let long: Vec<String> = (0..100).map(|i| format!("keyword{i}")).collect();
+        assert!(expand(&t, "IMG", 1, 1, None, &long).unwrap().chars().count() <= 4 + 80, "the token is limited to 80 characters");
     }
 
     #[test]

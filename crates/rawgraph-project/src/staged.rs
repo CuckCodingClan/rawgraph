@@ -148,7 +148,7 @@ impl Project {
         let e = ImageEntry {
             id, uuid: ids::new_uuid(), path, file_size: size, modified_unix_ms: mtime,
             content_hash: String::new(), capture: pending_capture(), rating: 0,
-            flag: Flag::None, color_label: None, missing: false,
+            flag: Flag::None, color_label: None, keywords: Vec::new(), missing: false,
         };
         self.images.push(e.clone());
         e

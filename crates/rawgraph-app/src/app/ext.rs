@@ -464,11 +464,14 @@ impl App {
     }
 
     /// Applies what a finished read found and fills the dialog's summary.
-    fn apply_xmp(&mut self, found: &XmpFound, elapsed_ms: u128) {
+    pub(super) fn apply_xmp(&mut self, found: &XmpFound, elapsed_ms: u128) {
         let (summary, changed) = xmp_import::apply(&mut self.session.project, found);
         if !changed.is_empty() {
-            self.session.touch();
-            self.session.refresh_visible();
+            // Provider captures and `images_gen` too, so Keyword filters and splits update at once.
+            self.session.after_keyword_edit(&changed);
+            if self.session.scanning {
+                self.session.refresh_visible();
+            }
         }
         eprintln!(
             "XMP import: {} checked, {} changed, {} unchanged, {} without XMP, {} errors in {elapsed_ms} ms",
@@ -517,7 +520,8 @@ impl App {
         if self.cli.import_xmp || self.session.demo {
             return;
         }
-        let opts = xmp_import::XmpOptions::default();
+        // The quiet look only counts ratings; keywords are merged by the import dialog.
+        let opts = xmp_import::XmpOptions { merge_keywords: false, ..Default::default() };
         let (targets, skipped) = xmp_import::pick_targets(self.session.project.images(), &opts);
         if targets.is_empty() {
             return;

@@ -1849,13 +1849,17 @@ impl App {
         cmds
     }
 
-    /// 0-5 rating, P/X/U flags, 6-9 colour labels (when no text field has focus).
+    /// 0-5 rating, P/X/U flags, 6-9 colour labels, K for the keyword field (when no text field has focus).
     fn handle_culling(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() || self.session.demo {
             return;
         }
-        let Some(id) = self.session.selected else { return };
         let pressed = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+        // K: type a keyword (the add field of the keyword panel takes the focus).
+        if pressed(Key::K) && !self.session.selected_images().is_empty() {
+            self.filmstrip.keyword_panel.focus_add = true;
+        }
+        let Some(id) = self.session.selected else { return };
         let ratings = [(Key::Num0, 0u8), (Key::Num1, 1), (Key::Num2, 2), (Key::Num3, 3), (Key::Num4, 4), (Key::Num5, 5)];
         for (k, r) in ratings {
             if pressed(k) {
@@ -2613,7 +2617,7 @@ impl App {
                 item(ui, cmds, "New project", Command::NewProject, true);
                 item(ui, cmds, "Open project...", Command::OpenProject, true);
                 item(ui, cmds, "Open folder...", Command::OpenFolder, true);
-                item(ui, cmds, "Import ratings from XMP...", Command::ImportXmp, true);
+                item(ui, cmds, "Import ratings and keywords from XMP...", Command::ImportXmp, true);
                 ui.separator();
                 item(ui, cmds, "Save", Command::Save, true);
                 item(ui, cmds, "Save as...", Command::SaveAs, true);
@@ -2949,7 +2953,7 @@ Click to dismiss")).clicked();
                 ("Ctrl+Shift+K", "Scopes window"),
                 ("Right-click image", "Set as reference, locate a missing file"),
                 ("Right-click graph", "Paste here, Recipes"),
-                ("File > Import ratings from XMP", "Stars, rejects and labels from XMP"),
+                ("File > Import ratings and keywords from XMP", "Stars, rejects, labels and keywords from XMP"),
                 ("View > Clear thumbnail cache", "Deletes the thumbnails kept on disk"),
             ];
             egui::Grid::new("shortcut_grid").num_columns(2).spacing([20.0, 4.0]).show(ui, |ui| {
@@ -3124,6 +3128,9 @@ Click to dismiss")).clicked();
             egui::Panel::bottom(("filmstrip-info", epoch)).resizable(false).show_separator_line(true).show(ui, |ui| {
                 ui.add_space(4.0);
                 Filmstrip::capture_info(ui, &self.session, target.image);
+                ui.add_space(4.0);
+                ui.separator();
+                self.filmstrip.keywords_ui(ui, &mut self.session);
                 ui.add_space(4.0);
             });
             // A Source is just folder membership. Don't hold its newly listed
@@ -3302,8 +3309,11 @@ impl eframe::App for App {
         self.start_queued_scan(&ctx);
         self.cli_run_export_node(&ctx);
 
+        self.session.reconcile_image_selection();
         let mut cmds = self.handle_shortcuts(&ctx);
         if self.prompt.is_none() && !self.save_flow.is_open() {
+            // A K request of the last frame for a keyword panel that was not drawn is dropped.
+            self.filmstrip.end_frame();
             self.handle_culling(&ctx);
             self.handle_compare_keys(&ctx);
         }
@@ -3538,6 +3548,17 @@ pub fn apply_cli_state(session: &mut Session, cli: &Cli) {
             eprintln!("--rate: there is no image {image}");
         }
     }
+    for (image, keywords) in &cli.keyword {
+        if let Some(id) = session.visible().get(*image).copied() {
+            session.edit_keywords(&[id], |list| rawgraph_project::add_keywords_to_list(list, keywords));
+        } else {
+            eprintln!("--keyword: there is no image {image}");
+        }
+    }
+    if !cli.filter_keyword.is_empty() {
+        session.filter.keywords = cli.filter_keyword.clone();
+        session.refresh_visible();
+    }
     for &(image, flag) in &cli.flag {
         if let Some(id) = session.visible().get(image).copied() {
             session.set_flag(id, flag);
@@ -3572,6 +3593,15 @@ pub fn apply_cli_state(session: &mut Session, cli: &Cli) {
     }
     if let Some(i) = cli.select_image {
         session.select_index(i);
+    }
+    if let Some((a, b)) = cli.select_range {
+        let ids = session.visible().to_vec();
+        if let Some(first) = ids.get(a).copied() {
+            session.selected = Some(first);
+            if let Some(last) = ids.get(b).copied() {
+                session.click_image(last, false, true, &ids);
+            }
+        }
     }
     for &(node, port) in &cli.disconnect {
         if let Some(id) = session.node_by_index(node) {
@@ -4132,5 +4162,24 @@ mod tests {
         assert_eq!(shortcut_of(Command::ToggleMaskOverlay), Some(sc(Modifiers::NONE, Key::M)));
         assert!(SHORTCUT_ORDER.contains(&Command::ToggleMaskOverlay));
     }
+
+    #[test]
+    fn xmp_import_updates_the_keywords_the_graph_sees_at_once() {
+        use crate::session::tests::{png_project, provider};
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        let photos = tempfile::tempdir().unwrap();
+        app.session = Session::new(png_project(photos.path(), 3), provider());
+        app.session.sync_paths();
+        app.session.refresh_visible();
+        let id = app.session.visible()[0];
+        let item = (id, rawgraph_project::XmpCulling { keywords: vec!["Reise|Graz".into()], ..Default::default() }, crate::xmp_import::Origin::Sidecar);
+        let found = crate::xmp_import::XmpFound { items: vec![item], ..Default::default() };
+        let gen = app.session.images_gen;
+        app.apply_xmp(&found, 0);
+        assert!(app.session.images_gen > gen, "the collection queries are recomputed");
+        assert_eq!(app.session.provider_keywords(id), vec!["Reise|Graz".to_owned()]);
+    }
+
 }
 

@@ -71,7 +71,7 @@ fn settings(out: &Path, format: ExportFormat) -> ExportSettings {
 }
 
 pub(crate) fn item(id: u64, p: PathBuf) -> ExportItem {
-    ExportItem { id: ImageId(id), source: p }
+    ExportItem { id: ImageId(id), source: p, keywords: Vec::new() }
 }
 
 fn run(g: &Graph, n: NodeId, items: &[ExportItem], s: &ExportSettings) -> ExportReport {
@@ -1069,4 +1069,66 @@ fn caption_sheet_names_and_a_missing_row_fails_only_that_image() {
     let report = run(&g, out, &items[..2], &s);
     assert_eq!(report.written(), 2);
     assert!(files_in(&t.path("out")).contains(&"0076_Anna_Job-0076.png".to_string()));
+}
+
+// ------------------------------------------------------------------------------ keywords in names and files
+
+#[test]
+fn an_unusable_keywords_token_never_aborts_the_batch() {
+    let t = TempDir::new();
+    let tags: [&[&str]; 4] = [&[], &["CON"], &["..."], &["Rome"]];
+    let items: Vec<_> = tags
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let p = t.path(&format!("src/s{i}.png"));
+            write_grey(&p, 8, 6, 60);
+            ExportItem { id: ImageId(i as u64 + 1), source: p, keywords: k.iter().map(|s| (*s).to_owned()).collect() }
+        })
+        .collect();
+    let (g, _, out) = make_graph(0.0);
+    let mut s = settings(&t.path("out"), ExportFormat::Png);
+    s.name_template = "{keywords}".into();
+    s.on_conflict = OnConflict::Rename;
+    let report = run(&g, out, &items, &s);
+    assert_eq!((report.written(), report.failed()), (4, 0), "{:?}", report.items);
+    let names: Vec<String> = report.items.iter().map(|(_, st)| written_path(st).file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned()).collect();
+    assert_eq!(names, ["untagged.png", "untagged (2).png", "untagged (3).png", "Rome.png"]);
+}
+
+#[test]
+fn a_name_that_cannot_be_built_fails_only_its_own_item() {
+    let t = TempDir::new();
+    let good = |n: &str, id: u64| {
+        let p = t.path(&format!("src/{n}"));
+        write_grey(&p, 8, 6, 60);
+        item(id, p)
+    };
+    // The source named like a Windows device is never created: the name check rejects it first.
+    let items = vec![good("a.png", 1), item(2, t.path("src/CON.png")), good("c.png", 3)];
+    let (g, _, out) = make_graph(0.0);
+    let s = settings(&t.path("out"), ExportFormat::Png);
+    let report = run(&g, out, &items, &s);
+    assert_eq!((report.written(), report.failed()), (2, 1), "{:?}", report.items);
+    assert!(matches!(&report.items[1].1, ItemStatus::Failed(m) if m.contains("reserved")), "{:?}", report.items[1]);
+}
+
+#[test]
+fn a_huge_keyword_list_is_cut_for_jpeg_and_reported() {
+    let t = TempDir::new();
+    let p = t.path("src/a.png");
+    write_grey(&p, 8, 6, 60);
+    let keywords: Vec<String> = (0..2000).map(|i| format!("keyword number {i:05} with some padding to make the packet grow quickly")).collect();
+    let items = vec![ExportItem { id: ImageId(1), source: p, keywords: keywords.clone() }];
+    let (g, _, out) = make_graph(0.0);
+    let mut s = settings(&t.path("out"), ExportFormat::Jpeg { quality: 90 });
+    s.copy_metadata = true;
+    s.meta = MetaSelection { camera: false, exposure: false, date: false, gps: false, author: false, software: false, keywords: true };
+    let report = run(&g, out, &items, &s);
+    assert_eq!(report.written(), 1, "{:?}", report.items);
+    let fit = rawgraph_io::jpeg_embeddable_keywords(&keywords).len();
+    let name = items[0].source.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(report.warnings, vec![(ImageId(1), format!("{name}: {} keywords not embedded (JPEG XMP limit)", 2000 - fit))], "the warning names the image");
+    let packet = rawgraph_io::read_xmp_packet(&written_path(&report.items[0].1)).unwrap_or_default();
+    assert!(packet.contains("keyword number 00000") && !packet.contains("keyword number 01999"), "the end of the list is dropped");
 }

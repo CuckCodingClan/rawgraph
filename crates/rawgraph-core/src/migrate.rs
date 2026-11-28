@@ -28,6 +28,12 @@ use crate::graph::{GraphError, GRAPH_FORMAT_VERSION, SUBGRAPH_FORMAT_VERSION};
 /// First graph / sub-graph format without the old mask nodes and ports.
 const MASK_FREE_GRAPH_FORMAT: u64 = 3;
 const MASK_FREE_SUBGRAPH_FORMAT: u64 = 2;
+/// First graph / sub-graph format whose absent Develop tone toggle means "local" (older ones assume Legacy).
+const TONE_TOGGLE_GRAPH_FORMAT: u64 = 4;
+const TONE_TOGGLE_SUBGRAPH_FORMAT: u64 = 3;
+/// First graph / sub-graph format with the Export "Keywords" toggle (`meta_keywords`).
+const KEYWORD_GRAPH_FORMAT: u64 = 5;
+const KEYWORD_SUBGRAPH_FORMAT: u64 = 4;
 
 type Obj = Map<String, Value>;
 
@@ -1201,13 +1207,69 @@ fn tone_step<'a>(nodes: impl Iterator<Item = (u64, &'a mut Obj)>, absent: Absent
     }
 }
 
+/// Export toggles that decided before format 5 whether an export copied any metadata, with their defaults.
+const OLD_META_TOGGLES: [(&str, bool); 6] = [
+    ("meta_camera", true),
+    ("meta_exposure", true),
+    ("meta_date", true),
+    ("meta_gps", false),
+    ("meta_author", true),
+    ("meta_software", true),
+];
+
+fn toggle_in(scope: Option<&Obj>, name: &str) -> Option<bool> {
+    scope?.get(name).and_then(Value::as_f64).map(|v| v >= 0.5)
+}
+
+/// Whether an export copied metadata before the Keywords toggle existed: any old metadata toggle on.
+fn copied_metadata(all: Option<&Obj>, individual: Option<&Obj>) -> bool {
+    OLD_META_TOGGLES.iter().any(|&(name, default)| toggle_in(individual, name).or_else(|| toggle_in(all, name)).unwrap_or(default))
+}
+
+/// Graph format 5 / sub-graph format 4 added the Export "Keywords" toggle (default on). Exports that copied
+/// no metadata before (every old toggle off) must not start embedding keywords, so they get it switched off;
+/// per-image overrides are compared with the node-wide value and only get an entry where they differ.
+fn keyword_step<'a>(nodes: impl Iterator<Item = &'a mut Obj>) {
+    for n in nodes {
+        if n.get("kind").and_then(Value::as_str) != Some("Export") {
+            continue;
+        }
+        let all_on = copied_metadata(n.get("all").and_then(Value::as_object), None);
+        if !all_on {
+            if let Some(Value::Object(all)) = n.get_mut("all") {
+                all.entry("meta_keywords").or_insert_with(|| json!(0.0));
+            } else {
+                n.insert("all".into(), json!({"meta_keywords": 0.0}));
+            }
+        }
+        let all_copy = n.get("all").and_then(Value::as_object).cloned();
+        if let Some(Value::Object(ind)) = n.get_mut("individual") {
+            for v in ind.values_mut() {
+                let Value::Object(p) = v else { continue };
+                if p.contains_key("meta_keywords") {
+                    continue;
+                }
+                let on = copied_metadata(all_copy.as_ref(), Some(p));
+                if on != all_on {
+                    p.insert("meta_keywords".into(), json!(if on { 1.0 } else { 0.0 }));
+                }
+            }
+        }
+    }
+}
+
 /// Rewrites an older graph document in place into the current format and returns the notes:
 /// formats 1 and 2 lose the old mask nodes and ports, formats up to 3 get the Develop tone toggle.
 pub(crate) fn migrate_graph(root: &mut Value) -> Result<Vec<String>, GraphError> {
     let Some(obj) = root.as_object_mut() else { return Ok(Vec::new()) };
     let Some(version) = obj.get("format_version").and_then(Value::as_u64) else { return Ok(Vec::new()) };
     let mut tone_notes = Vec::new();
-    if version < u64::from(GRAPH_FORMAT_VERSION) {
+    if version < KEYWORD_GRAPH_FORMAT {
+        if let Some(Value::Object(nodes)) = obj.get_mut("nodes") {
+            keyword_step(nodes.values_mut().filter_map(Value::as_object_mut));
+        }
+    }
+    if version < TONE_TOGGLE_GRAPH_FORMAT {
         if let Some(Value::Object(nodes)) = obj.get_mut("nodes") {
             // Format 3 was written both before the Legacy toggle (absent = Legacy, release 2611.002)
             // and by builds with it (absent = local): a stored toggle anywhere marks the latter.
@@ -1257,7 +1319,12 @@ pub(crate) fn migrate_subgraph(root: &mut Value) -> Result<Vec<String>, GraphErr
     let Some(obj) = root.as_object_mut() else { return Ok(Vec::new()) };
     let Some(version) = obj.get("format_version").and_then(Value::as_u64) else { return Ok(Vec::new()) };
     let mut tone_notes = Vec::new();
-    if version < u64::from(SUBGRAPH_FORMAT_VERSION) {
+    if version < KEYWORD_SUBGRAPH_FORMAT {
+        if let Some(Value::Array(nodes)) = obj.get_mut("nodes") {
+            keyword_step(nodes.iter_mut().filter_map(Value::as_object_mut));
+        }
+    }
+    if version < TONE_TOGGLE_SUBGRAPH_FORMAT {
         if let Some(Value::Array(nodes)) = obj.get_mut("nodes") {
             let absent = if version < MASK_FREE_SUBGRAPH_FORMAT {
                 AbsentTone::Legacy

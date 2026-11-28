@@ -25,7 +25,7 @@ use crate::lens::LENS_MODES;
 /// Bumped whenever the serialized graph layout changes incompatibly.
 /// Version 2 added the Layer and Export kinds, Source folders, curve sets and
 /// the Develop tone parameters; version 1 files still load.
-pub const GRAPH_FORMAT_VERSION: u32 = 4;
+pub const GRAPH_FORMAT_VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -179,6 +179,16 @@ pub struct Catalog<'a> {
 /// (or no capture info) follows the `missing` option and is not flipped.
 pub fn metadata_filter_matches(node: &Node, image: ImageId, capture: Option<&CaptureInfo>) -> bool {
     let measure = Measure::from_index(node.choice("measure", image)).unwrap_or(Measure::Iso);
+    if measure == Measure::Keyword {
+        // Text measure: an image without keywords is not "missing", it simply contains nothing.
+        let text = match node.data(image) {
+            Some(NodeData::Keyword(t)) => t.as_str(),
+            _ => "",
+        };
+        let has = capture.is_some_and(|c| crate::keywords::keywords_contain_text(&c.keywords, text));
+        let matches = has != (node.choice("keyword_op", image) == 1);
+        return matches != node.toggle("invert", image);
+    }
     match capture.and_then(|c| c.measure(measure)) {
         Some(v) => {
             let inside = node.param("min", image) <= v && v <= node.param("max", image);
@@ -328,6 +338,9 @@ const CLARITY_PARAMS: &[ParamSpec] = &[
     p("texture", "Texture", "", -1.0, 1.0, 0.0),
 ];
 const MEASURE_OPTIONS: &[&str] = &Measure::LABELS;
+/// The two tests of the Keyword measure.
+pub const KEYWORD_OPS: [&str; 2] = ["contains", "does not contain"];
+const KEYWORD_OP_OPTIONS: &[&str] = &KEYWORD_OPS;
 const MISSING_OPTIONS: &[&str] = &["Exclude", "Include"];
 const METADATA_FILTER_PARAMS: &[ParamSpec] = &[
     choice("measure", "Measure", MEASURE_OPTIONS, 0),
@@ -335,6 +348,8 @@ const METADATA_FILTER_PARAMS: &[ParamSpec] = &[
     plog("max", "Maximum", "", -100.0, 1_000_000.0, 1_000_000.0),
     toggle("invert", "Invert", false),
     choice("missing", "Missing metadata", MISSING_OPTIONS, 0),
+    // Keyword measure only (appended): how the text is tested.
+    choice("keyword_op", "Keyword test", KEYWORD_OP_OPTIONS, 0),
 ];
 const IMAGE_OUTPUTS: &[OutputSpec] = &[OutputSpec { label: "Images", ty: PortType::Images }];
 const NO_OUTPUTS: &[OutputSpec] = &[];
@@ -508,6 +523,7 @@ const EXPORT_PARAMS: &[ParamSpec] = &[
     toggle("meta_gps", "GPS location", false),
     toggle("meta_author", "Author", true),
     toggle("meta_software", "Software", true),
+    toggle("meta_keywords", "Keywords", true),
 ];
 const DRAW_PARAMS: &[ParamSpec] = &[
     p("width", "Width", "px", 1.0, 8192.0, 1024.0),
@@ -517,6 +533,8 @@ const SPLIT_MISSING_OPTIONS: &[&str] = &["Unmatched", "Exclude"];
 const METADATA_SPLIT_PARAMS: &[ParamSpec] = &[
     choice("measure", "Measure", MEASURE_OPTIONS, 0),
     choice("missing", "Missing metadata", SPLIT_MISSING_OPTIONS, 0),
+    // Keyword measure only (appended): how each range name is tested.
+    choice("keyword_op", "Keyword test", KEYWORD_OP_OPTIONS, 0),
 ];
 
 /// ASC-CDL style parameters derived from a ColorWheels node for one image.
@@ -785,6 +803,7 @@ impl NodeKind {
             NodeKind::Generator => &[DataKind::GradientRamp],
             NodeKind::Draw => &[DataKind::Strokes],
             NodeKind::MetadataSplit => &[DataKind::Ranges],
+            NodeKind::MetadataFilter => &[DataKind::Keyword],
             NodeKind::Source => &[DataKind::Folder],
             NodeKind::Export => &[DataKind::Export],
             NodeKind::Lut => &[DataKind::LutFile],
@@ -834,6 +853,8 @@ pub enum NodeData {
     Export(ExportText),
     /// LUT: absolute path of the `.cube` file; "" = none chosen.
     LutFile(String),
+    /// Metadata Filter with the Keyword measure: the text to look for.
+    Keyword(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -846,6 +867,7 @@ pub enum DataKind {
     CurveSet,
     Export,
     LutFile,
+    Keyword,
 }
 
 impl NodeData {
@@ -859,6 +881,7 @@ impl NodeData {
             NodeData::CurveSet(_) => DataKind::CurveSet,
             NodeData::Export(_) => DataKind::Export,
             NodeData::LutFile(_) => DataKind::LutFile,
+            NodeData::Keyword(_) => DataKind::Keyword,
         }
     }
 }
@@ -902,6 +925,7 @@ fn validate_data(kind: NodeKind, data: &NodeData) -> Result<(), String> {
         }
         NodeData::Folder(path) => validate_text("folder", path)?,
         NodeData::LutFile(path) => validate_text("LUT file", path)?,
+        NodeData::Keyword(text) => validate_text("keyword", text)?,
         NodeData::Export(t) => {
             validate_text("output folder", &t.out_dir)?;
             validate_text("name template", &t.name_template)?;
@@ -1217,6 +1241,8 @@ pub enum GraphError {
     TypeMismatch { expected: PortType, found: PortType },
     WouldCycle,
     UnsupportedVersion(u32),
+    /// A sub-graph (clipboard, recipe) of a newer format.
+    UnsupportedSubgraphVersion(u32),
     Parse(String),
 }
 
@@ -1232,6 +1258,9 @@ impl std::fmt::Display for GraphError {
             GraphError::WouldCycle => write!(f, "connection would create a cycle"),
             GraphError::UnsupportedVersion(v) => {
                 write!(f, "graph format version {v} is newer than this build supports ({GRAPH_FORMAT_VERSION})")
+            }
+            GraphError::UnsupportedSubgraphVersion(v) => {
+                write!(f, "sub-graph format version {v} is newer than this build supports ({SUBGRAPH_FORMAT_VERSION})")
             }
             GraphError::Parse(e) => write!(f, "graph file is not valid: {e}"),
         }
@@ -1283,6 +1312,17 @@ fn source_folder(n: &Node) -> Option<(&str, bool)> {
 /// image's capture (see [`Graph::split_port`]).
 fn split_value(n: &Node, image: ImageId, cap: Option<&CaptureInfo>) -> Option<usize> {
     let measure = Measure::from_index(n.choice("measure", image)).unwrap_or(Measure::Iso);
+    if measure == Measure::Keyword {
+        // Each named range is a keyword test (first match wins); the rest is unmatched. "Missing
+        // metadata" does not apply: an image without keywords contains nothing.
+        let keywords: &[String] = cap.map_or(&[], |c| c.keywords.as_slice());
+        let negate = n.choice("keyword_op", image) == 1;
+        let port = match n.data(image) {
+            Some(NodeData::Ranges(ranges)) => ranges.iter().position(|r| crate::keywords::keywords_contain_text(keywords, &r.name) != negate),
+            _ => None,
+        };
+        return Some(port.unwrap_or(SPLIT_UNMATCHED_PORT));
+    }
     let Some(value) = cap.and_then(|c| c.measure(measure)) else {
         return if n.choice("missing", image) == 1 { None } else { Some(SPLIT_UNMATCHED_PORT) };
     };
@@ -2118,6 +2158,10 @@ impl Graph {
     /// The list is empty for a graph that needed no changes.
     pub fn from_json_with_notes(text: &str) -> Result<(Self, Vec<String>), GraphError> {
         let mut value: serde_json::Value = serde_json::from_str(text).map_err(|e| GraphError::Parse(e.to_string()))?;
+        // Before anything is parsed: a newer file may hold node kinds or data this build does not know.
+        if let Some(v) = value.get("format_version").and_then(serde_json::Value::as_u64).filter(|v| *v > u64::from(GRAPH_FORMAT_VERSION)) {
+            return Err(GraphError::UnsupportedVersion(u32::try_from(v).unwrap_or(u32::MAX)));
+        }
         let notes = crate::migrate::migrate_graph(&mut value)?;
         let mut graph: Graph = serde_json::from_value(value).map_err(|e| GraphError::Parse(e.to_string()))?;
         if graph.format_version > GRAPH_FORMAT_VERSION {
@@ -2242,7 +2286,7 @@ impl Graph {
 }
 
 /// Bumped whenever the serialized sub-graph layout changes incompatibly.
-pub const SUBGRAPH_FORMAT_VERSION: u32 = 3;
+pub const SUBGRAPH_FORMAT_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SubNode {
@@ -2310,10 +2354,13 @@ impl Subgraph {
     /// (copied or saved as a recipe before the mask nodes were removed).
     pub fn from_json_with_notes(text: &str) -> Result<(Subgraph, Vec<String>), GraphError> {
         let mut value: serde_json::Value = serde_json::from_str(text).map_err(|e| GraphError::Parse(e.to_string()))?;
+        if let Some(v) = value.get("format_version").and_then(serde_json::Value::as_u64).filter(|v| *v > u64::from(SUBGRAPH_FORMAT_VERSION)) {
+            return Err(GraphError::UnsupportedSubgraphVersion(u32::try_from(v).unwrap_or(u32::MAX)));
+        }
         let notes = crate::migrate::migrate_subgraph(&mut value)?;
         let sub: Subgraph = serde_json::from_value(value).map_err(|e| GraphError::Parse(e.to_string()))?;
         if sub.format_version > SUBGRAPH_FORMAT_VERSION {
-            return Err(GraphError::UnsupportedVersion(sub.format_version));
+            return Err(GraphError::UnsupportedSubgraphVersion(sub.format_version));
         }
         for (i, e) in sub.edges.iter().enumerate() {
             if e.from >= sub.nodes.len() || e.to >= sub.nodes.len() {
@@ -2560,7 +2607,7 @@ mod tests {
 
     #[test]
     fn newer_format_versions_are_refused() {
-        let text = Graph::new().to_json().replace("\"format_version\": 4", "\"format_version\": 999");
+        let text = Graph::new().to_json().replace("\"format_version\": 5", "\"format_version\": 999");
         assert_eq!(Graph::from_json(&text), Err(GraphError::UnsupportedVersion(999)));
         assert!(matches!(Graph::from_json("not json"), Err(GraphError::Parse(_))));
     }
@@ -2693,7 +2740,7 @@ mod tests {
         assert_eq!((n.param("min", A), n.param("max", A)), (0.0, 1_000_000.0));
 
         // Choice: nearest index, clamped into 0..len-1.
-        for (input, expect) in [(2.4, 2), (2.6, 3), (-3.0, 0), (99.0, 4), (f32::INFINITY, 0)] {
+        for (input, expect) in [(2.4, 2), (2.6, 3), (-3.0, 0), (99.0, 5), (f32::INFINITY, 0)] {
             n.set_param("measure", A, input);
             assert_eq!(n.choice("measure", A), expect, "input {input}");
         }
@@ -2766,8 +2813,8 @@ mod tests {
         };
         assert!(load(&|_| {}).is_ok());
         assert_rejected(load(&|v| v["nodes"]["1"]["all"]["measure"] = serde_json::json!(1.5)), "not a whole option");
-        assert_rejected(load(&|v| v["nodes"]["1"]["all"]["measure"] = serde_json::json!(5)), "outside 0..4");
-        assert_rejected(load(&|v| v["nodes"]["1"]["all"]["measure"] = serde_json::json!(-1)), "outside 0..4");
+        assert_rejected(load(&|v| v["nodes"]["1"]["all"]["measure"] = serde_json::json!(6)), "outside 0..5");
+        assert_rejected(load(&|v| v["nodes"]["1"]["all"]["measure"] = serde_json::json!(-1)), "outside 0..5");
         assert_rejected(load(&|v| v["nodes"]["1"]["all"]["invert"] = serde_json::json!(0.5)), "not a whole option");
         assert_rejected(load(&|v| v["nodes"]["1"]["all"]["invert"] = serde_json::json!(2)), "outside 0..1");
         assert_rejected(
@@ -3113,6 +3160,64 @@ mod tests {
         assert_eq!(members(&g, f, &capture), vec![2, 3, 4, 5, 6, 7], "unknown flash is included");
     }
 
+    /// Images 1..=4 with keywords: 1 "Travel|Italy|Rome", 2 "travel" + "Food", 3 none, 4 "Ärger"; 5 and 6 have
+    /// no keywords, 7 is unknown to the lookup.
+    fn keyword_caps() -> impl Fn(ImageId) -> Option<CaptureInfo> {
+        |image: ImageId| {
+            let keywords: Vec<String> = match image.0 {
+                1 => vec!["Travel|Italy|Rome".into()],
+                2 => vec!["Food".into(), "travel".into()],
+                4 => vec!["Ärger".into()],
+                7 => return None,
+                _ => vec![],
+            };
+            Some(CaptureInfo { keywords, ..Default::default() })
+        }
+    }
+
+    #[test]
+    fn keyword_measure_of_the_filter_contains_and_does_not_contain() {
+        let capture = keyword_caps();
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
+        let f = g.add_node(NodeKind::MetadataFilter, [0.0, 0.0]);
+        g.connect(src, f, 0).unwrap();
+        g.node_mut(f).unwrap().set_param("measure", A, 5.0);
+        assert!(g.node_mut(f).unwrap().set_data(A, Some(NodeData::Keyword("TRAVEL".into()))));
+        assert_eq!(members(&g, f, &capture), vec![1, 2], "case-insensitive, any level of the path");
+        g.node_mut(f).unwrap().set_param("keyword_op", A, 1.0);
+        assert_eq!(members(&g, f, &capture), vec![3, 4, 5, 6, 7], "images without keywords do not contain it");
+        g.node_mut(f).unwrap().set_param("invert", A, 1.0);
+        assert_eq!(members(&g, f, &capture), vec![1, 2], "invert flips the test");
+        g.node_mut(f).unwrap().set_param("invert", A, 0.0);
+        assert!(g.node_mut(f).unwrap().set_data(A, Some(NodeData::Keyword("ärg".into()))));
+        assert_eq!(members(&g, f, &capture), vec![1, 2, 3, 5, 6, 7]);
+        // The numeric measures are unchanged and ignore the text.
+        g.node_mut(f).unwrap().set_param("measure", A, 0.0);
+        assert_eq!(members(&g, f, &capture), Vec::<u64>::new(), "no ISO anywhere, missing = exclude");
+        // Saved and loaded again (the text is node data).
+        let again = Graph::from_json(&g.to_json()).unwrap();
+        assert_eq!(again, g);
+    }
+
+    #[test]
+    fn keyword_measure_of_the_split_sends_images_to_the_first_matching_range() {
+        let capture = keyword_caps();
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
+        let s = split_node(&mut g, src, &[("food", 0.0, 0.0), ("travel", 0.0, 0.0)]);
+        g.node_mut(s).unwrap().set_param("measure", A, 5.0);
+        assert_eq!(port_members(&g, s, 0, &capture), vec![2]);
+        assert_eq!(port_members(&g, s, 1, &capture), vec![1], "image 2 matches both and takes the first range");
+        assert_eq!(port_members(&g, s, SPLIT_UNMATCHED_PORT, &capture), vec![3, 4, 5, 6, 7]);
+        g.node_mut(s).unwrap().set_param("keyword_op", A, 1.0);
+        assert_eq!(port_members(&g, s, 0, &capture), vec![1, 3, 4, 5, 6, 7], "does not contain food");
+        assert_eq!(g.output_label(s, 0, A), "food");
+        // "Missing metadata: Exclude" does not drop untagged images for the text measure.
+        g.node_mut(s).unwrap().set_param("missing", A, 1.0);
+        assert!(g.split_port(s, ImageId(3), &capture).is_some());
+    }
+
     #[test]
     fn filters_chain_by_intersection_and_a_blocked_input_blocks_everything() {
         let capture = standard_caps();
@@ -3378,6 +3483,7 @@ mod tests {
                 NodeKind::Source => Some(DataKind::Folder),
                 NodeKind::Export => Some(DataKind::Export),
                 NodeKind::Lut => Some(DataKind::LutFile),
+                NodeKind::MetadataFilter => Some(DataKind::Keyword),
                 _ => None,
             };
             assert_eq!(kind.data_kind(), expected, "{kind:?}");
@@ -3412,7 +3518,8 @@ mod tests {
         assert_eq!(s.inputs().len(), 1);
         assert_eq!(s.param_spec("measure").unwrap().kind, ParamKind::Choice(&Measure::LABELS));
         assert_eq!(s.param_spec("missing").unwrap().kind, ParamKind::Choice(&["Unmatched", "Exclude"]));
-        assert_eq!(s.params().len(), 2);
+        assert_eq!(s.params().len(), 3);
+        assert_eq!(s.param_spec("keyword_op").unwrap().kind, ParamKind::Choice(&["contains", "does not contain"]));
         assert!(NodeKind::ALL.contains(&c) && NodeKind::ALL.contains(&b) && NodeKind::ALL.contains(&s));
         assert_eq!(NodeKind::ALL.len(), 32);
     }
@@ -4022,7 +4129,7 @@ mod tests {
         };
         assert!(matches!(Subgraph::from_json("nope"), Err(GraphError::Parse(_))));
         assert!(matches!(Subgraph::from_json("{}"), Err(GraphError::Parse(_))));
-        assert_eq!(load(&|v| v["format_version"] = json!(99)), Err(GraphError::UnsupportedVersion(99)));
+        assert_eq!(load(&|v| v["format_version"] = json!(99)), Err(GraphError::UnsupportedSubgraphVersion(99)));
         parse_err(load(&|v| v["nodes"][0]["kind"] = json!("Teleporter")), "Teleporter");
         parse_err(load(&|v| v["nodes"][0]["all"]["ev"] = json!(9.0)), "outside -6..6");
         parse_err(load(&|v| v["nodes"][0]["all"]["nope"] = json!(1.0)), "unknown parameter");

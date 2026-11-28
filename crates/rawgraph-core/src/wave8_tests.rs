@@ -1192,7 +1192,8 @@ fn export_node_shape() {
             "meta_date",
             "meta_gps",
             "meta_author",
-            "meta_software"
+            "meta_software",
+            "meta_keywords"
         ]
     );
     assert_eq!(
@@ -1220,6 +1221,7 @@ fn export_node_shape() {
         ("meta_gps", false),
         ("meta_author", true),
         ("meta_software", true),
+        ("meta_keywords", true),
     ] {
         let s = k.param_spec(name).unwrap();
         assert_eq!((s.kind, s.default), (ParamKind::Toggle, if on { 1.0 } else { 0.0 }), "{name}");
@@ -1247,7 +1249,7 @@ fn export_spec_defaults() {
             space: OutputSpace::Srgb,
             embed_profile: true,
             collision: ExportCollision::Skip,
-            meta: MetaSelection { camera: true, exposure: true, date: true, gps: false, author: true, software: true },
+            meta: MetaSelection { camera: true, exposure: true, date: true, gps: false, author: true, software: true, keywords: true },
             text: ExportText {
                 out_dir: String::new(),
                 name_template: "{name}".to_owned(),
@@ -1304,13 +1306,13 @@ fn export_spec_reads_every_param() {
         n.set_param("collision", id(1), v);
         assert_eq!(export_spec(n, id(1)).collision, c);
     }
-    for name in ["meta_camera", "meta_exposure", "meta_date", "meta_gps", "meta_author", "meta_software"] {
+    for name in ["meta_camera", "meta_exposure", "meta_date", "meta_gps", "meta_author", "meta_software", "meta_keywords"] {
         let before = export_spec(n, id(1)).meta;
         let flipped = !n.toggle(name, id(1));
         n.set_param(name, id(1), if flipped { 1.0 } else { 0.0 });
         let after = export_spec(n, id(1)).meta;
         assert_ne!(before, after, "{name}");
-        let count = |m: MetaSelection| [m.camera, m.exposure, m.date, m.gps, m.author, m.software].iter().filter(|b| **b).count();
+        let count = |m: MetaSelection| [m.camera, m.exposure, m.date, m.gps, m.author, m.software, m.keywords].iter().filter(|b| **b).count();
         assert_eq!(count(after) as i32 - count(before) as i32, if flipped { 1 } else { -1 }, "{name}");
     }
     // Individual mode: per image.
@@ -1557,7 +1559,7 @@ const FIXTURE_V3: &str = include_str!("../tests/fixtures/graph_v3.json");
 
 #[test]
 fn version_3_fixture_round_trips_and_routes_images() {
-    assert_eq!(GRAPH_FORMAT_VERSION, 4);
+    assert_eq!(GRAPH_FORMAT_VERSION, 5);
     assert!(FIXTURE_V3.contains("\"format_version\": 3"));
     let g = Graph::from_json(FIXTURE_V3).expect("version 3 loads");
     assert_eq!(g.nodes().count(), 11);
@@ -1603,12 +1605,12 @@ fn version_3_fixture_round_trips_and_routes_images() {
 
     // Saving writes the current version, which loads back to the same graph.
     let json = g.to_json();
-    assert!(json.contains("\"format_version\": 4"));
+    assert!(json.contains("\"format_version\": 5"));
     assert_eq!(Graph::from_json(&json), Ok(g.clone()));
     // Current files and no newer ones.
     assert!(Graph::from_json(&json).is_ok());
-    let newer = json.replace("\"format_version\": 4", "\"format_version\": 5");
-    assert_eq!(Graph::from_json(&newer), Err(GraphError::UnsupportedVersion(5)));
+    let newer = json.replace("\"format_version\": 5", "\"format_version\": 6");
+    assert_eq!(Graph::from_json(&newer), Err(GraphError::UnsupportedVersion(6)));
 }
 
 #[test]
