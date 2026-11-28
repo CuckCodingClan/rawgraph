@@ -8,8 +8,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunState {
-    /// Written before the first rename; still this when the program stopped in the middle.
+    /// Written before the first rename; still this when the program stopped in phase 1.
     Started,
+    /// Every file has its temporary name; written before the first final name. Still this when the program
+    /// stopped in phase 2 or before the final save.
+    Phase1Done,
     Done,
     /// A finished rename that was undone later.
     Undone,
@@ -28,6 +31,13 @@ pub struct LogEntry {
     pub old: PathBuf,
     pub new: PathBuf,
     pub size: u64,
+    /// The size must be unchanged (false for sidecars, which programs rewrite).
+    #[serde(default = "yes")]
+    pub exact_size: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,8 +81,21 @@ impl RenameLog {
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+            f.write_all(text.as_bytes()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+            f.sync_all().map_err(|e| format!("{}: {e}", tmp.display()))?;
+        }
+        std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))?;
+        // Make the rename itself durable (a folder cannot be opened for syncing on Windows).
+        #[cfg(unix)]
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
     }
 
     /// The finished rename that "Undo last rename" would reverse.
@@ -82,7 +105,7 @@ impl RenameLog {
 
     /// Runs whose journal says they were interrupted.
     pub fn interrupted(&self) -> usize {
-        self.runs.iter().filter(|r| r.state == RunState::Started).count()
+        self.runs.iter().filter(|r| matches!(r.state, RunState::Started | RunState::Phase1Done)).count()
     }
 }
 
@@ -107,7 +130,7 @@ mod tests {
         let p = t.path().join("sub").join("log.json");
         assert_eq!(RenameLog::load(&p).unwrap(), RenameLog::default(), "missing = empty");
         let mut l = RenameLog::default();
-        l.runs.push(RunRecord { id: "a".into(), started_unix_ms: 5, label: "x".into(), kind: RunKind::Rename, state: RunState::Done, entries: vec![LogEntry { old: "a.jpg".into(), new: "b.jpg".into(), size: 3 }] });
+        l.runs.push(RunRecord { id: "a".into(), started_unix_ms: 5, label: "x".into(), kind: RunKind::Rename, state: RunState::Done, entries: vec![LogEntry { old: "a.jpg".into(), new: "b.jpg".into(), size: 3, exact_size: true }] });
         l.save(&p).unwrap();
         assert_eq!(RenameLog::load(&p).unwrap(), l);
         assert_eq!(l.last_undoable().map(|r| r.id.as_str()), Some("a"));

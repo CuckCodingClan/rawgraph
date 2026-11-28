@@ -111,6 +111,8 @@ pub struct CompiledRules {
     ext_case: ExtCase,
     pub number_pattern: NumberPattern,
     pub uses_sheet: bool,
+    pub uses_caption: bool,
+    pub uses_number: bool,
     pub uses_capture: bool,
 }
 
@@ -126,8 +128,10 @@ impl RenameRules {
         };
         // A zero step is allowed; it gives equal names, which the duplicate check reports.
         let uses_sheet = toks.iter().any(|t| matches!(t, Tok::SheetName | Tok::Caption));
+        let uses_caption = toks.iter().any(|t| matches!(t, Tok::Caption));
+        let uses_number = toks.iter().any(|t| matches!(t, Tok::No(_)));
         let uses_capture = toks.iter().any(|t| matches!(t, Tok::Date | Tok::Time | Tok::DateTime | Tok::Camera));
-        Ok(CompiledRules { toks, counter: self.counter, find, case: self.case, ext_case: self.ext_case, number_pattern: self.number_pattern.clone(), uses_sheet, uses_capture })
+        Ok(CompiledRules { toks, counter: self.counter, find, case: self.case, ext_case: self.ext_case, number_pattern: self.number_pattern.clone(), uses_sheet, uses_caption, uses_number, uses_capture })
     }
 }
 
@@ -271,7 +275,7 @@ fn clean_value(s: &str) -> String {
             out.push('_');
             gap = false;
         }
-        out.push(if crate::names::INVALID_CHARS.contains(&c) || (c as u32) < 32 { '-' } else { c });
+        out.push(if crate::names::is_bad_char(c) { '-' } else { c });
     }
     out
 }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use rawgraph_core::ImageId;
 use rawgraph_rename::names::key;
 use rawgraph_rename::{
-    CaptionSheet, CaseChange, Counter, ExtCase, Move, NumberPattern, Plan, RealFs, RenameLog, RenameRules, SheetBinding, SheetColumns, SourceFile,
+    CaptionSheet, CaseChange, Control, Counter, ExtCase, Move, NumberPattern, Plan, RealFs, RenameLog, RenameRules, RunState, SheetBinding, SheetColumns, SourceFile,
 };
 
 use crate::datadir::DataDirs;
@@ -184,18 +184,32 @@ pub fn relink(session: &mut Session, moves: &[Move]) -> Result<usize, String> {
 /// How the project follows renamed files (replaceable in tests).
 type Follow<'a> = &'a dyn Fn(&mut Session, &[Move]) -> Result<usize, String>;
 
-/// Renames the files of `plan` on disk and re-points the project. If the project cannot follow, the files are
-/// put back and the error says so.
-pub fn run(session: &mut Session, plan: &Plan, log: &Path, activity: &Activity) -> Result<Outcome, String> {
-    run_with(session, plan, log, activity, &relink)
+/// Whether any file of the journal entries is an image of the open project (a log of another project, or of
+/// another unsaved session, must not be undone here).
+fn belongs_to_project(session: &Session, entries: &[rawgraph_rename::log::LogEntry]) -> bool {
+    let keys: std::collections::HashSet<String> = session.project.images().iter().map(|e| key(&e.path)).collect();
+    entries.iter().any(|e| keys.contains(&key(&e.old)) || keys.contains(&key(&e.new)))
 }
 
-pub(crate) fn run_with(session: &mut Session, plan: &Plan, log: &Path, activity: &Activity, follow: Follow) -> Result<Outcome, String> {
-    if let Some(r) = refusal(session, activity) {
-        return Err(r);
+/// Why the log cannot be used for this project, if so (the message says why).
+pub fn log_refusal(session: &Session, log: &Path, undo: bool) -> Option<String> {
+    let l = match RenameLog::load(log) {
+        Ok(l) => l,
+        Err(e) => return Some(format!("The rename log is unusable: {e}")),
+    };
+    let runs: Vec<&rawgraph_rename::RunRecord> = if undo {
+        l.last_undoable().into_iter().collect()
+    } else {
+        l.runs.iter().filter(|r| matches!(r.state, RunState::Started | RunState::Phase1Done)).collect()
+    };
+    if runs.iter().any(|r| !belongs_to_project(session, &r.entries)) {
+        return Some("The last rename in the log was done for another project (none of its files are images of this project); it is not undone or recovered here".to_owned());
     }
-    let label = format!("{} file(s) in {}", plan.change_count(), session.project_name());
-    let report = rawgraph_rename::execute(plan, &RealFs, Some(log), &label).map_err(|e| e.to_string())?;
+    None
+}
+
+/// What happens after the files are renamed: the project follows; if it cannot, the files are renamed back.
+fn follow_up(session: &mut Session, log: &Path, report: rawgraph_rename::RunReport, follow: Follow) -> Result<Outcome, String> {
     match follow(session, &report.moved) {
         Ok(images) => Ok(Outcome { files: report.moved.len(), images, warning: report.log_warning }),
         Err(e) => match rawgraph_rename::undo_last(log, &RealFs) {
@@ -205,22 +219,109 @@ pub(crate) fn run_with(session: &mut Session, plan: &Plan, log: &Path, activity:
     }
 }
 
+/// Renames the files of `plan` on disk and re-points the project. If the project cannot follow, the files are
+/// put back and the error says so.
+#[cfg(test)]
+pub fn run(session: &mut Session, plan: &Plan, log: &Path, activity: &Activity) -> Result<Outcome, String> {
+    run_with(session, plan, log, activity, &relink)
+}
+
+#[cfg(test)]
+pub(crate) fn run_with(session: &mut Session, plan: &Plan, log: &Path, activity: &Activity, follow: Follow) -> Result<Outcome, String> {
+    if let Some(r) = refusal(session, activity) {
+        return Err(r);
+    }
+    let label = format!("{} file(s) in {}", plan.change_count(), session.project_name());
+    let report = rawgraph_rename::execute(plan, &RealFs, Some(log), &label).map_err(|e| e.to_string())?;
+    follow_up(session, log, report, follow)
+}
+
 /// Reverses the last rename of the log (same two-phase method, same checks) and re-points the project.
+#[cfg(test)]
 pub fn undo(session: &mut Session, log: &Path, activity: &Activity) -> Result<Outcome, String> {
     if let Some(r) = refusal(session, activity) {
         return Err(r);
     }
+    if let Some(r) = log_refusal(session, log, true) {
+        return Err(r);
+    }
     let report = rawgraph_rename::undo_last(log, &RealFs).map_err(|e| e.to_string())?;
+    undo_follow_up(session, report)
+}
+
+fn undo_follow_up(session: &mut Session, report: rawgraph_rename::RunReport) -> Result<Outcome, String> {
     let images = relink(session, &report.moved).map_err(|e| format!("The files were renamed back, but the project could not follow: {e}"))?;
     Ok(Outcome { files: report.moved.len(), images, warning: report.log_warning })
 }
 
-/// Puts back the files of runs a crash or power loss interrupted (the journal says `Started`).
-pub fn recover(session: &mut Session, log: &Path) -> Result<String, String> {
-    let lines = rawgraph_rename::recover_interrupted(log, &RealFs).map_err(|e| e.to_string())?;
+/// Finishes the runs a crash or power loss interrupted: a run whose files are all at their new names is recorded as
+/// done and the project follows; any other is put back through the temporary names and the project points at the
+/// old names again. Refused while a scan, export or other job runs, and for a log of another project.
+pub fn recover(session: &mut Session, log: &Path, activity: &Activity) -> Result<String, String> {
+    if let Some(r) = refusal(session, activity) {
+        return Err(r);
+    }
+    if let Some(r) = log_refusal(session, log, false) {
+        return Err(r);
+    }
+    let rep = rawgraph_rename::recover_interrupted(log, &RealFs).map_err(|e| e.to_string())?;
+    let followed = relink(session, &rep.relink).map_err(|e| format!("The files are in order, but the project could not follow: {e}"))?;
     session.project.refresh_missing();
     session.refresh_visible();
-    Ok(if lines.is_empty() { "Nothing to put back".to_owned() } else { format!("Put back {} file(s)", lines.len()) })
+    let mut text = if rep.lines.is_empty() { "Nothing to put back".to_owned() } else { rep.lines.join("; ") };
+    if followed > 0 {
+        text.push_str(&format!("; {followed} image(s) of the project follow"));
+    }
+    if rep.stuck_runs > 0 {
+        return Err(format!("{text}. {} run(s) could not be finished; the files are named above", rep.stuck_runs));
+    }
+    Ok(text)
+}
+
+/// A rename or undo running on its own thread (so the window stays alive; cancel puts everything back).
+pub struct RenameJob {
+    pub rx: std::sync::mpsc::Receiver<Result<rawgraph_rename::RunReport, rawgraph_rename::RunError>>,
+    pub control: Control,
+    pub undo: bool,
+    pub log: PathBuf,
+}
+
+impl RenameJob {
+    /// Starts the rename of `plan` (or the undo of the log's last rename when `plan` is `None`). `wake` is called
+    /// when the job is done.
+    pub fn start(plan: Option<Plan>, log: PathBuf, label: String, wake: impl Fn() + Send + 'static) -> RenameJob {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let control = Control::default();
+        let (c2, l2, undo) = (control.clone(), log.clone(), plan.is_none());
+        let _ = std::thread::Builder::new().name("rawgraph-rename".into()).spawn(move || {
+            let result = match plan {
+                Some(p) => rawgraph_rename::execute_with(&p, &RealFs, Some(&l2), &label, &c2),
+                None => rawgraph_rename::undo_last_with(&l2, &RealFs, &c2),
+            };
+            let _ = tx.send(result);
+            wake();
+        });
+        RenameJob { rx, control, undo, log }
+    }
+
+    /// (done, total) of the files renamed so far.
+    pub fn progress(&self) -> (usize, usize) {
+        (self.control.done.load(std::sync::atomic::Ordering::Relaxed), self.control.total.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn cancel(&self) {
+        self.control.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Applies a finished job to the session (the project follows, or the files are put back).
+pub fn finish_job(session: &mut Session, job: &RenameJob, result: Result<rawgraph_rename::RunReport, rawgraph_rename::RunError>) -> Result<Outcome, String> {
+    let report = result.map_err(|e| e.to_string())?;
+    if job.undo {
+        undo_follow_up(session, report)
+    } else {
+        follow_up(session, &job.log, report, &relink)
+    }
 }
 
 /// The sheet as the export and the dialog share it.
@@ -383,10 +484,10 @@ mod tests {
         let (mut s, job, ids) = setup(tmp.path(), &["a.png", "b.png"]);
         let a = s.entry(ids[0]).unwrap().path.clone();
         // A sidecar-like move for a file that is no image of the project is ignored.
-        let other = Move { old: job.join("x.xmp"), new: job.join("y.xmp"), size: 1 };
+        let other = Move { old: job.join("x.xmp"), new: job.join("y.xmp"), size: 1, exact_size: true };
         assert_eq!(relink(&mut s, std::slice::from_ref(&other)).unwrap(), 0);
         // A target that does not exist: error, nothing changed.
-        let bad = Move { old: a.clone(), new: job.join("nope.png"), size: 1 };
+        let bad = Move { old: a.clone(), new: job.join("nope.png"), size: 1, exact_size: true };
         assert!(relink(&mut s, &[bad]).is_err());
         assert_eq!(s.entry(ids[0]).unwrap().path, a);
     }
@@ -419,6 +520,69 @@ mod tests {
     }
 
     #[test]
+    fn a_log_of_another_project_is_neither_undone_nor_recovered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut s, _job, ids) = setup(tmp.path(), &["a.png", "b.png"]);
+        let log = tmp.path().join("shared-unsaved.json");
+        let plan = plan_for(&s, &ids, &counter_rules(5));
+        run(&mut s, &plan, &log, &Activity::default()).unwrap();
+        // A second session (another project) uses the same log file.
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let (mut s2, _j2, _ids2) = setup(&other, &["c.png"]);
+        let e = undo(&mut s2, &log, &Activity::default()).unwrap_err();
+        assert!(e.contains("another project"), "{e}");
+        let e = log_refusal(&s2, &log, true).unwrap();
+        assert!(e.contains("not undone"), "{e}");
+        assert!(log_refusal(&s, &log, true).is_none(), "its own project may undo");
+        // a broken log says what is wrong
+        std::fs::write(&log, "{ not json").unwrap();
+        assert!(undo(&mut s, &log, &Activity::default()).unwrap_err().contains("log"));
+        assert!(log_refusal(&s, &log, false).unwrap().contains("unusable"));
+    }
+
+    #[test]
+    fn recovery_makes_the_project_follow_a_completed_swap() {
+        use rawgraph_rename::log::LogEntry;
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut s, job, ids) = setup(tmp.path(), &["a.png", "b.png"]);
+        let (a, b) = (job.join("a.png"), job.join("b.png"));
+        let (sa, sb) = (std::fs::metadata(&a).unwrap().len(), std::fs::metadata(&b).unwrap().len());
+        let log = tmp.path().join("l.json");
+        let mut l = RenameLog::default();
+        l.runs.push(rawgraph_rename::RunRecord {
+            id: "done-but-unsaved".into(),
+            started_unix_ms: 0,
+            label: "x".into(),
+            kind: rawgraph_rename::RunKind::Rename,
+            // the final save of the log never happened
+            state: RunState::Phase1Done,
+            entries: vec![LogEntry { old: a.clone(), new: b.clone(), size: sa, exact_size: true }, LogEntry { old: b.clone(), new: a.clone(), size: sb, exact_size: true }],
+        });
+        l.save(&log).unwrap();
+        // On disk the swap is complete; the project still has the old paths.
+        let tmpname = job.join("swap.tmp");
+        std::fs::rename(&a, &tmpname).unwrap();
+        std::fs::rename(&b, &a).unwrap();
+        std::fs::rename(&tmpname, &b).unwrap();
+        assert_eq!(log_state(&log).1, 1);
+        // A new rename is refused while the journal holds the interrupted run.
+        let plan = plan_for(&s, &ids, &counter_rules(5));
+        assert!(run(&mut s, &plan, &log, &Activity::default()).unwrap_err().contains("Recover"));
+        // Recovery is refused while something else runs ...
+        assert!(recover(&mut s, &log, &Activity { exporting: true, ..Default::default() }).is_err());
+        // ... and otherwise records the run as done and points the project at the new names.
+        let msg = recover(&mut s, &log, &Activity::default()).unwrap();
+        assert!(msg.contains("already at their new names") && msg.contains("2 image(s) of the project follow"), "{msg}");
+        assert_eq!(s.entry(ids[0]).unwrap().file_name(), "b.png");
+        assert_eq!(s.entry(ids[1]).unwrap().file_name(), "a.png");
+        assert!(s.dirty);
+        assert_eq!(log_state(&log), (true, 0), "the run is done and can be undone");
+        undo(&mut s, &log, &Activity::default()).unwrap();
+        assert_eq!(s.entry(ids[0]).unwrap().file_name(), "a.png");
+    }
+
+    #[test]
     fn a_crash_journal_is_recovered() {
         let tmp = tempfile::tempdir().unwrap();
         let (mut s, job, ids) = setup(tmp.path(), &["a.png"]);
@@ -431,12 +595,13 @@ mod tests {
             label: "x".into(),
             kind: rawgraph_rename::RunKind::Rename,
             state: RunState::Started,
-            entries: vec![rawgraph_rename::log::LogEntry { old: job.join("a.png"), new: job.join("b.png"), size: 1 }],
+            entries: vec![rawgraph_rename::log::LogEntry { old: job.join("a.png"), new: job.join("b.png"), size: std::fs::metadata(job.join("a.png")).unwrap().len(), exact_size: true }],
         });
         l.save(&log).unwrap();
         std::fs::rename(job.join("a.png"), job.join(".rgrename-crash-0.tmp")).unwrap();
         assert_eq!(log_state(&log).1, 1);
-        assert_eq!(recover(&mut s, &log).unwrap(), "Put back 1 file(s)");
+        let msg = recover(&mut s, &log, &Activity::default()).unwrap();
+        assert!(msg.contains("put back under their old names"), "{msg}");
         assert_eq!(names(&job), vec!["a.png"]);
         assert_eq!(log_state(&log).1, 0);
         assert!(!s.entry(ids[0]).unwrap().missing);

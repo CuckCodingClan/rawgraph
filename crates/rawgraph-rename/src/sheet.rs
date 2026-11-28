@@ -105,6 +105,9 @@ impl CaptionSheet {
         let mut seen_number = false;
         for (i, row) in cells.iter().enumerate() {
             let cell = |c: usize| row.get(c).map(|s| s.trim()).unwrap_or("");
+            if let Some(bad) = row_problem(row, cols) {
+                return Err(SheetError::Format(format!("row {} {bad}", i + 1)));
+            }
             match parse_number(cell(cols.number)) {
                 None => {
                     if seen_number {
@@ -176,6 +179,19 @@ impl CaptionSheet {
         self.by_number.keys().copied().collect()
     }
 
+    /// Rows whose name starts with a number that is not the photo number of the row (an offset inside the
+    /// sheet: `076_Anna` in the row of photo 75). `(row, photo number, number in the name)`.
+    pub fn offset_rows(&self) -> Vec<(usize, u64, u64)> {
+        self.rows
+            .iter()
+            .filter_map(|r| {
+                let lead: String = r.name.chars().take_while(|c| c.is_ascii_digit()).collect();
+                let n: u64 = lead.parse().ok()?;
+                (n != r.number).then_some((r.row, r.number, n))
+            })
+            .collect()
+    }
+
     /// Numbers that appear in several rows with different content.
     pub fn ambiguous_numbers(&self) -> Vec<u64> {
         self.by_number.iter().filter(|(_, v)| v.len() > 1).map(|(n, _)| *n).collect()
@@ -235,14 +251,33 @@ fn join_rows(rows: &[usize]) -> String {
     rows.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ")
 }
 
+const EXCEL_ERRORS: &[&str] = &["#DIV/0!", "#N/A", "#NAME?", "#NULL!", "#NUM!", "#REF!", "#VALUE!", "#GETTING_DATA", "#SPILL!", "#CALC!"];
+
+/// Something in the used columns of a row that makes the sheet unusable: an Excel error value, or a control or
+/// direction character in a name or caption.
+fn row_problem(row: &[String], cols: &SheetColumns) -> Option<String> {
+    for (c, what) in [(cols.number, "number"), (cols.name, "name"), (cols.caption, "caption")] {
+        let cell = row.get(c).map(|s| s.trim()).unwrap_or("");
+        if EXCEL_ERRORS.contains(&cell) {
+            return Some(format!("contains the Excel error {cell} in the {what} column"));
+        }
+        if c != cols.number && cell.chars().any(crate::names::is_control_or_bidi) {
+            return Some(format!("has a control or text-direction character in the {what} column"));
+        }
+    }
+    None
+}
+
 /// A cell is a photo number when it is only digits, or a whole number written as `76.0`.
 fn parse_number(cell: &str) -> Option<u64> {
     let c = cell.trim();
     if c.is_empty() {
         return None;
     }
+    // Only whole numbers: "76" and "76.0" (a number cell written by a spreadsheet). "1.000" is a thousands
+    // separator in some countries and no photo number.
     let digits = match c.split_once('.') {
-        Some((i, f)) if !f.is_empty() && f.chars().all(|d| d == '0') => i,
+        Some((i, "0")) => i,
         _ => c,
     };
     if digits.is_empty() || !digits.chars().all(|d| d.is_ascii_digit()) {
@@ -259,7 +294,20 @@ fn decode_text(bytes: &[u8]) -> String {
     let b = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     match std::str::from_utf8(b) {
         Ok(s) => s.to_owned(),
-        Err(_) => b.iter().map(|&x| char::from(x)).collect(),
+        Err(_) => b.iter().map(|&x| windows_1252(x)).collect(),
+    }
+}
+
+/// A byte of Windows-1252 (Latin-1 plus the printable characters of 0x80..0x9F).
+fn windows_1252(b: u8) -> char {
+    const HIGH: [char; 32] = [
+        '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}', '\u{2c6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}', '\u{8f}', '\u{90}',
+        '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}', '\u{2014}', '\u{2dc}', '\u{2122}', '\u{161}', '\u{203a}', '\u{153}', '\u{9d}', '\u{17e}', '\u{178}',
+    ];
+    if (0x80..=0x9f).contains(&b) {
+        HIGH[usize::from(b - 0x80)]
+    } else {
+        char::from(b)
     }
 }
 
@@ -352,7 +400,10 @@ fn read_workbook(path: &Path, sheet_name: Option<&str>) -> Result<Vec<Vec<String
     let names = wb.sheet_names();
     let name = match sheet_name.filter(|s| !s.is_empty()) {
         Some(n) => names.iter().find(|x| x.eq_ignore_ascii_case(n)).cloned().ok_or_else(|| SheetError::Format(format!("the workbook has no sheet named {n:?}")))?,
-        None => names.first().cloned().ok_or_else(|| SheetError::Format("the workbook has no sheets".into()))?,
+        None => {
+            let visible = wb.sheets_metadata().iter().find(|s| s.visible == calamine::SheetVisible::Visible).map(|s| s.name.clone());
+            visible.or_else(|| names.first().cloned()).ok_or_else(|| SheetError::Format("the workbook has no sheets".into()))?
+        }
     };
     let range = wb.worksheet_range(&name).map_err(|e| SheetError::Format(format!("sheet {name:?}: {e}")))?;
     let (row0, col0) = range.start().map(|(r, c)| (r as usize, c as usize)).unwrap_or((0, 0));
@@ -444,6 +495,27 @@ mod tests {
 
     fn decode_rows(t: &str) -> Vec<Vec<String>> {
         parse_csv(t.strip_prefix('\u{feff}').unwrap_or(t))
+    }
+
+    #[test]
+    fn only_whole_numbers_are_photo_numbers() {
+        assert_eq!(parse_number("76"), Some(76));
+        assert_eq!(parse_number("076"), Some(76));
+        assert_eq!(parse_number("76.0"), Some(76));
+        for bad in ["1.000", "1.5", "1,5", "7.00", "-3", "", "x1", "1e3"] {
+            assert_eq!(parse_number(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn windows_1252_text_and_bad_cells() {
+        assert_eq!(decode_text(&[0x80, b' ', 0x93, b'a', 0x94, 0xFC]), "\u{20ac} \u{201c}a\u{201d}\u{fc}");
+        let c = |rows: &[&[&str]]| CaptionSheet::from_cells(&cells(rows), &SheetColumns::default());
+        let e = c(&[&["1", "001_A", "A"], &["2", "#N/A", "x"]]).unwrap_err().to_string();
+        assert!(e.contains("row 2") && e.contains("#N/A"), "{e}");
+        assert!(c(&[&["1", "001\u{202e}A", "A"]]).unwrap_err().to_string().contains("direction"));
+        assert!(c(&[&["1", "001_A", "line\nbreak"]]).is_err());
+        assert!(c(&[&["1", "001_A", "A"]]).is_ok());
     }
 
     #[test]

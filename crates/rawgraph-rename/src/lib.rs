@@ -22,7 +22,7 @@ pub mod sheet;
 mod xlsx_tests;
 
 pub use blocks::{check_blocks, BlockReport, BlockView};
-pub use exec::{execute, recover_interrupted, run_moves, undo_last, Fs, RealFs, RunError, RunFailure, RunReport};
+pub use exec::{execute, execute_with, recover_interrupted, run_moves, undo_last, undo_last_with, Control, Fs, RealFs, RecoverReport, RunError, RunFailure, RunReport};
 pub use log::{RenameLog, RunKind, RunRecord, RunState};
 pub use numbers::NumberPattern;
 pub use plan::{build, Entry, EntryKind, Move, Plan, PlanOptions, Problem, SourceFile};

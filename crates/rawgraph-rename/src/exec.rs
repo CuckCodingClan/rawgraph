@@ -3,21 +3,26 @@
 //! Every run goes through the same steps, for a rename and for its undo:
 //! 1. Check again that every old file is there with the size the plan saw, that no new name is taken
 //!    by a file outside the run and that nothing leaves its folder.
-//! 2. Write the journal (state `Started`) before the first file is touched.
-//! 3. Phase 1: every file gets a unique temporary name in its own folder. Phase 2: every temporary
-//!    name becomes the final name. Chains (a->b, b->c) and swaps (a<->b) work because no final name
-//!    is written before all old names are out of the way.
+//! 2. Write the journal (state `Started`) before the first file is touched, flushed to disk.
+//! 3. Phase 1: every file gets a unique temporary name in its own folder; the journal then says
+//!    `Phase1Done`. Phase 2: every temporary name becomes the final name. Chains (a->b, b->c) and swaps
+//!    (a<->b) work because no final name is written before all old names are out of the way.
 //! 4. Verify: every new name exists with the old size, every old name is gone, no temporary name is left.
-//! 5. A failure in phase 1, phase 2 or the verification puts every file back (best effort; whatever
-//!    could not be put back is reported by name) and the journal says so.
+//! 5. A failure in phase 1, phase 2, the verification or a cancel puts every file back (best effort;
+//!    whatever could not be put back is reported by name) and the journal says so.
 //!
-//! Files never change folder and never leave the volume: a rename inside one folder only.
+//! Every single rename is atomic and never replaces: `RealFs::rename` fails when something is at the
+//! target, even when it appeared a moment after the check (`MoveFileExW` without REPLACE_EXISTING on
+//! Windows, `renameat2(RENAME_NOREPLACE)` on Linux, a hard link plus unlink elsewhere). Files never change
+//! folder and never leave the volume.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::log::{new_run_id, now_ms, LogEntry, RenameLog, RunKind, RunRecord, RunState};
 use crate::names::key;
@@ -25,6 +30,7 @@ use crate::plan::{Move, Plan};
 
 /// The file system operations of a run (replaceable in tests to inject a failure).
 pub trait Fs {
+    /// Renames without ever replacing: fails with `AlreadyExists` when `to` exists.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn size(&self, path: &Path) -> io::Result<u64>;
     /// Whether anything (file, folder, link) is at `path`.
@@ -36,9 +42,53 @@ pub trait Fs {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RealFs;
 
+#[cfg(windows)]
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
+    let (f, t) = (wide(from), wide(to));
+    // SAFETY: both buffers are NUL-terminated UTF-16 and live for the call. Flags 0: no replacing, no copy
+    // across volumes.
+    let ok = unsafe { windows_sys::Win32::Storage::FileSystem::MoveFileExW(f.as_ptr(), t.as_ptr(), 0) };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Hard link, then unlink the old name: never replaces. Used where no atomic no-replace rename exists.
+#[cfg(not(windows))]
+fn link_rename(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    std::fs::remove_file(from)
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path contains a NUL byte"));
+    let (f, t) = (c(from)?, c(to)?);
+    // SAFETY: valid NUL-terminated paths for the duration of the call.
+    let r = unsafe { libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, f.as_ptr(), libc::AT_FDCWD, t.as_ptr(), libc::RENAME_NOREPLACE) };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::ENOSYS) | Some(libc::EINVAL) => link_rename(from, to),
+        _ => Err(e),
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+    link_rename(from, to)
+}
+
 impl Fs for RealFs {
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to)
+        rename_noreplace(from, to)
     }
 
     fn size(&self, path: &Path) -> io::Result<u64> {
@@ -59,6 +109,25 @@ impl Fs for RealFs {
     }
 }
 
+/// Cancel flag and progress of a run, shared with the thread that shows them.
+#[derive(Clone, Debug, Default)]
+pub struct Control {
+    /// Set to stop: the run puts every file back and ends with an error that says so.
+    pub cancel: Arc<AtomicBool>,
+    pub done: Arc<AtomicUsize>,
+    pub total: Arc<AtomicUsize>,
+}
+
+impl Control {
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    fn step(&self) {
+        self.done.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// A failure after files were touched.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunFailure {
@@ -75,9 +144,9 @@ pub enum RunError {
     Blocked(String),
     /// A file is not what the plan saw (changed, gone). Nothing was touched.
     Stale(String),
-    /// Something failed while files were being renamed.
+    /// Something failed (or the user cancelled) while files were being renamed.
     Failed(RunFailure),
-    /// The undo log could not be written; nothing was touched.
+    /// The undo log could not be read or written; nothing was touched.
     Log(String),
 }
 
@@ -85,7 +154,7 @@ impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RunError::Blocked(m) | RunError::Stale(m) => f.write_str(m),
-            RunError::Log(m) => write!(f, "the undo log could not be written, nothing was renamed: {m}"),
+            RunError::Log(m) => write!(f, "the undo log is unusable, nothing was renamed: {m}"),
             RunError::Failed(r) => {
                 write!(f, "{}", r.message)?;
                 if r.rolled_back {
@@ -105,8 +174,16 @@ impl std::error::Error for RunError {}
 pub struct RunReport {
     pub run_id: String,
     pub moved: Vec<Move>,
-    /// The rename was done and verified but the undo log could not be saved afterwards.
+    /// The rename is done and verified but the undo log could not be saved afterwards (it still says that the
+    /// run was interrupted; "Recover" completes the book-keeping).
     pub log_warning: Option<String>,
+}
+
+/// What a check failure is called in messages.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ctx {
+    Preview,
+    Undo,
 }
 
 fn parent_of(p: &Path) -> PathBuf {
@@ -121,10 +198,14 @@ fn name_of(p: &Path) -> OsString {
     p.file_name().map(OsString::from).unwrap_or_default()
 }
 
-/// Checks before the first file is touched.
-fn preflight(moves: &[Move], fs: &dyn Fs) -> Result<(), RunError> {
+/// Checks before the first file is touched. Returns the actual size of every file (the size check after the
+/// rename compares against it).
+fn preflight(moves: &[Move], fs: &dyn Fs, ctx: Ctx) -> Result<Vec<u64>, RunError> {
     let old_keys: HashSet<String> = moves.iter().map(|m| key(&m.old)).collect();
     let mut new_keys: HashSet<String> = HashSet::new();
+    let mut sizes = Vec::with_capacity(moves.len());
+    let when = if ctx == Ctx::Undo { "since the rename" } else { "since the preview" };
+    let again = if ctx == Ctx::Undo { "undo cannot be done safely" } else { "make a new preview" };
     for m in moves {
         if m.old == m.new {
             return Err(RunError::Blocked(format!("{} is listed with an unchanged name", m.old.display())));
@@ -136,15 +217,15 @@ fn preflight(moves: &[Move], fs: &dyn Fs) -> Result<(), RunError> {
             return Err(RunError::Blocked(format!("two files would both be named {}", m.new.display())));
         }
         match fs.size(&m.old) {
-            Ok(s) if s == m.size => {}
-            Ok(s) => return Err(RunError::Stale(format!("{} changed since the preview (size {s} instead of {} bytes); make a new preview", m.old.display(), m.size))),
-            Err(e) => return Err(RunError::Stale(format!("{} cannot be read any more ({e}); make a new preview", m.old.display()))),
+            Ok(s) if s == m.size || !m.exact_size => sizes.push(s),
+            Ok(s) => return Err(RunError::Stale(format!("{} changed {when} (size {s} instead of {} bytes); {again}", m.old.display(), m.size))),
+            Err(e) => return Err(RunError::Stale(format!("{} cannot be read any more ({e}); {again}", m.old.display()))),
         }
         if fs.exists(&m.new) && !old_keys.contains(&key(&m.new)) {
             return Err(RunError::Blocked(format!("{} exists already and is not part of this rename", m.new.display())));
         }
     }
-    Ok(())
+    Ok(sizes)
 }
 
 fn fail(message: String, moves: &[Move], temps: &[PathBuf], p2_done: usize, p1_done: usize, fs: &dyn Fs) -> RunError {
@@ -152,7 +233,8 @@ fn fail(message: String, moves: &[Move], temps: &[PathBuf], p2_done: usize, p1_d
     RunError::Failed(RunFailure { message, rolled_back: errors.is_empty(), rollback_errors: errors })
 }
 
-/// Undoes phase 2 for the first `p2_done` moves and phase 1 for the first `p1_done`. Returns what failed.
+/// Undoes phase 2 for the first `p2_done` moves and phase 1 for the first `p1_done`. Returns what failed. Nothing
+/// is ever replaced: an occupied name is reported instead.
 fn rollback(moves: &[Move], temps: &[PathBuf], p2_done: usize, p1_done: usize, fs: &dyn Fs) -> Vec<String> {
     let mut errors = Vec::new();
     let mut stuck: HashSet<usize> = HashSet::new();
@@ -166,12 +248,9 @@ fn rollback(moves: &[Move], temps: &[PathBuf], p2_done: usize, p1_done: usize, f
         if stuck.contains(&i) {
             continue;
         }
-        if fs.exists(&moves[i].old) {
-            errors.push(format!("{} is now named {} (the old name is occupied)", moves[i].old.display(), temps[i].display()));
-            continue;
-        }
         if let Err(e) = fs.rename(&temps[i], &moves[i].old) {
-            errors.push(format!("{} is now named {} (taking it back failed: {e})", moves[i].old.display(), temps[i].display()));
+            let why = if e.kind() == io::ErrorKind::AlreadyExists { "the old name is occupied".to_owned() } else { format!("taking it back failed: {e}") };
+            errors.push(format!("{} is now named {} ({why})", moves[i].old.display(), temps[i].display()));
         }
     }
     errors
@@ -179,31 +258,46 @@ fn rollback(moves: &[Move], temps: &[PathBuf], p2_done: usize, p1_done: usize, f
 
 /// The two-phase rename with verification. `Ok` only when everything is renamed and verified.
 pub fn run_moves(moves: &[Move], run_id: &str, fs: &dyn Fs) -> Result<(), RunError> {
+    run_moves_ctx(moves, run_id, fs, Ctx::Preview, &Control::default(), &mut || Ok(()))
+}
+
+fn run_moves_ctx(moves: &[Move], run_id: &str, fs: &dyn Fs, ctx: Ctx, control: &Control, after_phase1: &mut dyn FnMut() -> Result<(), String>) -> Result<(), RunError> {
     if moves.is_empty() {
         return Ok(());
     }
-    preflight(moves, fs)?;
+    let sizes = preflight(moves, fs, ctx)?;
     let temps: Vec<PathBuf> = moves.iter().enumerate().map(|(i, m)| temp_path(&m.old, run_id, i)).collect();
     if let Some(t) = temps.iter().find(|t| fs.exists(t)) {
         return Err(RunError::Blocked(format!("the temporary name {} is already in use", t.display())));
     }
+    control.done.store(0, Ordering::Relaxed);
+    control.total.store(moves.len() * 2, Ordering::Relaxed);
     // Phase 1: out of the way.
     for i in 0..moves.len() {
+        if control.cancelled() {
+            return Err(fail("Cancelled.".to_owned(), moves, &temps, 0, i, fs));
+        }
         if let Err(e) = fs.rename(&moves[i].old, &temps[i]) {
             return Err(fail(format!("Renaming {} failed in phase 1: {e}.", moves[i].old.display()), moves, &temps, 0, i, fs));
         }
+        control.step();
     }
-    // Phase 2: into place.
+    if let Err(e) = after_phase1() {
+        return Err(fail(format!("The undo log could not be saved after phase 1 ({e})."), moves, &temps, 0, moves.len(), fs));
+    }
+    // Phase 2: into place. Never replaces, even when a file appears after the check.
     for i in 0..moves.len() {
-        if fs.exists(&moves[i].new) {
-            return Err(fail(format!("{} appeared during the rename.", moves[i].new.display()), moves, &temps, i, moves.len(), fs));
+        if control.cancelled() {
+            return Err(fail("Cancelled.".to_owned(), moves, &temps, i, moves.len(), fs));
         }
         if let Err(e) = fs.rename(&temps[i], &moves[i].new) {
-            return Err(fail(format!("Renaming to {} failed in phase 2: {e}.", moves[i].new.display()), moves, &temps, i, moves.len(), fs));
+            let why = if e.kind() == io::ErrorKind::AlreadyExists { "a file with that name appeared meanwhile and was left untouched".to_owned() } else { e.to_string() };
+            return Err(fail(format!("Renaming to {} failed in phase 2: {why}.", moves[i].new.display()), moves, &temps, i, moves.len(), fs));
         }
+        control.step();
     }
     // Verification.
-    let problems = verify(moves, &temps, fs);
+    let problems = verify(moves, &temps, &sizes, fs);
     if !problems.is_empty() {
         let shown: Vec<&str> = problems.iter().take(5).map(String::as_str).collect();
         return Err(fail(format!("Verification failed ({} problem(s): {}).", problems.len(), shown.join("; ")), moves, &temps, moves.len(), moves.len(), fs));
@@ -211,7 +305,8 @@ pub fn run_moves(moves: &[Move], run_id: &str, fs: &dyn Fs) -> Result<(), RunErr
     Ok(())
 }
 
-fn verify(moves: &[Move], temps: &[PathBuf], fs: &dyn Fs) -> Vec<String> {
+fn verify(moves: &[Move], temps: &[PathBuf], sizes: &[u64], fs: &dyn Fs) -> Vec<String> {
+    use std::collections::HashMap;
     let mut problems = Vec::new();
     let mut listings: HashMap<PathBuf, Option<HashSet<OsString>>> = HashMap::new();
     let new_names: HashSet<OsString> = moves.iter().map(|m| name_of(&m.new)).collect();
@@ -233,21 +328,30 @@ fn verify(moves: &[Move], temps: &[PathBuf], fs: &dyn Fs) -> Vec<String> {
             problems.push(format!("the temporary file {} is left over", temps[i].display()));
         }
         match fs.size(&m.new) {
-            Ok(s) if s == m.size => {}
-            Ok(s) => problems.push(format!("{} has {s} bytes instead of {}", m.new.display(), m.size)),
+            Ok(s) if s == sizes[i] => {}
+            Ok(s) => problems.push(format!("{} has {s} bytes instead of {}", m.new.display(), sizes[i])),
             Err(e) => problems.push(format!("{} cannot be read: {e}", m.new.display())),
         }
     }
     problems
 }
 
-fn finish_log(log_path: Option<&Path>, log: &mut RenameLog, idx: usize, state: RunState) -> Option<String> {
-    let path = log_path?;
-    log.runs[idx].state = state;
-    log.save(path).err()
+/// Saves the log, trying a few times (a sync client may hold the file for a moment).
+fn save_retry(log: &RenameLog, path: &Path) -> Result<(), String> {
+    let mut last = String::new();
+    for i in 0..3 {
+        match log.save(path) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+        if i < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    Err(last)
 }
 
-fn run_logged(moves: &[Move], fs: &dyn Fs, log_path: Option<&Path>, label: &str, kind: RunKind) -> Result<RunReport, RunError> {
+fn run_logged(moves: &[Move], fs: &dyn Fs, log_path: Option<&Path>, label: &str, kind: RunKind, control: &Control) -> Result<RunReport, RunError> {
     let run_id = new_run_id();
     let mut log = RenameLog::default();
     let mut idx = 0;
@@ -259,23 +363,43 @@ fn run_logged(moves: &[Move], fs: &dyn Fs, log_path: Option<&Path>, label: &str,
             label: label.to_owned(),
             kind,
             state: RunState::Started,
-            entries: moves.iter().map(|m| LogEntry { old: m.old.clone(), new: m.new.clone(), size: m.size }).collect(),
+            entries: moves.iter().map(|m| LogEntry { old: m.old.clone(), new: m.new.clone(), size: m.size, exact_size: m.exact_size }).collect(),
         });
         idx = log.runs.len() - 1;
         log.save(path).map_err(RunError::Log)?;
     }
-    match run_moves(moves, &run_id, fs) {
+    let ctx = if kind == RunKind::Undo { Ctx::Undo } else { Ctx::Preview };
+    let result = {
+        let log_ref = &mut log;
+        run_moves_ctx(moves, &run_id, fs, ctx, control, &mut || match log_path {
+            Some(path) => {
+                log_ref.runs[idx].state = RunState::Phase1Done;
+                log_ref.save(path)
+            }
+            None => Ok(()),
+        })
+    };
+    match result {
         Ok(()) => {
-            let warn = finish_log(log_path, &mut log, idx, RunState::Done);
-            Ok(RunReport { run_id, moved: moves.to_vec(), log_warning: warn.map(|e| format!("the rename is done but the undo log could not be saved: {e}")) })
+            let mut warn = None;
+            if let Some(path) = log_path {
+                log.runs[idx].state = RunState::Done;
+                warn = save_retry(&log, path).err();
+            }
+            Ok(RunReport {
+                run_id,
+                moved: moves.to_vec(),
+                log_warning: warn.map(|e| format!("The files are renamed, but the undo log could not be saved ({e}). Use Recover in the Rename window to finish the book-keeping before you do anything else with these files.")),
+            })
         }
         Err(e) => {
             // Anything but a failed rollback leaves every file under its old name.
-            let state = match &e {
-                RunError::Failed(f) if !f.rolled_back => RunState::Started,
-                _ => RunState::RolledBack,
-            };
-            let _ = finish_log(log_path, &mut log, idx, state);
+            if let Some(path) = log_path {
+                if !matches!(&e, RunError::Failed(f) if !f.rolled_back) {
+                    log.runs[idx].state = RunState::RolledBack;
+                }
+                let _ = save_retry(&log, path);
+            }
             Err(e)
         }
     }
@@ -283,6 +407,11 @@ fn run_logged(moves: &[Move], fs: &dyn Fs, log_path: Option<&Path>, label: &str,
 
 /// Renames every changed file of a plan without conflicts. The undo log (when given) is written first.
 pub fn execute(plan: &Plan, fs: &dyn Fs, log_path: Option<&Path>, label: &str) -> Result<RunReport, RunError> {
+    execute_with(plan, fs, log_path, label, &Control::default())
+}
+
+/// [`execute`] with a cancel flag and progress counters.
+pub fn execute_with(plan: &Plan, fs: &dyn Fs, log_path: Option<&Path>, label: &str, control: &Control) -> Result<RunReport, RunError> {
     if plan.blocked() {
         return Err(RunError::Blocked(format!("the preview has {} file(s) with conflicts; nothing was renamed", plan.problem_count())));
     }
@@ -290,25 +419,38 @@ pub fn execute(plan: &Plan, fs: &dyn Fs, log_path: Option<&Path>, label: &str) -
     if moves.is_empty() {
         return Err(RunError::Blocked("no file would get a new name".into()));
     }
-    run_logged(&moves, fs, log_path, label, RunKind::Rename)
+    if let Some(path) = log_path {
+        let n = RenameLog::load(path).map_err(RunError::Log)?.interrupted();
+        if n > 0 {
+            return Err(RunError::Blocked(format!("{n} interrupted rename(s) are in the log; use Recover first")));
+        }
+    }
+    run_logged(&moves, fs, log_path, label, RunKind::Rename, control)
 }
 
 /// Reverses the last finished rename of the log the same way it was done, with the same checks.
 pub fn undo_last(log_path: &Path, fs: &dyn Fs) -> Result<RunReport, RunError> {
+    undo_last_with(log_path, fs, &Control::default())
+}
+
+pub fn undo_last_with(log_path: &Path, fs: &dyn Fs, control: &Control) -> Result<RunReport, RunError> {
     let log = RenameLog::load(log_path).map_err(RunError::Log)?;
+    if log.interrupted() > 0 {
+        return Err(RunError::Blocked("an interrupted rename is in the log; use Recover first".into()));
+    }
     let Some(pos) = log.runs.iter().rposition(|r| r.kind == RunKind::Rename && r.state == RunState::Done) else {
         return Err(RunError::Blocked("there is no finished rename to undo".into()));
     };
-    let moves: Vec<Move> = log.runs[pos].entries.iter().map(|e| Move { old: e.new.clone(), new: e.old.clone(), size: e.size }).collect();
+    let moves: Vec<Move> = log.runs[pos].entries.iter().map(|e| Move { old: e.new.clone(), new: e.old.clone(), size: e.size, exact_size: e.exact_size }).collect();
     let label = format!("undo of {}", log.runs[pos].label);
-    let mut report = run_logged(&moves, fs, Some(log_path), &label, RunKind::Undo)?;
+    let mut report = run_logged(&moves, fs, Some(log_path), &label, RunKind::Undo, control)?;
     // The undo wrote its own record; mark the original one on a fresh copy of the log.
     match RenameLog::load(log_path) {
         Ok(mut fresh) => {
             if let Some(r) = fresh.runs.iter_mut().find(|r| r.id == log.runs[pos].id) {
                 r.state = RunState::Undone;
             }
-            if let Err(e) = fresh.save(log_path) {
+            if let Err(e) = save_retry(&fresh, log_path) {
                 report.log_warning = Some(format!("the undo is done but the log could not be saved: {e}"));
             }
         }
@@ -317,43 +459,102 @@ pub fn undo_last(log_path: &Path, fs: &dyn Fs) -> Result<RunReport, RunError> {
     Ok(report)
 }
 
-/// Finishes the clean-up of a run the program did not get to finish (power loss, crash): every file of a
-/// `Started` run is put back under its old name. Returns one line per file that was moved.
-pub fn recover_interrupted(log_path: &Path, fs: &dyn Fs) -> Result<Vec<String>, RunError> {
+/// What recovery found and did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoverReport {
+    /// Moves for the project, in the direction "from the name the project may still have to the name the file
+    /// has now": for a completed run old -> new, for a reverted run new -> old.
+    pub relink: Vec<Move>,
+    pub completed_runs: usize,
+    pub reverted_runs: usize,
+    pub lines: Vec<String>,
+    /// Runs that could not be finished (files are named in `lines`).
+    pub stuck_runs: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Loc {
+    Old,
+    Temp,
+    New,
+}
+
+/// Decides from the journal state and the disk what an interrupted run left, then either records it as completed
+/// (state `Phase1Done`, every file at its final name) or puts every file back through the temporary names with the
+/// normal checks. Never a direct new -> old rename of a chain.
+pub fn recover_interrupted(log_path: &Path, fs: &dyn Fs) -> Result<RecoverReport, RunError> {
     let mut log = RenameLog::load(log_path).map_err(RunError::Log)?;
-    let mut lines = Vec::new();
-    for run in log.runs.iter_mut().filter(|r| r.state == RunState::Started) {
-        let mut stuck = false;
+    let mut rep = RecoverReport::default();
+    for run in log.runs.iter_mut().filter(|r| r.state == RunState::Started || r.state == RunState::Phase1Done) {
+        // `Phase1Done` is saved before the first final name is written, `Started` before the first file moves: so in
+        // `Started` no file is at a new name and in `Phase1Done` none is at an old one.
+        let phase2 = run.state == RunState::Phase1Done;
+        let temps: Vec<PathBuf> = run.entries.iter().enumerate().map(|(i, e)| temp_path(&e.old, &run.id, i)).collect();
+        let size_ok = |p: &Path, e: &LogEntry| fs.size(p).is_ok_and(|s| s == e.size || !e.exact_size);
+        let mut locs = Vec::new();
+        let mut lost = Vec::new();
         for (i, e) in run.entries.iter().enumerate() {
-            let temp = temp_path(&e.old, &run.id, i);
-            let from = if fs.exists(&temp) {
-                Some(temp)
-            } else if !fs.exists(&e.old) && fs.exists(&e.new) {
-                Some(e.new.clone())
+            let (loc, at) = if fs.exists(&temps[i]) {
+                (Loc::Temp, temps[i].clone())
+            } else if phase2 {
+                (Loc::New, e.new.clone())
             } else {
-                None
+                (Loc::Old, e.old.clone())
             };
-            if let Some(from) = from {
-                if fs.exists(&e.old) {
-                    lines.push(format!("{} could not be put back: {} is occupied", from.display(), e.old.display()));
-                    stuck = true;
-                    continue;
-                }
-                match fs.rename(&from, &e.old) {
-                    Ok(()) => lines.push(format!("{} -> {}", from.display(), e.old.display())),
-                    Err(err) => {
-                        lines.push(format!("{} could not be put back: {err}", from.display()));
-                        stuck = true;
-                    }
+            if !size_ok(&at, e) {
+                lost.push(format!("{} cannot be found at {} with its logged size", e.old.display(), at.display()));
+            }
+            locs.push(loc);
+        }
+        if !lost.is_empty() {
+            rep.lines.extend(lost);
+            rep.stuck_runs += 1;
+            continue;
+        }
+        let moves_of = |reverse: bool| -> Vec<Move> {
+            run.entries
+                .iter()
+                .map(|e| if reverse { Move { old: e.new.clone(), new: e.old.clone(), size: e.size, exact_size: e.exact_size } } else { Move { old: e.old.clone(), new: e.new.clone(), size: e.size, exact_size: e.exact_size } })
+                .collect()
+        };
+        if phase2 && locs.iter().all(|l| *l == Loc::New) {
+            run.state = RunState::Done;
+            rep.completed_runs += 1;
+            rep.relink.extend(moves_of(false));
+            rep.lines.push(format!("{} file(s) of an interrupted run were already at their new names; the run is recorded as done", run.entries.len()));
+            continue;
+        }
+        // Reverse: everything that is at its new name goes back to the temporary name first, then every temporary
+        // name becomes the old name (no-replace renames; an occupied name is reported, never overwritten).
+        let mut problems = Vec::new();
+        for (i, e) in run.entries.iter().enumerate() {
+            if locs[i] == Loc::New {
+                match fs.rename(&e.new, &temps[i]) {
+                    Ok(()) => locs[i] = Loc::Temp,
+                    Err(err) => problems.push(format!("{} could not be taken back ({err}); it is still named {}", e.old.display(), e.new.display())),
                 }
             }
         }
-        if !stuck {
+        for (i, e) in run.entries.iter().enumerate() {
+            if locs[i] == Loc::Temp {
+                match fs.rename(&temps[i], &e.old) {
+                    Ok(()) => locs[i] = Loc::Old,
+                    Err(err) => problems.push(format!("{} is now named {} ({err})", e.old.display(), temps[i].display())),
+                }
+            }
+        }
+        if problems.is_empty() && locs.iter().all(|l| *l == Loc::Old) {
             run.state = RunState::RolledBack;
+            rep.reverted_runs += 1;
+            rep.relink.extend(moves_of(true));
+            rep.lines.push(format!("{} file(s) of an interrupted run were put back under their old names", run.entries.len()));
+        } else {
+            rep.stuck_runs += 1;
+            rep.lines.extend(problems);
         }
     }
-    log.save(log_path).map_err(RunError::Log)?;
-    Ok(lines)
+    save_retry(&log, log_path).map_err(RunError::Log)?;
+    Ok(rep)
 }
 
 #[cfg(test)]
@@ -369,7 +570,7 @@ mod tests {
     }
 
     fn mv(old: &Path, new: &Path) -> Move {
-        Move { old: old.to_path_buf(), new: new.to_path_buf(), size: std::fs::metadata(old).unwrap().len() }
+        Move { old: old.to_path_buf(), new: new.to_path_buf(), size: std::fs::metadata(old).unwrap().len(), exact_size: true }
     }
 
     /// Fails the n-th rename call (counting from 1) and passes everything else through.
@@ -553,7 +754,7 @@ mod tests {
         }
         let t = tempfile::tempdir().unwrap();
         let a = touch(t.path(), "a.jpg", "A");
-        let m = Move { old: a.clone(), new: t.path().join("b.jpg"), size: 1 };
+        let m = Move { old: a.clone(), new: t.path().join("b.jpg"), size: 1, exact_size: true };
         let err = run_moves(&[m], "v", &Liar(RealFs)).unwrap_err();
         assert!(matches!(&err, RunError::Failed(f) if f.message.contains("Verification failed") && f.rolled_back), "{err}");
         assert_eq!(listing(t.path()), vec!["a.jpg"]);
@@ -637,30 +838,209 @@ mod tests {
         assert!(a.exists());
     }
 
-    #[test]
-    fn an_interrupted_run_can_be_recovered_from_the_journal() {
-        let t = tempfile::tempdir().unwrap();
-        let log = t.path().join("l.json");
-        let (a, b) = (touch(t.path(), "a.jpg", "A"), touch(t.path(), "b.jpg", "BB"));
-        let moves = [mv(&a, &t.path().join("x.jpg")), mv(&b, &t.path().join("y.jpg"))];
-        // Simulate a crash after phase 1 and one rename of phase 2: journal says Started.
+    /// Journal of a hand-made run `moves` in `state`.
+    fn journal(log: &Path, id: &str, state: RunState, moves: &[Move]) {
         let mut l = RenameLog::default();
         l.runs.push(RunRecord {
-            id: "crash".into(),
+            id: id.into(),
             started_unix_ms: 0,
             label: "x".into(),
             kind: RunKind::Rename,
-            state: RunState::Started,
-            entries: moves.iter().map(|m| LogEntry { old: m.old.clone(), new: m.new.clone(), size: m.size }).collect(),
+            state,
+            entries: moves.iter().map(|m| LogEntry { old: m.old.clone(), new: m.new.clone(), size: m.size, exact_size: true }).collect(),
         });
-        l.save(&log).unwrap();
-        std::fs::rename(&a, temp_path(&a, "crash", 0)).unwrap();
-        std::fs::rename(&b, temp_path(&b, "crash", 1)).unwrap();
-        std::fs::rename(temp_path(&a, "crash", 0), t.path().join("x.jpg")).unwrap();
-        let lines = recover_interrupted(&log, &RealFs).unwrap();
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert_eq!(listing(t.path()), vec!["a.jpg", "b.jpg", "l.json"]);
+        l.save(log).unwrap();
+    }
+
+    #[test]
+    fn the_rename_never_replaces_an_existing_file() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (touch(t.path(), "a.jpg", "A"), touch(t.path(), "b.jpg", "BB"));
+        let err = RealFs.rename(&a, &b).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
         assert_eq!((read(&a), read(&b)), ("A".into(), "BB".into()));
-        assert_eq!(RenameLog::load(&log).unwrap().runs[0].state, RunState::RolledBack);
+        RealFs.rename(&a, &t.path().join("c.jpg")).unwrap();
+        assert_eq!(read(&t.path().join("c.jpg")), "A");
+    }
+
+    /// Creates a file at the target of a rename just before the rename (after every existence check).
+    struct Racy {
+        /// Rename targets that get an intruder first (once).
+        appear_at: Vec<PathBuf>,
+        /// The rename to this target fails.
+        fail_to: Option<PathBuf>,
+        fired: std::cell::RefCell<Vec<PathBuf>>,
+    }
+
+    impl Fs for Racy {
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            if self.fail_to.as_deref() == Some(to) {
+                return Err(io::Error::other("injected failure"));
+            }
+            if self.appear_at.iter().any(|p| p == to) && !self.fired.borrow().iter().any(|p| p == to) {
+                self.fired.borrow_mut().push(to.to_path_buf());
+                std::fs::write(to, "INTRUDER").unwrap();
+            }
+            RealFs.rename(from, to)
+        }
+        fn size(&self, p: &Path) -> io::Result<u64> {
+            RealFs.size(p)
+        }
+        fn exists(&self, p: &Path) -> bool {
+            RealFs.exists(p)
+        }
+        fn list(&self, d: &Path) -> io::Result<HashSet<OsString>> {
+            RealFs.list(d)
+        }
+    }
+
+    #[test]
+    fn a_file_that_appears_at_a_target_after_the_check_is_never_destroyed() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (touch(t.path(), "a.jpg", "A"), touch(t.path(), "b.jpg", "BB"));
+        let (x, y) = (t.path().join("x.jpg"), t.path().join("y.jpg"));
+        let fs = Racy { appear_at: vec![y.clone()], fail_to: None, fired: Default::default() };
+        let err = run_moves(&[mv(&a, &x), mv(&b, &y)], "race", &fs).unwrap_err();
+        assert!(matches!(&err, RunError::Failed(f) if f.rolled_back && f.message.contains("appeared meanwhile")), "{err}");
+        assert_eq!(read(&y), "INTRUDER", "the newcomer is untouched");
+        assert_eq!((read(&a), read(&b)), ("A".into(), "BB".into()), "the run's files are back");
+        assert!(!x.exists());
+    }
+
+    #[test]
+    fn a_file_that_appears_at_an_old_name_during_the_rollback_is_never_destroyed() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (touch(t.path(), "a.jpg", "A"), touch(t.path(), "b.jpg", "BB"));
+        let (x, y) = (t.path().join("x.jpg"), t.path().join("y.jpg"));
+        // Phase 2 fails for y; during the rollback something is written at a.jpg.
+        let fs = Racy { appear_at: vec![a.clone()], fail_to: Some(y.clone()), fired: Default::default() };
+        let err = run_moves(&[mv(&a, &x), mv(&b, &y)], "race2", &fs).unwrap_err();
+        match &err {
+            RunError::Failed(f) => {
+                assert!(!f.rolled_back, "{err}");
+                assert!(f.rollback_errors.iter().any(|e| e.contains("occupied") && e.contains(".rgrename-race2-0")), "{:?}", f.rollback_errors);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(read(&a), "INTRUDER");
+        assert_eq!(read(&t.path().join(".rgrename-race2-0.tmp")), "A", "the file is kept under its temporary name, and reported");
+        assert_eq!(read(&b), "BB");
+    }
+
+    /// Chain a->b, b->c, c->d interrupted at `p1` phase-1 renames (state Started), or after phase 1 with `p2`
+    /// phase-2 renames (state Phase1Done). Returns the listing contents after recovery.
+    fn crash(p1: usize, p2: Option<usize>) -> (tempfile::TempDir, PathBuf, RecoverReport) {
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("l.json");
+        let names = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"];
+        let paths: Vec<PathBuf> = names.iter().map(|n| t.path().join(n)).collect();
+        for (p, c) in paths.iter().zip(["A", "BB", "CCC"]) {
+            std::fs::write(p, c).unwrap();
+        }
+        let moves: Vec<Move> = (0..3).map(|i| mv(&paths[i], &paths[i + 1])).collect();
+        journal(&log, "crash", if p2.is_some() { RunState::Phase1Done } else { RunState::Started }, &moves);
+        let n1 = if p2.is_some() { 3 } else { p1 };
+        for (i, p) in paths.iter().enumerate().take(n1) {
+            std::fs::rename(p, temp_path(p, "crash", i)).unwrap();
+        }
+        for (j, p) in paths.iter().enumerate().take(p2.unwrap_or(0)) {
+            std::fs::rename(temp_path(p, "crash", j), &paths[j + 1]).unwrap();
+        }
+        let rep = recover_interrupted(&log, &RealFs).unwrap();
+        (t, log, rep)
+    }
+
+    #[test]
+    fn every_crash_point_of_a_chain_ends_completed_or_fully_reverted() {
+        // Started: crash after 0..=3 phase-1 renames.
+        for p1 in 0..=3 {
+            let (t, log, rep) = crash(p1, None);
+            assert_eq!((rep.reverted_runs, rep.stuck_runs), (1, 0), "p1={p1} {:?}", rep.lines);
+            assert_eq!(listing(t.path()), vec!["a.jpg", "b.jpg", "c.jpg", "l.json"], "p1={p1}");
+            assert_eq!((read(&t.path().join("a.jpg")), read(&t.path().join("b.jpg")), read(&t.path().join("c.jpg"))), ("A".into(), "BB".into(), "CCC".into()), "p1={p1}");
+            assert_eq!(RenameLog::load(&log).unwrap().runs[0].state, RunState::RolledBack);
+            assert_eq!(rep.relink.len(), 3);
+            assert_eq!(rep.relink[0].new, t.path().join("a.jpg"), "the project is pointed back at the old names");
+        }
+        // Phase1Done: crash after 0..=3 phase-2 renames.
+        for p2 in 0..=3 {
+            let (t, log, rep) = crash(3, Some(p2));
+            if p2 == 3 {
+                assert_eq!((rep.completed_runs, rep.reverted_runs), (1, 0), "{:?}", rep.lines);
+                assert_eq!(listing(t.path()), vec!["b.jpg", "c.jpg", "d.jpg", "l.json"]);
+                assert_eq!((read(&t.path().join("b.jpg")), read(&t.path().join("c.jpg")), read(&t.path().join("d.jpg"))), ("A".into(), "BB".into(), "CCC".into()));
+                assert_eq!(RenameLog::load(&log).unwrap().runs[0].state, RunState::Done, "a completed run is recorded as done");
+                assert_eq!(rep.relink[0].new, t.path().join("b.jpg"), "the project follows the new names");
+                // ... and "Undo last rename" works on it.
+                undo_last(&log, &RealFs).unwrap();
+                assert_eq!(listing(t.path()), vec!["a.jpg", "b.jpg", "c.jpg", "l.json"]);
+            } else {
+                assert_eq!((rep.completed_runs, rep.reverted_runs, rep.stuck_runs), (0, 1, 0), "p2={p2} {:?}", rep.lines);
+                assert_eq!(listing(t.path()), vec!["a.jpg", "b.jpg", "c.jpg", "l.json"], "p2={p2}");
+                assert_eq!((read(&t.path().join("a.jpg")), read(&t.path().join("b.jpg")), read(&t.path().join("c.jpg"))), ("A".into(), "BB".into(), "CCC".into()), "p2={p2}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_completed_swap_is_not_half_reverted() {
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("l.json");
+        let (a, b) = (touch(t.path(), "a.jpg", "A"), touch(t.path(), "b.jpg", "BB"));
+        let moves = [mv(&a, &b), mv(&b, &a)];
+        journal(&log, "sw", RunState::Phase1Done, &moves);
+        // phase 1 and 2 both done: a.jpg holds the old b, b.jpg the old a
+        std::fs::write(&a, "BB").unwrap();
+        std::fs::write(&b, "A").unwrap();
+        let rep = recover_interrupted(&log, &RealFs).unwrap();
+        assert_eq!((rep.completed_runs, rep.reverted_runs), (1, 0));
+        assert_eq!((read(&a), read(&b)), ("BB".into(), "A".into()), "the swap stays swapped");
+        assert_eq!(RenameLog::load(&log).unwrap().runs[0].state, RunState::Done);
+    }
+
+    #[test]
+    fn recovery_reports_files_it_cannot_find_and_keeps_the_journal_open() {
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("l.json");
+        let (a, b) = (touch(t.path(), "a.jpg", "A"), t.path().join("b.jpg"));
+        journal(&log, "lost", RunState::Phase1Done, &[mv(&a, &b)]);
+        std::fs::remove_file(&a).unwrap();
+        let rep = recover_interrupted(&log, &RealFs).unwrap();
+        assert_eq!(rep.stuck_runs, 1);
+        assert!(rep.lines[0].contains("cannot be found"));
+        assert_eq!(RenameLog::load(&log).unwrap().runs[0].state, RunState::Phase1Done);
+        // a new rename is refused while the journal holds an interrupted run
+        let c = touch(t.path(), "c.jpg", "C");
+        let plan = build(&[src(&c, 1)], &RenameRules { template: "d".into(), ..Default::default() }, None, &PlanOptions::default()).unwrap();
+        assert!(matches!(execute(&plan, &RealFs, Some(&log), "x"), Err(RunError::Blocked(m)) if m.contains("Recover")));
+        assert!(matches!(undo_last(&log, &RealFs), Err(RunError::Blocked(_))));
+    }
+
+    #[test]
+    fn a_cancelled_run_puts_everything_back() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (touch(t.path(), "a.jpg", "A"), touch(t.path(), "b.jpg", "BB"));
+        let control = Control::default();
+        control.cancel.store(true, Ordering::Relaxed);
+        let err = run_moves_ctx(&[mv(&a, &t.path().join("x.jpg")), mv(&b, &t.path().join("y.jpg"))], "c", &RealFs, Ctx::Preview, &control, &mut || Ok(())).unwrap_err();
+        assert!(matches!(&err, RunError::Failed(f) if f.rolled_back && f.message.contains("Cancelled")), "{err}");
+        assert_eq!(listing(t.path()), vec!["a.jpg", "b.jpg"]);
+    }
+
+    #[test]
+    fn a_sidecar_may_change_size_but_a_picture_may_not() {
+        let t = tempfile::tempdir().unwrap();
+        let log = t.path().join("l.json");
+        let raw = touch(t.path(), "IMG_1.CR2", "raw");
+        touch(t.path(), "IMG_1.xmp", "x");
+        let plan = build(&[src(&raw, 1)], &RenameRules { template: "N".into(), ..Default::default() }, None, &PlanOptions::default()).unwrap();
+        execute(&plan, &RealFs, Some(&log), "x").unwrap();
+        std::fs::write(t.path().join("N.xmp"), "an editor rewrote this sidecar").unwrap();
+        undo_last(&log, &RealFs).unwrap();
+        assert_eq!(read(&t.path().join("IMG_1.xmp")), "an editor rewrote this sidecar");
+        execute(&plan, &RealFs, Some(&log), "x").unwrap();
+        std::fs::write(t.path().join("N.CR2"), "edited").unwrap();
+        let err = undo_last(&log, &RealFs).unwrap_err();
+        assert!(matches!(&err, RunError::Stale(m) if m.contains("since the rename")), "{err}");
     }
 }

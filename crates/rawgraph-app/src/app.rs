@@ -527,6 +527,8 @@ pub struct App {
     rename_thumbs: Option<ThumbLoader>,
     /// Bumped whenever the caption sheet is loaded or removed (the preview is made again).
     rename_sheet_gen: u64,
+    /// A batch rename (or its undo) running on its own thread.
+    rename_job: Option<crate::rename_ops::RenameJob>,
     xmp_job: Option<XmpJob>,
     xmp_probe: Option<XmpJob>,
     xmp_offer: Option<XmpOffer>,
@@ -817,6 +819,7 @@ impl App {
             rename: None,
             rename_thumbs: None,
             rename_sheet_gen: 0,
+            rename_job: None,
             xmp_job: None,
             xmp_probe: None,
             xmp_offer: None,
@@ -910,7 +913,7 @@ impl App {
             Command::ManageRecipes => self.editor.request(EditOp::ManageRecipes),
             Command::ImportXmp => self.open_xmp_dialog(),
             Command::RenameFiles => self.open_rename(),
-            Command::UndoRename => self.undo_rename_command(),
+            Command::UndoRename => self.undo_rename_command(ctx),
             Command::Compare => self.toggle_compare(),
             Command::ToggleMissingOnly => {
                 self.session.filter.missing_only = !self.session.filter.missing_only;
@@ -1178,6 +1181,10 @@ impl App {
             self.status.error("An export is already running");
             return;
         }
+        if self.rename_job.is_some() {
+            self.status.error("A rename is running; wait until it has finished");
+            return;
+        }
         let Some(node) = export::export_node(&self.session) else {
             self.status.error("Select or pin an image node to export");
             return;
@@ -1293,6 +1300,10 @@ impl App {
     fn start_scan(&mut self, ctx: &egui::Context, folder: PathBuf) {
         if self.scan.is_some() {
             self.status.error("A scan is already running");
+            return;
+        }
+        if self.rename_job.is_some() {
+            self.status.error("A rename is running; wait until it has finished");
             return;
         }
         if self.session.demo {
@@ -3145,6 +3156,7 @@ impl eframe::App for App {
         self.unfinished_window(&ctx);
         self.xmp_window(&ctx);
         self.relink_windows(&ctx);
+        self.poll_rename_job(&ctx);
         self.rename_windows(&ctx);
         self.clear_cache_window(&ctx);
         self.handle_film_actions(&ctx);
