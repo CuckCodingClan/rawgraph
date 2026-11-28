@@ -49,6 +49,8 @@ struct Extras {
     /// Leave out ColorMatrix1 and AsShotNeutral (a file without usable white-balance data).
     no_wb: bool,
     preview: bool,
+    /// ICC profile stored in the embedded preview JPEG (needs `preview`).
+    preview_icc: Option<Vec<u8>>,
 }
 
 fn rational_bytes(v: &[(i64, i64)], signed: bool) -> Vec<u8> {
@@ -159,7 +161,11 @@ fn make_dng_with(w: u32, h: u32, mosaic: &[u16], orientation: u16, extras: &Extr
     if extras.preview {
         let (w, h) = (640, 400);
         let mut jpeg = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new(&mut jpeg).encode(&[170, 80, 40].repeat(w * h), w as u32, h as u32, image::ExtendedColorType::Rgb8).unwrap();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new(&mut jpeg);
+        if let Some(icc) = &extras.preview_icc {
+            image::ImageEncoder::set_icc_profile(&mut encoder, icc.clone()).unwrap();
+        }
+        encoder.encode(&[170, 80, 40].repeat(w * h), w as u32, h as u32, image::ExtendedColorType::Rgb8).unwrap();
         let entries = [(254, 4, 1), (256, 4, w as u32), (257, 4, h as u32), (258, 3, 8),
             (259, 3, 34892), (262, 3, 2), (273, 4, 0), (277, 3, 3), (278, 4, h as u32),
             (279, 4, jpeg.len() as u32), (284, 3, 1)];
@@ -447,4 +453,20 @@ fn embedded_preview_exists_only_for_the_dng_with_a_preview_and_is_upright() {
     let (w, h, pixels) = raw::load_embedded_preview(&path, 1280).unwrap().expect("embedded JPEG");
     assert_eq!((w, h), (400, 640));
     assert!(pixels[0].abs_diff(170) <= 3, "{pixels:?}");
+}
+
+#[test]
+fn embedded_preview_with_an_adobe_rgb_profile_is_converted_to_srgb() {
+    let dir = Tmp::new("embedded-icc");
+    let path = dir.0.join("adobe.dng");
+    let adobe = rawgraph_io::icc_profile(rawgraph_core::color::OutputSpace::AdobeRgb).to_vec();
+    std::fs::write(&path, make_dng_with(32, 24, &[350; 32 * 24], 6, &Extras { preview: true, preview_icc: Some(adobe), ..Default::default() })).unwrap();
+    let (_, _, pixels) = raw::load_embedded_preview(&path, 1280).unwrap().expect("embedded JPEG");
+    // Adobe RGB (170, 80, 40) is more saturated than the same codes in sRGB: red goes up, green and
+    // blue go down.
+    assert!(pixels[0] > 180 && pixels[1] < 80 && pixels[2] < 40, "{:?}", &pixels[..4]);
+    // A preview without a profile stays as it was.
+    std::fs::write(&path, make_dng_with(32, 24, &[350; 32 * 24], 6, &Extras { preview: true, ..Default::default() })).unwrap();
+    let (_, _, plain) = raw::load_embedded_preview(&path, 1280).unwrap().expect("embedded JPEG");
+    assert!(plain[0].abs_diff(170) <= 3 && plain[1].abs_diff(80) <= 3, "{:?}", &plain[..4]);
 }

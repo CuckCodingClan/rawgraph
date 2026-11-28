@@ -15,16 +15,27 @@ use rawgraph_core::{CaptureInfo, ImageBuf};
 
 mod avif;
 mod export;
+mod heic;
+// The HEIF box editing is only called by the Windows HEIC encoder; its tests run everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod heif_box;
 mod icc;
 mod lens;
 mod meta;
+mod webp_icc;
 mod orient;
 pub mod raw;
 pub mod rendered;
 
-pub use export::{encode_rgb, save_avif8, save_webp8, save_exr, save_srgb16_with, save_srgb8, save_srgb8_with, SaveOptions};
+pub use export::{decode_webp8, encode_heic8, encode_heic8_detailed, encode_rgb, encode_webp8, save_avif8, save_heic8, save_webp8, save_exr, save_srgb16_with, save_srgb8, save_srgb8_with, SaveOptions};
+pub use heic::{embedded_icc, heic_available, HeicEncoded, HeicImage, HEIC_MIN_SIDE, HEIC_MISSING_MESSAGE};
 pub use icc::{icc_profile, srgb_icc_profile};
 pub use lens::read_lens_profile;
+/// Decodes a HEIC file with the operating system (Export preview and tests; not an import path).
+pub fn decode_heic8(bytes: &[u8]) -> Result<HeicImage, IoError> {
+    heic::decode(bytes)
+}
+pub use webp_icc::webp_icc_profile;
 pub use meta::{read_export_metadata, read_xmp_packet, ExportMetadata, GpsInfo};
 
 /// Whether a source file still carries sensor data or is already developed.

@@ -46,11 +46,6 @@ fn open_reader(path: &Path) -> Result<ImageReader<BufReader<File>>, IoError> {
     Ok(reader)
 }
 
-/// Decodes to a `DynamicImage` with the file's orientation applied.
-fn decode_oriented(path: &Path) -> Result<DynamicImage, IoError> {
-    decode_oriented_with_icc(path).map(|(img, _)| img)
-}
-
 /// Like [`decode_oriented`], plus the embedded ICC profile bytes if there are any.
 fn decode_oriented_with_icc(path: &Path) -> Result<(DynamicImage, Option<Vec<u8>>), IoError> {
     let reader = open_reader(path)?;
@@ -140,9 +135,17 @@ pub fn load(path: &Path, max_dim: Option<u32>) -> Result<Loaded, IoError> {
     Ok(Loaded { image, capture, kind: SourceKind::Rendered, full_size, profile })
 }
 
+/// Thumbnail in sRGB: pictures that carry a matrix/TRC profile (Adobe RGB, Display P3, ...) are
+/// converted with it after the shrink (so the cost is per thumbnail pixel, not per source pixel).
 pub fn load_thumbnail(path: &Path, max_dim: u32) -> Result<(u32, u32, Vec<u8>), IoError> {
-    let img = guard("image", || decode_oriented(path))?;
-    Ok(crate::dynamic_to_thumb(img, max_dim))
+    let (img, icc) = guard("image", || decode_oriented_with_icc(path))?;
+    // 32-bit float files are linear Rec.709 by definition; a profile does not change that.
+    let is_float = matches!(img, DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_));
+    let (w, h, mut rgba) = crate::dynamic_to_thumb(img, max_dim);
+    if !is_float {
+        crate::icc::thumbnail_to_srgb(icc.as_deref(), &mut rgba);
+    }
+    Ok((w, h, rgba))
 }
 
 fn ascii(field: &exif::Field) -> Option<String> {

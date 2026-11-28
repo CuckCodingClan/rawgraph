@@ -439,7 +439,7 @@ Legacy compatibility only: hidden from the add-node UI and no longer part of new
 
 ### Export (`Export`)
 
-Structured fields: output folder, filename template, artist, copyright, and description. The inspector groups PNG and TIFF by format with a separate 8/16-bit selector; the table lists their underlying stored choices. PNG 16-bit data map bypasses photo colour transforms. Viewing JPEG or 8-bit PNG shows an automatic encode/decode preview without writing a file. XMP is metadata-only; other codecs do not currently preview. HEIC is not implemented.
+Structured fields: output folder, filename template, artist, copyright, and description. The inspector groups PNG and TIFF by format with a separate 8/16-bit selector; the table lists their underlying stored choices. PNG 16-bit data map bypasses photo colour transforms. Viewing the node shows what the codec does to the picture, without writing a file: JPEG, PNG/TIFF 8-bit, WebP and HEIC (system decoder) are encoded and decoded again; PNG/TIFF 16-bit, the data map and EXR are lossless and shown unchanged with a note; AVIF has no decoder in this build and says so. XMP is metadata-only. HEIC (stored choice 10, appended) is written through the operating system's encoder (Windows with the HEVC Video Extensions; elsewhere unavailable) and is greyed out with the reason when missing. WebP embeds the ICC profile of the output space.
 
 - **Inputs:** Images: Images (required)
 - **Outputs:** None
@@ -447,8 +447,8 @@ Structured fields: output folder, filename template, artist, copyright, and desc
 
 | Setting | Key | Default | Range or choices |
 | --- | --- | --- | --- |
-| Format | `format` | JPEG | JPEG / PNG / PNG 16-bit / TIFF / TIFF 16-bit / EXR / AVIF / Adobe XMP sidecar / PNG 16-bit data map / WebP |
-| Quality | `quality` | 92 | 1 to 100 |
+| Format | `format` | JPEG | JPEG / PNG / PNG 16-bit / TIFF / TIFF 16-bit / EXR / AVIF / Adobe XMP sidecar / PNG 16-bit data map / WebP / HEIC |
+| Quality | `quality` | 92 | 1 to 100 (JPEG, AVIF, HEIC, lossy WebP) |
 | WebP lossless | `webp_lossless` | Off | Off / On |
 | Size | `size` | Original | Original / Long edge / Percent |
 | Long edge | `long_edge` | 2048 | 16 to 32000 px (log scale) |

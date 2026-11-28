@@ -7,7 +7,7 @@ publish.workspace = true
 [dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "accesskit", "persistence", "default_fonts", "wayland", "x11"] }
 half = "2"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 rawgraph-batch = { version = "26.11.1", path = "../rawgraph-batch" }
 rawgraph-core.workspace = true
 rawgraph-engine = { version = "26.11.1", path = "../rawgraph-engine" }
