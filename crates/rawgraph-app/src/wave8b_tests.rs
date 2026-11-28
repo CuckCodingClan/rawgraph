@@ -275,7 +275,7 @@ fn save_as_over_another_project_asks_before_replacing_it() {
 
 // ------------------------------------------------------------------ A4 / A5: opening
 
-/// Copy of a saved project whose format number reads 3 (a newer program wrote it).
+/// Copy of a saved project whose format number reads one more than this build knows (a newer program wrote it).
 fn newer_file(dir: &Path) -> PathBuf {
     let src = dir.join("src.rawgraph");
     let mut s = session_with_images(dir, 1);
@@ -283,8 +283,8 @@ fn newer_file(dir: &Path) -> PathBuf {
     let mut data = bytes(&src);
     let key = b"schema_version";
     let at = data.windows(key.len()).position(|w| w == key).unwrap() + key.len();
-    assert_eq!(data[at], b'2');
-    data[at] = b'3';
+    assert_eq!(data[at], b'0' + rawgraph_project::SCHEMA_VERSION as u8);
+    data[at] = b'0' + rawgraph_project::SCHEMA_VERSION as u8 + 1;
     let out = dir.join("newer.rawgraph");
     std::fs::write(&out, data).unwrap();
     out
@@ -298,7 +298,7 @@ fn a_newer_format_is_refused_with_a_clear_message_and_the_project_stays() {
     let before = s.project.clone();
     s.set_rating(s.visible()[0], 3);
     let err = s.load_project(&newer).unwrap_err();
-    assert_eq!(err.to_string(), "This project was saved by a newer version of RawGraph (format 3, this version reads up to 2)");
+    assert_eq!(err.to_string(), "This project was saved by a newer version of RawGraph (format 4, this version reads up to 3)");
     assert_eq!(s.project.images().len(), before.images().len(), "the current project stays open");
     assert!(s.dirty, "with its unsaved change");
     assert!(s.project_path.is_none());
@@ -332,8 +332,8 @@ fn a_format_1_project_opens_with_a_note_and_the_first_save_keeps_a_backup() {
     let baks: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".v1.bak")).collect();
     assert_eq!(baks, ["old.rawgraph.v1.bak"]);
     assert_eq!(bytes(&dir.path().join(&baks[0])), original, "the backup is the old file");
-    // Now it is format 2: no note.
-    assert_eq!(revisions::file_format_version(&file), Some(2));
+    // Now it has the current format: no note.
+    assert_eq!(revisions::file_format_version(&file), Some(rawgraph_project::SCHEMA_VERSION));
     assert_eq!(revisions::open_project(&file).unwrap().1, None);
 }
 

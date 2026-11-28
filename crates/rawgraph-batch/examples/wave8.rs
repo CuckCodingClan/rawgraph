@@ -24,7 +24,7 @@ fn real_main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let out = PathBuf::from(args.next().ok_or("usage: wave8 <out dir> <file> ...")?);
     let catalog: Vec<ExportItem> =
-        args.enumerate().map(|(i, p)| ExportItem { id: ImageId(i as u64 + 1), source: PathBuf::from(p) }).collect();
+        args.enumerate().map(|(i, p)| ExportItem { id: ImageId(i as u64 + 1), source: PathBuf::from(p), keywords: Vec::new() }).collect();
     if catalog.is_empty() {
         return Err("no input files".into());
     }

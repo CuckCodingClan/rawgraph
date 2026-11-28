@@ -24,6 +24,7 @@ mod lens;
 mod meta;
 mod webp_icc;
 mod orient;
+mod xmp;
 pub mod raw;
 pub mod rendered;
 
@@ -36,6 +37,7 @@ pub fn decode_heic8(bytes: &[u8]) -> Result<HeicImage, IoError> {
     heic::decode(bytes)
 }
 pub use webp_icc::webp_icc_profile;
+pub use xmp::jpeg_embeddable_keywords;
 pub use meta::{read_export_metadata, read_xmp_packet, ExportMetadata, GpsInfo};
 
 /// Whether a source file still carries sensor data or is already developed.

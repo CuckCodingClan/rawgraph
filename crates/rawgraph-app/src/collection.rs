@@ -130,7 +130,8 @@ pub fn compute(graph: &Graph, ids: &[ImageId], captures: &Captures, view_node: O
                 let mut s = FilterStats { reaching: reaching.len(), matching: n, missing: 0 };
                 for id in &reaching {
                     let measure = Measure::from_index(node.choice("measure", *id)).unwrap_or(Measure::Iso);
-                    if captures.get(id).and_then(|c| c.measure(measure)).is_none() {
+                    // The text measure has no "missing": an image without keywords contains nothing.
+                    if measure != Measure::Keyword && captures.get(id).and_then(|c| c.measure(measure)).is_none() {
                         s.missing += 1;
                     }
                 }

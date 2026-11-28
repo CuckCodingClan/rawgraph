@@ -45,6 +45,7 @@ pub fn entries() -> Vec<ImageEntry> {
             rating: 0,
             flag: Flag::None,
             color_label: None,
+            keywords: Vec::new(),
             missing: false,
             uuid: format!("{:032x}", 0xde30_0000u64 + i as u64 + 1),
         })

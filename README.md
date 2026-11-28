@@ -332,6 +332,40 @@ Non-finite pixels: the CPU box blur keeps one running sum per row, so a NaN or i
 spreads along the rest of its row (and then column); the GPU sums each window separately, so the
 damage stays within the blur radius. Finite pictures (all of them in practice) are not affected.
 
+### Keywords
+
+Every image can carry keywords (Stichwörter). They are stored in the project file (format 3, one row per
+image and keyword, see `docs/project-format.md`) and never written to the source files.
+
+- **Form.** A keyword is text or a hierarchical path `Parent|Child` (Lightroom's convention). The case you
+  type is kept, keywords are compared case-insensitively, and an image never holds the same keyword twice.
+- **Panel.** Under the filmstrip list the *Keywords* panel shows the keywords of the selected images as a
+  tree with counts ("3 of 5" when several images are selected). Select several images with Ctrl+click
+  (toggle) or Shift+click (range). Type in the add field and press Enter to add to all selected images
+  (several keywords separated by commas; `Parent|Child` makes levels); suggestions from every keyword of the
+  project appear while you type (Tab completes the first). **K** moves the cursor into the add field (when
+  no other text field has the focus). The x button removes a keyword and everything below it from the
+  selected images; the right-click menu renames a keyword in the whole project (its children follow;
+  renaming into an existing keyword merges them) or removes only that level.
+- **Filter.** The *Keywords* button in the filmstrip header filters the list by keywords: any or all of the
+  checked keywords (a parent finds its children), or only images without keywords.
+- **Graph.** Metadata Filter and Split by Metadata have the measure *Keyword* with the tests *contains* /
+  *does not contain* (see `node_structure.md`).
+- **XMP import** (File > Import ratings and keywords from XMP) reads `dc:subject` and
+  `lr:hierarchicalSubject` from sidecars and embedded packets and adds them to the images (*Merge keywords*,
+  on by default; nothing is removed; "Only images I have not rated here" protects the rating, flag and label of rated
+  images only: their keywords are merged all the same).
+  **Adobe XMP sidecar** export writes the keywords too (`dc:subject` with the last levels and
+  `lr:hierarchicalSubject` with the paths); it still skips existing sidecars and refuses source folders.
+- **Export.** The Export node has a *Keywords* metadata switch (on by default) that writes the keywords as an
+  XMP packet into JPEG, PNG, TIFF and WebP files (not AVIF or EXR; details in `node_structure.md`), and the
+  file name token `{keywords}` (`untagged` when an image has no keywords or they leave no usable name, so a
+  keyword never stops a batch). A JPEG holds about 64 KB of XMP: if a huge list does not fit, the keywords
+  at the end of the sorted list are left out and the export reports "N keywords not embedded (JPEG XMP
+  limit)". Limitation: HEIC exports carry no keywords yet (Windows encoder path).
+- **Undo.** Like ratings, flags and labels, keyword edits are not part of the graph's undo/redo; they are
+  edits of the project data and mark the project as changed.
+
 ### Per-node timing
 
 Enable **Debug → Per-node CPU timing** to profile the previews. Each node then shows a
@@ -597,7 +631,7 @@ saturation), Curves (luminance, RGB, Sat vs Sat, Hue vs Hue, Hue vs Sat), Lens C
 and auto from DNG correction data) and Export (format incl. AVIF, size, output colour space,
 metadata selection, folder, collision rule). Also: exposed image controls and paintable Draw images, viewer with
 crop and brush tools, node graph with multi-selection, copy/paste and recipes, filmstrip with
-culling, XMP rating import and relinking, colourised scopes, project files in format 2 with
+culling, keywords, XMP rating and keyword import and relinking, colourised scopes, project files in format 3 with
 revisions, history, graph restore, conflict check and crash recovery, and a packaging script. Project files are
 updated in place in one rollback-journal transaction (only changed rows, appended history, conflict check inside
 the transaction, only on local drives outside sync folders, otherwise the whole file is rewritten; see `docs/project-format.md`), saving works while a folder scan runs, XMP import reads
@@ -615,6 +649,8 @@ Update this section as implementation files are added.
 ## Change log
 
 - 2026-11-28 — Caption sheets and batch rename (Library > Rename files, `{sheet_name}` / `{caption}` / `{no}` export tokens).
+
+- 2026-11-28 — Keywords: project format 3 (`keywords` table, migration from 2), keyword panel and filter, Keyword measure of Metadata Filter / Split by Metadata, XMP keyword import and sidecar export, keywords in exported JPEG / PNG / TIFF / WebP, `{keywords}` file name token.
 - 2026-11-28 — Project defects: save during a folder scan, in-place incremental project saves (rollback journal, atomic conflict check), XMP import on a dedicated 8-thread pool, undo history shares unchanged nodes (`Graph` nodes are `Arc`, copy on write).
 - 2026-11-15 — Wave 8: nodes of `node_structure.md` (Source folders, Merge rule, Layer, Develop tone, Curves set, Lens Correction auto, Export node), colourised scopes, output colour spaces, AVIF, project format 2 with history and conflict check; new requirements (platforms, project storage and collaboration).
 - 2026-11-15 — Wave 7: Lift/Gamma/Gain, Clarity/Texture, more GPU operations, brush behind crop, curve histogram, packaging script.

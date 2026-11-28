@@ -73,8 +73,10 @@ pub struct ExportSettings {
     pub out_dir: PathBuf,
     pub format: ExportFormat,
     /// Placeholders: `{name}` source file stem, `{index}` 1-based position in the batch,
-    /// `{index:04}` zero-padded, `{id}` image id; with a caption sheet `{sheet_name}` (column B),
-    /// `{caption}` (column C), and `{no}` / `{no:03}` (photo number of the source name). Default `{name}`.
+    /// `{index:04}` zero-padded, `{id}` image id, `{keywords}` the last level of every keyword of
+    /// the image joined with `-` (file-name safe; `untagged` when the image has no keywords or they leave no usable name);
+    /// with a caption sheet `{sheet_name}` (column B), `{caption}` (column C), and `{no}` / `{no:03}`
+    /// (photo number of the source name). Default `{name}`.
     pub name_template: String,
     /// Exact long edge of the output in pixels; `None` = see `percent`. Never upscales. Wins over
     /// `percent`.
@@ -125,7 +127,7 @@ impl Default for ExportSettings {
             embed_profile: true,
             copy_metadata: true,
             space: OutputSpace::Srgb,
-            meta: MetaSelection { camera: true, exposure: true, date: true, gps: false, author: true, software: true },
+            meta: MetaSelection { camera: true, exposure: true, date: true, gps: false, author: true, software: true, keywords: true },
             artist: None,
             copyright: None,
             description: None,
@@ -175,7 +177,7 @@ pub fn settings_from_spec(spec: &ExportSpec, display: DisplayTransform) -> Expor
         display,
         generator_view_tone: display.tone_map,
         embed_profile: spec.embed_profile,
-        copy_metadata: m.camera || m.exposure || m.date || m.gps || m.author || m.software || description.is_some(),
+        copy_metadata: m.camera || m.exposure || m.date || m.gps || m.author || m.software || m.keywords || description.is_some(),
         space: spec.space,
         meta: m,
         artist: non_empty(&spec.text.artist),
@@ -190,6 +192,16 @@ pub fn settings_from_spec(spec: &ExportSpec, display: DisplayTransform) -> Expor
 pub struct ExportItem {
     pub id: ImageId,
     pub source: PathBuf,
+    /// Keywords of the image (normalised): the `{keywords}` file name token, the keyword measure of
+    /// the graph's filters and, with the Keywords switch on, the XMP keywords of rendered files.
+    pub keywords: Vec<String>,
+}
+
+impl ExportItem {
+    /// An item without keywords.
+    pub fn new(id: ImageId, source: PathBuf) -> Self {
+        ExportItem { id, source, keywords: Vec::new() }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -216,6 +228,8 @@ pub struct ExportProgress {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExportReport {
     pub items: Vec<(ImageId, ItemStatus)>,
+    /// Things that did not stop an item from being written, e.g. "N keywords not embedded (JPEG XMP limit)".
+    pub warnings: Vec<(ImageId, String)>,
 }
 
 impl ExportReport {
@@ -303,8 +317,8 @@ fn plan(item: &ExportItem, index: usize, settings: &ExportSettings, tokens: &[te
     let stem = if item.source.as_os_str().is_empty() { format!("generated-{}", item.id.0) } else if let Some(stem) = item.source.file_stem().map(|s| s.to_string_lossy().into_owned()) { stem } else {
         return Err(PlanError::Settings(ExportError::InvalidSettings(format!("source {} has no file name", item.source.display()))));
     };
-    let name = template::expand(tokens, &stem, index, item.id.0, settings.sheet.as_deref()).map_err(|e| PlanError::Item(format!("{e} (source {})", item.source.display())))?;
-    template::check_stem(&name).map_err(|e| PlanError::Settings(ExportError::InvalidSettings(format!("{e} (source {})", item.source.display()))))?;
+    let name = template::expand(tokens, &stem, index, item.id.0, settings.sheet.as_deref(), &item.keywords).map_err(|e| PlanError::Item(format!("{e} (source {})", item.source.display())))?;
+    template::check_stem(&name).map_err(|e| PlanError::Item(format!("{e} (source {})", item.source.display())))?;
     Ok(settings.out_dir.join(format!("{name}.{}", extension(settings.format))))
 }
 
@@ -404,6 +418,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) struct CatalogProvider<'a> {
     order: Vec<ImageId>,
     paths: HashMap<ImageId, PathBuf>,
+    keywords: HashMap<ImageId, Vec<String>>,
     read_capture: CaptureReader<'a>,
     read_lens: LensReader<'a>,
     captures: Mutex<HashMap<ImageId, CaptureInfo>>,
@@ -415,9 +430,13 @@ impl<'a> CatalogProvider<'a> {
     pub(crate) fn new(catalog: &[ExportItem], read_capture: CaptureReader<'a>, read_lens: LensReader<'a>) -> Self {
         let mut order = Vec::with_capacity(catalog.len());
         let mut paths = HashMap::with_capacity(catalog.len());
+        let mut keywords = HashMap::new();
         for it in catalog {
             if it.source.as_os_str().is_empty() { continue; }
             if let std::collections::hash_map::Entry::Vacant(v) = paths.entry(it.id) {
+                if !it.keywords.is_empty() {
+                    keywords.insert(it.id, it.keywords.clone());
+                }
                 order.push(it.id);
                 v.insert(it.source.clone());
             }
@@ -425,6 +444,7 @@ impl<'a> CatalogProvider<'a> {
         CatalogProvider {
             order,
             paths,
+            keywords,
             read_capture,
             read_lens,
             captures: Mutex::new(HashMap::new()),
@@ -468,6 +488,7 @@ impl ImageProvider for CatalogProvider<'_> {
         // filter's Missing option).
         let mut info = (self.read_capture)(path).unwrap_or_default();
         info.path = Some(path.to_string_lossy().into_owned());
+        info.keywords = self.keywords.get(&id).cloned().unwrap_or_default();
         lock(&self.captures).insert(id, info.clone());
         Some(info)
     }
@@ -590,12 +611,15 @@ fn effective_long_edge(settings: &ExportSettings, width: u32, height: u32) -> Op
 
 /// The metadata block of one export: the source's, narrowed to the selected groups, plus the
 /// overrides. `None` when metadata is switched off.
-fn build_metadata(source: &Path, settings: &ExportSettings) -> Option<rawgraph_io::ExportMetadata> {
+fn build_metadata(source: &Path, settings: &ExportSettings, keywords: &[String]) -> Option<rawgraph_io::ExportMetadata> {
     if !settings.copy_metadata {
         return None;
     }
     // Reading metadata never fails an item: an unreadable source gives an (almost) empty block.
-    let mut meta = rawgraph_io::read_export_metadata(source).select(&settings.meta);
+    let mut meta = rawgraph_io::read_export_metadata(source);
+    // The keywords come from the project, not from the source file.
+    meta.keywords = keywords.to_vec();
+    let mut meta = meta.select(&settings.meta);
     let set = |v: &Option<String>| v.as_ref().filter(|s| !s.is_empty()).cloned();
     if settings.meta.author {
         if let Some(a) = set(&settings.artist) {
@@ -665,7 +689,7 @@ struct Plan {
     failure: Option<String>,
 }
 
-fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job, plan: &Plan, reserved: &HashSet<String>) -> ItemStatus {
+fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job, plan: &Plan, reserved: &HashSet<String>, warnings: &mut Vec<String>) -> ItemStatus {
     let planned: &Path = &plan.base;
     let settings = job.settings;
     let item = &job.item;
@@ -743,7 +767,16 @@ fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job
         }
     };
     drop(image);
-    let metadata = build_metadata(&item.source, settings);
+    let mut metadata = build_metadata(&item.source, settings, &item.keywords);
+    if let (Some(m), ExportFormat::Jpeg { .. }) = (metadata.as_mut(), settings.format) {
+        // A JPEG XMP segment holds about 64 KB: the keywords that do not fit are left out and reported.
+        let total = rawgraph_core::keywords::normalize_keywords(&m.keywords).len();
+        let fit = rawgraph_io::jpeg_embeddable_keywords(&m.keywords);
+        if fit.len() < total {
+            warnings.push(format!("{} keywords not embedded (JPEG XMP limit)", total - fit.len()));
+            m.keywords = fit;
+        }
+    }
 
     if ctx.cancel.is_cancelled() {
         return ItemStatus::Cancelled;
@@ -920,7 +953,7 @@ fn export_node_impl(
         .map(|(&id, s)| match by_id.get(&id) {
             Some(it) => Job { item: (*it).clone(), settings: s, pre_failure: None },
             None => Job {
-                item: ExportItem { id, source: PathBuf::new() },
+                item: ExportItem { id, source: PathBuf::new(), keywords: Vec::new() },
                 settings: s,
                 pre_failure: (!members.contains(&id)).then(|| format!("image {} is not part of the project", id.0)),
             },
@@ -1042,8 +1075,14 @@ fn run_batch(
             ItemStatus::Excluded
         } else {
             let plan = path.clone().unwrap_or_default();
-            catch_unwind(AssertUnwindSafe(|| run_item(&ctx, &mut ev, &provider, job, &plan, &reserved)))
-                .unwrap_or_else(|_| ItemStatus::Failed("internal error while processing this image".into()))
+            let mut item_warnings = Vec::new();
+            let status = catch_unwind(AssertUnwindSafe(|| run_item(&ctx, &mut ev, &provider, job, &plan, &reserved, &mut item_warnings)))
+                .unwrap_or_else(|_| ItemStatus::Failed("internal error while processing this image".into()));
+            if matches!(status, ItemStatus::Written { .. }) {
+                let name = job.item.source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                report.warnings.extend(item_warnings.into_iter().map(|w| (job.item.id, if name.is_empty() { w } else { format!("{name}: {w}") })));
+            }
+            status
         };
         // Whatever the outcome, nothing stays decoded between two items.
         ev.clear();

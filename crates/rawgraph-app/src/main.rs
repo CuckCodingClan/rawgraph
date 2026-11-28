@@ -31,6 +31,7 @@ mod groups;
 mod histogram;
 mod history;
 mod inspector;
+mod keyword_panel;
 mod gradient_editor;
 mod handles;
 mod handles_logic;

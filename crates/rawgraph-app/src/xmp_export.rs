@@ -12,10 +12,13 @@ fn proprietary_raw(path: &Path) -> bool {
         "3fr" | "ari" | "arw" | "bay" | "cr2" | "cr3" | "crw" | "cap" | "dcr" | "dcs" | "drf" | "eip" | "erf" | "fff" | "iiq" | "k25" | "kdc" | "mef" | "mos" | "mrw" | "nef" | "nrw" | "orf" | "pef" | "ptx" | "pxn" | "raf" | "raw" | "rwl" | "rw2" | "rwz" | "sr2" | "srf" | "srw" | "x3f"))
 }
 
-fn packet(rating: u8, flag: Flag, label: Option<ColorLabel>) -> String {
+fn packet(rating: u8, flag: Flag, label: Option<ColorLabel>, keywords: &[String]) -> String {
     let rating = if flag == Flag::Reject { -1 } else { i32::from(rating.min(5)) };
     let label = match label { Some(ColorLabel::Red) => "Red", Some(ColorLabel::Yellow) => "Yellow", Some(ColorLabel::Green) => "Green", Some(ColorLabel::Blue) => "Blue", Some(ColorLabel::Purple) => "Purple", None => "" };
-    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmp:Rating=\"{rating}\" xmp:Label=\"{label}\"/></rdf:RDF></x:xmpmeta>\n")
+    // dc:subject (flat leaf names) and lr:hierarchicalSubject (Parent|Child paths), as Lightroom writes them.
+    let elements = rawgraph_core::keywords::xmp_keyword_elements(keywords);
+    let (namespaces, body) = if elements.is_empty() { (String::new(), "/>".to_owned()) } else { (rawgraph_core::keywords::XMP_KEYWORD_NAMESPACES.to_owned(), format!(">{elements}</rdf:Description>")) };
+    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"{namespaces} xmp:Rating=\"{rating}\" xmp:Label=\"{label}\"{body}</rdf:RDF></x:xmpmeta>\n")
 }
 
 pub fn run(graph: &Graph, node: NodeId, run: &NodeRun, selection: &[ImageId], cancel: &CancelToken, progress: &mut dyn FnMut(usize, usize)) -> ExportReport {
@@ -28,7 +31,10 @@ pub fn run(graph: &Graph, node: NodeId, run: &NodeRun, selection: &[ImageId], ca
             let spec = rawgraph_core::export_spec(n, id);
             if spec.format != ExportFileFormat::Xmp {
                 ItemStatus::Failed("Mixed XMP and rendered formats in one run are not supported; run separately".into())
-            } else { write_sidecar(&item.source, Path::new(spec.text.out_dir.trim()), &run.catalog, rating, flag, label) }
+            } else {
+                let keywords: &[String] = if spec.meta.keywords { &item.keywords } else { &[] };
+                write_sidecar(&item.source, Path::new(spec.text.out_dir.trim()), &run.catalog, rating, flag, label, keywords)
+            }
         } else { ItemStatus::Failed("Image or metadata missing from project".into()) };
         report.items.push((id, status));
         progress(i + 1, selection.len());
@@ -36,8 +42,8 @@ pub fn run(graph: &Graph, node: NodeId, run: &NodeRun, selection: &[ImageId], ca
     report
 }
 
-fn write_sidecar(source: &Path, dir: &Path, catalog: &[rawgraph_batch::ExportItem], rating: u8, flag: Flag, label: Option<ColorLabel>) -> ItemStatus {
-    fn write(source: &Path, dir: &Path, catalog: &[rawgraph_batch::ExportItem], rating: u8, flag: Flag, label: Option<ColorLabel>) -> Result<ItemStatus, String> {
+fn write_sidecar(source: &Path, dir: &Path, catalog: &[rawgraph_batch::ExportItem], rating: u8, flag: Flag, label: Option<ColorLabel>, keywords: &[String]) -> ItemStatus {
+    fn write(source: &Path, dir: &Path, catalog: &[rawgraph_batch::ExportItem], rating: u8, flag: Flag, label: Option<ColorLabel>, keywords: &[String]) -> Result<ItemStatus, String> {
         if !proprietary_raw(source) { return Err("XMP export supports proprietary RAW files only (not DNG or rendered images)".into()); }
         if !source.is_file() { return Err("Source RAW is missing or not a file".into()); }
         if dir.as_os_str().is_empty() { return Err("Choose an output folder".into()); }
@@ -60,14 +66,14 @@ fn write_sidecar(source: &Path, dir: &Path, catalog: &[rawgraph_batch::ExportIte
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(ItemStatus::SkippedExisting(target)),
             Err(e) => return Err(e.to_string()),
         };
-        if let Err(e) = file.write_all(packet(rating, flag, label).as_bytes()) {
+        if let Err(e) = file.write_all(packet(rating, flag, label, keywords).as_bytes()) {
             drop(file);
             let _ = std::fs::remove_file(&target);
             return Err(e.to_string());
         }
         Ok(ItemStatus::Written { path: target, width: 0, height: 0 })
     }
-    write(source, dir, catalog, rating, flag, label).unwrap_or_else(ItemStatus::Failed)
+    write(source, dir, catalog, rating, flag, label, keywords).unwrap_or_else(ItemStatus::Failed)
 }
 
 #[cfg(test)]
@@ -75,24 +81,49 @@ mod tests {
     use super::*;
     #[test]
     fn culling_packet_and_raw_restrictions() {
-        let parsed = rawgraph_project::parse_xmp_culling(&packet(4, Flag::None, Some(ColorLabel::Blue))).unwrap();
+        let parsed = rawgraph_project::parse_xmp_culling(&packet(4, Flag::None, Some(ColorLabel::Blue), &[])).unwrap();
         assert_eq!(parsed.rating, Some(4));
         assert_eq!(parsed.label.as_deref(), Some("Blue"));
-        assert_eq!(rawgraph_project::parse_xmp_culling(&packet(3, Flag::Reject, None)).unwrap().rating, Some(-1));
+        assert_eq!(rawgraph_project::parse_xmp_culling(&packet(3, Flag::Reject, None, &[])).unwrap().rating, Some(-1));
         assert!(proprietary_raw(Path::new("a.CR3")));
         assert!(!proprietary_raw(Path::new("a.dng")));
         assert!(!proprietary_raw(Path::new("a.jpg")));
     }
     #[test]
+    fn keywords_round_trip_through_the_sidecar_with_hierarchy_and_non_ascii() {
+        let kw: Vec<String> = vec!["Reise|Österreich|Wörthersee".into(), "Tom & <Jerry>".into(), "日本".into(), "Food".into()];
+        let xml = packet(2, Flag::None, None, &kw);
+        let parsed = rawgraph_project::parse_xmp_culling(&xml).unwrap();
+        assert_eq!(parsed.rating, Some(2));
+        assert_eq!(parsed.keywords, rawgraph_core::keywords::normalize_keywords(&kw), "the same keywords come back, hierarchy included");
+        assert!(xml.contains("<rdf:li>Wörthersee</rdf:li>") && xml.contains("<rdf:li>Reise|Österreich|Wörthersee</rdf:li>"));
+        // No keywords: the packet is what it was before.
+        assert!(packet(2, Flag::None, None, &[]).contains("xmp:Label=\"\"/>"));
+        // Written to a file and read back through the sidecar reader.
+        let t = tempfile::tempdir().unwrap();
+        let source = t.path().join("a.nef");
+        std::fs::write(&source, b"x").unwrap();
+        let catalog = vec![rawgraph_batch::ExportItem { id: ImageId(1), source: source.clone(), keywords: kw.clone() }];
+        let out = t.path().join("out");
+        assert!(matches!(write_sidecar(&source, &out, &catalog, 4, Flag::None, None, &kw), ItemStatus::Written { .. }));
+        let text = std::fs::read_to_string(out.join("a.xmp")).unwrap();
+        assert_eq!(rawgraph_project::parse_xmp_culling(&text).unwrap().keywords, rawgraph_core::keywords::normalize_keywords(&kw));
+        // An existing sidecar is still skipped, keywords or not.
+        assert!(matches!(write_sidecar(&source, &out, &catalog, 4, Flag::None, None, &kw), ItemStatus::SkippedExisting(_)));
+        // And a folder with source photos is still refused.
+        assert!(matches!(write_sidecar(&source, t.path(), &catalog, 4, Flag::None, None, &kw), ItemStatus::Failed(_)));
+    }
+
+    #[test]
     fn never_overwrite_or_write_into_source_dir() {
         let t = tempfile::tempdir().unwrap();
         let source = t.path().join("a.nef");
         std::fs::write(&source, b"original").unwrap();
-        let catalog = vec![rawgraph_batch::ExportItem { id: ImageId(1), source: source.clone() }];
-        assert!(matches!(write_sidecar(&source, t.path(), &catalog, 3, Flag::None, None), ItemStatus::Failed(_)));
+        let catalog = vec![rawgraph_batch::ExportItem { id: ImageId(1), source: source.clone(), keywords: Vec::new() }];
+        assert!(matches!(write_sidecar(&source, t.path(), &catalog, 3, Flag::None, None, &[]), ItemStatus::Failed(_)));
         let out = t.path().join("out");
-        assert!(matches!(write_sidecar(&source, &out, &catalog, 3, Flag::None, None), ItemStatus::Written { .. }));
-        assert!(matches!(write_sidecar(&source, &out, &catalog, 5, Flag::None, None), ItemStatus::SkippedExisting(_)));
+        assert!(matches!(write_sidecar(&source, &out, &catalog, 3, Flag::None, None, &[]), ItemStatus::Written { .. }));
+        assert!(matches!(write_sidecar(&source, &out, &catalog, 5, Flag::None, None, &[]), ItemStatus::SkippedExisting(_)));
         assert_eq!(std::fs::read(source).unwrap(), b"original");
     }
 }

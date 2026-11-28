@@ -68,7 +68,7 @@ fn xmp_attribute_form() {
         <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="4" xmp:Label="Red"/>
         </rdf:RDF></x:xmpmeta>"#;
     let c = parse_xmp_culling(x).unwrap();
-    assert_eq!(c, XmpCulling { rating: Some(4), label: Some("Red".into()) });
+    assert_eq!(c, XmpCulling { rating: Some(4), label: Some("Red".into()), ..Default::default() });
 }
 
 #[test]
@@ -77,14 +77,14 @@ fn xmp_element_form() {
         <rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/"><xmp:Rating>3</xmp:Rating>
         <xmp:Label> Blau </xmp:Label></rdf:Description></rdf:RDF></x:xmpmeta>"#;
     let c = parse_xmp_culling(x).unwrap();
-    assert_eq!(c, XmpCulling { rating: Some(3), label: Some("Blau".into()) });
+    assert_eq!(c, XmpCulling { rating: Some(3), label: Some("Blau".into()), ..Default::default() });
 }
 
 #[test]
 fn xmp_prefix_variation() {
     let x = r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description
         xmlns:a="http://ns.adobe.com/xap/1.0/" a:Rating="2" a:Label="Green"/></rdf:RDF>"#;
-    assert_eq!(parse_xmp_culling(x).unwrap(), XmpCulling { rating: Some(2), label: Some("Green".into()) });
+    assert_eq!(parse_xmp_culling(x).unwrap(), XmpCulling { rating: Some(2), label: Some("Green".into()), ..Default::default() });
     // A different namespace with the same local name is not the XMP rating.
     let y = r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description
         xmlns:other="http://example.com/ns/" other:Rating="5"/></rdf:RDF>"#;
@@ -115,7 +115,7 @@ fn xmp_lightroom_sidecar() {
   </rdf:Description>\n\
  </rdf:RDF>\n\
 </x:xmpmeta>\n<?xpacket end=\"w\"?>";
-    assert_eq!(parse_xmp_culling(x).unwrap(), XmpCulling { rating: Some(5), label: Some("Lila".into()) });
+    assert_eq!(parse_xmp_culling(x).unwrap(), XmpCulling { rating: Some(5), label: Some("Lila".into()), keywords: vec!["wedding".into()] });
 }
 
 #[test]
@@ -159,19 +159,19 @@ fn xmp_label_names_and_apply() {
     ];
     for (name, want) in cases {
         p.image_mut(id).unwrap().color_label = None;
-        let x = XmpCulling { rating: None, label: Some(name.into()) };
+        let x = XmpCulling { rating: None, label: Some(name.into()), ..Default::default() };
         assert!(p.apply_xmp_culling(id, &x), "{name}");
         assert_eq!(p.image(id).unwrap().color_label, Some(want));
         assert!(!p.apply_xmp_culling(id, &x), "second apply changes nothing");
     }
-    let unknown = XmpCulling { rating: Some(0), label: Some("Pink".into()) };
+    let unknown = XmpCulling { rating: Some(0), label: Some("Pink".into()), ..Default::default() };
     assert!(!p.apply_xmp_culling(id, &unknown));
-    assert!(p.apply_xmp_culling(id, &XmpCulling { rating: Some(4), label: None }));
+    assert!(p.apply_xmp_culling(id, &XmpCulling { rating: Some(4), label: None, ..Default::default() }));
     assert_eq!(p.image(id).unwrap().rating, 4);
-    assert!(p.apply_xmp_culling(id, &XmpCulling { rating: Some(-1), label: None }));
+    assert!(p.apply_xmp_culling(id, &XmpCulling { rating: Some(-1), label: None, ..Default::default() }));
     let e = p.image(id).unwrap();
     assert_eq!((e.flag, e.rating), (Flag::Reject, 4));
-    assert!(!p.apply_xmp_culling(ImageId(999), &XmpCulling { rating: Some(3), label: None }));
+    assert!(!p.apply_xmp_culling(ImageId(999), &XmpCulling { rating: Some(3), label: None, ..Default::default() }));
 }
 
 fn sidecar(rating: &str, label: &str) -> String {

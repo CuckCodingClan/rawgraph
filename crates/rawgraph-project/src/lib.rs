@@ -19,6 +19,7 @@
 
 mod history;
 mod ids;
+mod keywords;
 mod maintain;
 mod recovery;
 mod store;
@@ -36,6 +37,8 @@ mod tests_extra;
 mod tests_project;
 #[cfg(test)]
 mod tests_inplace;
+#[cfg(test)]
+mod tests_keywords;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -47,6 +50,7 @@ use rawgraph_core::{CaptureInfo, Graph, ImageId, NodeKind};
 use serde::{Deserialize, Serialize};
 
 pub use history::HistoryEntry;
+pub use keywords::{add_to_list as add_keywords_to_list, count_keywords, remove_from_list as remove_keyword_from_list, KeywordCount, KeywordMatch};
 pub use recovery::{discard_recovery, list_recoveries, load_recovery, RecoveryInfo};
 pub use thumbs::ThumbCache;
 pub use util::{content_hash, natural_cmp};
@@ -59,7 +63,7 @@ pub const PROJECT_EXTENSION: &str = "rawgraph";
 /// [`Project::commit`]. Files with an older version are migrated when loaded
 /// (in memory; the file on disk is only replaced by the next write, after a
 /// `.v<N>.bak` copy of it), files with a newer one give [`ProjectError::TooNew`].
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Flag {
@@ -98,6 +102,10 @@ pub struct ImageEntry {
     pub rating: u8,
     pub flag: Flag,
     pub color_label: Option<ColorLabel>,
+    /// Keywords (stichwörter): normalised (see `rawgraph_core::keywords`), de-duplicated
+    /// case-insensitively and sorted; a hierarchical keyword is `Parent|Child`. Stored in the
+    /// `keywords` table (schema 3).
+    pub keywords: Vec<String>,
     /// The file was not found at `path` at the last check.
     pub missing: bool,
 }
@@ -155,6 +163,12 @@ pub struct Filter {
     pub flash_fired: Option<bool>,
     /// Case-insensitive substring of the file name.
     pub text: Option<String>,
+    /// Keywords to look for (an image carries a keyword when it has it or one below it). Empty = no
+    /// keyword filter. Combined by [`Filter::keyword_match`].
+    pub keywords: Vec<String>,
+    pub keyword_match: KeywordMatch,
+    /// Only images without any keyword (wins over `keywords`).
+    pub no_keywords: bool,
     pub include_missing: bool,
 }
 
@@ -185,7 +199,7 @@ impl Filter {
                 return false;
             }
         }
-        true
+        keywords::matches_filter(e, &self.keywords, self.keyword_match, self.no_keywords)
     }
 }
 
@@ -683,6 +697,7 @@ impl Project {
                                 rating: 0,
                                 flag: Flag::None,
                                 color_label: None,
+                                keywords: Vec::new(),
                                 missing: false,
                             });
                             report.added.push(id);

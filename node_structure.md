@@ -1,6 +1,6 @@
 # RawGraph node structure
 
-Current inventory for graph format 4, not a list of what shipped in `2611.001`. Node labels, stable keys, port types, choice order and defaults come from the core graph definitions. Tables describe stored settings; the inspector may group settings or hide ones that do not apply.
+Current inventory for graph format 5 (sub-graph format 4; format 5 added the Keyword measure, `keyword_op` and the Export `meta_keywords` toggle; older Export nodes that copied no metadata get `meta_keywords` off when they load, so they do not start embedding keywords), not a list of what shipped in `2611.001`. Node labels, stable keys, port types, choice order and defaults come from the core graph definitions. Tables describe stored settings; the inspector may group settings or hide ones that do not apply.
 
 Graphs of format 1 and 2 (and sub-graphs of format 1) are rewritten to these nodes when loaded; see the README section "Per-pixel image controls" for the mapping of the removed mask kinds and ports.
 
@@ -24,11 +24,14 @@ Edit the relevant node section in Git. To distinguish a request from an implemen
 
 | Setting | Key | Default | Range or choices |
 | --- | --- | --- | --- |
-| Measure | `measure` | ISO | ISO / Shutter time (s) / Aperture (f) / EV100 / Flash |
+| Measure | `measure` | ISO | ISO / Shutter time (s) / Aperture (f) / EV100 / Flash / Keyword |
 | Minimum | `min` | 0 | -100 to 1000000 (log scale) |
 | Maximum | `max` | 1000000 | -100 to 1000000 (log scale) |
 | Invert | `invert` | Off | Off / On |
 | Missing metadata | `missing` | Exclude | Exclude / Include |
+| Keyword test | `keyword_op` | contains | contains / does not contain |
+
+**Keyword measure** (stored choice 5, appended; the numeric measures are unchanged). The text to look for is the structured setting `Keyword` (a string, up to 1024 characters, empty = any keyword). An image matches "contains" when one of its keywords contains the text, case-insensitively and in any part of the path (`rom` finds `Travel|Italy|Rome`); "does not contain" is the opposite, so an image without keywords matches it. Minimum, maximum and Missing metadata do not apply to the Keyword measure (an image without keywords is not "missing": it contains nothing); Invert still flips the result. The inspector hides the settings that do not apply. Older files have no `keyword_op` and no text: they read as "contains" and empty.
 
 ### Merge (`Merge`)
 
@@ -41,7 +44,7 @@ Edit the relevant node section in Git. To distinguish a request from an implemen
 
 ### Split by Metadata (`MetadataSplit`)
 
-Up to six editable named ranges (name, min, max); range names label their output ports. Unmatched has its own output.
+Up to six editable named ranges (name, min, max); range names label their output ports. Unmatched has its own output. With the Keyword measure every range is a keyword test instead: the name is the text to look for (min and max are ignored), an image leaves through the first range whose test it passes, all others through Unmatched.
 
 - **Inputs:** Images: Images (required)
 - **Outputs:** Range 1: Images; Range 2: Images; Range 3: Images; Range 4: Images; Range 5: Images; Range 6: Images; Unmatched: Images
@@ -49,8 +52,11 @@ Up to six editable named ranges (name, min, max); range names label their output
 
 | Setting | Key | Default | Range or choices |
 | --- | --- | --- | --- |
-| Measure | `measure` | ISO | ISO / Shutter time (s) / Aperture (f) / EV100 / Flash |
+| Measure | `measure` | ISO | ISO / Shutter time (s) / Aperture (f) / EV100 / Flash / Keyword |
 | Missing metadata | `missing` | Unmatched | Unmatched / Exclude |
+| Keyword test | `keyword_op` | contains | contains / does not contain |
+
+With the Keyword measure the ranges are tested as described under Metadata Filter ("contains" / "does not contain" applied to each range name); Missing metadata does not apply (an image without keywords simply fails "contains" and passes "does not contain").
 
 ### Layer (`Layer`)
 
@@ -468,6 +474,9 @@ Structured fields: output folder, filename template (`{name}`, `{index}`, `{id}`
 | GPS location | `meta_gps` | Off | Off / On |
 | Author | `meta_author` | On | Off / On |
 | Software | `meta_software` | On | Off / On |
+| Keywords | `meta_keywords` | On | Off / On |
+
+**Keywords in exports.** With the Keywords switch on, the keywords of an image are written into rendered files as an XMP packet: `dc:subject` (flat: the last level of every keyword) and `lr:hierarchicalSubject` (`Parent|Child` paths of the keywords that have levels), the same fields Lightroom writes. Where: JPEG (APP1 `http://ns.adobe.com/xap/1.0/`, after the Exif segment, shortened to fit 65,000 bytes when a list is huge), PNG (uncompressed `iTXt` chunk `XML:com.adobe.xmp` before the pixel data), TIFF 8 and 16 bit (tag 700), WebP lossy and lossless (`XMP ` chunk and the XMP flag of the `VP8X` header). **Not written:** AVIF (the container writer has no XMP item), EXR, PNG 16-bit data map; HEIC is not implemented. An image without keywords gets no packet; with every metadata switch off (including Keywords) and no description the file has no metadata block at all. For Adobe XMP sidecars the switch decides whether the sidecar carries the keywords. File names: the template token `{keywords}` is the last level of every keyword joined with `-`, with characters that are not allowed in file names replaced by `_`, at most 80 characters (`untagged` for an image without keywords or when the text leaves no usable name, e.g. only dots or a reserved device name such as `CON`). A JPEG XMP segment is limited to about 65,000 bytes: keywords that do not fit are dropped from the end of the sorted list and reported as "N keywords not embedded (JPEG XMP limit)". HEIC exports carry no keywords yet.
 
 ## Tone
 

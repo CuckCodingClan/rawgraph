@@ -53,6 +53,9 @@ pub struct ExportMetadata {
     /// characters are the UTF-8 encoding that exiftool, macOS and Windows display correctly.
     /// Embedded NUL characters are dropped.
     pub description: Option<String>,
+    /// Keywords, written as an XMP packet (`dc:subject` and `lr:hierarchicalSubject`) into JPEG, PNG,
+    /// TIFF and WebP files. The EXIF block does not carry them.
+    pub keywords: Vec<String>,
 }
 
 impl ExportMetadata {
@@ -84,6 +87,9 @@ impl ExportMetadata {
         if sel.author {
             out.artist = self.artist.clone();
             out.copyright = self.copyright.clone();
+        }
+        if sel.keywords {
+            out.keywords = self.keywords.clone();
         }
         out.software = if sel.software { self.software.clone() } else { Some(String::new()) };
         out
@@ -146,6 +152,7 @@ fn from_exif(ex: &exif::Exif) -> ExportMetadata {
         software: None,
         gps: gps_from_exif(ex),
         description: get(exif::Tag::ImageDescription).and_then(ascii),
+        keywords: Vec::new(),
     }
 }
 
@@ -228,6 +235,7 @@ pub fn read_export_metadata(path: &Path) -> ExportMetadata {
             software: None,
             gps: md.gps.or(r.gps),
             description: md.description.or(r.description),
+            keywords: Vec::new(),
         };
     }
     md
@@ -483,7 +491,10 @@ pub(crate) fn tiff_add_exif(path: &Path, md: &ExportMetadata, srgb: bool) -> Res
     let mut table = vec![0u8; n * 12];
     f.read_exact(&mut table).map_err(|e| io_err(path, e))?;
 
-    let (new_ifd0, exif, gps) = build_entries(md, srgb);
+    let (mut new_ifd0, exif, gps) = build_entries(md, srgb);
+    if let Some(packet) = crate::xmp::tiff_packet(&md.keywords) {
+        new_ifd0.push(Entry::New { tag: 700, typ: T_BYTE, count: packet.len() as u32, data: packet });
+    }
     let replaced: Vec<u16> = new_ifd0.iter().map(Entry::tag).chain([34665, 34853]).collect();
     let mut entries: Vec<Entry> = table
         .as_chunks::<12>()
@@ -621,9 +632,22 @@ fn xmp_tiff(f: &mut BufReader<File>, le: bool) -> Option<String> {
     xmp_from_bytes(rd(f, count as usize)?)
 }
 
+fn xmp_webp(f: &mut BufReader<File>) -> Option<String> {
+    // RIFF header (12 bytes, 8 already read), then chunks: fourcc, little-endian size, data, pad.
+    f.seek(SeekFrom::Start(12)).ok()?;
+    loop {
+        let head = rd(f, 8)?;
+        let len = u64::from(u32::from_le_bytes([head[4], head[5], head[6], head[7]]));
+        if &head[..4] == b"XMP " && len <= MAX_XMP {
+            return xmp_from_bytes(rd(f, len as usize)?);
+        }
+        f.seek(SeekFrom::Current((len + (len & 1)) as i64)).ok()?;
+    }
+}
+
 /// The XMP packet embedded in a file: tag 700 of a TIFF / DNG / TIFF-based RAW (ARW, NEF, ...), the
-/// APP1 segment "http://ns.adobe.com/xap/1.0/" of a JPEG, or the uncompressed iTXt chunk
-/// "XML:com.adobe.xmp" of a PNG. Container recognition is by content, not by extension. `None`
+/// APP1 segment "http://ns.adobe.com/xap/1.0/" of a JPEG, the uncompressed iTXt chunk
+/// "XML:com.adobe.xmp" of a PNG, or the "XMP " chunk of a WebP. Container recognition is by content, not by extension. `None`
 /// when there is no packet or the file cannot be read; only the headers and the packet are read,
 /// never the pixel data. (Not read: extended XMP in further JPEG segments, ISO-BMFF containers such
 /// as CR3.)
@@ -635,6 +659,11 @@ pub fn read_xmp_packet(path: &Path) -> Option<String> {
         [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] => xmp_png(&mut f),
         [b'I', b'I', 42, 0, ..] => xmp_tiff(&mut f, true),
         [b'M', b'M', 0, 42, ..] => xmp_tiff(&mut f, false),
+        [b'R', b'I', b'F', b'F', ..] => {
+            let kind = rd(&mut f, 4)?;
+            // The 8 bytes read so far were "RIFF" + size; the form type follows.
+            (&kind[..] == b"WEBP").then(|| xmp_webp(&mut f)).flatten()
+        }
         _ => None,
     }
 }
@@ -658,6 +687,7 @@ mod tests {
             software: None,
             gps: None,
             description: None,
+            keywords: Vec::new(),
         }
     }
 

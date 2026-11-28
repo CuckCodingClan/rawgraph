@@ -127,7 +127,7 @@ fn real_main() -> Result<(), String> {
 
     let files = collect(Path::new(&src))?;
     let items: Vec<ExportItem> =
-        files.into_iter().enumerate().map(|(i, source)| ExportItem { id: ImageId(i as u64 + 1), source }).collect();
+        files.into_iter().enumerate().map(|(i, source)| ExportItem { id: ImageId(i as u64 + 1), source, keywords: Vec::new() }).collect();
 
     let mut graph = Graph::new();
     let develop_node = develop.then(|| graph.add_node(NodeKind::Develop, [100.0, 0.0]));

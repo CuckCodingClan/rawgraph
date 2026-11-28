@@ -168,7 +168,7 @@ impl ExportState {
         if self.scope != Scope::Selected {
             ids.extend(Self::generated_items(session));
         }
-        ids.into_iter().map(|id| ExportItem { id, source: session.entry(id).map(|e| e.path.clone()).unwrap_or_default() }).collect()
+        ids.into_iter().map(|id| ExportItem { id, source: session.entry(id).map(|e| e.path.clone()).unwrap_or_default(), keywords: session.entry(id).map(|e| e.keywords.clone()).unwrap_or_default() }).collect()
     }
 
     fn generated_items(session: &Session) -> Vec<ImageId> {
@@ -251,7 +251,11 @@ pub fn counts(report: &ExportReport) -> (usize, usize, usize, usize, usize) {
 
 pub fn summarize(report: &ExportReport) -> String {
     let (w, s, x, f, c) = counts(report);
-    format!("Export finished: {w} written, {s} skipped, {x} excluded, {f} failed, {c} cancelled")
+    let mut text = format!("Export finished: {w} written, {s} skipped, {x} excluded, {f} failed, {c} cancelled");
+    if let Some((_, first)) = report.warnings.first() {
+        text.push_str(&format!("; {} warning(s), e.g. {first}", report.warnings.len()));
+    }
+    text
 }
 
 pub enum ExportMsg {
@@ -398,7 +402,7 @@ pub fn catalog_items(session: &Session) -> Vec<ExportItem> {
     if session.demo {
         return Vec::new();
     }
-    session.project.images().iter().map(|e| ExportItem { id: e.id, source: e.path.clone() }).collect()
+    session.project.images().iter().map(|e| ExportItem { id: e.id, source: e.path.clone(), keywords: e.keywords.clone() }).collect()
 }
 
 /// The images a node export writes for `scope`: the node's collection, limited to the selected
@@ -431,7 +435,7 @@ pub fn node_plan(session: &mut Session, node: NodeId, scope: Scope) -> (Vec<Expo
     let catalog = catalog_items(session);
     let selection = node_selection(session, node, scope);
     let by_id: std::collections::HashMap<ImageId, &ExportItem> = catalog.iter().map(|i| (i.id, i)).collect();
-    let items: Vec<ExportItem> = selection.iter().map(|id| by_id.get(id).map(|i| (*i).clone()).unwrap_or_else(|| ExportItem { id: *id, source: Default::default() })).collect();
+    let items: Vec<ExportItem> = selection.iter().map(|id| by_id.get(id).map(|i| (*i).clone()).unwrap_or_else(|| ExportItem { id: *id, source: Default::default(), keywords: Vec::new() })).collect();
     let display = node_display(&session.view);
     let members = node_members(session, node);
     let culling = session.project.images().iter().map(|e| (e.id, (e.rating, e.flag, e.color_label))).collect();
@@ -956,7 +960,7 @@ mod tests {
         assert_eq!((Fmt::Png16.label(), Fmt::Tiff16.label()), ("PNG 16-bit", "TIFF 16-bit"));
         assert!(Fmt::Png16.has_profile_options() && !Fmt::Exr.has_profile_options());
         // The file name keeps the format's extension.
-        let items = vec![ExportItem { id: ImageId(1), source: "a.arw".into() }];
+        let items = vec![ExportItem { id: ImageId(1), source: "a.arw".into(), keywords: Vec::new() }];
         st.format = Fmt::Tiff16;
         assert_eq!(st.preview(&view, &items).unwrap(), "a.tif");
         st.format = Fmt::Png16;
@@ -1031,10 +1035,11 @@ mod tests {
                 (ImageId(4), ItemStatus::Cancelled),
                 (ImageId(5), ItemStatus::Excluded),
             ],
+            ..Default::default()
         };
         assert_eq!(counts(&report), (1, 1, 1, 1, 1));
         assert_eq!(summarize(&report), "Export finished: 1 written, 1 skipped, 1 excluded, 1 failed, 1 cancelled");
-        let items: Vec<ExportItem> = (1..=5).map(|i| ExportItem { id: ImageId(i), source: format!("{i}.arw").into() }).collect();
+        let items: Vec<ExportItem> = (1..=5).map(|i| ExportItem { id: ImageId(i), source: format!("{i}.arw").into(), keywords: Vec::new() }).collect();
         assert_eq!(report.retry_items(&items).len(), 2);
     }
 }

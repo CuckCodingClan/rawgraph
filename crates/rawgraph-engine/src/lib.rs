@@ -1063,6 +1063,10 @@ fn hash_node_data(data: Option<&NodeData>, hasher: &mut DefaultHasher) {
             hasher.write_u8(8);
             path.hash(hasher);
         }
+        Some(NodeData::Keyword(text)) => {
+            hasher.write_u8(9);
+            text.hash(hasher);
+        }
         Some(NodeData::Export(text)) => {
             hasher.write_u8(6);
             text.out_dir.hash(hasher);

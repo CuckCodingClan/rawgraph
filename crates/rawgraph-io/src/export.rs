@@ -99,7 +99,13 @@ fn write_rgb(
     ext: &str,
     options: &SaveOptions,
 ) -> Result<(), IoError> {
+    let in_memory = matches!(ext, "jpg" | "jpeg" | "png") && options.metadata.as_ref().is_some_and(|m| !m.keywords.is_empty());
     write_atomic(path, options.overwrite, |tmp| {
+        if in_memory {
+            // The XMP packet is inserted into the finished stream.
+            let data = encode_rgb(width, height, bytes, color, ext, options)?;
+            return fs::write(tmp, data).map_err(|e| io_err(tmp, e));
+        }
         let mut writer = BufWriter::new(File::create(tmp).map_err(|e| io_err(tmp, e))?);
         encode_rgb_to(&mut writer, width, height, bytes, color, ext, options)?;
         writer.flush().map_err(|e| io_err(tmp, e))?;
@@ -114,14 +120,24 @@ fn write_rgb(
 }
 
 /// Encode RGB samples with the same image encoder as file export, entirely in memory.
-/// TIFF EXIF is appended by the file writer and is not included in these bytes.
+/// TIFF EXIF and the TIFF keywords packet are appended by the file writer and are not included in
+/// these bytes; the keywords packet of JPEG and PNG is.
 pub fn encode_rgb(
     width: u32, height: u32, bytes: &[u8], color: ExtendedColorType,
     ext: &str, options: &SaveOptions,
 ) -> Result<Vec<u8>, IoError> {
     let mut w = Cursor::new(Vec::new());
     encode_rgb_to(&mut w, width, height, bytes, color, ext, options)?;
-    Ok(w.into_inner())
+    let data = w.into_inner();
+    let keywords = options.metadata.as_ref().map(|m| m.keywords.as_slice()).unwrap_or_default();
+    if keywords.is_empty() {
+        return Ok(data);
+    }
+    match ext {
+        "jpg" | "jpeg" => crate::xmp::embed_jpeg(data, keywords),
+        "png" => crate::xmp::embed_png(data, keywords),
+        _ => Ok(data),
+    }
 }
 
 fn encode_rgb_to<W: Write + Seek>(mut w: W, width: u32, height: u32, bytes: &[u8], color: ExtendedColorType, ext: &str, options: &SaveOptions) -> Result<(), IoError> {
@@ -162,7 +178,8 @@ fn encode_rgb_to<W: Write + Seek>(mut w: W, width: u32, height: u32, bytes: &[u8
 /// jpg/jpeg (uses `options.jpeg_quality`), png, tif/tiff. `rgb8` must already be encoded in
 /// `options.space` (despite the name the function writes any of the output spaces). With
 /// `embed_profile` the ICC profile of `options.space` is embedded; with `metadata` EXIF is written
-/// (JPEG APP1, PNG eXIf, TIFF EXIF IFD, including GPS and description).
+/// (JPEG APP1, PNG eXIf, TIFF EXIF IFD, including GPS and description); keywords go into an XMP
+/// packet (JPEG APP1, PNG iTXt `XML:com.adobe.xmp`, TIFF tag 700).
 /// Refuses to replace an existing file unless `options.overwrite`.
 pub fn save_srgb8_with(path: &Path, width: u32, height: u32, rgb8: &[u8], options: &SaveOptions) -> Result<(), IoError> {
     let ext = extension_of(path);
@@ -242,7 +259,7 @@ pub fn save_heic8(path: &Path, width: u32, height: u32, rgb8: &[u8], options: &S
 
 /// Writes RGBA WebP. Pixels are already encoded in the selected output space. With `embed_profile`
 /// the ICC profile of `options.space` is stored in an `ICCP` chunk (extended `VP8X` container,
-/// lossy and lossless); EXIF is supported as well.
+/// lossy and lossless); EXIF and keywords (an `XMP ` chunk) are supported as well.
 pub fn save_webp8(path: &Path, width: u32, height: u32, rgba: &[u8], lossless: bool, options: &SaveOptions) -> Result<(), IoError> {
     if !options.overwrite && path.exists() { return Err(IoError::Exists(path.to_path_buf())); }
     let bytes = encode_webp8(width, height, rgba, lossless, options)?;
@@ -264,7 +281,9 @@ pub fn encode_webp8(width: u32, height: u32, rgba: &[u8], lossless: bool, option
         let config = webp_rust::LossyEncodingConfig { quality: options.jpeg_quality.clamp(1, 100) as f32, ..Default::default() };
         webp_rust::encode_lossy_with_config(&img, &config, exif.as_deref())
     }.map_err(|e| io_err(path, e))?;
-    if options.embed_profile { crate::webp_icc::with_icc(&bytes, icc_profile(options.space), width, height) } else { Ok(bytes) }
+    let bytes = if options.embed_profile { crate::webp_icc::with_icc(&bytes, icc_profile(options.space), width, height)? } else { bytes };
+    let keywords = options.metadata.as_ref().map(|m| m.keywords.as_slice()).unwrap_or_default();
+    if keywords.is_empty() { Ok(bytes) } else { crate::xmp::embed_webp(bytes, keywords, width, height) }
 }
 
 /// Decodes a WebP file to `(width, height, RGBA8)` (Export preview, tests).
