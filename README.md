@@ -326,6 +326,10 @@ changes the photo on screen. Space+drag and the middle button still pan.
   hollow centre knob moves the whole gradient (new **Gradient center X / Y** settings,
   default 50 % / 50 %, so older graphs look the same). Double-click the centre to recentre;
   double-click an end to reset angle and scale.
+- **Crop / Rotate:** besides the crop frame, a knob above the top edge straightens: drag it
+  around the picture to turn the image (−45° to 45°, the fine grid shows while turning).
+  Double-click it for 0°. Scale and move are the crop frame itself (corners and inside);
+  there are no separate scale or offset settings.
 - **Vignette:** three rings at the exact distances the effect uses (the same
   centre-to-half-diagonal metric): the bright ring is the midpoint, the faint inner and
   outer rings are where the feather starts and reaches full strength. Drag the midpoint

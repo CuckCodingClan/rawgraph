@@ -330,6 +330,13 @@ pub fn oriented_uv(quarter_turns: u8, flip_h: bool, flip_v: bool) -> [[f32; 2]; 
 
 /// Corners of a `w` x `h` rectangle centred at `centre`, rotated clockwise by
 /// `angle_deg` (screen coordinates, y down): top-left, top-right, bottom-right, bottom-left.
+/// Straighten angle after turning the picture by `delta` degrees on screen (clockwise
+/// positive, like the `angle` parameter), clamped to the parameter range.
+pub fn straighten_angle(start: f32, delta: f32) -> f32 {
+    let a = start + delta;
+    if a.is_finite() { a.clamp(-45.0, 45.0) } else { start }
+}
+
 pub fn rotated_corners(centre: [f32; 2], w: f32, h: f32, angle_deg: f32) -> [[f32; 2]; 4] {
     let (s, c) = angle_deg.to_radians().sin_cos();
     [[-w * 0.5, -h * 0.5], [w * 0.5, -h * 0.5], [w * 0.5, h * 0.5], [-w * 0.5, h * 0.5]].map(|[x, y]| [centre[0] + x * c - y * s, centre[1] + x * s + y * c])
