@@ -1190,7 +1190,7 @@ fn the_keywords_token_names_the_files() {
     r.text(|x| x.name_template = "{name}_{keywords}".into());
     let report = r.run();
     let names: Vec<String> = report.items.iter().map(|(_, s)| written_of(s).file_name().and_then(|n| n.to_str()).unwrap_or("").to_owned()).collect();
-    assert_eq!(names, ["a_Rome-a_b.jpg", "b_Ärger.jpg", "c_.jpg"], "last level of each keyword, unsafe characters replaced, empty without keywords");
+    assert_eq!(names, ["a_Rome-a_b.jpg", "b_Ärger.jpg", "c_untagged.jpg"], "last level of each keyword, unsafe characters replaced, `untagged` without keywords");
 }
 
 #[test]

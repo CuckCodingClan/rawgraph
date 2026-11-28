@@ -75,6 +75,19 @@ pub(crate) fn parse(template: &str) -> Result<Vec<Token>, String> {
     Ok(tokens)
 }
 
+/// Stem used for `{keywords}` when an image has no keywords or they give no usable name (only dots,
+/// a reserved Windows device name, ...): the export never fails because of a keyword.
+pub(crate) const UNTAGGED: &str = "untagged";
+
+fn keywords_token(keywords: &[String]) -> String {
+    let token = rawgraph_core::keywords::keywords_file_token(keywords);
+    if check_stem(&token).is_ok() {
+        token
+    } else {
+        UNTAGGED.to_owned()
+    }
+}
+
 pub(crate) fn expand(tokens: &[Token], stem: &str, index: usize, id: u64, keywords: &[String]) -> String {
     let mut out = String::new();
     for t in tokens {
@@ -83,7 +96,7 @@ pub(crate) fn expand(tokens: &[Token], stem: &str, index: usize, id: u64, keywor
             Token::Name => out.push_str(stem),
             Token::Index(w) => out.push_str(&format!("{index:0w$}", w = *w)),
             Token::Id => out.push_str(&id.to_string()),
-            Token::Keywords => out.push_str(&rawgraph_core::keywords::keywords_file_token(keywords)),
+            Token::Keywords => out.push_str(&keywords_token(keywords)),
         }
     }
     out
@@ -117,7 +130,12 @@ mod tests {
         let kw = ["Travel|Italy|Rome".to_owned(), "a/b: c".to_owned(), "Ärger".to_owned()];
         let t = parse("{name}_{keywords}").unwrap_or_default();
         assert_eq!(expand(&t, "IMG", 1, 1, &kw), "IMG_Rome-a_b_ c-Ärger", "last levels, joined by -, unsafe characters replaced");
-        assert_eq!(expand(&t, "IMG", 1, 1, &[]), "IMG_");
+        assert_eq!(expand(&t, "IMG", 1, 1, &[]), "IMG_untagged");
+        for odd in [["..."], ["CON"], ["con"], ["  "]] {
+            let kw = odd.map(str::to_owned);
+            assert_eq!(expand(&t, "IMG", 1, 1, &kw), "IMG_untagged", "{odd:?}");
+        }
+        assert_eq!(expand(&parse("{keywords}").unwrap_or_default(), "IMG", 1, 1, &["Nul".to_owned()]), "untagged");
         let long: Vec<String> = (0..100).map(|i| format!("keyword{i}")).collect();
         assert!(expand(&t, "IMG", 1, 1, &long).chars().count() <= 4 + 80, "the token is limited to 80 characters");
     }

@@ -454,11 +454,14 @@ impl App {
     }
 
     /// Applies what a finished read found and fills the dialog's summary.
-    fn apply_xmp(&mut self, found: &XmpFound, elapsed_ms: u128) {
+    pub(super) fn apply_xmp(&mut self, found: &XmpFound, elapsed_ms: u128) {
         let (summary, changed) = xmp_import::apply(&mut self.session.project, found);
         if !changed.is_empty() {
-            self.session.touch();
-            self.session.refresh_visible();
+            // Provider captures and `images_gen` too, so Keyword filters and splits update at once.
+            self.session.after_keyword_edit(&changed);
+            if self.session.scanning {
+                self.session.refresh_visible();
+            }
         }
         eprintln!(
             "XMP import: {} checked, {} changed, {} unchanged, {} without XMP, {} errors in {elapsed_ms} ms",

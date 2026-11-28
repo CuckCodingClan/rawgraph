@@ -98,14 +98,20 @@ pub fn keywords_contain_text(keywords: &[String], text: &str) -> bool {
 pub fn rename_in_list(keywords: &mut Vec<String>, from: &str, to: &str) -> bool {
     let Some(to) = normalize_keyword(to) else { return false };
     let Some(from) = normalize_keyword(from) else { return false };
-    let from_chars = from.chars().count();
+    // Strip by level count, not by characters: lower-casing may change a name's length (`İ`).
+    let from_levels = keyword_depth(&from);
     let mut changed = false;
     let renamed: Vec<String> = keywords
         .iter()
         .map(|k| {
             if keyword_is_within(k, &from) {
                 changed = true;
-                format!("{to}{}", k.chars().skip(from_chars).collect::<String>())
+                let rest: Vec<&str> = k.split(KEYWORD_SEPARATOR).skip(from_levels).collect();
+                if rest.is_empty() {
+                    to.clone()
+                } else {
+                    format!("{to}{KEYWORD_SEPARATOR}{}", rest.join(&KEYWORD_SEPARATOR.to_string()))
+                }
             } else {
                 k.clone()
             }
@@ -194,11 +200,12 @@ pub fn xmp_keyword_elements(keywords: &[String]) -> String {
 }
 
 /// Combines the keywords read from `dc:subject` (flat names) and `lr:hierarchicalSubject` (paths)
-/// of one packet: every path is kept; a flat name is added only when no path ends in it.
+/// of one packet: every path is kept; a flat name is added only when no level of any path has that name
+/// (Lightroom writes every ancestor of a keyword into `dc:subject`, not only the last level).
 pub fn merge_xmp_keywords(flat: &[String], hierarchical: &[String]) -> Vec<String> {
     let paths = normalize_keywords(hierarchical);
-    let leaves: std::collections::HashSet<String> = paths.iter().map(|p| keyword_key(keyword_leaf(p))).collect();
-    let extra: Vec<String> = flat.iter().filter_map(|f| normalize_keyword(f)).filter(|f| !leaves.contains(&keyword_key(keyword_leaf(f)))).collect();
+    let levels: std::collections::HashSet<String> = paths.iter().flat_map(|p| p.split(KEYWORD_SEPARATOR).map(keyword_key)).collect();
+    let extra: Vec<String> = flat.iter().filter_map(|f| normalize_keyword(f)).filter(|f| !levels.contains(&keyword_key(f))).collect();
     normalize_keywords(paths.into_iter().chain(extra))
 }
 
@@ -243,6 +250,26 @@ mod tests {
         assert!(!keywords_contain_text(&k, "paris"));
         assert!(keywords_contain_text(&k, ""), "empty text: any keyword");
         assert!(!keywords_contain_text(&[], ""), "empty text: no keyword, no match");
+    }
+
+    #[test]
+    fn xmp_merge_drops_flat_names_equal_to_any_path_level() {
+        let flat = v(&["Travel", "Italy", "Rome", "Solo"]);
+        assert_eq!(merge_xmp_keywords(&flat, &v(&["Travel|Italy|Rome"])), v(&["Solo", "Travel|Italy|Rome"]));
+        assert_eq!(merge_xmp_keywords(&v(&["travel"]), &v(&["Travel|Italy"])), v(&["Travel|Italy"]), "case-insensitive");
+        assert_eq!(merge_xmp_keywords(&v(&["Travel", "Italy", "Rome"]), &v(&["Travel|Italy|Rome"])), v(&["Travel|Italy|Rome"]));
+        assert_eq!(merge_xmp_keywords(&v(&["A"]), &[]), v(&["A"]));
+    }
+
+    #[test]
+    fn renaming_survives_lowercase_changing_the_length() {
+        // `İ` lower-cases to two chars; the old character-count strip cut the wrong place.
+        let mut k = v(&["İstanbul|Altstadt"]);
+        assert!(rename_in_list(&mut k, "İstanbul", "Konstantinopel"));
+        assert_eq!(k, v(&["Konstantinopel|Altstadt"]));
+        let mut k = v(&["İstanbul|Altstadt", "İstanbul"]);
+        assert!(rename_in_list(&mut k, "İstanbul|Altstadt", "Alt"));
+        assert_eq!(k, v(&["Alt", "İstanbul"]));
     }
 
     #[test]

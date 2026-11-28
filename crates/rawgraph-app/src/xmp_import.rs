@@ -21,7 +21,8 @@ const MAX_SIDECAR_BYTES: u64 = 4 << 20;
 pub struct XmpOptions {
     pub sidecars: bool,
     pub embedded: bool,
-    /// Skip images that already carry a rating, flag or label here (their keywords as well).
+    /// Leave the rating, flag and label of images that already carry one here alone. Keywords are
+    /// always merged (a union), whatever this says.
     pub only_unrated: bool,
     /// Also read the keywords (`dc:subject`, `lr:hierarchicalSubject`) and add them to the images
     /// (a union with what the image has; nothing is removed).
@@ -112,7 +113,9 @@ pub struct Target {
     pub path: PathBuf,
 }
 
-/// Images that are looked at: not missing, and (with `only_unrated`) still without rating, flag and label.
+/// Images that are looked at: not missing. With `only_unrated` and no keyword merge, images that carry a
+/// rating, flag or label are left out (there would be nothing to apply); when keywords are merged they
+/// are read too and only their rating, flag and label are kept (see [`apply`]).
 /// Returns `(targets, skipped because already rated)`.
 pub fn pick_targets<'a>(entries: impl IntoIterator<Item = &'a ImageEntry>, opts: &XmpOptions) -> (Vec<Target>, usize) {
     let mut skipped = 0;
@@ -121,7 +124,7 @@ pub fn pick_targets<'a>(entries: impl IntoIterator<Item = &'a ImageEntry>, opts:
         if e.missing {
             continue;
         }
-        if opts.only_unrated && (e.rating != 0 || e.flag != Flag::None || e.color_label.is_some()) {
+        if opts.only_unrated && !opts.merge_keywords && (e.rating != 0 || e.flag != Flag::None || e.color_label.is_some()) {
             skipped += 1;
             continue;
         }
@@ -187,6 +190,8 @@ pub struct XmpFound {
     pub errors: usize,
     pub skipped_rated: usize,
     pub checked: usize,
+    /// Rating, flag and label of images that carry one already are not touched.
+    pub only_unrated: bool,
 }
 
 impl XmpFound {
@@ -201,8 +206,9 @@ pub fn apply(project: &mut Project, found: &XmpFound) -> (XmpSummary, Vec<ImageI
     let mut s = XmpSummary { without_xmp: found.without_xmp, errors: found.errors, skipped_rated: found.skipped_rated, unchanged: found.skipped_rated, ..Default::default() };
     let mut changed = Vec::new();
     for (id, culling, origin) in &found.items {
-        // Keywords are only present when the read was asked to merge them.
-        let culling_changed = project.apply_xmp_culling(*id, culling);
+        // Rating, flag and label only for images without any (when asked); keywords are always merged.
+        let keep_culling = found.only_unrated && project.image(*id).is_some_and(|e| e.rating != 0 || e.flag != Flag::None || e.color_label.is_some());
+        let culling_changed = !keep_culling && project.apply_xmp_culling(*id, culling);
         let keywords_changed = project.apply_xmp_keywords(*id, culling);
         if culling_changed || keywords_changed {
             s.changed += 1;
@@ -302,7 +308,7 @@ impl XmpJob {
             let reply = if c2.load(Ordering::Relaxed) {
                 JobResult::Cancelled
             } else {
-                let mut found = XmpFound { skipped_rated, checked: results.len(), ..Default::default() };
+                let mut found = XmpFound { skipped_rated, checked: results.len(), only_unrated: opts.only_unrated, ..Default::default() };
                 for (id, d) in results.into_iter().flatten() {
                     match d {
                         Decision::Use(c, origin) => found.items.push((id, c, origin)),
@@ -421,7 +427,9 @@ mod tests {
         flagged.flag = Flag::Pick;
         let all = [entry(1, "a.png", 0), entry(2, "b.png", 3), gone, flagged];
         let (t, skipped) = pick_targets(&all, &XmpOptions::default());
-        assert_eq!((t.iter().map(|t| t.id.0).collect::<Vec<_>>(), skipped), (vec![1], 2));
+        assert_eq!((t.iter().map(|t| t.id.0).collect::<Vec<_>>(), skipped), (vec![1, 2, 4], 0), "rated images are read for their keywords");
+        let (t, skipped) = pick_targets(&all, &XmpOptions { merge_keywords: false, ..XmpOptions::default() });
+        assert_eq!((t.iter().map(|t| t.id.0).collect::<Vec<_>>(), skipped), (vec![1], 2), "without keywords there is nothing to do for them");
         let (t, skipped) = pick_targets(&all, &XmpOptions { only_unrated: false, ..BOTH });
         assert_eq!((t.iter().map(|t| t.id.0).collect::<Vec<_>>(), skipped), (vec![1, 2, 4], 0));
     }
@@ -502,9 +510,12 @@ mod tests {
         assert_eq!(by("c.png").rating, 0);
         // The image files and sidecars are untouched by the import (read only).
         assert!(std::fs::read_to_string(p("a.xmp")).unwrap().contains("Rating=\"2\""));
-        // Second run: "only unrated" now skips the three imported images.
-        let (targets, skipped) = pick_targets(project.images(), &XmpOptions::default());
+        // Second run: "only unrated" without keywords skips the three imported images ...
+        let (targets, skipped) = pick_targets(project.images(), &XmpOptions { merge_keywords: false, ..XmpOptions::default() });
         assert_eq!((targets.len(), skipped), (2, 3));
+        // ... with keywords it still reads them (only their rating, flag and label stay as they are).
+        let (targets, skipped) = pick_targets(project.images(), &XmpOptions::default());
+        assert_eq!((targets.len(), skipped), (5, 0));
         // Switching it off re-reads everything; nothing changes any more.
         let all = XmpOptions { only_unrated: false, ..BOTH };
         let (targets, skipped) = pick_targets(project.images(), &all);

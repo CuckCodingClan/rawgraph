@@ -175,6 +175,16 @@ pub struct Session {
     /// Further selected images (Ctrl/Shift+click in the filmstrip); the selection as a whole is
     /// [`Session::selected_images`]. Session-only, never saved.
     pub image_sel: std::collections::BTreeSet<ImageId>,
+    /// The primary image `image_sel` belongs to: when `selected` moves on by any other path than
+    /// [`Session::click_image`] (arrow keys, ...), the multi-selection no longer applies.
+    sel_expected: Option<ImageId>,
+    /// Keyword counts of the project, cached per state of the image list (see `keyword_counts_cached`).
+    kw_counts_key: Option<(u64, usize, usize)>,
+    kw_counts_val: Arc<Vec<rawgraph_project::KeywordCount>>,
+    /// How often the keyword counts were computed (the cache is tested with it).
+    pub kw_counts_computed: usize,
+    /// Bumped whenever the set of selected images changes (caches of the keyword panel key on it).
+    pub sel_gen: u64,
     /// The primary node: the one selected last (the inspector shows it).
     pub selected_node: Option<NodeId>,
     /// All selected nodes; its primary node is `selected_node`.
@@ -238,6 +248,11 @@ impl Session {
             provider,
             selected: None,
             image_sel: std::collections::BTreeSet::new(),
+            sel_expected: None,
+            sel_gen: 0,
+            kw_counts_key: None,
+            kw_counts_val: Arc::default(),
+            kw_counts_computed: 0,
             selected_node: None,
             node_sel: NodeSelection::default(),
             edit_gen: 0,
@@ -296,6 +311,7 @@ impl Session {
         self.provider.reset_paths();
         self.sync_paths();
         self.selected = None;
+        self.clear_image_sel();
         self.refresh_visible();
     }
 
@@ -358,8 +374,41 @@ impl Session {
             Project::sort_entries(entries.filter(|e| filter.matches(e) && (!self.filter.missing_only || e.missing)), self.filter.sort, self.filter.descending)
 
         };
+        let in_sync = self.selected == self.sel_expected;
+        if !self.image_sel.is_empty() {
+            // Only images that are still listed stay selected.
+            let listed: HashSet<ImageId> = self.visible.iter().copied().collect();
+            let before = self.image_sel.len();
+            self.image_sel.retain(|id| listed.contains(id));
+            if self.image_sel.len() != before {
+                self.sel_gen += 1;
+            }
+            if self.image_sel.len() <= 1 {
+                self.clear_image_sel();
+            }
+        }
         if self.selected.is_none_or(|id| !self.visible.contains(&id)) {
-            self.selected = self.visible.first().copied();
+            self.selected = self.image_sel.iter().next().copied().or_else(|| self.visible.first().copied());
+        }
+        if in_sync {
+            self.sel_expected = self.selected;
+        }
+    }
+
+    /// Drops the multi-selection (the primary image stays).
+    pub fn clear_image_sel(&mut self) {
+        if !self.image_sel.is_empty() {
+            self.image_sel.clear();
+            self.sel_gen += 1;
+        }
+        self.sel_expected = self.selected;
+    }
+
+    /// Call once per frame: when the primary image changed by anything other than a click on the
+    /// filmstrip (arrow keys, steps through the gallery, ...), the multi-selection is dropped.
+    pub fn reconcile_image_selection(&mut self) {
+        if self.selected != self.sel_expected {
+            self.clear_image_sel();
         }
     }
 
@@ -513,7 +562,12 @@ impl Session {
             }
             if hit {
                 changed += 1;
-                pushed.push((id, info));
+            }
+            if hit {
+                // The provider gets the capture with the entry's keywords, as everywhere else.
+                if let Some(e) = self.entry(id) {
+                    pushed.push((id, capture_with_keywords(e)));
+                }
             }
         }
         if changed > 0 {
@@ -645,7 +699,9 @@ impl Session {
         self.edit_keywords(&ids, move |list| rawgraph_core::keywords::rename_in_list(list, &from, &to))
     }
 
-    fn after_keyword_edit(&mut self, changed: &[ImageId]) {
+    /// Refreshes everything that depends on keywords after code outside the session changed them
+    /// (the XMP import writes into the project directly).
+    pub fn after_keyword_edit(&mut self, changed: &[ImageId]) {
         if changed.is_empty() {
             return;
         }
@@ -676,6 +732,17 @@ impl Session {
         rawgraph_project::count_keywords(self.project.images().iter().chain(extra))
     }
 
+    /// [`Session::keyword_counts`], computed again only when the images changed.
+    pub fn keyword_counts_cached(&mut self) -> Arc<Vec<rawgraph_project::KeywordCount>> {
+        let key = (self.images_gen, self.project.images().len(), self.scan_map.len());
+        if self.kw_counts_key != Some(key) {
+            self.kw_counts_val = Arc::new(self.keyword_counts());
+            self.kw_counts_key = Some(key);
+            self.kw_counts_computed += 1;
+        }
+        Arc::clone(&self.kw_counts_val)
+    }
+
     /// The keywords the graph sees for an image (test helper).
     #[cfg(test)]
     pub fn provider_keywords(&self, id: ImageId) -> Vec<String> {
@@ -686,7 +753,8 @@ impl Session {
 
     /// The selected images: the Ctrl/Shift selection when there is one, otherwise the primary image.
     pub fn selected_images(&self) -> Vec<ImageId> {
-        let multi: Vec<ImageId> = self.image_sel.iter().copied().filter(|id| self.entry(*id).is_some()).collect();
+        let in_sync = self.selected == self.sel_expected;
+        let multi: Vec<ImageId> = if in_sync { self.image_sel.iter().copied().filter(|id| self.entry(*id).is_some()).collect() } else { Vec::new() };
         match self.selected {
             Some(sel) if multi.contains(&sel) => multi,
             // The primary image moved on without the list (arrow keys, other code): it is the selection.
@@ -698,6 +766,12 @@ impl Session {
     /// A click on an image of the list `ids`: plain = only this one, Ctrl = toggle it in the
     /// selection, Shift = everything between the primary image and this one.
     pub fn click_image(&mut self, id: ImageId, ctrl: bool, shift: bool, ids: &[ImageId]) {
+        self.click_image_inner(id, ctrl, shift, ids);
+        self.sel_gen += 1;
+        self.sel_expected = self.selected;
+    }
+
+    fn click_image_inner(&mut self, id: ImageId, ctrl: bool, shift: bool, ids: &[ImageId]) {
         if shift {
             let anchor = self.selected.and_then(|s| ids.iter().position(|x| *x == s));
             let to = ids.iter().position(|x| *x == id);
@@ -896,6 +970,7 @@ impl Session {
         self.node_sel.clear();
         self.viewed_node = None;
         self.selected = None;
+        self.clear_image_sel();
         self.edit_gen += 1;
         self.sync_paths();
         self.refresh_visible();

@@ -1749,7 +1749,7 @@ impl App {
         }
         let pressed = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
         // K: type a keyword (the add field of the keyword panel takes the focus).
-        if pressed(Key::K) {
+        if pressed(Key::K) && !self.session.selected_images().is_empty() {
             self.filmstrip.keyword_panel.focus_add = true;
         }
         let Some(id) = self.session.selected else { return };
@@ -3086,6 +3086,7 @@ impl eframe::App for App {
         self.start_queued_scan(&ctx);
         self.cli_run_export_node(&ctx);
 
+        self.session.reconcile_image_selection();
         let mut cmds = self.handle_shortcuts(&ctx);
         if self.prompt.is_none() && !self.save_flow.is_open() {
             self.handle_culling(&ctx);
@@ -3929,5 +3930,24 @@ mod tests {
         assert_eq!(shortcut_of(Command::ToggleMaskOverlay), Some(sc(Modifiers::NONE, Key::M)));
         assert!(SHORTCUT_ORDER.contains(&Command::ToggleMaskOverlay));
     }
+
+    #[test]
+    fn xmp_import_updates_the_keywords_the_graph_sees_at_once() {
+        use crate::session::tests::{png_project, provider};
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        let photos = tempfile::tempdir().unwrap();
+        app.session = Session::new(png_project(photos.path(), 3), provider());
+        app.session.sync_paths();
+        app.session.refresh_visible();
+        let id = app.session.visible()[0];
+        let item = (id, rawgraph_project::XmpCulling { keywords: vec!["Reise|Graz".into()], ..Default::default() }, crate::xmp_import::Origin::Sidecar);
+        let found = crate::xmp_import::XmpFound { items: vec![item], ..Default::default() };
+        let gen = app.session.images_gen;
+        app.apply_xmp(&found, 0);
+        assert!(app.session.images_gen > gen, "the collection queries are recomputed");
+        assert_eq!(app.session.provider_keywords(id), vec!["Reise|Graz".to_owned()]);
+    }
+
 }
 

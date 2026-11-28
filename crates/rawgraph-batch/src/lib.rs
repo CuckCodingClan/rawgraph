@@ -72,7 +72,7 @@ pub struct ExportSettings {
     pub format: ExportFormat,
     /// Placeholders: `{name}` source file stem, `{index}` 1-based position in the batch,
     /// `{index:04}` zero-padded, `{id}` image id, `{keywords}` the last level of every keyword of
-    /// the image joined with `-` (file-name safe, empty without keywords). Default `{name}`.
+    /// the image joined with `-` (file-name safe; `untagged` when the image has no keywords or they leave no usable name). Default `{name}`.
     pub name_template: String,
     /// Exact long edge of the output in pixels; `None` = see `percent`. Never upscales. Wins over
     /// `percent`.
@@ -219,6 +219,8 @@ pub struct ExportProgress {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExportReport {
     pub items: Vec<(ImageId, ItemStatus)>,
+    /// Things that did not stop an item from being written, e.g. "N keywords not embedded (JPEG XMP limit)".
+    pub warnings: Vec<(ImageId, String)>,
 }
 
 impl ExportReport {
@@ -657,7 +659,7 @@ struct Plan {
     duplicate_of: Option<PathBuf>,
 }
 
-fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job, plan: &Plan, reserved: &HashSet<String>) -> ItemStatus {
+fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job, plan: &Plan, reserved: &HashSet<String>, warnings: &mut Vec<String>) -> ItemStatus {
     let planned: &Path = &plan.base;
     let settings = job.settings;
     let item = &job.item;
@@ -732,7 +734,16 @@ fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job
         }
     };
     drop(image);
-    let metadata = build_metadata(&item.source, settings, &item.keywords);
+    let mut metadata = build_metadata(&item.source, settings, &item.keywords);
+    if let (Some(m), ExportFormat::Jpeg { .. }) = (metadata.as_mut(), settings.format) {
+        // A JPEG XMP segment holds about 64 KB: the keywords that do not fit are left out and reported.
+        let total = rawgraph_core::keywords::normalize_keywords(&m.keywords).len();
+        let fit = rawgraph_io::jpeg_embeddable_keywords(&m.keywords);
+        if fit.len() < total {
+            warnings.push(format!("{} keywords not embedded (JPEG XMP limit)", total - fit.len()));
+            m.keywords = fit;
+        }
+    }
 
     if ctx.cancel.is_cancelled() {
         return ItemStatus::Cancelled;
@@ -918,6 +929,8 @@ fn run_batch(
         .collect();
 
     let mut planned: Vec<Option<Plan>> = Vec::with_capacity(jobs.len());
+    // Items whose file name cannot be built (it depends on the image's own name or data): they fail alone.
+    let mut plan_failures: HashMap<usize, String> = HashMap::new();
     // Final paths of the items planned so far (first owner wins).
     let mut seen: HashMap<String, usize> = HashMap::new();
     for (i, job) in jobs.iter().enumerate() {
@@ -926,7 +939,14 @@ fn run_batch(
             continue;
         }
         let tokens = check_settings(job.settings)?;
-        let path = plan(&job.item, i + 1, job.settings, &tokens)?;
+        let path = match plan(&job.item, i + 1, job.settings, &tokens) {
+            Ok(p) => p,
+            Err(ExportError::InvalidSettings(m)) => {
+                plan_failures.insert(i, m);
+                planned.push(None);
+                continue;
+            }
+        };
         let mut entry = Plan { base: path.clone(), target: path.clone(), start_n: 1, duplicate_of: None };
         if let Some(&first) = seen.get(&abs_key(&path)) {
             match job.settings.on_conflict {
@@ -987,10 +1007,17 @@ fn run_batch(
     for (i, (job, path)) in jobs.iter().zip(&planned).enumerate() {
         let status = if !included[i] {
             ItemStatus::Excluded
+        } else if let Some(m) = plan_failures.get(&i) {
+            ItemStatus::Failed(m.clone())
         } else {
             let plan = path.clone().unwrap_or_default();
-            catch_unwind(AssertUnwindSafe(|| run_item(&ctx, &mut ev, &provider, job, &plan, &reserved)))
-                .unwrap_or_else(|_| ItemStatus::Failed("internal error while processing this image".into()))
+            let mut item_warnings = Vec::new();
+            let status = catch_unwind(AssertUnwindSafe(|| run_item(&ctx, &mut ev, &provider, job, &plan, &reserved, &mut item_warnings)))
+                .unwrap_or_else(|_| ItemStatus::Failed("internal error while processing this image".into()));
+            if matches!(status, ItemStatus::Written { .. }) {
+                report.warnings.extend(item_warnings.into_iter().map(|w| (job.item.id, w)));
+            }
+            status
         };
         // Whatever the outcome, nothing stays decoded between two items.
         ev.clear();

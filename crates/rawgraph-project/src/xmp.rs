@@ -309,21 +309,20 @@ impl Project {
     }
 
     /// For every non-missing entry with a sidecar: read, parse, apply. With
-    /// `only_unrated`, only entries that still have rating 0, no flag and no
-    /// label are touched. Unreadable or broken sidecars are skipped. The keywords of the
-    /// sidecars are merged into the entries (a union, nothing is removed). Returns the ids that changed.
+    /// `only_unrated`, the rating, flag and label of entries that already have one are left alone.
+    /// Unreadable or broken sidecars are skipped. The keywords of the sidecars are always merged
+    /// into the entries (a union, nothing is removed). Returns the ids that changed.
     pub fn import_xmp_sidecars(&mut self, only_unrated: bool) -> Vec<ImageId> {
-        let todo: Vec<(ImageId, PathBuf)> = self
+        let todo: Vec<(ImageId, PathBuf, bool)> = self
             .images()
             .iter()
             .filter(|e| !e.missing)
-            .filter(|e| !only_unrated || (e.rating == 0 && e.flag == Flag::None && e.color_label.is_none()))
-            .filter_map(|e| xmp_sidecar_path(&e.path).map(|p| (e.id, p)))
+            .filter_map(|e| xmp_sidecar_path(&e.path).map(|p| (e.id, p, only_unrated && (e.rating != 0 || e.flag != Flag::None || e.color_label.is_some()))))
             .collect();
         let mut changed = Vec::new();
-        for (id, sidecar) in todo {
+        for (id, sidecar, keep_culling) in todo {
             if let Some(xmp) = read_sidecar(&sidecar) {
-                let a = self.apply_xmp_culling(id, &xmp);
+                let a = !keep_culling && self.apply_xmp_culling(id, &xmp);
                 let b = self.apply_xmp_keywords(id, &xmp);
                 if a || b {
                     changed.push(id);

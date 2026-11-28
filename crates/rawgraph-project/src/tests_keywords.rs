@@ -321,13 +321,13 @@ fn sidecar_import_merges_keywords_and_respects_only_unrated() {
     p.image_mut(ImageId(2)).unwrap().rating = 5;
     p.set_keywords(ImageId(1), &v(&["Mine"]));
     let changed = p.import_xmp_sidecars(true);
-    assert_eq!(changed, vec![ImageId(1)], "the rated image is skipped as a whole");
+    assert_eq!(changed, vec![ImageId(1), ImageId(2)], "the rated image keeps its rating but still takes the keywords");
     let (a, b) = (p.image(ImageId(1)).unwrap(), p.image(ImageId(2)).unwrap());
     assert_eq!((a.rating, b.rating), (3, 5));
     assert_eq!(a.keywords.len(), 6, "the XMP keywords were added to the existing one");
-    assert!(b.keywords.is_empty());
+    assert_eq!(b.keywords.len(), 5, "keywords are always merged, only_unrated or not");
     let changed = p.import_xmp_sidecars(false);
-    assert_eq!(changed, vec![ImageId(2)], "the first image has everything already; the second takes rating and keywords");
+    assert_eq!(changed, vec![ImageId(2)], "the first image has everything already; the second takes the rating now");
     assert_eq!(p.image(ImageId(2)).unwrap().keywords.len(), 5);
     assert_eq!(p.image(ImageId(2)).unwrap().rating, 3);
 }

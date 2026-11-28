@@ -307,12 +307,16 @@ image and keyword, see `docs/project-format.md`) and never written to the source
   *does not contain* (see `node_structure.md`).
 - **XMP import** (File > Import ratings and keywords from XMP) reads `dc:subject` and
   `lr:hierarchicalSubject` from sidecars and embedded packets and adds them to the images (*Merge keywords*,
-  on by default; nothing is removed; "Only images I have not rated here" applies to keywords as well).
+  on by default; nothing is removed; "Only images I have not rated here" protects the rating, flag and label of rated
+  images only: their keywords are merged all the same).
   **Adobe XMP sidecar** export writes the keywords too (`dc:subject` with the last levels and
   `lr:hierarchicalSubject` with the paths); it still skips existing sidecars and refuses source folders.
 - **Export.** The Export node has a *Keywords* metadata switch (on by default) that writes the keywords as an
   XMP packet into JPEG, PNG, TIFF and WebP files (not AVIF or EXR; details in `node_structure.md`), and the
-  file name token `{keywords}`.
+  file name token `{keywords}` (`untagged` when an image has no keywords or they leave no usable name, so a
+  keyword never stops a batch). A JPEG holds about 64 KB of XMP: if a huge list does not fit, the keywords
+  at the end of the sorted list are left out and the export reports "N keywords not embedded (JPEG XMP
+  limit)". Limitation: HEIC exports carry no keywords yet (Windows encoder path).
 - **Undo.** Like ratings, flags and labels, keyword edits are not part of the graph's undo/redo; they are
   edits of the project data and mark the project as changed.
 

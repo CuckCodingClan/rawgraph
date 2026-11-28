@@ -54,6 +54,8 @@ pub struct Filmstrip {
     pub xmp_banner: Option<usize>,
     /// The keyword panel under the list (K focuses its add field).
     pub keyword_panel: crate::keyword_panel::KeywordPanel,
+    /// The tree of the keyword filter popup, rebuilt only when the images change and the popup is open.
+    keyword_tree: crate::keyword_panel::Memo<(u64, usize, usize), Vec<crate::keyword_panel::TreeRow>>,
 }
 
 pub(crate) fn gallery_keyboard_available(ctx: &egui::Context) -> bool {
@@ -63,7 +65,7 @@ pub(crate) fn gallery_keyboard_available(ctx: &egui::Context) -> bool {
 
 impl Filmstrip {
     pub fn with_thumbs(thumbs: ThumbLoader, live: crate::live_thumbs::LiveThumbs) -> Self {
-        Self { thumbs, live, live_wanted: Vec::new(), live_visible: 0, last_selected: None, last_range: 0..0, scan_wanted: Vec::new(), scan_hash_pending: false, actions: Vec::new(), xmp_banner: None, keyword_panel: Default::default() }
+        Self { thumbs, live, live_wanted: Vec::new(), live_visible: 0, last_selected: None, last_range: 0..0, scan_wanted: Vec::new(), scan_hash_pending: false, actions: Vec::new(), xmp_banner: None, keyword_panel: Default::default(), keyword_tree: Default::default() }
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
@@ -81,10 +83,11 @@ impl Filmstrip {
     pub fn scan_thumbs_ready(&self) -> bool { !self.scan_hash_pending && self.all_loaded() }
 
     /// Header controls. Returns true if the filter or sort changed.
-    fn header(ui: &mut egui::Ui, session: &mut Session) -> bool {
+    fn header(ui: &mut egui::Ui, session: &mut Session, tree: &mut crate::keyword_panel::Memo<(u64, usize, usize), Vec<crate::keyword_panel::TreeRow>>) -> bool {
         let before = session.filter.clone();
-        let counts = session.keyword_counts();
-        let f = &mut session.filter;
+        // The filter is edited on its own copy: the keyword popup needs the session to build its list.
+        let mut filter = std::mem::take(&mut session.filter);
+        let f = &mut filter;
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
         ui.add(egui::TextEdit::singleline(&mut f.text).hint_text("Filter by name").desired_width(f32::INFINITY));
         ui.horizontal(|ui| {
@@ -128,7 +131,7 @@ impl Filmstrip {
                     ui.selectable_value(&mut f.flash, Some(false), "No flash");
                 });
         });
-        Self::keyword_filter(ui, f, &counts);
+        Self::keyword_filter(ui, f, session, tree);
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("flt-sort").width(66.0).selected_text(format!("Sort: {}", sort_label(f.sort))).show_ui(ui, |ui| {
                 for k in SORT_KEYS {
@@ -143,13 +146,15 @@ impl Filmstrip {
                 *f = crate::filter::FilterUi { sort, descending: desc, ..Default::default() };
             }
         });
-        session.filter != before
+        let changed = filter != before;
+        session.filter = filter;
+        changed
     }
 
     /// The keyword filter: a button with the summary that opens the list of all keywords of the
     /// project (tree, with counts), Any/All and "No keywords".
-    fn keyword_filter(ui: &mut egui::Ui, f: &mut crate::filter::FilterUi, counts: &[rawgraph_project::KeywordCount]) {
-        use rawgraph_core::keywords::{keyword_depth, keyword_is_within, keyword_leaf, keywords_equal, tree_paths};
+    fn keyword_filter(ui: &mut egui::Ui, f: &mut crate::filter::FilterUi, session: &mut Session, tree: &mut crate::keyword_panel::Memo<(u64, usize, usize), Vec<crate::keyword_panel::TreeRow>>) {
+        use rawgraph_core::keywords::keywords_equal;
         use rawgraph_project::KeywordMatch;
         let button = ui.add(egui::Button::new(f.keyword_summary()).selected(f.keyword_filter_active())).on_hover_text("Show only images with these keywords");
         egui::Popup::from_toggle_button_response(&button).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
@@ -162,21 +167,23 @@ impl Filmstrip {
                 f.keywords.clear();
             }
             ui.separator();
-            if counts.is_empty() {
+            // Only an open popup gets here: the counts and the tree are built now, once per change of the images.
+            let key = (session.images_gen, session.project.images().len(), session.scan_found());
+            let counts = session.keyword_counts_cached();
+            let rows = tree.get(key, || crate::keyword_panel::keyword_tree(&counts));
+            if rows.is_empty() {
                 ui.weak("No image has keywords yet.");
             }
             egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                for path in tree_paths(&counts.iter().map(|c| c.keyword.clone()).collect::<Vec<_>>()) {
-                    // A path counts the images that carry it or anything below it.
-                    let below: usize = counts.iter().filter(|c| keyword_is_within(&c.keyword, &path)).map(|c| c.images).sum();
-                    let on = f.keywords.iter().any(|k| keywords_equal(k, &path));
+                for row in rows {
+                    let on = f.keywords.iter().any(|k| keywords_equal(k, &row.path));
                     ui.horizontal(|ui| {
-                        ui.add_space((keyword_depth(&path) - 1) as f32 * 14.0);
+                        ui.add_space(row.depth as f32 * 14.0);
                         let mut checked = on;
-                        if ui.checkbox(&mut checked, keyword_leaf(&path)).on_hover_text(&path).changed() {
-                            f.toggle_keyword(&path);
+                        if ui.checkbox(&mut checked, &row.name).on_hover_text(&row.path).changed() {
+                            f.toggle_keyword(&row.path);
                         }
-                        ui.weak(below.to_string());
+                        ui.weak(row.below.to_string());
                     });
                 }
             });
@@ -190,7 +197,8 @@ impl Filmstrip {
     pub fn show(&mut self, ui: &mut egui::Ui, session: &mut Session, mut target: ViewerTarget, members: Option<&std::collections::HashSet<rawgraph_core::ImageId>>) {
         self.scan_wanted.clear();
         self.scan_hash_pending = false;
-        if Self::header(ui, session) {
+        session.reconcile_image_selection();
+        if Self::header(ui, session, &mut self.keyword_tree) {
             session.refresh_visible();
         }
         let ids = members.map_or_else(Vec::new, |members| session.gallery_images(members));
@@ -255,7 +263,7 @@ impl Filmstrip {
             self.last_selected = target.image;
         }
         let mut clicked: Option<(rawgraph_core::ImageId, egui::Modifiers)> = None;
-        let multi: std::collections::BTreeSet<rawgraph_core::ImageId> = session.image_sel.clone();
+        let multi = &session.image_sel;
         let out = scroll.show_rows(ui, ROW_H, rows, |ui, range| {
             for row in range.clone() {
                 ui.horizontal(|ui| {
