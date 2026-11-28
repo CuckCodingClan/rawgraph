@@ -4155,17 +4155,19 @@ mod tests {
 
     #[test]
     fn the_mask_overlay_and_new_metadata_trigger_exactly_one_new_request() {
+        // Other tests reload LUTs in parallel, which moves the global LUT generation: not part of this test.
+        let key = |s: &Session, out, prep, overlay| RequestKey { lut_generation: 0, ..RequestKey::new(s, out, prep, overlay) };
         let s = demo_session();
         let out = s.output_node().unwrap();
         let mask = s.project.graph.nodes().find(|n| n.kind == NodeKind::Generator).unwrap().id;
-        let base = RequestKey::new(&s, out, None, None);
-        assert!(base != RequestKey::new(&s, out, None, Some(mask)), "switching the overlay on asks once");
-        assert!(RequestKey::new(&s, out, None, Some(mask)) == RequestKey::new(&s, out, None, Some(mask)));
+        let base = key(&s, out, None, None);
+        assert!(base != key(&s, out, None, Some(mask)), "switching the overlay on asks once");
+        assert!(key(&s, out, None, Some(mask)) == key(&s, out, None, Some(mask)));
         // New capture metadata (background refresh) changes the revision.
         let mut c = s.entry(ImageId(1)).unwrap().capture.clone();
         c.as_shot_kelvin = Some(4200.0);
         s.provider.set_captures([(ImageId(1), c)]);
-        assert!(base != RequestKey::new(&s, out, None, None), "a changed capture must re-render");
+        assert!(base != key(&s, out, None, None), "a changed capture must re-render");
     }
 
     #[test]
