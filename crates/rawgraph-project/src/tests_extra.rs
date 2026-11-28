@@ -499,3 +499,55 @@ fn thumb_cache_concurrent() {
     });
     assert_eq!(c.total_bytes(), 10_000);
 }
+
+// ---- apply_renames (files renamed on disk by the batch rename) ----
+
+#[test]
+fn apply_renames_keeps_identity_and_handles_a_swap_and_a_chain() {
+    let t = Tmp::new();
+    let mut p = project_with(&t, &[("a.raw", "aaaa"), ("b.raw", "bbbbb"), ("c.raw", "cc")]);
+    let (a, b, c) = (id_of(&p, "a.raw"), id_of(&p, "b.raw"), id_of(&p, "c.raw"));
+    {
+        let e = p.image_mut(a).unwrap();
+        e.rating = 5;
+        e.flag = Flag::Pick;
+        e.color_label = Some(ColorLabel::Blue);
+        e.capture.iso = Some(200.0);
+    }
+    let before = p.image(a).unwrap().clone();
+    // On disk: a -> x, b -> a, c -> b (a chain through the names a and b).
+    fs::rename(t.path("c.raw"), t.path("c_tmp")).unwrap();
+    fs::rename(t.path("b.raw"), t.path("b_tmp")).unwrap();
+    fs::rename(t.path("a.raw"), t.path("x.raw")).unwrap();
+    fs::rename(t.path("b_tmp"), t.path("a.raw")).unwrap();
+    fs::rename(t.path("c_tmp"), t.path("b.raw")).unwrap();
+    let n = p.apply_renames(&[(a, t.path("x.raw")), (b, t.path("a.raw")), (c, t.path("b.raw"))]).unwrap();
+    assert_eq!(n, 3);
+    let e = p.image(a).unwrap();
+    assert_eq!(e.path, std::path::absolute(t.path("x.raw")).unwrap());
+    assert_eq!((e.id, &e.uuid, &e.content_hash, e.file_size, e.modified_unix_ms), (before.id, &before.uuid, &before.content_hash, before.file_size, before.modified_unix_ms));
+    assert_eq!((e.rating, e.flag, e.color_label, e.capture.iso), (5, Flag::Pick, Some(ColorLabel::Blue), Some(200.0)));
+    assert_eq!(p.image(b).unwrap().file_name(), "a.raw");
+    assert_eq!(p.image(c).unwrap().file_name(), "b.raw");
+    assert_eq!(p.refresh_missing(), 0, "every entry points at an existing file");
+}
+
+#[test]
+fn apply_renames_is_all_or_nothing() {
+    let t = Tmp::new();
+    let mut p = project_with(&t, &[("a.raw", "a"), ("b.raw", "b")]);
+    let (a, b) = (id_of(&p, "a.raw"), id_of(&p, "b.raw"));
+    let paths = |p: &Project| p.images().iter().map(|e| e.path.clone()).collect::<Vec<_>>();
+    let before = paths(&p);
+    t.write("n.raw", "n");
+    // The new path does not exist.
+    assert!(p.apply_renames(&[(a, t.path("n.raw")), (b, t.path("nope.raw"))]).is_err());
+    // Two images on one path.
+    assert!(p.apply_renames(&[(a, t.path("n.raw")), (b, t.path("n.raw"))]).is_err());
+    // A path of an image that stays.
+    assert!(p.apply_renames(&[(a, t.path("b.raw"))]).is_err());
+    // Unknown and repeated ids.
+    assert!(p.apply_renames(&[(ImageId(999), t.path("n.raw"))]).is_err());
+    assert!(p.apply_renames(&[(a, t.path("n.raw")), (a, t.path("n.raw"))]).is_err());
+    assert_eq!(paths(&p), before, "nothing changed");
+}

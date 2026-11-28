@@ -89,6 +89,10 @@ impl App {
 
     /// Loads a recovery copy as an unsaved project. The original project file is not touched.
     pub(super) fn recover(&mut self, file: &std::path::Path, ctx: &egui::Context) {
+        if self.rename_job.is_some() {
+            self.status.error("A rename is running: wait until it has finished (or cancel it in the Rename window)");
+            return;
+        }
         match rawgraph_project::load_recovery(file) {
             Ok((project, info)) => {
                 self.cancel_scan();
@@ -211,6 +215,12 @@ impl App {
 
     /// Clean shutdown: wait for a running write, remove this session's recovery files and its lock.
     pub(super) fn shutdown(&mut self) {
+        // A rename still running (the window was closed by force): stop it and wait for the put-back, so no
+        // file stays under a temporary name. The journal covers the rest if even that does not finish.
+        if let Some(job) = self.rename_job.take() {
+            job.cancel();
+            let _ = job.rx.recv_timeout(Duration::from_secs(60));
+        }
         if let Some(job) = self.autosave_job.take() {
             let started = Instant::now();
             while started.elapsed() < Duration::from_secs(5) {
@@ -572,7 +582,7 @@ impl App {
         self.relink = RelinkUi::Folder { old, new: String::new(), preview: None, error: None };
     }
 
-    fn after_relink(&mut self, ids: &[rawgraph_core::ImageId]) {
+    pub(super) fn after_relink(&mut self, ids: &[rawgraph_core::ImageId]) {
         if ids.is_empty() {
             self.filmstrip.thumbs.clear();
         } else {
@@ -792,6 +802,10 @@ impl App {
     /// Opens a project file in the window: the current project stays open if that fails. Asks when an
     /// interrupted save beside the file needs the user's word.
     pub(super) fn open_project_path(&mut self, path: &std::path::Path, ctx: &egui::Context) {
+        if self.rename_job.is_some() {
+            self.status.error("A rename is running: wait until it has finished (or cancel it in the Rename window)");
+            return;
+        }
         match crate::revisions::open_project_ex(path) {
             Ok(opened) => {
                 self.cancel_scan();
@@ -807,6 +821,7 @@ impl App {
                     None => self.status.info(format!("Opened {}", path.display())),
                 }
                 self.status.migration("Project", self.session.project.migration_notes().to_vec());
+                self.check_rename_log_on_open();
             }
             Err(crate::revisions::OpenError::Unfinished(file)) => self.ask_unfinished(file, Retry::Open(path.to_path_buf())),
             Err(e) => self.status.error(format!("Cannot open {}: {e}", path.display())),

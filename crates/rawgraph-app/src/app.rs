@@ -51,6 +51,7 @@ use crate::workspace::{MainLayout, Preset, WindowRole, WorkspaceStore};
 mod ext;
 mod ff_driver;
 mod nodes;
+mod rename;
 mod revs;
 mod workspaces;
 #[cfg(test)]
@@ -177,6 +178,8 @@ enum Command {
     Compare,
     ToggleMissingOnly,
     ClearThumbCache,
+    RenameFiles,
+    UndoRename,
 }
 
 /// Actions that replace the document and therefore ask about unsaved changes.
@@ -205,6 +208,8 @@ enum DialogKind {
     NodeExportFolder(NodeId),
     /// Pick the `.cube` file of a LUT node.
     LutFile(NodeId),
+    /// Pick the caption sheet (.xlsx / .csv) of the rename dialog.
+    CaptionSheet,
 }
 
 struct Dialog {
@@ -574,6 +579,14 @@ pub struct App {
     compare_started: Option<Instant>,
     compare_reported: bool,
     xmp_dialog: Option<XmpDialog>,
+    /// Library > Rename files: the open window (None = closed).
+    rename: Option<crate::rename_ui::RenameUi>,
+    /// Thumbnails of the block check (its own loader, so the filmstrip's requests are left alone).
+    rename_thumbs: Option<ThumbLoader>,
+    /// Bumped whenever the caption sheet is loaded or removed (the preview is made again).
+    rename_sheet_gen: u64,
+    /// A batch rename (or its undo) running on its own thread.
+    rename_job: Option<crate::rename_ops::RenameJob>,
     xmp_job: Option<XmpJob>,
     xmp_probe: Option<XmpJob>,
     xmp_offer: Option<XmpOffer>,
@@ -868,6 +881,10 @@ impl App {
             compare_started: None,
             compare_reported: false,
             xmp_dialog: None,
+            rename: None,
+            rename_thumbs: None,
+            rename_sheet_gen: 0,
+            rename_job: None,
             xmp_job: None,
             xmp_probe: None,
             xmp_offer: None,
@@ -960,6 +977,8 @@ impl App {
             Command::SaveRecipe => self.editor.request(EditOp::SaveRecipe),
             Command::ManageRecipes => self.editor.request(EditOp::ManageRecipes),
             Command::ImportXmp => self.open_xmp_dialog(),
+            Command::RenameFiles => self.open_rename(),
+            Command::UndoRename => self.undo_rename_command(ctx),
             Command::Compare => self.toggle_compare(),
             Command::ToggleMissingOnly => {
                 self.session.filter.missing_only = !self.session.filter.missing_only;
@@ -1007,6 +1026,15 @@ impl App {
     }
 
     fn execute(&mut self, p: Pending, ctx: &egui::Context) {
+        // The rename thread relinks and saves the open project when it ends: the document must stay.
+        if self.rename_job.is_some() {
+            if matches!(p, Pending::Quit) {
+                self.cancel_rename_for_close();
+            } else {
+                self.status.error("A rename is running: wait until it has finished (or cancel it in the Rename window)");
+            }
+            return;
+        }
         match p {
             Pending::NewProject => {
                 self.cancel_scan();
@@ -1104,6 +1132,7 @@ impl App {
                 DialogKind::SourceFolder(_) => "Choose the folder of the Source",
                 DialogKind::NodeExportFolder(_) => "Choose the output folder of the Export node",
                 DialogKind::LutFile(_) => "Choose a LUT file",
+                DialogKind::CaptionSheet => "Choose the caption sheet",
             },
             self.session.project_path.as_ref().and_then(|p| p.parent()).map(std::path::Path::to_path_buf),
         );
@@ -1118,6 +1147,7 @@ impl App {
             DialogKind::RelinkNewFolder => 7,
             DialogKind::SourceFolder(_) | DialogKind::NodeExportFolder(_) => 8,
             DialogKind::LutFile(_) => 9,
+            DialogKind::CaptionSheet => 10,
         };
         let name = self.save_as_name.take().unwrap_or_else(|| format!("{}{PROJECT_EXT}", self.session.project_name().replace("Untitled project", "untitled")));
         let _ = std::thread::Builder::new().name("rawgraph-dialog".into()).spawn(move || {
@@ -1130,6 +1160,7 @@ impl App {
                 1 | 5 | 7 | 8 => d.pick_folder(),
                 6 => d.pick_file(),
                 9 => d.add_filter("Cube LUT (*.cube)", &["cube", "CUBE", "Cube"]).pick_file(),
+                10 => d.add_filter("Caption sheet (*.xlsx, *.csv)", &["xlsx", "xlsm", "xls", "ods", "csv", "tsv"]).pick_file(),
                 2 => d.set_file_name(name).add_filter("RawGraph project (*.rawgraph)", &["rawgraph"]).save_file(),
                 3 => d.add_filter("RawGraph graph (*.rawgraph.json)", &["json"]).pick_file(),
                 _ => d.set_file_name(format!("graph{GRAPH_EXT}")).add_filter("RawGraph graph (*.rawgraph.json)", &["json"]).save_file(),
@@ -1154,6 +1185,7 @@ impl App {
             DialogKind::OpenFolder => self.start_scan(ctx, path),
             DialogKind::ExportFolder => self.export_ui.out_dir = path.to_string_lossy().into_owned(),
             DialogKind::LocateFile(id) => self.locate_file(id, path),
+            DialogKind::CaptionSheet => self.caption_sheet_picked(path),
             DialogKind::SourceFolder(node) => {
                 let folder = path.to_string_lossy().into_owned();
                 if !node_ui::set_source_folder(&mut self.session.project.graph, node, Some(folder)) {
@@ -1223,10 +1255,15 @@ impl App {
             self.status.error("An export is already running");
             return;
         }
+        if self.rename_job.is_some() {
+            self.status.error("A rename is running; wait until it has finished");
+            return;
+        }
         let Some(node) = export::export_node(&self.session) else {
             self.status.error("Select or pin an image node to export");
             return;
         };
+        self.export_ui.sheet = self.session.caption_sheet.clone();
         let items = self.export_ui.items(&self.session);
         let settings = match self.export_ui.settings(&self.session.view) {
             Ok(s) => s,
@@ -1293,6 +1330,7 @@ impl App {
 
     fn export_windows(&mut self, ctx: &egui::Context) {
         if self.show_export {
+            self.export_ui.sheet = self.session.caption_sheet.clone();
             let items = self.export_ui.items(&self.session);
             let counts = ExportState::scope_counts(&self.session);
             let node_text = export::export_node(&self.session).map_or_else(|| "(no image node selected)".to_owned(), |n| export::node_label(&self.session.project.graph, n));
@@ -1336,6 +1374,10 @@ impl App {
     fn start_scan(&mut self, ctx: &egui::Context, folder: PathBuf) {
         if self.scan.is_some() {
             self.status.error("A scan is already running");
+            return;
+        }
+        if self.rename_job.is_some() {
+            self.status.error("A rename is running; wait until it has finished");
             return;
         }
         if self.session.demo {
@@ -2604,6 +2646,11 @@ impl App {
                 item(ui, cmds, "View selected node", Command::ViewNode, has_sel);
                 item(ui, cmds, "Frame all nodes", Command::FrameAll, true);
             });
+            ui.menu_button("Library", |ui| {
+                item_tip(ui, cmds, "Rename files...", Command::RenameFiles, true, "Renames the listed or the selected files on disk (RAW originals and .xmp sidecars included), with a full preview and an undo log");
+                let undo_ok = crate::rename_ops::log_state(&crate::rename_ops::log_path(&self.session, &self.dirs)).0;
+                item_tip(ui, cmds, "Undo last rename", Command::UndoRename, undo_ok, "Puts the files of the last rename back under their old names");
+            });
             ui.menu_button("Debug", |ui| {
                 if ui.checkbox(&mut self.timing_debug, "Per-node CPU timing").changed() {
                     self.node_timings = None;
@@ -3221,7 +3268,11 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.session.dirty && self.shot.is_none() && self.bench.is_none() && self.first_frame.is_none() {
+        if ctx.input(|i| i.viewport().close_requested()) && self.rename_job.is_some() {
+            // Never leave a rename half done: stop it (it is put back), then the window can close.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.cancel_rename_for_close();
+        } else if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.session.dirty && self.shot.is_none() && self.bench.is_none() && self.first_frame.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.prompt = Some(Pending::Quit);
         }
@@ -3290,6 +3341,8 @@ impl eframe::App for App {
         self.unfinished_window(&ctx);
         self.xmp_window(&ctx);
         self.relink_windows(&ctx);
+        self.poll_rename_job(&ctx);
+        self.rename_windows(&ctx);
         self.clear_cache_window(&ctx);
         self.handle_film_actions(&ctx);
 
@@ -4013,22 +4066,24 @@ mod tests {
 
     #[test]
     fn identical_state_gives_equal_request_keys_regardless_of_node_position() {
+        // Other tests reload LUTs in parallel, which moves the global LUT generation: not part of this test.
+        let key = |s: &Session, out, prep, overlay| RequestKey { lut_generation: 0, ..RequestKey::new(s, out, prep, overlay) };
         let mut s = demo_session();
         let out = s.output_node().unwrap();
-        let a = RequestKey::new(&s, out, None, None);
+        let a = key(&s, out, None, None);
         let id = s.node_by_index(3).unwrap();
         s.project.graph.node_mut(id).unwrap().pos = [999.0, 999.0];
-        assert!(a == RequestKey::new(&s, out, None, None), "moving a node must not trigger a render");
+        assert!(a == key(&s, out, None, None), "moving a node must not trigger a render");
         s.project.graph.node_mut(id).unwrap().set_param("temp", ImageId(1), 20.0);
-        assert!(a != RequestKey::new(&s, out, None, None), "a parameter change must");
-        let b = RequestKey::new(&s, out, None, None);
+        assert!(a != key(&s, out, None, None), "a parameter change must");
+        let b = key(&s, out, None, None);
         s.provider.set_preview_size(1280);
-        assert!(b != RequestKey::new(&s, out, None, None), "a new preview size must");
-        let c = RequestKey::new(&s, out, Some(PrepareSettings::default()), None);
+        assert!(b != key(&s, out, None, None), "a new preview size must");
+        let c = key(&s, out, Some(PrepareSettings::default()), None);
         let changed = PrepareSettings { gain: 2.0, ..PrepareSettings::default() };
-        assert!(c == RequestKey::new(&s, out, Some(PrepareSettings::default()), None), "same scope settings: no new request");
-        assert!(c != RequestKey::new(&s, out, Some(changed), None), "a scope settings change must trigger a new request");
-        assert!(c != RequestKey::new(&s, out, None, None), "hiding the scopes must too");
+        assert!(c == key(&s, out, Some(PrepareSettings::default()), None), "same scope settings: no new request");
+        assert!(c != key(&s, out, Some(changed), None), "a scope settings change must trigger a new request");
+        assert!(c != key(&s, out, None, None), "hiding the scopes must too");
         assert_eq!(demo_graph().nodes().count(), 9);
     }
 

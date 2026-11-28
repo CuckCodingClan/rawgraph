@@ -31,6 +31,8 @@ use rayon::prelude::*;
 pub mod resize;
 mod template;
 
+pub use rawgraph_rename::SheetBinding;
+
 pub use resize::{resize_area, resize_to_long_edge, target_size};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +73,8 @@ pub struct ExportSettings {
     pub out_dir: PathBuf,
     pub format: ExportFormat,
     /// Placeholders: `{name}` source file stem, `{index}` 1-based position in the batch,
-    /// `{index:04}` zero-padded, `{id}` image id. Default `{name}`.
+    /// `{index:04}` zero-padded, `{id}` image id; with a caption sheet `{sheet_name}` (column B),
+    /// `{caption}` (column C), and `{no}` / `{no:03}` (photo number of the source name). Default `{name}`.
     pub name_template: String,
     /// Exact long edge of the output in pixels; `None` = see `percent`. Never upscales. Wins over
     /// `percent`.
@@ -101,6 +104,9 @@ pub struct ExportSettings {
     /// Output size as a percentage (1..=100) of the rendered size when `long_edge` is `None`.
     /// Never upscales.
     pub percent: Option<f32>,
+    /// Caption sheet for the name tokens `{sheet_name}`, `{caption}` (and the number pattern of `{no}`).
+    /// An image without a row in the sheet fails on its own; there is no fallback name.
+    pub sheet: Option<Arc<SheetBinding>>,
 }
 
 /// JPEG quality 92, `{name}`, full size, skip existing files, default display transform, sRGB,
@@ -124,6 +130,7 @@ impl Default for ExportSettings {
             copyright: None,
             description: None,
             percent: None,
+            sheet: None,
         }
     }
 }
@@ -175,6 +182,7 @@ pub fn settings_from_spec(spec: &ExportSpec, display: DisplayTransform) -> Expor
         copyright: non_empty(&spec.text.copyright),
         description,
         percent,
+        sheet: None,
     }
 }
 
@@ -284,12 +292,19 @@ fn extension(format: ExportFormat) -> &'static str {
     }
 }
 
-fn plan(item: &ExportItem, index: usize, settings: &ExportSettings, tokens: &[template::Token]) -> Result<PathBuf, ExportError> {
+/// Why an item has no output name: the settings are wrong (the whole run is refused) or only this image
+/// has a problem (a missing caption-sheet row; the run goes on and this image is reported as failed).
+enum PlanError {
+    Settings(ExportError),
+    Item(String),
+}
+
+fn plan(item: &ExportItem, index: usize, settings: &ExportSettings, tokens: &[template::Token]) -> Result<PathBuf, PlanError> {
     let stem = if item.source.as_os_str().is_empty() { format!("generated-{}", item.id.0) } else if let Some(stem) = item.source.file_stem().map(|s| s.to_string_lossy().into_owned()) { stem } else {
-        return invalid(format!("source {} has no file name", item.source.display()));
+        return Err(PlanError::Settings(ExportError::InvalidSettings(format!("source {} has no file name", item.source.display()))));
     };
-    let name = template::expand(tokens, &stem, index, item.id.0);
-    template::check_stem(&name).map_err(|e| ExportError::InvalidSettings(format!("{e} (source {})", item.source.display())))?;
+    let name = template::expand(tokens, &stem, index, item.id.0, settings.sheet.as_deref()).map_err(|e| PlanError::Item(format!("{e} (source {})", item.source.display())))?;
+    template::check_stem(&name).map_err(|e| PlanError::Settings(ExportError::InvalidSettings(format!("{e} (source {})", item.source.display()))))?;
     Ok(settings.out_dir.join(format!("{name}.{}", extension(settings.format))))
 }
 
@@ -297,7 +312,18 @@ fn plan(item: &ExportItem, index: usize, settings: &ExportSettings, tokens: &[te
 /// 1-based position of the item in the batch (the value of `{index}`).
 pub fn planned_path(item: &ExportItem, index: usize, settings: &ExportSettings) -> Result<PathBuf, ExportError> {
     let tokens = template::parse(&settings.name_template).map_err(ExportError::InvalidSettings)?;
-    plan(item, index, settings, &tokens)
+    check_sheet(&tokens, settings)?;
+    plan(item, index, settings, &tokens).map_err(|e| match e {
+        PlanError::Settings(e) => e,
+        PlanError::Item(m) => ExportError::InvalidSettings(m),
+    })
+}
+
+fn check_sheet(tokens: &[template::Token], settings: &ExportSettings) -> Result<(), ExportError> {
+    if template::needs_sheet(tokens) && settings.sheet.is_none() {
+        return invalid("the name template uses {sheet_name} or {caption}, but no caption sheet is loaded");
+    }
+    Ok(())
 }
 
 /// Comparable identity of a path: absolute, symlinks resolved where the file or its folder
@@ -333,6 +359,7 @@ fn abs_key(p: &Path) -> String {
 fn check_settings(settings: &ExportSettings) -> Result<Vec<template::Token>, ExportError> {
     if settings.format == ExportFormat::Xmp { return invalid("XMP requires project culling metadata; use the application Export node"); }
     let tokens = template::parse(&settings.name_template).map_err(ExportError::InvalidSettings)?;
+    check_sheet(&tokens, settings)?;
     if settings.long_edge == Some(0) {
         return invalid("the long edge must be at least 1 pixel");
     }
@@ -634,6 +661,8 @@ struct Plan {
     start_n: usize,
     /// Set when an earlier item of this run owns the path and this item is to be skipped.
     duplicate_of: Option<PathBuf>,
+    /// Set when this item cannot be named (no caption-sheet row): it is reported as failed.
+    failure: Option<String>,
 }
 
 fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job, plan: &Plan, reserved: &HashSet<String>) -> ItemStatus {
@@ -644,6 +673,9 @@ fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job
         return ItemStatus::Cancelled;
     }
     if let Some(m) = &job.pre_failure {
+        return ItemStatus::Failed(m.clone());
+    }
+    if let Some(m) = &plan.failure {
         return ItemStatus::Failed(m.clone());
     }
     if ctx.sources.contains(&norm_key(planned)) {
@@ -805,12 +837,29 @@ pub fn export_node(
     cancel: &CancelToken,
     progress: &mut dyn FnMut(&ExportProgress),
 ) -> Result<ExportReport, ExportError> {
-    export_node_with(
+    export_node_sheet(graph, export_node, catalog, selection, display, None, cancel, progress)
+}
+
+/// [`export_node`] with a caption sheet for the name tokens `{sheet_name}`, `{caption}` and `{no}` of the
+/// Export node's name template. An image without a row in the sheet fails on its own.
+#[allow(clippy::too_many_arguments)]
+pub fn export_node_sheet(
+    graph: &Graph,
+    export_node: NodeId,
+    catalog: &[ExportItem],
+    selection: &[ImageId],
+    display: DisplayTransform,
+    sheet: Option<Arc<SheetBinding>>,
+    cancel: &CancelToken,
+    progress: &mut dyn FnMut(&ExportProgress),
+) -> Result<ExportReport, ExportError> {
+    export_node_impl(
         graph,
         export_node,
         catalog,
         selection,
         display,
+        sheet,
         cancel,
         progress,
         &|p| rawgraph_io::read_capture_info(p).ok(),
@@ -818,6 +867,7 @@ pub fn export_node(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn export_node_with(
     graph: &Graph,
@@ -825,6 +875,22 @@ pub(crate) fn export_node_with(
     catalog: &[ExportItem],
     selection: &[ImageId],
     display: DisplayTransform,
+    cancel: &CancelToken,
+    progress: &mut dyn FnMut(&ExportProgress),
+    read_capture: CaptureReader,
+    read_lens: LensReader,
+) -> Result<ExportReport, ExportError> {
+    export_node_impl(graph, export_node, catalog, selection, display, None, cancel, progress, read_capture, read_lens)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_node_impl(
+    graph: &Graph,
+    export_node: NodeId,
+    catalog: &[ExportItem],
+    selection: &[ImageId],
+    display: DisplayTransform,
+    sheet: Option<Arc<SheetBinding>>,
     cancel: &CancelToken,
     progress: &mut dyn FnMut(&ExportProgress),
     read_capture: CaptureReader,
@@ -840,7 +906,8 @@ pub(crate) fn export_node_with(
     let members = Evaluator::new().members(graph, export_node, 0, &provider);
     let mut settings = Vec::with_capacity(selection.len());
     for &id in selection {
-        let s = settings_from_spec(&export_spec(node, id), display);
+        let mut s = settings_from_spec(&export_spec(node, id), display);
+        s.sheet = sheet.clone();
         if s.out_dir.as_os_str().is_empty() {
             return invalid(format!("the output folder of the Export node is empty (image {})", id.0));
         }
@@ -905,8 +972,15 @@ fn run_batch(
             continue;
         }
         let tokens = check_settings(job.settings)?;
-        let path = plan(&job.item, i + 1, job.settings, &tokens)?;
-        let mut entry = Plan { base: path.clone(), target: path.clone(), start_n: 1, duplicate_of: None };
+        let path = match plan(&job.item, i + 1, job.settings, &tokens) {
+            Ok(p) => p,
+            Err(PlanError::Settings(e)) => return Err(e),
+            Err(PlanError::Item(m)) => {
+                planned.push(Some(Plan { failure: Some(m), ..Plan::default() }));
+                continue;
+            }
+        };
+        let mut entry = Plan { base: path.clone(), target: path.clone(), start_n: 1, duplicate_of: None, failure: None };
         if let Some(&first) = seen.get(&abs_key(&path)) {
             match job.settings.on_conflict {
                 OnConflict::Overwrite => {

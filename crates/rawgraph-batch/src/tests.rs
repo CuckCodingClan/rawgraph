@@ -1025,3 +1025,48 @@ mod deliverables {
         assert_eq!((w, h), (16, 16));
     }
 }
+
+#[test]
+fn caption_sheet_names_and_a_missing_row_fails_only_that_image() {
+    use rawgraph_rename::{CaptionSheet, NumberPattern, SheetColumns};
+    let t = TempDir::new();
+    let items: Vec<_> = [(1u64, "Job-0076"), (2, "Job-0077"), (3, "Job-0099"), (4, "nodigits")]
+        .iter()
+        .map(|(id, n)| {
+            let p = t.path(&format!("src/{n}.png"));
+            write_grey(&p, 4, 4, 100);
+            item(*id, p)
+        })
+        .collect();
+    let cells: Vec<Vec<String>> = [("76", "076_Anna", "Anna"), ("77", "077_Bob", "Bob")].iter().map(|r| vec![r.0.into(), r.1.into(), r.2.into()]).collect();
+    let binding = SheetBinding { sheet: CaptionSheet::from_cells(&cells, &SheetColumns::default()).unwrap(), pattern: NumberPattern::default() };
+    let (g, _, out) = make_graph(0.0);
+    let mut s = settings(&t.path("out"), ExportFormat::Png);
+    s.name_template = "{sheet_name}".into();
+
+    // Without a sheet the settings are refused before any image is touched.
+    assert!(matches!(export(&g, out, &items, &s, &CancelToken::new(), &mut |_| {}), Err(ExportError::InvalidSettings(m)) if m.contains("caption sheet")));
+
+    s.sheet = Some(Arc::new(binding));
+    let report = run(&g, out, &items, &s);
+    assert_eq!((report.written(), report.failed()), (2, 2));
+    assert_eq!(files_in(&t.path("out")), vec!["076_Anna.png", "077_Bob.png"], "no fallback name for the others");
+    match &report.items[2].1 {
+        ItemStatus::Failed(m) => assert!(m.contains("photo 99 has no row"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    match &report.items[3].1 {
+        ItemStatus::Failed(m) => assert!(m.contains("no photo number"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    // The preview helper reports the same sentence.
+    assert!(planned_path(&items[2], 3, &s).unwrap_err().to_string().contains("no row"));
+    assert_eq!(planned_path(&items[0], 1, &s).unwrap(), t.path("out/076_Anna.png"));
+
+    // {caption} and {no:03} work in any template, also combined with {name}.
+    s.name_template = "{no:04}_{caption}_{name}".into();
+    s.on_conflict = OnConflict::Overwrite;
+    let report = run(&g, out, &items[..2], &s);
+    assert_eq!(report.written(), 2);
+    assert!(files_in(&t.path("out")).contains(&"0076_Anna_Job-0076.png".to_string()));
+}
