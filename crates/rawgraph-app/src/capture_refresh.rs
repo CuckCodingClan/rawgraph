@@ -12,6 +12,16 @@ use rawgraph_core::{CaptureInfo, ImageId};
 /// Reader threads (metadata reads are small; more threads help on a NAS).
 const THREADS: usize = 4;
 
+/// What a failed read reports: "looked, found nothing". Applying it only sets `focal_read`.
+pub fn failure_marker() -> CaptureInfo {
+    CaptureInfo { focal_read: true, ..Default::default() }
+}
+
+/// True for [`failure_marker`].
+pub fn is_failure_marker(info: &CaptureInfo) -> bool {
+    *info == failure_marker()
+}
+
 pub struct CaptureRefresh {
     rx: Receiver<(ImageId, CaptureInfo)>,
     pub done: usize,
@@ -33,13 +43,13 @@ impl CaptureRefresh {
                 if !path.is_file() {
                     continue;
                 }
-                if let Ok(info) = rawgraph_io::read_capture_info(path) {
-                    if tx.send((*id, info)).is_err() {
-                        break;
-                    }
-                    if i % 32 == 0 {
-                        ctx.request_repaint();
-                    }
+                // A file that cannot be read is remembered (the marker), so it is not read again at every start.
+                let info = rawgraph_io::read_capture_info(path).unwrap_or_else(|_| failure_marker());
+                if tx.send((*id, info)).is_err() {
+                    break;
+                }
+                if i % 32 == 0 {
+                    ctx.request_repaint();
                 }
             });
         }

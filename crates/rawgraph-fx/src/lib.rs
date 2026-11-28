@@ -19,6 +19,7 @@ mod local;
 mod lut;
 mod masks;
 mod pixel_sort;
+pub mod pano;
 mod sharpen;
 mod tone;
 mod util;

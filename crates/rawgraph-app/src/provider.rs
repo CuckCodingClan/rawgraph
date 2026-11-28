@@ -458,6 +458,13 @@ impl ImageProvider for FileProvider {
         self.lens_blocking(id)
     }
 
+    /// Size of the cached proxy (never decodes); `None` when it is not in the cache.
+    fn proxy_size(&self, id: ImageId) -> Option<(u32, u32)> {
+        let key = (id, self.preview_size());
+        let mut c = self.cache.lock().ok()?;
+        c.lru.get(&key).map(|img| (img.width(), img.height()))
+    }
+
     fn revision(&self, _id: ImageId) -> u64 {
         u64::from(self.preview_size()) | (self.epoch.load(Ordering::Relaxed) << 16)
     }

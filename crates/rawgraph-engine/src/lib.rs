@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rawgraph_core::{
-    cdl_params, color, curve_set, develop_settings, develop_tone, group_exposure_evs, iso_noise_scale, layer_settings, ops, CaptureInfo, Catalog, CdlParams, QueryMemo,
+    cdl_params, color, curve_set, develop_settings, develop_tone, group_exposure_evs, group_kind, iso_noise_scale, layer_settings, ops, CaptureInfo, Catalog, CdlParams, QueryMemo,
     DevelopSettings, DevelopTone, Graph, ImageBuf, ImageId, LayerSettings, LensProfile, MaskBuf, NodeData, NodeId, NodeKind, PortType,
     MAX_LAYERS,
 };
@@ -47,6 +47,11 @@ pub trait ImageProvider: Send + Sync {
     }
     /// Lens profile (DNG opcodes) of `id` in the upright image frame, if the file has one.
     fn lens_profile(&self, _id: ImageId) -> Option<LensProfile> {
+        None
+    }
+    /// Size (width, height) of the picture `image(id)` returns, when it is known without decoding
+    /// anything (for example from a cache). `None` makes callers fall back to `image(id)`.
+    fn proxy_size(&self, _id: ImageId) -> Option<(u32, u32)> {
         None
     }
 }
@@ -149,6 +154,11 @@ pub struct Evaluator {
     /// Local tone grids by (image, grid id), see [`Evaluator::tail_grid`].
     /// Least recently used last; kept across images (see `MAX_GRIDS`).
     grids: Vec<((ImageId, u64), Arc<ops::LocalToneGrid>)>,
+    /// Findings of nodes that computed a result (not cache hits), e.g. the Panorama's warnings.
+    notes: Vec<(NodeId, ImageId, String)>,
+    /// The findings of the result each group node holds in the cache (kept with its fingerprint), so
+    /// a cache hit still has them to show; see [`Evaluator::current_notes`].
+    group_notes: HashMap<Key, (u64, Vec<String>)>,
 }
 
 /// Local tone grids kept (each is about 0.7 MB at most).
@@ -156,7 +166,7 @@ const MAX_GRIDS: usize = 16;
 
 impl Default for Evaluator {
     fn default() -> Self {
-        Self { cache: HashMap::new(), view_tone: ToneMap::AcesFit, pre_tone: HashMap::new(), grids: Vec::new(), hits: 0, misses: 0, keep_intermediates: true, timings: None, timing_children: Vec::new(), timing_hit: Vec::new() }
+        Self { cache: HashMap::new(), view_tone: ToneMap::AcesFit, pre_tone: HashMap::new(), grids: Vec::new(), hits: 0, misses: 0, keep_intermediates: true, timings: None, timing_children: Vec::new(), timing_hit: Vec::new(), notes: Vec::new(), group_notes: HashMap::new() }
     }
 }
 
@@ -569,6 +579,7 @@ impl Evaluator {
 
     pub fn clear(&mut self) {
         self.cache.clear();
+        self.group_notes.clear();
         self.pre_tone.clear();
         self.grids.clear();
     }
@@ -612,6 +623,48 @@ impl Evaluator {
         let grid = Arc::new(grid);
         self.grids.push((key, Arc::clone(&grid)));
         Ok(grid)
+    }
+
+    /// Non-fatal findings of nodes computed since creation or the last [`Evaluator::take_notes`]
+    /// (node, image, text): a Panorama's stitching warnings, for example.
+    pub fn notes(&self) -> &[(NodeId, ImageId, String)] {
+        &self.notes
+    }
+
+    /// Keeps a note; the list is bounded (the oldest notes go) so a caller that never takes them
+    /// cannot make it grow without limit.
+    fn push_note(&mut self, node: NodeId, image: ImageId, note: String) {
+        const MAX_NOTES: usize = 64;
+        if self.notes.len() >= MAX_NOTES {
+            self.notes.remove(0);
+        }
+        self.notes.push((node, image, note));
+    }
+
+    /// The findings of the group nodes (a Panorama's stitching warnings) behind the picture of `node` for
+    /// `image` whose results are still cached: unlike [`Evaluator::notes`] they are also there after a
+    /// cache hit, and they go with the result (a changed graph recomputes them).
+    pub fn current_notes(&self, graph: &Graph, node: NodeId, image: ImageId) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = graph.upstream_group_node(node);
+        for _ in 0..8 {
+            let Some(g) = cur else { break };
+            for control in [false, true] {
+                let key: Key = (g, image, control);
+                if let (Some((fp, notes)), Some(entry)) = (self.group_notes.get(&key), self.cache.get(&key)) {
+                    if entry.fingerprint == *fp {
+                        out.extend(notes.iter().cloned());
+                    }
+                }
+            }
+            cur = graph.upstream_group_node_above(g);
+        }
+        out
+    }
+
+    /// Returns and clears the notes.
+    pub fn take_notes(&mut self) -> Vec<(NodeId, ImageId, String)> {
+        std::mem::take(&mut self.notes)
     }
 
     /// Cache hits since creation.
@@ -698,7 +751,7 @@ impl Evaluator {
         if node.kind == NodeKind::Layer {
             return self.eval_layer(graph, node, image, fingerprint, env, cancel, visiting);
         }
-        if node.kind == NodeKind::HdrMerge {
+        if group_kind(node.kind).is_some() {
             return self.eval_group(graph, node, image, fingerprint, env, cancel, visiting);
         }
         let chosen = if node.kind == NodeKind::Merge {
@@ -932,7 +985,7 @@ impl Evaluator {
                 c
             }
         };
-        let canvas_full = provider_full_size(env.provider, canvas_src);
+        let canvas_full = layer_full_size(graph, node.id, canvas_layer, env.provider, canvas_src, (cw, ch));
         for &layer in plan.active.iter().skip(1) {
             if cancel.is_cancelled() {
                 return Err(EvalError::Cancelled);
@@ -940,7 +993,7 @@ impl Evaluator {
             let src = plan.srcs[layer].ok_or(EvalError::NotInCollection { node: node.id })?;
             let layer_img = self.eval_layer_input(graph, node, layer, src, env, cancel, visiting)?;
             let s = &plan.settings[layer];
-            let scale = crop_scale((cw, ch), canvas_full, (layer_img.width(), layer_img.height()), provider_full_size(env.provider, src));
+            let scale = crop_scale((cw, ch), canvas_full, (layer_img.width(), layer_img.height()), layer_full_size(graph, node.id, layer, env.provider, src, (layer_img.width(), layer_img.height())));
             let placed = fx::place_layer(&layer_img, cw, ch, s.fit, s.filter, scale);
             fx::blend_layer(&mut canvas, &placed, s.blend, s.opacity);
         }
@@ -950,8 +1003,9 @@ impl Evaluator {
         Ok((fingerprint, value))
     }
 
-    /// HDR Merge: the output image is the reference of an image group; every member is evaluated
-    /// through the input (one after the other, each with its own fingerprint memo), then merged.
+    /// HDR Merge / Panorama: the output image is the reference of an image group; every member is
+    /// evaluated through the input (one after the other, each with its own fingerprint memo), then
+    /// merged (HDR) or stitched (Panorama; the output has the size of the panorama, not of the reference).
     #[allow(clippy::too_many_arguments)]
     fn eval_group(
         &mut self,
@@ -975,6 +1029,10 @@ impl Evaluator {
             return Err(EvalError::Cancelled);
         }
         let group = env.cat(|c| graph.image_group(node.id, image, c)).ok_or(EvalError::NotInCollection { node: node.id })?;
+        if node.kind == NodeKind::Panorama && group.members.len() > fx::pano::MAX_FRAMES {
+            // Refuse before any member is loaded: the stitcher would only fail on the count after all of them were.
+            return Err(EvalError::Failed { node: node.id, message: pano_count_message(group.members.len()) });
+        }
         // The frames are held once: each member's cache entries (and its pre-tone base) go as soon as
         // the member is evaluated (lean mode), so only this list and, at the end, the result stay.
         let mut frames: Vec<Arc<ImageBuf>> = Vec::with_capacity(group.members.len());
@@ -988,40 +1046,63 @@ impl Evaluator {
             let (_, value) = self.eval_node(graph, up, member, env, cancel, visiting, &mut memo)?;
             self.release(&[up], member);
             let Value::Images(img) = output_value(graph, up, up_port, value);
+            if node.kind == NodeKind::Panorama && frames.is_empty() {
+                // Refuse a group that cannot fit the memory budget before the other members are loaded.
+                if pano_over_budget(group.members.len(), img.width(), img.height()) {
+                    return Err(EvalError::Failed { node: node.id, message: pano_budget_message(group.members.len(), img.width(), img.height()) });
+                }
+            }
             frames.push(img);
         }
         if cancel.is_cancelled() {
             return Err(EvalError::Cancelled);
         }
         let reference = group.members.iter().position(|m| *m == group.reference).unwrap_or(0);
+        let mut found: Vec<String> = Vec::new();
         let value = if frames.len() == 1 {
             Value::Images(frames.swap_remove(0))
         } else {
             let captures: Vec<Option<CaptureInfo>> = group.members.iter().map(|&m| env.provider.capture(m)).collect();
-            let meta = group_exposure_evs(&captures.iter().map(Option::as_ref).collect::<Vec<_>>());
-            let params = fx::HdrParams {
-                measured: node.choice("exposure", image) == 0,
-                align: node.toggle("align", image),
-                max_shift_pct: node.param("max_shift_pct", image),
-                deghost: node.param("deghost", image),
-                clip: node.param("clip", image),
-                // Without exposure values for every member the planned reference is only the middle
-                // one in capture order: express the result at the median measured exposure instead
-                // (the output keeps the identity of the planned reference).
-                median_exposure: meta.iter().any(Option::is_none),
-            };
-            let refs: Vec<&ImageBuf> = frames.iter().map(|f| f.as_ref()).collect();
-            let cancelled = || cancel.is_cancelled();
-            // Notes ("alignment unsure ...") have no place in the evaluation result yet; they are dropped.
-            let merged = fx::merge_hdr_ex(&refs, reference, &meta, &params, &cancelled, &mut Vec::new()).map_err(|e| match e {
-                fx::HdrError::Cancelled => EvalError::Cancelled,
-                fx::HdrError::Failed(message) => EvalError::Failed { node: node.id, message },
-            })?;
-            Value::Images(Arc::new(merged))
+            if node.kind == NodeKind::Panorama {
+                let uncropped = uncropped_frame_size(env.provider, group.members[0], (frames[0].width(), frames[0].height()));
+                let (pano, notes) = stitch_group(node, image, &frames, &captures, uncropped, cancel)?;
+                found = notes.clone();
+                for note in notes {
+                    eprintln!("RawGraph: Panorama node {} (image {}): {note}", node.id.0, image.0);
+                    self.push_note(node.id, image, note);
+                }
+                Value::Images(Arc::new(pano))
+            } else {
+                let meta = group_exposure_evs(&captures.iter().map(Option::as_ref).collect::<Vec<_>>());
+                let params = fx::HdrParams {
+                    measured: node.choice("exposure", image) == 0,
+                    align: node.toggle("align", image),
+                    max_shift_pct: node.param("max_shift_pct", image),
+                    deghost: node.param("deghost", image),
+                    clip: node.param("clip", image),
+                    // Without exposure values for every member the planned reference is only the middle
+                    // one in capture order: express the result at the median measured exposure instead
+                    // (the output keeps the identity of the planned reference).
+                    median_exposure: meta.iter().any(Option::is_none),
+                };
+                let refs: Vec<&ImageBuf> = frames.iter().map(|f| f.as_ref()).collect();
+                let cancelled = || cancel.is_cancelled();
+                // Notes ("alignment unsure ...") have no place in the evaluation result yet; they are dropped.
+                let merged = fx::merge_hdr_ex(&refs, reference, &meta, &params, &cancelled, &mut Vec::new()).map_err(|e| match e {
+                    fx::HdrError::Cancelled => EvalError::Cancelled,
+                    fx::HdrError::Failed(message) => EvalError::Failed { node: node.id, message },
+                })?;
+                Value::Images(Arc::new(merged))
+            }
         };
         drop(frames);
         self.misses += 1;
         self.cache.insert(key, Entry { fingerprint, value: value.clone() });
+        if found.is_empty() {
+            self.group_notes.remove(&key);
+        } else {
+            self.group_notes.insert(key, (fingerprint, found));
+        }
         Ok((fingerprint, value))
     }
 
@@ -1052,6 +1133,7 @@ impl Evaluator {
         if !self.keep_intermediates {
             self.cache.retain(|(n, im, _), _| *im != image || !nodes.contains(n));
             self.pre_tone.retain(|(n, im, _), _| *im != image || !nodes.contains(n));
+            self.group_notes.retain(|k, _| self.cache.contains_key(k));
         }
     }
 }
@@ -1078,6 +1160,237 @@ fn layer_plan(node: &rawgraph_core::Node, image: ImageId, env: &Env, graph: &Gra
 
 fn provider_full_size(provider: &dyn ImageProvider, id: ImageId) -> Option<(u32, u32)> {
     provider.full_size(id).filter(|&(w, h)| w > 0 && h > 0)
+}
+
+/// The full-resolution size that belongs to the picture (`size`, a proxy) which input `layer` of the
+/// Layer node `layer_node` delivered for image `src`. Normally the full size of `src`'s file. Behind
+/// a Panorama the picture is not the size of any file: it is as many times smaller than a
+/// full-resolution panorama as the frames' proxies are than their files, so the full size follows
+/// from that ratio.
+fn layer_full_size(graph: &Graph, layer_node: NodeId, layer: usize, provider: &dyn ImageProvider, src: ImageId, size: (u32, u32)) -> Option<(u32, u32)> {
+    let full = provider_full_size(provider, src)?;
+    // A Panorama anywhere upstream, on any input of the nodes in between.
+    let behind_panorama = graph.input_edge(layer_node, layer).is_some_and(|(up, _)| graph.has_upstream_kind(up, NodeKind::Panorama));
+    if !behind_panorama {
+        return Some(full);
+    }
+    let (pw, ph) = match provider.proxy_size(src).filter(|&(w, h)| w > 0 && h > 0) {
+        Some(s) => s,
+        None => {
+            let proxy = provider.image(src).ok()?;
+            (proxy.width(), proxy.height())
+        }
+    };
+    let scale = pw.max(ph) as f64 / full.0.max(full.1) as f64;
+    if !(scale.is_finite() && scale > 0.0) {
+        return None;
+    }
+    let up = |v: u32| ((v as f64 / scale).round() as u32).max(1);
+    Some((up(size.0), up(size.1)))
+}
+
+/// Diagonal of a 35 mm frame in millimetres: a 35-mm-equivalent focal length refers to it.
+const FULL_FRAME_DIAGONAL_MM: f64 = 43.2666;
+
+/// Focal length in pixels (of a frame of `size`) for the stitch, and the findings about it.
+/// `mode` is the node's "Focal length" option (0 metadata, 1 estimate), `override_35` the
+/// 35-mm-equivalent value typed into the node (0 = none). `None` leaves it to the stitcher's estimate.
+fn pano_focal(mode: usize, override_35: f32, captures: &[Option<CaptureInfo>], size: (u32, u32)) -> (Option<f32>, Vec<String>) {
+    let to_px = |f35: f64| (f35 * (size.0 as f64).hypot(size.1 as f64) / FULL_FRAME_DIAGONAL_MM) as f32;
+    if override_35.is_finite() && override_35 > 0.0 {
+        return (Some(to_px(override_35 as f64)), Vec::new());
+    }
+    if mode != 0 {
+        return (None, Vec::new());
+    }
+    let values: Vec<Option<f32>> =
+        captures.iter().map(|c| c.as_ref().and_then(|c| c.focal_35mm).filter(|f| f.is_finite() && *f > 0.0)).collect();
+    let mut known: Vec<f32> = values.iter().flatten().copied().collect();
+    if known.is_empty() || known.len() != values.len() {
+        let real_only = captures.iter().flatten().any(|c| c.focal_mm.is_some() && c.focal_35mm.is_none());
+        let why = if real_only {
+            "only the real focal length is recorded, not the 35-mm equivalent"
+        } else {
+            "no focal length is recorded"
+        };
+        return (None, vec![format!("{why} in the metadata of every frame: the focal length is estimated (type it into the node for a better result)")]);
+    }
+    known.sort_by(f32::total_cmp);
+    let (lo, hi) = (known[0], known[known.len() - 1]);
+    if (hi - lo) / hi > 0.02 {
+        return (None, vec![format!("the frames have different focal lengths ({lo:.0} to {hi:.0} mm): the focal length is estimated")]);
+    }
+    (Some(to_px(known[known.len() / 2] as f64)), Vec::new())
+}
+
+/// Total physical memory of the machine in bytes (cached; 8 GiB when it cannot be read).
+fn total_memory_bytes() -> u64 {
+    static TOTAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TOTAL.get_or_init(|| read_total_memory().filter(|&b| b >= (1 << 30)).unwrap_or(8 << 30))
+}
+
+#[cfg(windows)]
+fn read_total_memory() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: `status` is a plain struct of integers with its length field set as the API requires.
+    unsafe {
+        let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        (GlobalMemoryStatusEx(&mut status) != 0).then_some(status.ullTotalPhys)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_total_memory() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: u64 = text.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.split_whitespace().next()?.parse().ok()?;
+    kib.checked_mul(1024)
+}
+
+#[cfg(target_os = "macos")]
+fn read_total_memory() -> Option<u64> {
+    let out = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn read_total_memory() -> Option<u64> {
+    None
+}
+
+/// Memory a Panorama may use for its input frames and its output: 70 % of the machine's RAM.
+fn pano_memory_budget() -> u64 {
+    total_memory_bytes() / 10 * 7
+}
+
+/// Bytes a stitch of `frames` frames of `w` x `h` px needs: the frames (float RGBA, 16 bytes per
+/// pixel, all held at once) plus the output, which is at most as large as the frames together and
+/// never beyond the stitcher's own output limit.
+fn pano_needed_bytes(frames: usize, w: u32, h: u32) -> u128 {
+    let inputs = w as u128 * h as u128 * frames as u128 * 16;
+    inputs + inputs.min(fx::pano::MAX_BYTES as u128)
+}
+
+/// True when the frames and the output of the stitch do not fit `budget` bytes; refuses before the
+/// other members are loaded.
+fn pano_over(frames: usize, w: u32, h: u32, budget: u64) -> bool {
+    pano_needed_bytes(frames, w, h) > budget as u128
+}
+
+/// True when the stitch does not fit the machine's memory budget.
+fn pano_over_budget(frames: usize, w: u32, h: u32) -> bool {
+    pano_over(frames, w, h, pano_memory_budget())
+}
+
+/// The message of a group with more images than the stitcher takes.
+fn pano_count_message(count: usize) -> String {
+    format!(
+        "Panorama: a group of {count} images is more than the {} the stitcher takes; lower Max group size or Max gap",
+        fx::pano::MAX_FRAMES
+    )
+}
+
+/// The size an image of `member` would have without any crop upstream: the file's full size at the
+/// scale of its proxy (what `provider.image` delivers). The delivered size when either is unknown or
+/// the result would be smaller than what was delivered.
+fn uncropped_frame_size(provider: &dyn ImageProvider, member: ImageId, delivered: (u32, u32)) -> (u32, u32) {
+    let Some(full) = provider_full_size(provider, member) else { return delivered };
+    let Some((pw, ph)) = provider.proxy_size(member).filter(|&(w, h)| w > 0 && h > 0).or_else(|| provider.image(member).ok().map(|i| (i.width(), i.height()))) else {
+        return delivered;
+    };
+    let scale = pw.max(ph) as f64 / full.0.max(full.1) as f64;
+    if !(scale.is_finite() && scale > 0.0) {
+        return delivered;
+    }
+    let size = (((full.0 as f64 * scale).round() as u32).max(1), ((full.1 as f64 * scale).round() as u32).max(1));
+    if size.0 >= delivered.0 && size.1 >= delivered.1 {
+        size
+    } else {
+        delivered
+    }
+}
+
+/// The message of a group that does not fit the panorama memory budget.
+fn pano_budget_message(frames: usize, w: u32, h: u32) -> String {
+    pano_budget_message_for(frames, w, h, pano_memory_budget())
+}
+
+fn pano_budget_message_for(frames: usize, w: u32, h: u32, budget: u64) -> String {
+    let gb = |b: f64| b / (1u64 << 30) as f64;
+    format!(
+        "Panorama: {frames} frames of {w} x {h} px need about {:.1} GB of memory, more than the {:.1} GB available for it; use fewer frames or a smaller long edge",
+        gb(pano_needed_bytes(frames, w, h) as f64),
+        gb(budget as f64)
+    )
+}
+
+/// The file name of an image for messages (its path's last component), else "image N".
+fn image_label(capture: Option<&CaptureInfo>, index: usize) -> String {
+    capture
+        .and_then(|c| c.path.as_deref())
+        .and_then(|p| p.rsplit(['/', '\\']).next())
+        .filter(|n| !n.is_empty())
+        .map_or_else(|| format!("image {}", index + 1), str::to_owned)
+}
+
+/// Stitches the frames of a Panorama group. Returns the panorama and the findings (stitch warnings,
+/// focal length notes).
+fn stitch_group(
+    node: &rawgraph_core::Node,
+    image: ImageId,
+    frames: &[Arc<ImageBuf>],
+    captures: &[Option<CaptureInfo>],
+    uncropped: (u32, u32),
+    cancel: &CancelToken,
+) -> Result<(ImageBuf, Vec<String>), EvalError> {
+    use fx::pano::{Blend, PanoError, Projection};
+    // The 35-mm value refers to the whole frame: a crop upstream does not shorten the focal length.
+    let typed = node.param("focal_mm_35", image);
+    let (focal_px, mut notes) = pano_focal(node.choice("focal", image), typed, captures, uncropped);
+    let params = fx::pano::PanoParams {
+        projection: match node.choice("projection", image) {
+            1 => Projection::Spherical,
+            2 => Projection::Planar,
+            _ => Projection::Cylindrical,
+        },
+        work_px: node.param("work_px", image).round().clamp(600.0, 3000.0) as u32,
+        blend: if node.choice("blend", image) == 1 { Blend::Feather } else { Blend::Multiband { levels: node.param("levels", image).round().clamp(2.0, 6.0) as u32 } },
+        exposure_comp: node.toggle("exposure_comp", image),
+        crop: node.toggle("crop", image),
+        focal_px,
+        // Only a value typed into the node can be exact; a recorded one is a start value.
+        focal_fixed: node.toggle("focal_fixed", image) && typed.is_finite() && typed > 0.0,
+        // Scene-linear data: the stitcher excludes the brightest percent of every frame on its own.
+        exposure_clip: None,
+        // What the machine's budget leaves after the frames held right now.
+        max_output_bytes: Some({
+            let held: u64 = frames.iter().map(|f| f.width() as u64 * f.height() as u64 * 16).sum();
+            pano_memory_budget().saturating_sub(held).max(64 << 20)
+        }),
+    };
+    if frames.len() >= fx::pano::MAX_FRAMES {
+        notes.push(format!(
+            "Panorama: this group has the maximum of {} images; a longer sequence continues in the next panorama",
+            fx::pano::MAX_FRAMES
+        ));
+    }
+    let refs: Vec<&ImageBuf> = frames.iter().map(|f| f.as_ref()).collect();
+    let cancelled = || cancel.is_cancelled();
+    match fx::pano::stitch(&refs, &params, &cancelled) {
+        Ok(p) => {
+            notes.extend(p.warnings.iter().cloned());
+            Ok((p.image, notes))
+        }
+        Err(PanoError::Cancelled) => Err(EvalError::Cancelled),
+        Err(PanoError::NotConnected { frames: lost }) => {
+            let names: Vec<String> = lost.iter().map(|&i| image_label(captures.get(i).and_then(Option::as_ref), i)).collect();
+            Err(EvalError::Failed {
+                node: node.id,
+                message: format!("Panorama: these images do not overlap the others enough to be stitched: {}", names.join(", ")),
+            })
+        }
+        Err(e) => Err(EvalError::Failed { node: node.id, message: format!("Panorama: {e}") }),
+    }
 }
 
 /// Scale of a "Crop" layer: one layer pixel of the full-resolution file stays one canvas
@@ -1384,7 +1697,7 @@ fn node_fingerprint_inner(
         return Ok(hasher.finish());
     }
 
-    if node.kind == NodeKind::HdrMerge {
+    if group_kind(node.kind).is_some() {
         // The group members are evaluated through the input, each as its own image.
         let group = env.cat(|c| graph.image_group(id, image, c)).ok_or(EvalError::NotInCollection { node: id })?;
         group.reference.hash(&mut hasher);
@@ -1405,6 +1718,11 @@ fn node_fingerprint_inner(
             capture.as_ref().and_then(|c| c.shutter_s).map(f32::to_bits).hash(&mut hasher);
             capture.as_ref().and_then(|c| c.iso).map(f32::to_bits).hash(&mut hasher);
             capture.as_ref().and_then(|c| c.aperture).map(f32::to_bits).hash(&mut hasher);
+            if node.kind == NodeKind::Panorama {
+                // The focal length of the metadata sets the geometry.
+                capture.as_ref().and_then(|c| c.focal_mm).map(f32::to_bits).hash(&mut hasher);
+                capture.as_ref().and_then(|c| c.focal_35mm).map(f32::to_bits).hash(&mut hasher);
+            }
             let fp = node_fingerprint(graph, up, member, env, &mut FingerprintMemo::new(), visiting)?;
             fp.hash(&mut hasher);
         }
@@ -2120,7 +2438,7 @@ fn compute(
             Ok(if ev == 0.0 { Value::Images(src) } else { modified(&src, |img| ops::apply_gain(img, ev.exp2())) })
         }
         // Develop is computed by `Evaluator::compute_develop` (pre-tone cache), Layer by `Evaluator::eval_layer`.
-        NodeKind::Develop | NodeKind::Layer | NodeKind::HdrMerge => Err(EvalError::MissingInput { node: id, port: 0 }),
+        NodeKind::Develop | NodeKind::Layer | NodeKind::HdrMerge | NodeKind::Panorama => Err(EvalError::MissingInput { node: id, port: 0 }),
         NodeKind::WhiteBalance => {
             let src = input_image(inputs, 0, id)?;
             let (temp, tint) = (param("temp"), param("tint"));
@@ -6803,3 +7121,6 @@ mod lut_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pano_tests;

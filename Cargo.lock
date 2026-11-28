@@ -3491,6 +3491,7 @@ dependencies = [
  "rawgraph-core",
  "rawgraph-fx",
  "rawgraph-scopes",
+ "rayon",
  "serde_json",
  "windows-sys 0.61.2",
 ]

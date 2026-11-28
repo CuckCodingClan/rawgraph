@@ -142,7 +142,7 @@ impl Tools {
         // Strokes belong to the frame of the node that uses the mask. Behind Crop / Rotate nodes the
         // pointer is mapped back through them (see `frames`).
         let mapper = match session.brush_plan(node) {
-            crate::frames::BrushPlan::Mapped { consumer, chain } => session.proxy_size(viewed_image).map(|src| crate::frames::Mapper::new(&session.project.graph, consumer, &chain, image, src)),
+            crate::frames::BrushPlan::Mapped { consumer, chain } => session.source_size_at(node, viewed_image).map(|src| crate::frames::Mapper::new(&session.project.graph, consumer, &chain, image, src)),
             _ => None,
         };
         let to_frame = |p: Pos2| -> Option<[f32; 2]> {

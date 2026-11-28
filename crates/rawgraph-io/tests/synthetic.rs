@@ -266,7 +266,8 @@ fn save_exr_marks_acescg_primaries() {
     assert!((c.red.0 - 0.713).abs() < 1e-4 && (c.blue.1 - 0.044).abs() < 1e-4);
 }
 
-/// Minimal little-endian TIFF/EXIF block: Make, Orientation, ExposureTime 1/250, f/2.8, ISO 400, Flash fired.
+/// Minimal little-endian TIFF/EXIF block: Make, Orientation, ExposureTime 1/250, f/2.8, ISO 400, Flash fired,
+/// focal length 24 mm (36 mm in 35-mm equivalent).
 fn exif_block(orientation: u16) -> Vec<u8> {
     fn entry(tag: u16, typ: u16, count: u32, value: u32) -> Vec<u8> {
         let mut e = Vec::new();
@@ -284,14 +285,16 @@ fn exif_block(orientation: u16) -> Vec<u8> {
     t.extend(entry(0x8769, 4, 1, 56));
     t.extend_from_slice(&0u32.to_le_bytes());
     t.extend_from_slice(b"Acme\0\0");
-    // Exif IFD at 56: 4 entries -> 2 + 48 + 4 = 54 -> ends at 110; rationals at 110 and 118.
-    t.extend_from_slice(&4u16.to_le_bytes());
-    t.extend(entry(0x829A, 5, 1, 110));
-    t.extend(entry(0x829D, 5, 1, 118));
+    // Exif IFD at 56: 6 entries -> 2 + 72 + 4 = 78 -> ends at 134; rationals at 134, 142 and 150.
+    t.extend_from_slice(&6u16.to_le_bytes());
+    t.extend(entry(0x829A, 5, 1, 134));
+    t.extend(entry(0x829D, 5, 1, 142));
     t.extend(entry(0x8827, 3, 1, 400));
     t.extend(entry(0x9209, 3, 1, 1));
+    t.extend(entry(0x920A, 5, 1, 150));
+    t.extend(entry(0xA405, 3, 1, 36));
     t.extend_from_slice(&0u32.to_le_bytes());
-    for v in [1u32, 250, 28, 10] {
+    for v in [1u32, 250, 28, 10, 240, 10] {
         t.extend_from_slice(&v.to_le_bytes());
     }
     t
@@ -328,6 +331,7 @@ fn jpeg_exif_metadata_and_orientation() {
     assert_eq!(info.shutter_s, Some(1.0 / 250.0));
     assert!((info.aperture.unwrap() - 2.8).abs() < 1e-6);
     assert_eq!(info.flash_fired, Some(true));
+    assert_eq!((info.focal_mm, info.focal_35mm), (Some(24.0), Some(36.0)));
     assert!(info.ev100().is_some());
 
     // Orientation 6 (rotate 90 CW) turns the 8x4 landscape into a 4x8 portrait.
@@ -344,8 +348,8 @@ fn jpeg_without_exif_has_empty_capture_info() {
     let t = Tmp::new("noexif");
     let p = t.file("plain.jpg");
     save_srgb8(&p, 16, 16, &rgb_gradient(16, 16), 90, false).unwrap();
-    // Only the source-type flag is known; every other field is missing.
-    let expect = rawgraph_core::CaptureInfo { raw: Some(false), ..Default::default() };
+    // Only the source-type flag is known (and that the focal length was looked for); every other field is missing.
+    let expect = rawgraph_core::CaptureInfo { raw: Some(false), focal_read: true, ..Default::default() };
     assert_eq!(read_capture_info(&p).unwrap(), expect);
 }
 

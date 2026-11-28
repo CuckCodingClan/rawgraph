@@ -317,6 +317,42 @@ fn read_dng_ifd0(path: &Path) -> Option<DngIfd0> {
     Some(out)
 }
 
+/// The entry `tag` of the TIFF IFD at `offset`, if the IFD is readable and has it.
+fn ifd_entry(f: &mut std::fs::File, le: bool, offset: u64, tag: u16) -> Option<[u8; 12]> {
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(offset)).ok()?;
+    let mut cnt = [0u8; 2];
+    f.read_exact(&mut cnt).ok()?;
+    let n = read_u16(le, &cnt) as usize;
+    if n == 0 || n > 4096 {
+        return None;
+    }
+    let mut table = vec![0u8; n * 12];
+    f.read_exact(&mut table).ok()?;
+    table.as_chunks::<12>().0.iter().find(|e| read_u16(le, &e[0..2]) == tag).copied()
+}
+
+/// `FocalLengthIn35mmFilm` (EXIF 0xA405) of a TIFF-based file (DNG, ARW, NEF, CR2, ...): two small
+/// reads of IFD0 and the Exif IFD, no pixel data. The RAW decoder's EXIF block does not carry it.
+/// `None` for other containers, a missing tag and anything malformed.
+fn read_focal_35mm(path: &Path) -> Option<f32> {
+    use std::io::Read;
+    const EXIF_IFD_POINTER: u16 = 0x8769;
+    const FOCAL_LENGTH_35: u16 = 0xA405;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 8];
+    f.read_exact(&mut head).ok()?;
+    let le = match &head[..4] {
+        [b'I', b'I', 42, 0] => true,
+        [b'M', b'M', 0, 42] => false,
+        _ => return None,
+    };
+    let pointer = ifd_entry(&mut f, le, read_u32(le, &head[4..8]) as u64, EXIF_IFD_POINTER)?;
+    let entry = ifd_entry(&mut f, le, read_u32(le, &pointer[8..12]) as u64, FOCAL_LENGTH_35)?;
+    let v = tiff_values(&mut f, le, &entry)?.first().copied()?;
+    (1.0..=2000.0).contains(&v).then_some(v as f32)
+}
+
 // ---------------------------------------------------------------- Sony ARW white balance
 
 /// Bounds-checked reader over a byte slice (the memory-mapped file or a decrypted block).
@@ -518,6 +554,9 @@ fn capture_from(md: &RawMetadata, header: impl FnOnce() -> Option<WbSource>, pat
         as_shot_kelvin: white.map(|w| w.0),
         as_shot_tint: white.map(|w| w.1),
         baseline_exposure: dng.as_ref().and_then(|d| d.baseline),
+        focal_mm: positive(e.focal_length),
+        focal_35mm: read_focal_35mm(path),
+        focal_read: true,
         ..Default::default()
     }
 }
@@ -1165,4 +1204,62 @@ pub fn load_thumbnail(path: &Path, max_dim: u32) -> Result<PreviewPixels, IoErro
         }
     });
     Ok((w, h, out))
+}
+
+#[cfg(test)]
+mod focal_tests {
+    use super::*;
+
+    /// A TIFF with IFD0 -> Exif IFD holding one entry `tag` (SHORT, `value`), little or big endian.
+    fn tiff(le: bool, exif_tag: u16, value: u16) -> Vec<u8> {
+        let u16b = |v: u16| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let u32b = |v: u32| if le { v.to_le_bytes() } else { v.to_be_bytes() };
+        let mut t: Vec<u8> = if le { vec![b'I', b'I', 42, 0] } else { vec![b'M', b'M', 0, 42] };
+        t.extend(u32b(8));
+        // IFD0 at 8: one entry (Exif IFD pointer to 26), next IFD 0.
+        t.extend(u16b(1));
+        t.extend(u16b(0x8769));
+        t.extend(u16b(4));
+        t.extend(u32b(1));
+        t.extend(u32b(26));
+        t.extend(u32b(0));
+        // Exif IFD at 26: one SHORT entry (the value sits in the first two bytes of the field).
+        t.extend(u16b(1));
+        t.extend(u16b(exif_tag));
+        t.extend(u16b(3));
+        t.extend(u32b(1));
+        t.extend(u16b(value));
+        t.extend(u16b(0));
+        t.extend(u32b(0));
+        t
+    }
+
+    fn read(name: &str, bytes: &[u8]) -> Option<f32> {
+        let path = std::env::temp_dir().join(format!("rawgraph-focal-{}-{name}", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let out = read_focal_35mm(&path);
+        let _ = std::fs::remove_file(&path);
+        out
+    }
+
+    #[test]
+    fn the_35mm_focal_length_is_read_from_the_exif_ifd_of_either_byte_order() {
+        assert_eq!(read("le.tif", &tiff(true, 0xA405, 35)), Some(35.0));
+        assert_eq!(read("be.tif", &tiff(false, 0xA405, 24)), Some(24.0));
+    }
+
+    #[test]
+    fn missing_zero_and_implausible_values_and_foreign_files_give_none() {
+        assert_eq!(read("other.tif", &tiff(true, 0xA406, 35)), None, "another tag");
+        assert_eq!(read("zero.tif", &tiff(true, 0xA405, 0)), None, "0 means unknown");
+        assert_eq!(read("huge.tif", &tiff(true, 0xA405, 5000)), None);
+        assert_eq!(read("png.png", b"\x89PNG\r\n\x1a\n0000000000000000"), None, "not a TIFF container");
+        assert_eq!(read("empty.tif", &[]), None);
+        let mut cut = tiff(true, 0xA405, 35);
+        cut.truncate(30);
+        assert_eq!(read("cut.tif", &cut), None, "truncated Exif IFD");
+        let mut loop_ptr = tiff(true, 0xA405, 35);
+        loop_ptr[18..22].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        assert_eq!(read("far.tif", &loop_ptr), None, "pointer beyond the file");
+    }
 }

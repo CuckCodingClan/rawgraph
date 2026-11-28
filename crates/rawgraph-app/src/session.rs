@@ -556,13 +556,15 @@ impl Session {
         self.scan_map.len()
     }
 
-    /// Entries whose capture metadata predates the as-shot fields; the worker
-    /// skips the ones whose file does not exist.
+    /// Entries whose capture metadata predates the as-shot fields or the focal length (both are
+    /// `focal_read == false`; a file that failed to read is marked read too, so it is not retried at
+    /// every start). Opening an old project may mark it changed once. The worker skips the ones
+    /// whose file does not exist.
     pub fn capture_refresh_targets(&self) -> Vec<(ImageId, PathBuf)> {
         if self.demo {
             return Vec::new();
         }
-        self.project.images().iter().filter(|e| !e.capture.scan_pending && e.capture.raw.is_none()).map(|e| (e.id, e.path.clone())).collect()
+        self.project.images().iter().filter(|e| !e.capture.scan_pending && !e.capture.focal_read).map(|e| (e.id, e.path.clone())).collect()
     }
 
     /// Applies re-read capture metadata. Marks the project unsaved when
@@ -576,7 +578,13 @@ impl Session {
         for (id, info) in updates {
             let mut hit = false;
             for entry in self.project.image_mut(id).into_iter().chain(self.scan_map.get_mut(&id)) {
-                if entry.capture != info {
+                if crate::capture_refresh::is_failure_marker(&info) {
+                    // The file could not be read: remember that (no retry at every start), keep the rest.
+                    if !entry.capture.focal_read {
+                        entry.capture.focal_read = true;
+                        hit = true;
+                    }
+                } else if entry.capture != info {
                     entry.capture = info.clone();
                     hit = true;
                 }
@@ -1149,6 +1157,16 @@ impl Session {
         Some((img.width(), img.height()))
     }
 
+    /// Pixel size of the picture that reaches `node` for `image`, before any Crop / Rotate, taken from the
+    /// decoded proxy. Unknown (`None`) behind a Panorama: its picture has its own size, which only the
+    /// render knows.
+    pub fn source_size_at(&self, node: NodeId, image: ImageId) -> Option<(u32, u32)> {
+        if self.project.graph.has_upstream_kind(node, NodeKind::Panorama) {
+            return None;
+        }
+        self.proxy_size(image)
+    }
+
     pub fn node_by_index(&self, index: usize) -> Option<NodeId> {
         self.project.graph.nodes().nth(index).map(|n| n.id)
     }
@@ -1595,7 +1613,9 @@ pub mod tests {
         let ids: Vec<ImageId> = project.images().iter().map(|e| e.id).collect();
         // Old project file: the new fields are missing.
         for id in &ids {
-            project.image_mut(*id).unwrap().capture.raw = None;
+            let c = &mut project.image_mut(*id).unwrap().capture;
+            c.raw = None;
+            c.focal_read = false;
         }
         let mut s = Session::new(project, provider());
         assert_eq!(s.capture_refresh_targets().len(), 3);
@@ -1622,6 +1642,51 @@ pub mod tests {
         // Applying the same data again changes nothing.
         let again = s.project.images().iter().map(|e| (e.id, e.capture.clone())).collect();
         assert_eq!(s.apply_capture_updates(again), 0);
+    }
+
+    #[test]
+    fn records_saved_before_the_focal_length_was_read_are_read_again_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = png_project(dir.path(), 2);
+        let ids: Vec<ImageId> = project.images().iter().map(|e| e.id).collect();
+        // A scan reads the focal length: nothing to refresh.
+        assert!(project.images().iter().all(|e| e.capture.focal_read && e.capture.raw.is_some()));
+        assert!(Session::new(project.clone(), provider()).capture_refresh_targets().is_empty());
+        // A record of an older build has the as-shot fields but never looked for the focal length.
+        project.image_mut(ids[0]).unwrap().capture.focal_read = false;
+        let mut s = Session::new(project, provider());
+        assert_eq!(s.capture_refresh_targets().len(), 1);
+        let mut job = crate::capture_refresh::CaptureRefresh::start(eframe::egui::Context::default(), s.capture_refresh_targets());
+        let started = std::time::Instant::now();
+        loop {
+            let (items, finished) = job.poll();
+            s.apply_capture_updates(items);
+            if finished || started.elapsed().as_secs() > 20 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(s.capture_refresh_targets().is_empty(), "read once, also when the file has no focal length");
+        assert!(s.entry(ids[0]).unwrap().capture.focal_read);
+    }
+
+    #[test]
+    fn a_file_that_fails_to_read_is_remembered_and_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = png_project(dir.path(), 2);
+        let ids: Vec<ImageId> = project.images().iter().map(|e| e.id).collect();
+        let c = &mut project.image_mut(ids[0]).unwrap().capture;
+        c.focal_read = false;
+        c.iso = Some(400.0);
+        let mut s = Session::new(project, provider());
+        assert_eq!(s.capture_refresh_targets().len(), 1);
+        // The reader reports a failure with the marker.
+        assert_eq!(s.apply_capture_updates(vec![(ids[0], crate::capture_refresh::failure_marker())]), 1);
+        assert!(s.capture_refresh_targets().is_empty(), "not read again at the next start");
+        let c = &s.entry(ids[0]).unwrap().capture;
+        assert!(c.focal_read && c.focal_mm.is_none() && c.focal_35mm.is_none());
+        assert_eq!(c.iso, Some(400.0), "the rest of the record stays");
+        assert_eq!(s.apply_capture_updates(vec![(ids[0], crate::capture_refresh::failure_marker())]), 0);
     }
 
     #[test]

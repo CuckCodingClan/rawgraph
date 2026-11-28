@@ -33,6 +33,16 @@ pub struct CaptureInfo {
     /// DNG BaselineExposure in stops, when the file carries one.
     #[serde(default)]
     pub baseline_exposure: Option<f32>,
+    /// Real focal length in millimetres (EXIF FocalLength), when the file records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focal_mm: Option<f32>,
+    /// Focal length in 35-mm-equivalent millimetres (EXIF FocalLengthIn35mmFilm), when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focal_35mm: Option<f32>,
+    /// The reader has looked for the focal length (found or not). Records saved before it was read
+    /// lack the flag and are read again in the background once.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub focal_read: bool,
     /// Absolute path of the source file. Filled in by the image provider at
     /// lookup time (it is the project's business, not the capture's), so it is
     /// never written to files.

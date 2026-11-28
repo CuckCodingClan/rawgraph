@@ -27,6 +27,8 @@ mod migrate_tests;
 mod wave8_tests;
 #[cfg(test)]
 mod hdr_tests;
+#[cfg(test)]
+mod pano_tests;
 
 pub use capture::{path_in_folder, CaptureInfo, Measure};
 pub use color::{OutputSpace, Transfer, OUTPUT_SPACES};
@@ -48,5 +50,5 @@ pub use layer::{
     MAX_LAYERS,
 };
 pub use lut::{Lut, LutError, LutSpace, LutState};
-pub use stack::{exposure_ev, group_exposure_evs, group_images, GroupRule, GroupSettings, ImageGroup, Reference, GROUP_RULES};
+pub use stack::{exposure_ev, group_exposure_evs, group_images, group_kind, GroupKindSpec, GroupRule, GroupSettings, ImageGroup, Reference, GROUP_RULES, PANORAMA_GROUP_RULES};
 pub use lens::{LensProfile, VignetteRadial, WarpRectilinear, LENS_MODES};

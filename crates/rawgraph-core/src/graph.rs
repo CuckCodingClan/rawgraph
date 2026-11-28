@@ -24,7 +24,7 @@ use crate::export::{
 };
 use crate::layer::{LAYER_BLEND_MODES, LAYER_FILTERS, LAYER_FITS, LAYER_MODES, MAX_LAYERS};
 use crate::lens::LENS_MODES;
-use crate::stack::{group_images, GroupRule, GroupSettings, ImageGroup, Reference};
+use crate::stack::{group_images, group_kind, GroupSettings, ImageGroup, GROUP_MAX_GAP_S, GROUP_MIN_SIZE};
 
 /// Bumped whenever the serialized graph layout changes incompatibly.
 /// Version 2 added the Layer and Export kinds, Source folders, curve sets and
@@ -119,6 +119,8 @@ pub enum NodeKind {
     /// It has no ports or parameters of its own kind; the ports and published
     /// parameters live in its group definition. Never evaluated.
     Group,
+    /// Stitches each panorama sequence (image group) into one wide image.
+    Panorama,
 }
 
 /// How a parameter is edited and which values it accepts.
@@ -491,6 +493,26 @@ const HDR_MERGE_PARAMS: &[ParamSpec] = &[
     p("clip", "Clip level", "of white", 0.5, 1.0, 0.95),
 ];
 
+const PANORAMA_GROUP_OPTIONS: &[&str] = &crate::stack::PANORAMA_GROUP_RULES;
+const PANORAMA_PROJECTION_OPTIONS: &[&str] = &["Cylindrical", "Spherical", "Planar"];
+const PANORAMA_BLEND_OPTIONS: &[&str] = &["Multiband", "Feather"];
+const PANORAMA_FOCAL_OPTIONS: &[&str] = &["From metadata", "Estimate"];
+const PANORAMA_PARAMS: &[ParamSpec] = &[
+    choice("group_by", "Group by", PANORAMA_GROUP_OPTIONS, 0),
+    p("gap_s", "Max gap", "s", 0.0, 120.0, 5.0),
+    p("max_size", "Max group size", "images", 2.0, 25.0, 25.0),
+    p("group", "Group number", "0 = none", 0.0, 999.0, 0.0),
+    choice("projection", "Projection", PANORAMA_PROJECTION_OPTIONS, 0),
+    choice("blend", "Blend", PANORAMA_BLEND_OPTIONS, 0),
+    p("levels", "Blend levels", "", 2.0, 6.0, 5.0),
+    toggle("exposure_comp", "Match exposure", true),
+    toggle("crop", "Crop to content", true),
+    choice("focal", "Focal length", PANORAMA_FOCAL_OPTIONS, 0),
+    p("focal_mm_35", "Focal length (35 mm equiv.)", "mm, 0 = automatic", 0.0, 400.0, 0.0),
+    toggle("focal_fixed", "Keep typed focal length fixed", false),
+    p("work_px", "Feature resolution", "px", 600.0, 3000.0, 1200.0),
+];
+
 const SOURCE_PARAMS: &[ParamSpec] = &[toggle("subfolders", "Include subfolders", true)];
 const MERGE_COLLISION_OPTIONS: &[&str] = &["Keep both", "First input wins", "Last input wins"];
 const MERGE_PARAMS: &[ParamSpec] = &[choice("collision", "Same file name", MERGE_COLLISION_OPTIONS, 0)];
@@ -657,7 +679,7 @@ pub fn curve_set(node: &Node, image: ImageId) -> Vec<CurveEntry> {
 }
 
 impl NodeKind {
-    pub const ALL: [NodeKind; 33] = [
+    pub const ALL: [NodeKind; 34] = [
         NodeKind::Source,
         NodeKind::CaptureEv,
         NodeKind::Exposure,
@@ -693,6 +715,7 @@ impl NodeKind {
         NodeKind::Generator,
         NodeKind::Lut,
         NodeKind::HdrMerge,
+        NodeKind::Panorama,
     ];
 
     /// Menu group of this kind.
@@ -710,7 +733,7 @@ impl NodeKind {
             NodeKind::NoiseReduction | NodeKind::Sharpen | NodeKind::Blur | NodeKind::Clarity => "Detail",
             NodeKind::Transform | NodeKind::LensManual => "Geometry",
             NodeKind::Vignette | NodeKind::PixelSort => "Effects",
-            NodeKind::MetadataFilter | NodeKind::Merge | NodeKind::MetadataSplit | NodeKind::Layer | NodeKind::HdrMerge => "Collection",
+            NodeKind::MetadataFilter | NodeKind::Merge | NodeKind::MetadataSplit | NodeKind::Layer | NodeKind::HdrMerge | NodeKind::Panorama => "Collection",
             NodeKind::Draw | NodeKind::DepthMap | NodeKind::NormalMap | NodeKind::Generator => "Generators",
             NodeKind::Group => "Structure",
         }
@@ -754,6 +777,7 @@ impl NodeKind {
             NodeKind::Lut => "LUT",
             NodeKind::HdrMerge => "HDR Merge",
             NodeKind::Group => "Group",
+            NodeKind::Panorama => "Panorama",
         }
     }
 
@@ -794,6 +818,7 @@ impl NodeKind {
             NodeKind::Generator => GENERATOR_PARAMS,
             NodeKind::Lut => LUT_PARAMS,
             NodeKind::HdrMerge => HDR_MERGE_PARAMS,
+            NodeKind::Panorama => PANORAMA_PARAMS,
         }
     }
 
@@ -1817,7 +1842,7 @@ impl Graph {
             let Some(n) = self.node(cur) else { return false };
             match n.kind {
                 NodeKind::Source => return true,
-                NodeKind::Transform | NodeKind::LensManual | NodeKind::Layer | NodeKind::HdrMerge => return false,
+                NodeKind::Transform | NodeKind::LensManual | NodeKind::Layer | NodeKind::HdrMerge | NodeKind::Panorama => return false,
                 _ => {}
             }
             let next = n
@@ -2054,7 +2079,7 @@ impl Graph {
                     self.members_ctx(ctx, node, 0).contains(&image)
                 }
             }
-            NodeKind::HdrMerge => {
+            NodeKind::HdrMerge | NodeKind::Panorama => {
                 if ctx.catalog.images.is_empty() {
                     self.input_contains_ctx(ctx, node, 0, image)
                 } else {
@@ -2154,7 +2179,7 @@ impl Graph {
                 )
             }
             NodeKind::Merge => Rc::new(self.merge_entries(ctx, node).iter().map(|(i, _)| *i).collect()),
-            NodeKind::HdrMerge => Rc::new(self.group_plan(ctx, node).iter().map(|g| g.reference).collect()),
+            NodeKind::HdrMerge | NodeKind::Panorama => Rc::new(self.group_plan(ctx, node).iter().map(|g| g.reference).collect()),
             NodeKind::Layer => match self.layer_plan(ctx, node) {
                 Some((driver, _)) => driver,
                 None => none(),
@@ -2209,65 +2234,137 @@ impl Graph {
         out
     }
 
-    /// For an HDR Merge: the groups of its input collection (see [`crate::stack`]),
-    /// listed by the input position of their reference.
+    /// For a node that makes groups (HDR Merge, Panorama): the groups of its input collection
+    /// (see [`crate::stack`]), listed by the input position of their reference.
     fn group_plan(&self, ctx: &Ctx, node: NodeId) -> Rc<Vec<ImageGroup>> {
         if let Some(v) = ctx.m().groups.borrow().get(&node) {
             return Rc::clone(v);
         }
-        let Some(n) = self.node(node).filter(|n| n.kind == NodeKind::HdrMerge) else { return Rc::new(Vec::new()) };
+        let Some((n, spec)) = self.node(node).and_then(|n| group_kind(n.kind).map(|s| (n, s))) else { return Rc::new(Vec::new()) };
         let input = self.input_members(ctx, node, 0);
         let settings = GroupSettings {
-            rule: GroupRule::from_index(n.all_choice("group_by")),
-            gap_s: n.all_value("gap_s").clamp(0.0, 60.0),
-            max_size: n.all_value("max_size").round().clamp(2.0, 25.0) as usize,
+            rule: spec.rule(n.all_choice("group_by")),
+            gap_s: n.all_value("gap_s").clamp(0.0, GROUP_MAX_GAP_S),
+            max_size: n.all_value("max_size").round().clamp(GROUP_MIN_SIZE as f32, spec.max_size as f32) as usize,
         };
         let manual = |i: ImageId| {
             let v = n.param("group", i);
             v.is_finite().then(|| v.round() as i64)
         };
-        let groups =
-            group_images(&input, &|i| ctx.cap(i), &manual, &settings, Reference::MiddleExposure);
+        // Behind an HDR Merge the frames of a panorama are brackets: they are placed by the span of
+        // their bracket (first exposure start to last exposure end), not by the reference frame alone.
+        let spans = if n.kind == NodeKind::Panorama { self.bracket_spans(ctx, node) } else { HashMap::new() };
+        let groups = group_images(&input, &|i| spans.get(&i).cloned().or_else(|| ctx.cap(i)), &manual, &settings, spec.reference);
         let out = Rc::new(groups);
         ctx.m().groups.borrow_mut().insert(node, Rc::clone(&out));
         out
     }
 
-    /// For an HDR Merge node and an image of its output collection (a group
+    /// For a group node behind an HDR Merge: per HDR reference the capture record of the whole
+    /// bracket (start of its first exposure, duration up to the end of its last one).
+    fn bracket_spans(&self, ctx: &Ctx, node: NodeId) -> HashMap<ImageId, Rc<CaptureInfo>> {
+        let mut out = HashMap::new();
+        let Some(hdr) = self.upstream_group_node_above(node).filter(|h| self.node(*h).is_some_and(|n| n.kind == NodeKind::HdrMerge)) else {
+            return out;
+        };
+        for g in self.group_plan(ctx, hdr).iter().filter(|g| g.members.len() > 1) {
+            let caps: Vec<Option<Rc<CaptureInfo>>> = g.members.iter().map(|&m| ctx.cap(m)).collect();
+            let times: Option<Vec<(i64, i64)>> = caps
+                .iter()
+                .map(|c| {
+                    let c = c.as_deref()?;
+                    let t = c.captured_unix_ms?;
+                    let ms = c.shutter_s.filter(|s| s.is_finite() && *s > 0.0).map_or(0, |s| (s as f64 * 1000.0).round() as i64);
+                    Some((t, t + ms))
+                })
+                .collect();
+            let Some(times) = times else { continue };
+            let start = times.iter().map(|t| t.0).min().unwrap_or(0);
+            let end = times.iter().map(|t| t.1).max().unwrap_or(start);
+            let base = g.members.iter().position(|m| *m == g.reference).and_then(|k| caps[k].as_deref()).cloned().unwrap_or_default();
+            out.insert(g.reference, Rc::new(CaptureInfo { captured_unix_ms: Some(start), shutter_s: Some(((end - start) as f64 / 1000.0) as f32), ..base }));
+        }
+        out
+    }
+
+    /// For a group node (HDR Merge, Panorama) and an image of its output collection (a group
     /// reference): the group it stands for, members in group order. `None` if
-    /// `node` is no HDR Merge, `image` is not one of its outputs, or the
+    /// `node` makes no groups, `image` is not one of its outputs, or the
     /// catalog is empty.
     pub fn image_group(&self, node: NodeId, image: ImageId, catalog: &Catalog) -> Option<ImageGroup> {
-        if catalog.images.is_empty() || !self.node(node).is_some_and(|n| n.kind == NodeKind::HdrMerge) {
+        if catalog.images.is_empty() || !self.node(node).is_some_and(|n| group_kind(n.kind).is_some()) {
             return None;
         }
         let ctx = Ctx::new(catalog);
         self.group_plan(&ctx, node).iter().find(|g| g.reference == image).cloned()
     }
 
-    /// Every group of an HDR Merge node, listed by the input position of the reference
-    /// (the order of its output collection). Empty if `node` is no HDR Merge or the
+    /// Every group of a group node, listed by the input position of the reference
+    /// (the order of its output collection). Empty if `node` makes no groups or the
     /// catalog is empty. One query for all images: use it instead of asking per image.
     pub fn image_groups(&self, node: NodeId, catalog: &Catalog) -> Vec<ImageGroup> {
-        if catalog.images.is_empty() || !self.node(node).is_some_and(|n| n.kind == NodeKind::HdrMerge) {
+        if catalog.images.is_empty() || !self.node(node).is_some_and(|n| group_kind(n.kind).is_some()) {
             return Vec::new();
         }
         let ctx = Ctx::new(catalog);
         self.group_plan(&ctx, node).as_ref().clone()
     }
 
-    /// The nearest HDR Merge at or above `node`, following the first connected image input
-    /// (used to label group references further down the graph).
-    pub fn upstream_hdr_merge(&self, node: NodeId) -> Option<NodeId> {
+    /// Like [`Graph::image_groups`], with the number of source frames each group stands for: a
+    /// member that is itself the reference of a group of the group node above (an HDR bracket
+    /// below a Panorama) counts with all its frames.
+    pub fn image_groups_with_frames(&self, node: NodeId, catalog: &Catalog) -> Vec<(ImageGroup, usize)> {
+        if catalog.images.is_empty() || !self.node(node).is_some_and(|n| group_kind(n.kind).is_some()) {
+            return Vec::new();
+        }
+        let ctx = Ctx::new(catalog);
+        let nested: HashMap<ImageId, usize> = match self.upstream_group_node_above(node) {
+            Some(up) => self.group_plan(&ctx, up).iter().map(|g| (g.reference, g.members.len())).collect(),
+            None => HashMap::new(),
+        };
+        self.group_plan(&ctx, node)
+            .iter()
+            .map(|g| (g.clone(), g.members.iter().map(|m| nested.get(m).copied().unwrap_or(1)).sum()))
+            .collect()
+    }
+
+    /// The nearest group node (HDR Merge or Panorama) at or above `node`, following the first
+    /// connected image input (used to label group references further down the graph; in a chain
+    /// the node nearest to `node` wins).
+    pub fn upstream_group_node(&self, node: NodeId) -> Option<NodeId> {
         let mut cur = node;
         for _ in 0..MAX_WALK {
             let n = self.node(cur)?;
-            if n.kind == NodeKind::HdrMerge {
+            if group_kind(n.kind).is_some() {
                 return Some(cur);
             }
             cur = (0..n.kind.inputs().len()).find_map(|port| self.input_of(cur, port))?;
         }
         None
+    }
+
+    /// The nearest group node strictly above `node` (the one feeding it).
+    pub fn upstream_group_node_above(&self, node: NodeId) -> Option<NodeId> {
+        let n = self.node(node)?;
+        let first = (0..n.kind.inputs().len()).find_map(|port| self.input_of(node, port))?;
+        self.upstream_group_node(first)
+    }
+
+    /// True if a node of `kind` lies at or above `node` on any image input.
+    pub fn has_upstream_kind(&self, node: NodeId, kind: NodeKind) -> bool {
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut stack = vec![node];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            let Some(n) = self.node(cur) else { continue };
+            if n.kind == kind {
+                return true;
+            }
+            stack.extend((0..n.kind.inputs().len()).flat_map(|port| self.input_edges(cur, port).map(|e| e.from)));
+        }
+        false
     }
 
     /// For a Layer: the driver's members and the members of every connected layer.
@@ -3287,6 +3384,7 @@ mod tests {
             (NodeKind::ColorWheels, "Lift / Gamma / Gain", "Colour"),
             (NodeKind::Clarity, "Clarity / Texture", "Detail"),
             (NodeKind::HdrMerge, "HDR Merge", "Collection"),
+            (NodeKind::Panorama, "Panorama", "Collection"),
         ];
         assert_eq!(labels.len(), NodeKind::ALL.len());
         for (kind, label, category) in labels {
@@ -3807,7 +3905,7 @@ mod tests {
         assert_eq!(s.params().len(), 3);
         assert_eq!(s.param_spec("keyword_op").unwrap().kind, ParamKind::Choice(&["contains", "does not contain"]));
         assert!(NodeKind::ALL.contains(&c) && NodeKind::ALL.contains(&b) && NodeKind::ALL.contains(&s));
-        assert_eq!(NodeKind::ALL.len(), 33);
+        assert_eq!(NodeKind::ALL.len(), 34);
     }
 
     #[test]

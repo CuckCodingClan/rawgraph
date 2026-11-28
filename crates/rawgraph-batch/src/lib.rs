@@ -664,20 +664,28 @@ struct Ctx<'a> {
     merged: HashMap<ImageId, ImageId>,
 }
 
-/// The images that an HDR Merge above `node` folds into another image: member -> reference.
+/// The images that the group nodes (HDR Merge, Panorama) above `node` fold into another image:
+/// member -> the image that is written for it. The nearest group node decides first; in a chain
+/// (HDR Merge, then Panorama) the frames of a bracket that went into a panorama are reported as
+/// merged into the panorama's reference.
 fn merged_members(graph: &Graph, node: NodeId, provider: &dyn ImageProvider) -> HashMap<ImageId, ImageId> {
-    let Some(hdr) = graph.upstream_hdr_merge(node) else { return HashMap::new() };
     let images = provider.images();
     let capture = |i: ImageId| provider.capture(i);
     let catalog = rawgraph_core::Catalog { images: &images, capture: &capture, memo: None };
-    graph
-        .image_groups(hdr, &catalog)
-        .into_iter()
-        .flat_map(|g| {
-            let reference = g.reference;
-            g.members.into_iter().filter(move |m| *m != reference).map(move |m| (m, reference))
-        })
-        .collect()
+    let mut merged: HashMap<ImageId, ImageId> = HashMap::new();
+    let mut at = graph.upstream_group_node(node);
+    for _ in 0..8 {
+        let Some(group_node) = at else { break };
+        for g in graph.image_groups(group_node, &catalog) {
+            // Where the reference of this group ends up: itself, or the image it was folded into.
+            let target = merged.get(&g.reference).copied().unwrap_or(g.reference);
+            for m in g.members.into_iter().filter(|m| *m != g.reference) {
+                merged.entry(m).or_insert(target);
+            }
+        }
+        at = graph.upstream_group_node_above(group_node);
+    }
+    merged
 }
 
 /// The status of an image that is not part of the collection reaching the export node.
@@ -756,6 +764,9 @@ fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job
 
     ev.set_view_tone(settings.generator_view_tone);
     let evaluated = ev.eval_image(ctx.graph, ctx.node, item.id, provider, ctx.cancel);
+    // Findings of nodes computed for this item (a Panorama's stitching warnings) go into the report; the
+    // list is emptied per item so it cannot grow over a run.
+    warnings.extend(ev.take_notes().into_iter().map(|(_, _, note)| note));
     ev.clear();
     provider.release_pixels();
     let image = match evaluated {
@@ -1131,3 +1142,5 @@ fn run_batch(
 pub(crate) mod tests;
 #[cfg(test)]
 mod node_tests;
+#[cfg(test)]
+mod pano_tests;

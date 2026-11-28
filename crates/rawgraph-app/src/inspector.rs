@@ -138,7 +138,7 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
         let (grouped, rest) = groups::param_groups(kind);
         if kind == NodeKind::Transform {
             // The crop tool comes first: its aspect combo belongs next to the picture.
-            let size = source_size(session, image);
+            let size = source_size(session, id, image);
             crate::tool_panels::crop_section(ui, session, id, size);
             // The result sizes sit right under the crop tool, where they are always in view.
             transform_size_line(ui, session, id, image);
@@ -373,7 +373,7 @@ pub fn result_sizes(graph: &rawgraph_core::Graph, node: NodeId, image: ImageId, 
 }
 
 fn transform_result_sizes(session: &Session, id: NodeId, image: ImageId) -> ResultSizes {
-    result_sizes(&session.project.graph, id, image, source_size(session, image), session.provider.full_size_of(image))
+    result_sizes(&session.project.graph, id, image, source_size(session, id, image), session.provider.full_size_of(image).filter(|_| !session.project.graph.has_upstream_kind(id, NodeKind::Panorama)))
 }
 
 /// The lines under the Crop / Rotate parameters.
@@ -390,9 +390,9 @@ pub fn size_lines(sizes: &ResultSizes) -> Vec<String> {
 }
 
 /// Pixel size of the decoded proxy of `image`, if it is in memory (the UI thread never decodes).
-fn source_size(session: &Session, image: ImageId) -> Option<(u32, u32)> {
+fn source_size(session: &Session, node: NodeId, image: ImageId) -> Option<(u32, u32)> {
     use rawgraph_engine::ImageProvider;
-    if !session.provider.is_cached(image) {
+    if session.project.graph.has_upstream_kind(node, NodeKind::Panorama) || !session.provider.is_cached(image) {
         return None;
     }
     let src = session.provider.image(image).ok()?;

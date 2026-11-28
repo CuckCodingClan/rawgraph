@@ -150,7 +150,7 @@ pub fn node_frame(session: &Session, node: NodeId, frame_px: [u32; 2], rect: Rec
     } else {
         let n = graph.node(node)?;
         let standalone = matches!(n.kind, NodeKind::Generator | NodeKind::Draw) && graph.input_edge(node, 0).is_none();
-        let source = if standalone { (n.param("width", image).round().max(1.0) as u32, n.param("height", image).round().max(1.0) as u32) } else { session.proxy_size(image)? };
+        let source = if standalone { (n.param("width", image).round().max(1.0) as u32, n.param("height", image).round().max(1.0) as u32) } else { session.source_size_at(node, image)? };
         frames::size_into(graph, node, image, source)
     };
     if size.0 == 0 || size.1 == 0 || frame_px[0] == 0 || frame_px[1] == 0 {
