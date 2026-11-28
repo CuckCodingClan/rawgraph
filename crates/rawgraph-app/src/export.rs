@@ -939,9 +939,11 @@ mod tests {
         assert_eq!(Fmt::ALL.len(), 8);
         st.format = Fmt::Heic;
         let heic = st.settings(&view);
-        match heic_status().or_else(|| Some(rawgraph_io::heic_available())) {
-            Some(Err(why)) => assert_eq!(heic, Err(why)),
-            _ => assert_eq!(heic.unwrap().format, ExportFormat::Heic { quality: st.quality }),
+        // The encoder probe runs on a worker thread: until it reports, the settings are accepted;
+        // a refusal must carry the reason the system gives.
+        match heic {
+            Ok(s) => assert_eq!(s.format, ExportFormat::Heic { quality: st.quality }),
+            Err(why) => assert_eq!(Err(why), rawgraph_io::heic_available()),
         }
         assert_eq!(Fmt::Heic.label(), "HEIC");
         assert_eq!((Fmt::Png16.label(), Fmt::Tiff16.label()), ("PNG 16-bit", "TIFF 16-bit"));
