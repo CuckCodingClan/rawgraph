@@ -17,7 +17,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Largest `LUT_3D_SIZE`.
@@ -437,13 +437,18 @@ pub fn file_stamp(path: &Path) -> Option<FileStamp> {
     Some((meta.len(), meta.modified().ok()))
 }
 
-/// Files kept in the registry.
-pub const MAX_ENTRIES: usize = 64;
+/// Files kept in the registry (a status is small; this only bounds a pathological project).
+pub const MAX_ENTRIES: usize = 4096;
 /// Bytes of table data kept in the registry.
-pub const MAX_BYTES: usize = 512 * 1024 * 1024;
+pub const MAX_BYTES: usize = 1024 * 1024 * 1024;
 
 static REFRESH_MS: AtomicU64 = AtomicU64::new(2000);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Paths being parsed right now, shared by the background refresher and blocking loads, so one
+/// change is read once and the second caller waits for the first one's result.
+static IN_FLIGHT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+static IN_FLIGHT_DONE: Condvar = Condvar::new();
 
 /// How long a checked file counts as unchanged without looking at the disk again (default 2 s).
 pub fn refresh_interval() -> Duration {
@@ -475,10 +480,19 @@ struct Registry {
     tick: u64,
     /// Paths a background refresh was asked for and has not finished.
     pending: Vec<PathBuf>,
+    /// How often each path was forgotten ("Reload"): a parse that started before must not store
+    /// its (maybe old) result.
+    forgets: Vec<(PathBuf, u64)>,
+}
+
+impl Registry {
+    fn forgets_of(&self, path: &Path) -> u64 {
+        self.forgets.iter().find(|(p, _)| p == path).map_or(0, |(_, n)| *n)
+    }
 }
 
 fn lock() -> std::sync::MutexGuard<'static, Registry> {
-    static REGISTRY: Mutex<Registry> = Mutex::new(Registry { entries: Vec::new(), tick: 0, pending: Vec::new() });
+    static REGISTRY: Mutex<Registry> = Mutex::new(Registry { entries: Vec::new(), tick: 0, pending: Vec::new(), forgets: Vec::new() });
     REGISTRY.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -502,6 +516,30 @@ fn same_status(a: &Result<Arc<Lut>, LutError>, b: &Result<Arc<Lut>, LutError>) -
 /// Looks at `path` (a stat) and parses it when it changed, then stores the status. Blocking: never
 /// call it from the UI thread.
 fn refresh(path: &Path) -> Result<Arc<Lut>, LutError> {
+    // One parse per path at a time: a second caller waits and takes the first one's result.
+    {
+        let mut busy = IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+        if busy.iter().any(|p| p == path) {
+            while busy.iter().any(|p| p == path) {
+                busy = IN_FLIGHT_DONE.wait(busy).unwrap_or_else(|p| p.into_inner());
+            }
+            drop(busy);
+            if let Some(e) = lock().entries.iter().find(|e| e.path == path) {
+                return e.result.clone();
+            }
+            busy = IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+        }
+        busy.push(path.to_path_buf());
+    }
+    struct Done<'a>(&'a Path);
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner()).retain(|p| p != self.0);
+            IN_FLIGHT_DONE.notify_all();
+        }
+    }
+    let _done = Done(path);
+    let forgets = lock().forgets_of(path);
     let stamp = file_stamp(path);
     {
         let mut reg = lock();
@@ -526,6 +564,10 @@ fn refresh(path: &Path) -> Result<Arc<Lut>, LutError> {
     let result = load_file(path).map(Arc::new);
     let bytes = result.as_ref().map_or(0, |l| l.bytes());
     let mut reg = lock();
+    if reg.forgets_of(path) != forgets {
+        // "Reload" happened while reading: the next load reads the file again.
+        return result;
+    }
     reg.tick += 1;
     let tick = reg.tick;
     let entry = Entry { path: path.to_path_buf(), stamp, checked: Instant::now(), result: result.clone(), bytes, used: tick };
@@ -546,22 +588,36 @@ fn refresh(path: &Path) -> Result<Arc<Lut>, LutError> {
     result
 }
 
-/// The status of `path` for an evaluation thread: the stored one while it was checked within
-/// [`refresh_interval`], otherwise the file is looked at again (blocking). Errors are stored too, so
-/// a broken file is parsed once.
+/// The status of `path` for an evaluation thread. A known file returns its stored status at once;
+/// when that is older than [`refresh_interval`] the background thread looks at the file again (so an
+/// offline network path never stalls a render). Only an unknown file (first use, after "Reload") is
+/// read here, blocking. With a zero interval every call looks at the file (tests). Errors are stored
+/// too, so a broken file is parsed once.
 pub fn load_cached(path: &Path) -> Result<Arc<Lut>, LutError> {
-    {
+    let interval = refresh_interval();
+    let stale = {
         let mut reg = lock();
         reg.tick += 1;
         let tick = reg.tick;
-        if let Some(e) = reg.entries.iter_mut().find(|e| e.path == path) {
-            if e.checked.elapsed() < refresh_interval() {
+        match reg.entries.iter_mut().find(|e| e.path == path) {
+            Some(e) if e.checked.elapsed() < interval => {
                 e.used = tick;
                 return e.result.clone();
             }
+            Some(e) if !interval.is_zero() => {
+                e.used = tick;
+                Some(e.result.clone())
+            }
+            _ => None,
         }
+    };
+    match stale {
+        Some(result) => {
+            schedule(path);
+            result
+        }
+        None => refresh(path),
     }
-    refresh(path)
 }
 
 /// What the UI knows about a LUT file.
@@ -628,7 +684,12 @@ fn schedule(path: &Path) {
 /// Drops `path` from the registry so the next load reads the file again ("Reload"), and moves
 /// [`generation`] so the picture is rendered again.
 pub fn forget(path: &Path) {
-    lock().entries.retain(|e| e.path != path);
+    let mut reg = lock();
+    match reg.forgets.iter_mut().find(|(p, _)| p == path) {
+        Some((_, n)) => *n += 1,
+        None => reg.forgets.push((path.to_path_buf(), 1)),
+    }
+    reg.entries.retain(|e| e.path != path);
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
