@@ -76,9 +76,15 @@ fn db_err(e: rusqlite::Error) -> ProjectError {
         if matches!(f.code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) {
             return ProjectError::Corrupt(format!("not a RawGraph project file ({e})"));
         }
+        if matches!(f.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) {
+            return ProjectError::Io(PROJECT_BUSY_TEXT.to_owned());
+        }
     }
     ProjectError::Database(e.to_string())
 }
+
+/// What the user sees when another program or computer holds the project file locked.
+pub(crate) const PROJECT_BUSY_TEXT: &str = "The project file is in use by another program or computer; try again.";
 
 fn flag_to_text(f: Flag) -> &'static str {
     match f {
@@ -221,7 +227,7 @@ fn write_all(
 /// existing file of the same project and the current schema is updated in
 /// place (only what differs); anything else is written as a whole new file.
 pub(crate) fn save(project: &Project, path: &Path) -> Result<(), ProjectError> {
-    if path.is_file() {
+    if path.is_file() && crate::writemode::write_mode(path).mode == crate::writemode::WriteMode::InPlace {
         let own = (project.revision, project.history.clone());
         if let InPlace::Written { .. } = update_in_place(project, path, &mut |_| Ok(own.clone()))? {
             return Ok(());
@@ -258,6 +264,7 @@ pub(crate) fn write_file(
         let mut conn = Connection::open(&tmp).map_err(db_err)?;
         write_all(&mut conn, project, ver, extra)?;
         conn.close().map_err(|(_, e)| db_err(e))?;
+        settle_journal(path)?;
         if backup {
             backup_other_version(path)?;
         }
@@ -323,7 +330,7 @@ pub(crate) struct DiskIdentity {
 }
 
 pub(crate) fn read_identity(path: &Path) -> Result<DiskIdentity, ProjectError> {
-    let conn = open_read(path).map_err(db_err)?;
+    let conn = open_read(path)?;
     let version = read_version(&conn)?;
     // Schema 1 has no project id; a newer schema is not interpreted.
     if !(2..=SCHEMA_VERSION).contains(&version) {
@@ -379,7 +386,7 @@ pub(crate) fn load(path: &Path) -> Result<Project, ProjectError> {
     if !meta.is_file() {
         return Err(ProjectError::Io(format!("{} is not a file", path.display())));
     }
-    let conn = open_read(path).map_err(db_err)?;
+    let conn = open_read(path)?;
     let version = read_version(&conn)?;
     if version > SCHEMA_VERSION {
         return Err(ProjectError::TooNew { file_version: version, supported: SCHEMA_VERSION });
@@ -626,7 +633,7 @@ fn read_current(conn: &Connection) -> Result<Project, ProjectError> {
 
 /// All `meta` rows of a project file plus its image count, read-only.
 pub(crate) fn read_meta(path: &Path) -> Result<(std::collections::HashMap<String, String>, usize), ProjectError> {
-    let conn = open_read(path).map_err(db_err)?;
+    let conn = open_read(path)?;
     let mut map = std::collections::HashMap::new();
     {
         let mut stmt = conn.prepare("SELECT key, value FROM meta").map_err(db_err)?;
@@ -647,8 +654,8 @@ pub(crate) fn migration_steps() -> Vec<u32> {
 
 // ------------------------------------------------------------------ in-place update
 
-/// How long a writer waits for another process that holds the file locked.
-const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long one lock request waits for another process that holds the file locked (a save asks twice: write lock, then commit; so at most about 4 s).
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 // Test hook (per thread): the next in-place update fails after all rows were written but
 // before the transaction is committed (crash-safety tests).
@@ -797,6 +804,8 @@ fn apply_diff(tx: &Connection, project: &Project, ver: &Versioning<'_>) -> Resul
         up.execute(params!["next_image_id", project.next_image_id.to_string()])?;
         up.execute(params!["project_uuid", project.uuid])?;
         up.execute(params!["revision", ver.revision.to_string()])?;
+        // Anything else (e.g. `recovery_*` keys of a recovery copy) does not belong in a project file: same result as a full write.
+        tx.execute("DELETE FROM meta WHERE key NOT IN ('application', 'schema_version', 'next_image_id', 'project_uuid', 'revision')", [])?;
     }
     diff_images(tx, project)?;
     diff_graph(tx, project)?;
@@ -933,21 +942,21 @@ fn diff_history(tx: &Connection, ver: &Versioning<'_>) -> Result<(), DiffError> 
         device: String,
         summary: String,
     }
-    let mut old: HashMap<i64, (Meta, Option<i64>)> = HashMap::new();
+    let mut old: HashMap<i64, (Meta, bool)> = HashMap::new();
     {
         let mut stmt = tx.prepare(
-            "SELECT revision, time_unix_ms, author, device, summary, length(CAST(graph_json AS BLOB)) FROM history",
+            "SELECT revision, time_unix_ms, author, device, summary, graph_json IS NOT NULL FROM history",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 Meta { time: r.get(1)?, author: r.get(2)?, device: r.get(3)?, summary: r.get(4)? },
-                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, bool>(5)?,
             ))
         })?;
         for row in rows {
-            let (revision, meta, len) = row?;
-            old.insert(revision, (meta, len));
+            let (revision, meta, has) = row?;
+            old.insert(revision, (meta, has));
         }
     }
     let mut revisions = HashSet::new();
@@ -967,10 +976,10 @@ fn diff_history(tx: &Connection, ver: &Versioning<'_>) -> Result<(), DiffError> 
     for (e, snap) in ver.log.entries.iter().zip(&ver.log.snapshots) {
         let revision = to_i64(e.revision, "revision")?;
         let meta = Meta { time: e.time_unix_ms, author: e.author.clone(), device: e.device.clone(), summary: e.summary.clone() };
-        let new_len = snap.as_ref().map(|s| i64::try_from(s.len()).unwrap_or(i64::MAX));
         match old.get(&revision) {
-            Some((old_meta, old_len)) if *old_meta == meta && *old_len == new_len => {}
-            Some((old_meta, Some(_))) if *old_meta == meta && snap.is_none() => {
+            // A snapshot of a revision never changes, so metadata and presence are enough (the snapshots, up to 32 MB, are not read).
+            Some((old_meta, has)) if *old_meta == meta && *has == snap.is_some() => {}
+            Some((old_meta, true)) if *old_meta == meta && snap.is_none() => {
                 drop_snapshot.execute(params![revision])?;
             }
             _ => {
@@ -981,24 +990,74 @@ fn diff_history(tx: &Connection, ver: &Versioning<'_>) -> Result<(), DiffError> 
     Ok(())
 }
 
-/// Opens a project file for reading. A rollback journal next to it (`<name>-journal`)
-/// means a commit was interrupted (crash, power loss): SQLite then has to roll
-/// the file back before anyone reads it, which needs write access, so the file is
-/// opened read-write first (nothing is written unless a rollback is needed).
-/// Without such a journal, or when the file is not writable, it is opened read-only.
-fn open_read(path: &Path) -> rusqlite::Result<Connection> {
+fn journal_of(path: &Path) -> PathBuf {
     let mut journal: OsString = path.as_os_str().to_owned();
     journal.push("-journal");
-    if Path::new(&journal).exists() {
-        if let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE) {
-            let _ = conn.busy_timeout(BUSY_TIMEOUT);
-            // Any read triggers the rollback of a hot journal.
-            if conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).is_ok() {
-                return Ok(conn);
-            }
-        }
-    }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    PathBuf::from(journal)
+}
+
+/// Opens a project file for reading, always read-only, and starts ONE read
+/// transaction: everything read through the connection comes from a single
+/// consistent state of the file, even if somebody commits meanwhile. The caller
+/// just drops the connection.
+///
+/// Reading never writes. A rollback journal next to the file (`<name>-journal`)
+/// that SQLite would have to replay (an interrupted save) is not replayed here:
+/// a reader may be on another computer, or the "interrupted" save may be a live
+/// one on a share with weak locking. The error says what to do;
+/// [`recover_unfinished_save`] is the explicit way.
+fn open_read(path: &Path) -> Result<Connection, ProjectError> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db_err)?;
     let _ = conn.busy_timeout(BUSY_TIMEOUT);
-    Ok(conn)
+    let started = conn
+        .execute_batch("BEGIN")
+        .and_then(|()| conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).map(|_| ()));
+    match started {
+        Ok(()) => Ok(conn),
+        Err(e) if journal_of(path).exists() && !is_busy(&e) => Err(ProjectError::Io(unfinished_save_text(path))),
+        Err(e) => Err(db_err(e)),
+    }
+}
+
+fn unfinished_save_text(path: &Path) -> String {
+    let journal = journal_of(path);
+    format!(
+        "the project file has an unfinished save next to it ({}): open it from the computer that saved it, or, if no program is saving it any more, use \"Recover unfinished save\" (this rolls the file back to its last complete state)",
+        journal.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    )
+}
+
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(f, _) if matches!(f.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked))
+}
+
+/// Rolls an interrupted save back: opens the file read-write once so SQLite
+/// replays the hot `<name>-journal` onto it, which restores the last complete
+/// state. Only to be called on explicit request of the user, on the computer
+/// that owns the file, when no program is saving it. Returns whether a journal
+/// was there.
+pub(crate) fn recover_unfinished_save(path: &Path) -> Result<bool, ProjectError> {
+    let had = journal_of(path).exists();
+    if !had {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(db_err)?;
+    let _ = conn.busy_timeout(BUSY_TIMEOUT);
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).map_err(db_err)?;
+    drop(conn);
+    if journal_of(path).exists() {
+        return Err(ProjectError::Io(format!("{} is still there after the recovery: another program may be saving the file", journal_of(path).display())));
+    }
+    Ok(true)
+}
+
+/// Before a full write replaces `path`: a journal beside the old file must not
+/// survive next to the new one (SQLite would replay it onto the new file). It
+/// is rolled back on the old file (this is the write path, so a read-write open
+/// is fine); if it cannot be settled the save is refused.
+fn settle_journal(path: &Path) -> Result<(), ProjectError> {
+    if !path.is_file() || !journal_of(path).exists() {
+        return Ok(());
+    }
+    recover_unfinished_save(path).map(|_| ())
 }

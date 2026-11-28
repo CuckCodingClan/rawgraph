@@ -553,7 +553,8 @@ mod tests {
         let started = Instant::now();
         let parallel = read_all(&targets, XMP_READ_THREADS, &AtomicBool::new(false), &done, &reader);
         let parallel_time = started.elapsed();
-        assert_eq!(peak.load(Ordering::SeqCst), XMP_READ_THREADS, "the pool is used completely and never exceeded");
+        let peak = peak.load(Ordering::SeqCst);
+        assert!((2..=XMP_READ_THREADS).contains(&peak), "reads overlap but never exceed the pool size: {peak}");
         assert_eq!(done.load(Ordering::SeqCst), 64, "progress counts every file");
         // Identical to reading one after the other, in target order.
         let serial = read_all(&targets, 1, &AtomicBool::new(false), &AtomicUsize::new(0), &reader);

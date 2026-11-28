@@ -22,7 +22,8 @@ impl App {
         match outcome {
             Outcome::Saved { revision, target, then } => {
                 self.discard_own_recovery();
-                self.status.info(format!("Saved {} (revision {revision})", target.display()));
+                let how = rawgraph_project::write_mode(&target).describe();
+                self.status.info(format!("Saved {} (revision {revision}; {how})", target.display()));
                 if let Some(p) = then {
                     self.execute(p, ctx);
                 }

@@ -9,6 +9,7 @@ use std::sync::{Arc, Barrier};
 use rawgraph_core::{BrushStroke, CaptureInfo, ImageId, NodeData, NodeKind};
 
 use super::*;
+use crate::{store, writemode};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -242,32 +243,6 @@ fn a_conflict_writes_nothing() {
     assert_eq!(Project::load(&file).unwrap(), b);
 }
 
-#[test]
-fn a_hot_journal_of_an_interrupted_commit_is_rolled_back_when_the_file_is_read() {
-    let t = Tmp::new();
-    let file = t.path("p.rawgraph");
-    let mut p = project_with_images(400);
-    p.commit(&file, "base").unwrap();
-
-    // A transaction that is still open (its cache is tiny, so it has spilled
-    // changed pages into the file and holds the original pages in the journal).
-    let conn = rusqlite::Connection::open(&file).unwrap();
-    conn.execute_batch("PRAGMA cache_size = 2; BEGIN IMMEDIATE; UPDATE images SET rating = 5, path = path || '-changed-by-the-interrupted-commit';").unwrap();
-    let crashed = t.path("crashed.rawgraph");
-    let copied = fs::copy(&file, &crashed).is_ok()
-        && fs::copy(t.path("p.rawgraph-journal"), t.path("crashed.rawgraph-journal")).is_ok();
-    drop(conn); // rolls the original back
-    if !copied {
-        eprintln!("the platform does not allow copying an open database; hot-journal case skipped");
-        return;
-    }
-    assert!(t.path("crashed.rawgraph-journal").exists());
-    // Reading the copy rolls back the interrupted transaction: the old state is intact.
-    let loaded = Project::load(&crashed).unwrap();
-    assert_eq!(loaded, p);
-    assert!(!t.path("crashed.rawgraph-journal").exists(), "the journal was consumed");
-    integrity_ok(&crashed);
-}
 
 #[test]
 fn another_projects_file_and_old_schemas_are_still_written_as_a_whole() {
@@ -382,4 +357,214 @@ fn bench_save_4000_images_100_history_entries() {
         pages.saturating_sub(grown_pages) * 4
     );
     assert!(in_place < rewrite);
+}
+
+/// A copy of `file` taken while a transaction on it is open and has spilled changed pages
+/// into the file: the state an interrupted save leaves behind (changed file plus hot journal).
+fn crashed_copy(t: &Tmp, file: &Path, name: &str) -> PathBuf {
+    let conn = rusqlite::Connection::open(file).unwrap();
+    conn.execute_batch("PRAGMA cache_size = 2; BEGIN IMMEDIATE; UPDATE images SET rating = 5, path = path || '-changed-by-the-interrupted-commit';").unwrap();
+    let crashed = t.path(&format!("{name}.rawgraph"));
+    let journal = t.path(&format!("{name}.rawgraph-journal"));
+    let copied = fs::copy(file, &crashed).is_ok() && fs::copy(t.path("p.rawgraph-journal"), &journal).is_ok();
+    drop(conn); // rolls the original back
+    // No silent pass: if the platform cannot copy an open database, this test fails and says so.
+    assert!(copied && journal.exists(), "cannot copy an open database and its journal on this platform; this test needs that");
+    crashed
+}
+
+#[test]
+fn a_leftover_journal_is_never_replayed_by_a_read_and_recovery_is_explicit() {
+    let t = Tmp::new();
+    let file = t.path("p.rawgraph");
+    let mut p = project_with_images(400);
+    p.commit(&file, "base").unwrap();
+    let crashed = crashed_copy(&t, &file, "crashed");
+    let changed_bytes = fs::read(&crashed).unwrap();
+    let journal_bytes = fs::read(t.path("crashed.rawgraph-journal")).unwrap();
+
+    // Loading refuses with a clear message and touches nothing.
+    let err = Project::load(&crashed).unwrap_err().to_string();
+    assert!(err.contains("unfinished save") && err.contains("crashed.rawgraph-journal"), "{err}");
+    assert_eq!(fs::read(&crashed).unwrap(), changed_bytes);
+    assert_eq!(fs::read(t.path("crashed.rawgraph-journal")).unwrap(), journal_bytes);
+
+    // The same on a file that is read-only (a share, a locked-down folder).
+    let mut perms = fs::metadata(&crashed).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&crashed, perms).unwrap();
+    let err = Project::load(&crashed).unwrap_err().to_string();
+    assert!(err.contains("unfinished save"), "{err}");
+    let mut perms = fs::metadata(&crashed).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    fs::set_permissions(&crashed, perms).unwrap();
+
+    // Explicit recovery restores the last complete state.
+    assert!(Project::recover_unfinished_save(&crashed).unwrap());
+    assert!(!t.path("crashed.rawgraph-journal").exists());
+    assert_eq!(Project::load(&crashed).unwrap(), p);
+    assert!(!Project::recover_unfinished_save(&crashed).unwrap(), "nothing left to recover");
+    integrity_ok(&crashed);
+}
+
+#[test]
+fn a_full_write_over_a_file_with_a_hot_journal_settles_the_journal_first() {
+    let t = Tmp::new();
+    let file = t.path("p.rawgraph");
+    let mut p = project_with_images(100);
+    p.commit(&file, "base").unwrap();
+    let crashed = crashed_copy(&t, &file, "crashed");
+    // Another project replaces the file as a whole (commit_overwrite: full write).
+    let mut other = project_with_images(7);
+    other.commit_overwrite(&crashed, "replace").unwrap();
+    assert!(!t.path("crashed.rawgraph-journal").exists(), "no journal may stay next to the new file");
+    assert_eq!(Project::load(&crashed).unwrap(), other);
+    integrity_ok(&crashed);
+}
+
+#[test]
+fn reading_while_another_writer_commits_always_sees_one_consistent_state() {
+    let t = Tmp::new();
+    let file = t.path("p.rawgraph");
+    let mut p = project_with_images(300);
+    p.commit(&file, "base").unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (file, stop) = (file.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut commits = 0;
+            while !stop.load(Ordering::SeqCst) && commits < 150 {
+                p.merge_found(&synthetic_entries(1000 + commits, 1));
+                p.image_mut(ImageId(1 + commits % 300)).unwrap().rating = (commits % 6) as u8;
+                match p.commit(&file, "writer") {
+                    Ok(_) => commits += 1,
+                    Err(ProjectError::Io(m)) if m.contains("in use") => {}
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            commits
+        })
+    };
+    let mut last = 0;
+    let mut loads = 0;
+    while loads < 60 {
+        match Project::load(&file) {
+            Ok(q) => {
+                assert!(q.revision() >= last, "revisions never go back");
+                assert_eq!(q.history().last().map(|e| e.revision), Some(q.revision()), "history and revision belong together");
+                last = q.revision();
+                loads += 1;
+            }
+            Err(ProjectError::Io(m)) if m.contains("in use") => {}
+            Err(e) => panic!("a healthy file must load: {e}"),
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    assert!(writer.join().unwrap() > 0);
+}
+
+#[test]
+fn the_whole_file_rewrite_mode_gives_the_same_files_and_never_touches_the_in_place_path() {
+    let t = Tmp::new();
+    let file = t.path("p.rawgraph");
+    let mut p = project_with_images(50);
+    writemode::TEST_OVERRIDE.with(|o| o.set(Some(WriteMode::FullRewrite)));
+    p.commit(&file, "one").unwrap();
+    // The in-place hook would fail the commit; it is not reached in this mode.
+    store::FAIL_BEFORE_COMMIT.with(|f| f.set(true));
+    p.image_mut(ImageId(3)).unwrap().rating = 5;
+    assert_eq!(p.commit(&file, "two").unwrap(), 2);
+    assert!(store::FAIL_BEFORE_COMMIT.with(|f| f.replace(false)), "the in-place path was not used");
+    p.save(&file).unwrap();
+    assert_eq!(Project::load(&file).unwrap(), p);
+    assert!(!t.path("p.rawgraph-journal").exists() && !t.path("p.rawgraph.saving").exists());
+    // A stale copy still gets the conflict.
+    let mut stale = Project::load(&file).unwrap();
+    p.commit(&file, "three").unwrap();
+    assert!(matches!(stale.commit(&file, "x"), Err(ProjectError::Conflict { .. })));
+    writemode::TEST_OVERRIDE.with(|o| o.set(None));
+}
+
+#[test]
+fn a_constraint_fallback_to_the_full_write_keeps_the_conflict_check() {
+    let t = Tmp::new();
+    let file = t.path("p.rawgraph");
+    let mut a = project_with_images(10);
+    a.commit(&file, "base").unwrap();
+    let mut b = Project::load(&file).unwrap();
+    // Swapping two image uuids cannot be done row by row (the uuids are unique): full write.
+    let (u1, u2) = (a.image(ImageId(1)).unwrap().uuid.clone(), a.image(ImageId(2)).unwrap().uuid.clone());
+    a.image_mut(ImageId(1)).unwrap().uuid = u2.clone();
+    a.image_mut(ImageId(2)).unwrap().uuid = u1.clone();
+    assert_eq!(a.commit(&file, "swap").unwrap(), 2);
+    let loaded = Project::load(&file).unwrap();
+    assert_eq!((loaded.image(ImageId(1)).unwrap().uuid.as_str(), loaded.image(ImageId(2)).unwrap().uuid.as_str()), (u2.as_str(), u1.as_str()));
+    assert_eq!(loaded, a);
+    // The same swap from a copy that is behind: conflict, nothing written.
+    let bytes = fs::read(&file).unwrap();
+    b.image_mut(ImageId(1)).unwrap().uuid = u2;
+    b.image_mut(ImageId(2)).unwrap().uuid = u1;
+    assert!(matches!(b.commit(&file, "swap too"), Err(ProjectError::Conflict { .. })));
+    assert_eq!(fs::read(&file).unwrap(), bytes);
+    assert_eq!(b.revision(), 1);
+}
+
+#[test]
+fn a_locked_file_gives_a_clear_error_and_nothing_changes() {
+    let t = Tmp::new();
+    let file = t.path("p.rawgraph");
+    let mut p = project_with_images(20);
+    p.commit(&file, "base").unwrap();
+    let bytes = fs::read(&file).unwrap();
+    let blocker = rusqlite::Connection::open(&file).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    p.image_mut(ImageId(1)).unwrap().rating = 5;
+    let before = p.clone();
+    let started = std::time::Instant::now();
+    let err = p.commit(&file, "blocked").unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "waits at most a few seconds");
+    assert!(matches!(&err, ProjectError::Io(m) if m == "The project file is in use by another program or computer; try again."), "{err}");
+    assert_eq!(p, before, "the project is unchanged");
+    assert!(!t.path("p.rawgraph.saving").exists(), "no rewrite was attempted");
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    assert_eq!(fs::read(&file).unwrap(), bytes);
+    assert_eq!(p.commit(&file, "free again").unwrap(), 2);
+}
+
+#[test]
+fn an_in_place_update_leaves_the_same_meta_rows_as_a_full_write() {
+    let t = Tmp::new();
+    let file = t.path("p.rawgraph");
+    let mut p = project_with_images(5);
+    p.commit(&file, "base").unwrap();
+    rusqlite::Connection::open(&file).unwrap().execute("INSERT INTO meta (key, value) VALUES ('recovery_marker', 'x')", []).unwrap();
+    p.commit(&file, "next").unwrap();
+    assert_eq!(rows(&file, "SELECT COUNT(*) FROM meta WHERE key LIKE 'recovery%'"), 0);
+    assert_eq!(rows(&file, "SELECT COUNT(*) FROM meta"), 5);
+}
+
+#[test]
+fn a_half_finished_entry_never_replaces_a_complete_one() {
+    let mut p = project_with_images(3);
+    let good = p.image(ImageId(2)).unwrap().clone();
+    // A rescan saw the file change: hash emptied, capture pending.
+    let mut pending = good.clone();
+    pending.content_hash.clear();
+    pending.file_size += 1;
+    pending.capture = CaptureInfo { scan_pending: true, ..Default::default() };
+    assert_eq!(p.merge_found(&[pending]), 0);
+    assert_eq!(p.image(ImageId(2)).unwrap(), &good);
+    // A new hash with a pending capture does not drop the good capture either.
+    let mut rehashed = good.clone();
+    rehashed.content_hash = "f".repeat(64);
+    rehashed.capture = CaptureInfo { scan_pending: true, ..Default::default() };
+    assert_eq!(p.merge_found(&[rehashed]), 0);
+    assert_eq!(p.image(ImageId(2)).unwrap(), &good);
+    // A complete entry replaces it normally.
+    let mut done = good.clone();
+    done.content_hash = "e".repeat(64);
+    assert_eq!(p.merge_found(&[done.clone()]), 1);
+    assert_eq!(p.image(ImageId(2)).unwrap(), &done);
 }

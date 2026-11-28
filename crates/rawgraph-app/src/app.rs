@@ -113,6 +113,8 @@ struct Settings {
     click_zoom: f32,
     wheel_navigates: bool,
     editable_thumb_gib: u32,
+    /// Always write the whole project file instead of updating it in place.
+    always_rewrite: bool,
 }
 
 impl Default for Settings {
@@ -128,6 +130,7 @@ impl Default for Settings {
             click_zoom: 2.0,
             wheel_navigates: false,
             editable_thumb_gib: crate::live_thumbs::DEFAULT_GIB,
+            always_rewrite: false,
         }
     }
 }
@@ -623,6 +626,7 @@ impl App {
                 }),
             },
         );
+        rawgraph_project::set_always_rewrite(settings.always_rewrite);
         let dirs = DataDirs::from_option(cli.data_dir.as_deref());
         let thumb_cache = rawgraph_project::ThumbCache::new(&dirs.thumbs(), CACHE_BUDGET).map_err(|e| eprintln!("thumbnail cache: {e}")).ok().map(Arc::new);
         let mut live = crate::live_thumbs::LiveThumbs::new(cc.egui_ctx.clone(), provider.clone(), dirs.thumbs().join("linear"), settings.editable_thumb_gib);
@@ -1332,11 +1336,8 @@ impl App {
             }
         }
         if let Some((project, report)) = finished {
-            // The scan worked on a copy: continue from the commit state of the project (it may have been saved meanwhile).
-            let mut project = project;
-            project.inherit_versioning(&self.session.project);
-            let changed = project != self.session.project;
-            self.session.finish_scan(project, changed);
+            // The session takes over the commit state, graph and edits itself and decides whether anything is unsaved.
+            self.session.finish_scan(project, false);
             let text = summarize(&report);
             if report.failed.is_empty() {
                 self.status.info(text);
@@ -2412,6 +2413,11 @@ impl App {
                 ui.radio_value(&mut self.viewer.wheel_navigates, false, "Zoom");
                 ui.radio_value(&mut self.viewer.wheel_navigates, true, "Navigate images");
                 ui.separator();
+                let mut rewrite = rawgraph_project::always_rewrite();
+                if ui.checkbox(&mut rewrite, "Always rewrite the whole project file").on_hover_text("Saves by writing a complete new file instead of updating the project file in place. Used automatically on network drives and in sync folders (Nextcloud, Dropbox, OneDrive).").changed() {
+                    rawgraph_project::set_always_rewrite(rewrite);
+                }
+                ui.separator();
                 ui.label(RichText::new("Preview size (long edge)").weak());
                 for n in PREVIEW_SIZES {
                     if ui.radio(preview == n, format!("{n} px")).clicked() {
@@ -3145,6 +3151,7 @@ impl eframe::App for App {
             click_zoom: self.viewer.click_zoom,
             wheel_navigates: self.viewer.wheel_navigates,
             editable_thumb_gib: self.filmstrip.live.budget(),
+            always_rewrite: rawgraph_project::always_rewrite(),
             // GPU-only is a test setting from the command line, never saved.
             renderer: if self.renderer_mode == RendererMode::Gpu { RendererMode::Auto } else { self.renderer_mode },
         };

@@ -404,7 +404,7 @@ crop and brush tools, node graph with multi-selection, copy/paste and recipes, f
 culling, XMP rating import and relinking, colourised scopes, project files in format 2 with
 revisions, history, graph restore, conflict check and crash recovery, and a packaging script. Project files are
 updated in place in one rollback-journal transaction (only changed rows, appended history, conflict check inside
-the transaction; see `docs/project-format.md`), saving works while a folder scan runs, XMP import reads
+the transaction, only on local drives outside sync folders, otherwise the whole file is rewritten; see `docs/project-format.md`), saving works while a folder scan runs, XMP import reads
 with its own 8-thread pool, and undo steps share unchanged nodes instead of copying the graph.
 The interactive preview runs the trailing pointwise operations and the display transform on the GPU
 with automatic CPU fallback; everything else, including export, uses the CPU reference path.

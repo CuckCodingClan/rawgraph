@@ -16,48 +16,92 @@ part of it.
 
 ## How a file is written
 
-Two ways, both all-or-nothing:
+Two ways, both all-or-nothing. Which one is used is decided per file (see "Which way is used where").
 
 - **In place** (`commit`, `commit_overwrite`, `save` onto an existing file that
   belongs to the same project and has the current schema version): one SQLite
   transaction updates the file where it lies. Only rows that differ are written:
   changed or new `images` rows (matched by `id`; rows that only moved get a new
   `position`), the `graph` row if its JSON changed, `folders` if the list changed,
-  the `meta` values that changed, and the new `history` entry. Old history entries
-  are not rewritten; pruned ones are deleted; a snapshot dropped for size is set to
-  NULL. What differs is found by reading the file's rows inside the transaction
-  and comparing them with the project (a few MB for thousands of images), not by
-  tracking edits, so the result is the same as a full write whatever happened
-  before. A failure (error, crash, power loss) rolls the transaction back and the
-  file keeps its old content. If a row-wise change is impossible (a constraint
-  fails) the full write below is used instead.
+  the `meta` values that changed (other `meta` keys are removed, so the result equals
+  a full write), and the new `history` entry. Old history entries are not rewritten
+  (and their snapshots are not read: a snapshot never changes, so metadata and
+  "has a snapshot" decide); pruned ones are deleted; a snapshot dropped for size is set
+  to NULL. What differs is found by reading the image rows, the graph and the history
+  metadata inside the transaction (about 1-2 MB for 4,000 images plus the graph, not the
+  snapshots) and comparing them with the project, not by tracking edits, so the result
+  is the same as a full write whatever happened before. A failure (error, crash, power
+  loss) rolls the transaction back and the file keeps its old content. If a row-wise
+  change is impossible (a constraint fails) the full write below is used instead.
 - **Full write** (new file, "save as" to a new path, another project's file,
-  schema migration, recovery copies): the whole database is written into
-  `<name>.saving` in one transaction and renamed over the target. A failed write
-  leaves the old file in place. A file of an older schema is first copied to
-  `<name>.v<N>.bak`.
+  schema migration, recovery copies, and every file for which in place is not allowed):
+  the whole database is written into `<name>.saving` in one transaction and renamed over
+  the target. The target is complete at every instant, and no journal file is involved.
+  A failed write leaves the old file in place. A file of an older schema is first copied
+  to `<name>.v<N>.bak`. A `<name>-journal` next to the old file is settled first
+  (rolled back on the old file; if that is not possible the save is refused), so a stale
+  journal never stays next to the new file.
 
-### Journal mode
+### Which way is used where
 
-In-place updates use SQLite's default **rollback journal** (`journal_mode = DELETE`),
-with the write lock taken up front (`BEGIN IMMEDIATE`) and a 5 s busy timeout.
-WAL is deliberately not used: it needs shared memory (`-shm`) that does not work
-across machines, so it is unsafe on SMB/NFS shares and on synced folders
-(Nextcloud, Dropbox). The rollback journal is a plain file `<name>.rawgraph-journal`
-next to the project that exists only during a commit; a copy of the file taken
-while it exists must be taken together with it. If a commit is interrupted the
-journal stays, and the next opener rolls the file back: the loaders open a file
-that has a journal read-write once so SQLite can do this (nothing is written when
-there is nothing to roll back; a read-only share gives an error instead of reading
-a half-written file). Deleted history entries leave free pages inside the file;
-they are reused by later commits, but the file does not shrink until it is written
-in full (e.g. "save as").
+In place is used **only on a local fixed drive that is not inside a sync folder**. The
+whole file is rewritten (full write) when the file is on:
+
+- a **network drive**: UNC paths (`\\server\share`), mapped drives (Windows
+  `GetDriveTypeW` is not "fixed"), removable drives; on Linux a mount of type
+  nfs/nfs4/cifs/smb3/smbfs/9p/afs/ceph/glusterfs/davfs/ncpfs/lustre/sshfs/rclone
+  (`/proc/self/mounts`); on macOS everything under `/Volumes`;
+- a **sync folder**: a folder or any parent that holds a marker of a sync client:
+  `.nextcloudsync.log`, `.owncloudsync.log`, `.sync_*.db` (Nextcloud/ownCloud),
+  `.dropbox`, `.dropbox.cache` (Dropbox), or a path under the folders named by the
+  environment variables `OneDrive`, `OneDriveConsumer`, `OneDriveCommercial`;
+- any file when the setting **"Always rewrite the whole project file"** is on
+  (Settings menu, default off, also `RAWGRAPH_ALWAYS_REWRITE=1`).
+
+The choice is made once per 30 s per folder. `rawgraph_project::write_mode(path)` returns
+it with the reason; the application shows it in the status line after a save, e.g.
+"Saved ... (revision 7; whole file rewritten, inside a Nextcloud sync folder)".
+
+Why: in place uses SQLite's rollback journal, a second file `<name>-journal` that exists
+during a save. That is safe on a local disk but not where files are copied or locked by
+somebody else:
+
+- A sync client (Nextcloud, Dropbox, OneDrive) can upload the main file and the journal
+  at different times. Another computer can then receive a changed main file with a
+  journal, or a journal alone, and replaying a stray journal onto a healthy file
+  corrupts it.
+- On network shares with weak locking (SMB/NFS, some NAS), two writers can both believe
+  they hold the write lock; and a reader that is allowed to write could roll back a
+  transaction that another user is still running.
+- WAL would be worse still (it needs shared memory between the processes of one machine)
+  and is not used.
+
+The full write has none of this (the target only ever changes by a rename), at the cost of
+writing the whole file (up to about 32 MB of history).
+
+### Reading
+
+Reading never writes. A file is opened read-only and everything (identity, images, graph,
+history) is read in **one read transaction**, so a commit by somebody else in between
+cannot give a mixed state. A leftover `<name>-journal` that SQLite would have to replay
+(an interrupted save) is **not** replayed by a read: loading fails with the message "the
+project file has an unfinished save next to it (<name>-journal): open it from the computer
+that saved it ...". `Project::recover_unfinished_save(path)` rolls the file back to its
+last complete state; it is meant for an explicit user action on the computer that saved the
+file, while no program is saving it. The next in-place commit or full write on the saving
+computer also settles the journal. Locks are waited for at most 2 s per request (a save
+asks twice); if the file is still locked the error is "The project file is in use by another
+program or computer; try again." and nothing is changed or rewritten.
+
+Deleted history entries leave free pages inside the file; they are reused by later
+commits, but the file does not shrink until it is written in full (e.g. "save as").
 
 Measured (dev build, local SSD): a project with 4,000 images and 100 history
 entries of a 300 KB graph (a 31 MB file), one parameter change saved: full
 rewrite about 60 ms and 32 MB written; in place about 30 ms and about 0.6 MB of
-changed pages plus the same amount in the journal. On a network share the written
-volume matters far more than the time on a local disk.
+changed pages plus about the same in the journal. On a network share the written
+volume matters far more than the time on a local disk (but see above: a network
+share gets the full write).
 
 ## What is stored, what is not
 
@@ -154,6 +198,18 @@ as pending (empty hash, `scan_pending` in `capture`) and are picked up by the ne
 of that folder. When the scan finishes, its copy inherits revision and history
 (`Project::inherit_versioning`), so the next save is a normal commit, not a conflict.
 Recovery copies written by autosave during a scan contain the images found so far too.
+
+The images are merged into a copy of the session's project, and the copy replaces the project
+only after the save succeeded: a failed save (conflict, I/O error, locked file) changes
+nothing. `merge_found` never replaces an entry that has a hash with a half-finished one
+(empty hash, or a pending capture over a read one): a save during a rescan keeps the good
+hash and capture of files the rescan found changed; their stored size and time no longer
+match the file, so the next scan reads them again. If the scan is cancelled after a save,
+what was saved stays in the session and the file; entries that were still pending stay marked
+pending and the next scan of the folder completes them. When the scan ends, the project counts
+as unsaved only if the scan's result differs from what the session holds after taking over
+the graph and the edits made meanwhile, so a scan that brings nothing new after the last
+save leaves the project saved and creates no revision.
 
 ## Collaboration foundations
 

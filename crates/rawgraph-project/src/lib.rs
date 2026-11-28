@@ -25,6 +25,7 @@ mod store;
 pub mod staged;
 mod thumbs;
 mod util;
+mod writemode;
 mod xmp;
 
 #[cfg(test)]
@@ -49,6 +50,7 @@ pub use history::HistoryEntry;
 pub use recovery::{discard_recovery, list_recoveries, load_recovery, RecoveryInfo};
 pub use thumbs::ThumbCache;
 pub use util::{content_hash, natural_cmp};
+pub use writemode::{always_rewrite, set_always_rewrite, write_mode, WriteChoice, WriteMode};
 pub use xmp::{parse_xmp_culling, xmp_sidecar_path, XmpCulling};
 
 /// File extension of project files (without the dot).
@@ -371,7 +373,14 @@ impl Project {
         let mut merged = 0;
         for entry in sorted {
             if let Some(i) = self.index_of(entry.id) {
-                if self.images[i] != *entry {
+                let old = &self.images[i];
+                // A rescan empties the hash (and marks the capture pending) of files that changed on
+                // disk while it reads them. Such a half-finished entry never replaces a complete one:
+                // the file keeps the old, good values, and because their size and time no longer match
+                // the file, the next scan reads it again.
+                let downgrade = !old.content_hash.is_empty()
+                    && (entry.content_hash.is_empty() || (entry.capture.scan_pending && !old.capture.scan_pending));
+                if !downgrade && *old != *entry {
                     self.images[i] = entry.clone();
                     merged += 1;
                 }
@@ -768,6 +777,15 @@ impl Project {
         store::save(self, path)
     }
 
+    /// Rolls an interrupted save back (see the module notes in `docs/project-format.md`):
+    /// loading never replays a leftover `<name>-journal`, it fails with a message that
+    /// names it. This opens the file read-write once so SQLite restores the last
+    /// complete state. Call it only when the user asks for it, on the computer that
+    /// saved the file, while no program is saving it. Returns whether a journal was found.
+    pub fn recover_unfinished_save(path: &Path) -> Result<bool, ProjectError> {
+        store::recover_unfinished_save(path)
+    }
+
     /// Loads a project file. Schema 1 files are migrated in memory (the file
     /// is not modified; the first write over it keeps a `.v1.bak` copy).
     pub fn load(path: &Path) -> Result<Project, ProjectError> {
@@ -818,7 +836,7 @@ impl Project {
     fn commit_impl(&mut self, path: &Path, summary: &str, overwrite: bool) -> Result<u64, ProjectError> {
         let mut base = self.revision;
         let meta = std::fs::metadata(path);
-        if meta.as_ref().is_ok_and(|m| m.is_file()) {
+        if meta.as_ref().is_ok_and(|m| m.is_file()) && writemode::write_mode(path).mode == WriteMode::InPlace {
             // Fast path: the file is a current-schema file of this project. It is
             // updated in place in one transaction, and the conflict check runs
             // inside that transaction (atomic with the write).
