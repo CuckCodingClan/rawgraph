@@ -1,0 +1,14 @@
+﻿[package]
+name = "rawgraph-rename"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+calamine = { version = "0.38", default-features = false }
+regex = "1"
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

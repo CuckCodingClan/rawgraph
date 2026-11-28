@@ -191,6 +191,8 @@ crates/
                                #   vignette, crop/rotate, lens correction, brush rasterization, curves,
                                #   colour wheels, clarity, layer placement and blending
   rawgraph-batch/              # Export pipeline: progress, cancel, partial failure, retry, 16-bit, ICC, metadata
+  rawgraph-rename/             # Caption sheets (.xlsx/.csv), naming rules, safe two-phase batch rename of files,
+                               #   undo log, block check
   rawgraph-gpu/                # GPU pixel path (wgpu): display transform and pointwise operations, verified
                                #   against the CPU reference; used by the application's interactive preview
   rawgraph-app/                # Desktop application (eframe/egui 0.37, wgpu)
@@ -466,6 +468,55 @@ The LUT node (category Colour) applies an Adobe / Resolve `.cube` file. The insp
 - **Problems:** a missing or unreadable file is a `Graph::validate()` issue, only for the data in effect (All mode: the file of All; Individual mode: the own file of each image plus the file of All). The viewer passes the image through unchanged. An export does not stop for it: only the items whose LUT cannot be read fail, each with the path and the line of the error, and the other images are written.
 - **GPU:** the sRGB, ACEScct and Linear modes run as a tail operation on the GPU (storage buffer, the same tetrahedral code as the CPU; within 1 code value). Display mode needs the inverse view transform, which exists on the CPU only, so that node is the CPU base of the plan: the frame stays on the GPU for the operations after it and the display transform. Export always uses the CPU path.
 
+### Caption sheets and batch rename
+
+**Caption sheet.** A spreadsheet (`.xlsx`, `.xlsm`, `.xls`, `.ods` or `.csv`) maps a photo number to the final
+file name: column A = photo number, column B = target name without extension (`076_Anna Berger`), column C = caption.
+The columns, the sheet tab and the place of the number in a file name can be changed (default: the last group of digits
+of the file name, so `Job-0076.jpg` is photo 76; `first` or a regular expression whose first group is the number are
+the alternatives). Rows above the first numeric row (a header) and rows without a number are ignored; the same number in
+two rows with different content is reported as ambiguous. The sheet is loaded in Library > Rename files > Caption sheet
+and kept for the session (not saved in the project). CSV files may use `;`, `,` or tab, UTF-8 or Latin-1.
+
+**Name tokens.** In the rename template and in the file name template of the Export dialog and of Export nodes:
+`{sheet_name}` (column B), `{caption}` (column C), `{no}` / `{no:03}` (the photo number found in the name). An image
+without a row in the sheet gets a clear per-image error in the export report ("photo 99 has no row in the caption sheet");
+there is no fallback name, and the other images are exported.
+
+**Library > Rename files...** renames files on disk, RAW originals included, for the listed (filtered) images or the selected
+image. Rules, applied in this order: name template (`{stem}`, `{counter}` / `{counter:4}` with start, step and digits,
+`{date}`, `{time}`, `{datetime}` from the capture time, `{camera}`, the sheet tokens), find/replace (plain or regular
+expression, `${1}` for groups), case change, extension case. The counter follows the filmstrip order.
+
+Safety rules (all enforced by the program, each with tests):
+
+- Nothing happens before a full preview (old name -> new name for every file) has no conflict. Conflicts are shown red and
+  block the run: two files with the same new name, an existing file that is not part of the rename, an invalid name
+  (`< > : " / \ | ? *`, control characters), a Windows reserved name (`CON`, `NUL`, ...), a name ending in a dot or a
+  space, a name longer than 255 characters, a missing source, a photo without a sheet row. Name comparison ignores case
+  on Windows and macOS.
+- The rename is two-phase: every file first gets a unique temporary name in its own folder, then its final name. Chains
+  (a -> b, b -> c) and swaps (a <-> b) therefore work. Files are renamed inside their own folder only; they never change
+  folder or volume, and an existing file is never overwritten.
+- The `.xmp` / `.XMP` sidecar with the same stem is renamed with its file. Optionally files with the same stem (RAW + JPEG)
+  are renamed as one unit.
+- Every renamed file that is an image of the open project keeps its image id, content hash, rating, flag, label and edits;
+  only its path changes, and the project is marked changed. If the project cannot follow, the files are renamed back.
+- Afterwards every new file is checked: it exists, has the size it had before, the old names are gone and no temporary file
+  is left. A failure in either phase or in this check puts every file back (best effort; whatever could not be put back is
+  listed with its current name).
+- Before the first file is touched the run is written to an undo log, `<project>.rename-log.json` next to the project file
+  (in the application data folder `rename\` while the project is not saved). "Undo last rename" (Library menu and the
+  window) reverses the last finished run with the same two-phase method and the same checks; it refuses when a file changed
+  or a name is taken. A run that a crash interrupted can be put back with "Recover" in the window.
+- The tool refuses to run while a folder scan, an export, an XMP import or another job that reads the files is running.
+- Block check (sheet-based renames): for every block of consecutive numbers with the same caption, the first and the last
+  photo of the folder with their thumbnails, old and new name, plus the numbers of the sheet that have no file, numbers
+  carried by several different files (a RAW + JPEG of one shot does not count), files whose number is not in the sheet and
+  files without a number. A shift by one inside a block does not show in the captions; only the number and the picture do.
+
+File times and EXIF are not used to verify a rename; the sizes are compared and the block check is looked at.
+
 ### Sample photos
 
 Some tests and the examples under `crates/*/examples` work on private sample photos, which are
@@ -503,6 +554,7 @@ Update this section as implementation files are added.
 
 ## Change log
 
+- 2026-11-28 — Caption sheets and batch rename (Library > Rename files, `{sheet_name}` / `{caption}` / `{no}` export tokens).
 - 2026-11-28 — Project defects: save during a folder scan, in-place incremental project saves (rollback journal, atomic conflict check), XMP import on a dedicated 8-thread pool, undo history shares unchanged nodes (`Graph` nodes are `Arc`, copy on write).
 - 2026-11-15 — Wave 8: nodes of `node_structure.md` (Source folders, Merge rule, Layer, Develop tone, Curves set, Lens Correction auto, Export node), colourised scopes, output colour spaces, AVIF, project format 2 with history and conflict check; new requirements (platforms, project storage and collaboration).
 - 2026-11-15 — Wave 7: Lift/Gamma/Gain, Clarity/Texture, more GPU operations, brush behind crop, curve histogram, packaging script.

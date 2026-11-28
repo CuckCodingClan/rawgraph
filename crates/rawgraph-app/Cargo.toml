@@ -15,6 +15,7 @@ rawgraph-fx = { path = "../rawgraph-fx" }
 rawgraph-gpu = { path = "../rawgraph-gpu" }
 rawgraph-io = { version = "26.11.1", path = "../rawgraph-io" }
 rawgraph-project = { version = "26.11.1", path = "../rawgraph-project" }
+rawgraph-rename = { path = "../rawgraph-rename" }
 rawgraph-scope-views = { version = "26.11.1", path = "../rawgraph-scope-views" }
 rawgraph-scopes = { version = "26.11.1", path = "../rawgraph-scopes" }
 arboard = { version = "3", default-features = false }

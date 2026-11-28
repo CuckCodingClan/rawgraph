@@ -122,6 +122,44 @@ impl Project {
         Ok(())
     }
 
+    /// Re-points entries at files that were just renamed on disk (same content, new name). Unlike
+    /// [`Project::relink`] all moves count together, so a chain or a swap of names is fine: the paths
+    /// only have to be unique once every move is applied. Id, uuid, hash, size, modification time,
+    /// rating, flag, label and capture are kept; only the path changes and `missing` is cleared.
+    ///
+    /// All-or-nothing: an unknown or repeated id, a new path that is not an existing file, or two
+    /// entries ending up with the same path changes nothing and returns an error. Returns how many
+    /// entries were re-pointed.
+    pub fn apply_renames(&mut self, moves: &[(ImageId, PathBuf)]) -> Result<usize, ProjectError> {
+        let mut targets: std::collections::HashMap<ImageId, PathBuf> = std::collections::HashMap::new();
+        for (id, path) in moves {
+            if self.image(*id).is_none() {
+                return Err(ProjectError::Mismatch(format!("no image with id {}", id.0)));
+            }
+            let path = abs(path);
+            if !path.is_file() {
+                return Err(ProjectError::Io(format!("{} is not a file", path.display())));
+            }
+            if targets.insert(*id, path).is_some() {
+                return Err(ProjectError::Mismatch(format!("image {} is renamed twice", id.0)));
+            }
+        }
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for e in &self.images {
+            let path = targets.get(&e.id).unwrap_or(&e.path);
+            if !used.insert(util::path_key(path)) {
+                return Err(ProjectError::Mismatch(format!("{} would be used by two images of the project", path.display())));
+            }
+        }
+        for (id, path) in targets {
+            if let Some(e) = self.image_mut(id) {
+                e.path = path;
+                e.missing = false;
+            }
+        }
+        Ok(moves.len())
+    }
+
     /// Rewrites the paths of all entries under `old_prefix` to `new_prefix`
     /// (for a moved job folder), only for entries whose new path exists and is
     /// not used by another entry. Nothing is verified; `missing` is cleared

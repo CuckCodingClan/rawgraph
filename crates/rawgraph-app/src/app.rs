@@ -51,6 +51,7 @@ use crate::workspace::{MainLayout, Preset, WindowRole, WorkspaceStore};
 mod ext;
 mod ff_driver;
 mod nodes;
+mod rename;
 mod revs;
 mod workspaces;
 #[cfg(test)]
@@ -177,6 +178,8 @@ enum Command {
     Compare,
     ToggleMissingOnly,
     ClearThumbCache,
+    RenameFiles,
+    UndoRename,
 }
 
 /// Actions that replace the document and therefore ask about unsaved changes.
@@ -205,6 +208,8 @@ enum DialogKind {
     NodeExportFolder(NodeId),
     /// Pick the `.cube` file of a LUT node.
     LutFile(NodeId),
+    /// Pick the caption sheet (.xlsx / .csv) of the rename dialog.
+    CaptionSheet,
 }
 
 struct Dialog {
@@ -516,6 +521,12 @@ pub struct App {
     compare_started: Option<Instant>,
     compare_reported: bool,
     xmp_dialog: Option<XmpDialog>,
+    /// Library > Rename files: the open window (None = closed).
+    rename: Option<crate::rename_ui::RenameUi>,
+    /// Thumbnails of the block check (its own loader, so the filmstrip's requests are left alone).
+    rename_thumbs: Option<ThumbLoader>,
+    /// Bumped whenever the caption sheet is loaded or removed (the preview is made again).
+    rename_sheet_gen: u64,
     xmp_job: Option<XmpJob>,
     xmp_probe: Option<XmpJob>,
     xmp_offer: Option<XmpOffer>,
@@ -803,6 +814,9 @@ impl App {
             compare_started: None,
             compare_reported: false,
             xmp_dialog: None,
+            rename: None,
+            rename_thumbs: None,
+            rename_sheet_gen: 0,
             xmp_job: None,
             xmp_probe: None,
             xmp_offer: None,
@@ -895,6 +909,8 @@ impl App {
             Command::SaveRecipe => self.editor.request(EditOp::SaveRecipe),
             Command::ManageRecipes => self.editor.request(EditOp::ManageRecipes),
             Command::ImportXmp => self.open_xmp_dialog(),
+            Command::RenameFiles => self.open_rename(),
+            Command::UndoRename => self.undo_rename_command(),
             Command::Compare => self.toggle_compare(),
             Command::ToggleMissingOnly => {
                 self.session.filter.missing_only = !self.session.filter.missing_only;
@@ -1039,6 +1055,7 @@ impl App {
                 DialogKind::SourceFolder(_) => "Choose the folder of the Source",
                 DialogKind::NodeExportFolder(_) => "Choose the output folder of the Export node",
                 DialogKind::LutFile(_) => "Choose a LUT file",
+                DialogKind::CaptionSheet => "Choose the caption sheet",
             },
             self.session.project_path.as_ref().and_then(|p| p.parent()).map(std::path::Path::to_path_buf),
         );
@@ -1053,6 +1070,7 @@ impl App {
             DialogKind::RelinkNewFolder => 7,
             DialogKind::SourceFolder(_) | DialogKind::NodeExportFolder(_) => 8,
             DialogKind::LutFile(_) => 9,
+            DialogKind::CaptionSheet => 10,
         };
         let name = self.save_as_name.take().unwrap_or_else(|| format!("{}{PROJECT_EXT}", self.session.project_name().replace("Untitled project", "untitled")));
         let _ = std::thread::Builder::new().name("rawgraph-dialog".into()).spawn(move || {
@@ -1065,6 +1083,7 @@ impl App {
                 1 | 5 | 7 | 8 => d.pick_folder(),
                 6 => d.pick_file(),
                 9 => d.add_filter("Cube LUT (*.cube)", &["cube", "CUBE", "Cube"]).pick_file(),
+                10 => d.add_filter("Caption sheet (*.xlsx, *.csv)", &["xlsx", "xlsm", "xls", "ods", "csv", "tsv"]).pick_file(),
                 2 => d.set_file_name(name).add_filter("RawGraph project (*.rawgraph)", &["rawgraph"]).save_file(),
                 3 => d.add_filter("RawGraph graph (*.rawgraph.json)", &["json"]).pick_file(),
                 _ => d.set_file_name(format!("graph{GRAPH_EXT}")).add_filter("RawGraph graph (*.rawgraph.json)", &["json"]).save_file(),
@@ -1089,6 +1108,7 @@ impl App {
             DialogKind::OpenFolder => self.start_scan(ctx, path),
             DialogKind::ExportFolder => self.export_ui.out_dir = path.to_string_lossy().into_owned(),
             DialogKind::LocateFile(id) => self.locate_file(id, path),
+            DialogKind::CaptionSheet => self.caption_sheet_picked(path),
             DialogKind::SourceFolder(node) => {
                 let folder = path.to_string_lossy().into_owned();
                 if !node_ui::set_source_folder(&mut self.session.project.graph, node, Some(folder)) {
@@ -1162,6 +1182,7 @@ impl App {
             self.status.error("Select or pin an image node to export");
             return;
         };
+        self.export_ui.sheet = self.session.caption_sheet.clone();
         let items = self.export_ui.items(&self.session);
         let settings = match self.export_ui.settings(&self.session.view) {
             Ok(s) => s,
@@ -1228,6 +1249,7 @@ impl App {
 
     fn export_windows(&mut self, ctx: &egui::Context) {
         if self.show_export {
+            self.export_ui.sheet = self.session.caption_sheet.clone();
             let items = self.export_ui.items(&self.session);
             let counts = ExportState::scope_counts(&self.session);
             let node_text = export::export_node(&self.session).map_or_else(|| "(no image node selected)".to_owned(), |n| export::node_label(&self.session.project.graph, n));
@@ -2437,6 +2459,11 @@ impl App {
                 item(ui, cmds, "View selected node", Command::ViewNode, has_sel);
                 item(ui, cmds, "Frame all nodes", Command::FrameAll, true);
             });
+            ui.menu_button("Library", |ui| {
+                item_tip(ui, cmds, "Rename files...", Command::RenameFiles, true, "Renames the listed or the selected files on disk (RAW originals and .xmp sidecars included), with a full preview and an undo log");
+                let undo_ok = crate::rename_ops::log_state(&crate::rename_ops::log_path(&self.session, &self.dirs)).0;
+                item_tip(ui, cmds, "Undo last rename", Command::UndoRename, undo_ok, "Puts the files of the last rename back under their old names");
+            });
             ui.menu_button("Debug", |ui| {
                 if ui.checkbox(&mut self.timing_debug, "Per-node CPU timing").changed() {
                     self.node_timings = None;
@@ -3118,6 +3145,7 @@ impl eframe::App for App {
         self.unfinished_window(&ctx);
         self.xmp_window(&ctx);
         self.relink_windows(&ctx);
+        self.rename_windows(&ctx);
         self.clear_cache_window(&ctx);
         self.handle_film_actions(&ctx);
 
