@@ -182,7 +182,7 @@ pub fn read_capture_info(path: &Path) -> Result<CaptureInfo, IoError> {
         reader.into_decoder().map(|_| ()).map_err(|e| IoError::Decode(e.to_string()))
     })?;
 
-    let mut info = CaptureInfo { raw: Some(false), ..Default::default() };
+    let mut info = CaptureInfo { raw: Some(false), focal_read: true, ..Default::default() };
     if file.rewind().is_err() { return Ok(info); }
     let Ok(ex) = exif::Reader::new().read_from_container(&mut file) else { return Ok(info) };
     let get = |tag| ex.get_field(tag, exif::In::PRIMARY);
@@ -200,5 +200,10 @@ pub fn read_capture_info(path: &Path) -> Result<CaptureInfo, IoError> {
     info.shutter_s = get(exif::Tag::ExposureTime).and_then(rational).filter(|v| *v > 0.0);
     info.aperture = get(exif::Tag::FNumber).and_then(rational).filter(|v| *v > 0.0);
     info.flash_fired = get(exif::Tag::Flash).and_then(|f| f.value.get_uint(0)).map(|v| v & 1 == 1);
+    info.focal_mm = get(exif::Tag::FocalLength).and_then(rational).filter(|v| *v > 0.0 && v.is_finite());
+    info.focal_35mm = get(exif::Tag::FocalLengthIn35mmFilm)
+        .and_then(|f| f.value.get_uint(0))
+        .filter(|v| (1..=2000).contains(v))
+        .map(|v| v as f32);
     Ok(info)
 }

@@ -100,6 +100,8 @@ pub struct Frame {
     pub path: RenderPath,
     /// One-time note for the status bar (the GPU path switched itself off).
     pub notice: Option<String>,
+    /// Findings of nodes behind this picture (a Panorama's stitching warnings), for the status bar.
+    pub warnings: Vec<String>,
     /// Unclamped display image; wave 2 feeds it to the scopes. Empty for a GPU frame.
     #[allow(dead_code)]
     pub display: Arc<DisplayImage>,
@@ -147,6 +149,17 @@ pub enum Reply {
     Dumped { path: PathBuf, result: Result<(), String> },
     /// The histogram behind the curve editor, for the frame of that generation.
     Histogram(Box<HistogramReply>),
+}
+
+/// The status-bar line for the findings of a picture: the first one (with the count of the others) and
+/// the full list for the tooltip. `None` when there are none.
+pub fn warning_line(warnings: &[String]) -> Option<(String, String)> {
+    let first = warnings.first()?;
+    let text = match warnings.len() - 1 {
+        0 => format!("Warning: {first}"),
+        more => format!("Warning: {first} (+{more} more)"),
+    };
+    Some((text, warnings.join("\n")))
 }
 
 impl Reply {
@@ -477,7 +490,13 @@ fn worker<B: Backend>(
                     continue;
                 }
                 let env = Env { no_gpu_reason: &no_gpu_reason, mode, shown: shown.load(Ordering::Relaxed), base_ms: &base_ms };
-                let reply = run_request(&mut evaluator, &request, provider.as_ref(), gpu.as_mut(), &env, &mut resting);
+                let mut reply = run_request(&mut evaluator, &request, provider.as_ref(), gpu.as_mut(), &env, &mut resting);
+                // The findings go with the frame (also when the group came from the cache); the evaluator's own
+                // list is emptied after every request so it cannot grow.
+                evaluator.take_notes();
+                if let Some(Reply::Frame(f)) = &mut reply {
+                    f.warnings = evaluator.current_notes(&request.graph, request.node, request.image);
+                }
                 if let Some(reply) = reply {
                     let gpu_frame = matches!(&reply, Reply::Frame(f) if f.path.is_gpu());
                     if let Reply::Frame(frame) = &reply {
@@ -786,6 +805,7 @@ fn run_gpu<B: Backend>(
         gpu: Some(picture),
         path: RenderPath::Gpu,
         notice: None,
+        warnings: Vec::new(),
         display: Arc::new(DisplayImage { width: 0, height: 0, rgb: Vec::new() }),
         prepared: None,
         scope_step,
@@ -979,6 +999,7 @@ fn run_cpu(evaluator: &mut Evaluator, req: &Request, provider: &dyn ImageProvide
         gpu: None,
         path,
         notice,
+        warnings: Vec::new(),
         display: Arc::new(display),
         prepared: None,
         scope_step,
@@ -1153,6 +1174,15 @@ mod tests {
         assert!(!gate.accept(g2), "a duplicate is dropped");
         assert!(gate.accept(g3));
         assert!(!gate.pending());
+    }
+
+    #[test]
+    fn the_status_line_shows_the_first_finding_and_counts_the_rest() {
+        assert_eq!(warning_line(&[]), None);
+        let one = warning_line(&["focal length estimated".to_owned()]).unwrap();
+        assert_eq!(one.0, "Warning: focal length estimated");
+        let two = warning_line(&["a".to_owned(), "b".to_owned()]).unwrap();
+        assert_eq!(two, ("Warning: a (+1 more)".to_owned(), "a\nb".to_owned()));
     }
 
     fn mk(generation: u64) -> Msg {

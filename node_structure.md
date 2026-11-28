@@ -89,6 +89,31 @@ Cuts the incoming collection into image groups (an exposure bracket per group) a
 
 Group by, gap and size are read from the All values even in Individual mode. The gap is measured from the end of the previous exposure; a Bracket spreads over at least 0.7 stop, otherwise its images stay single.
 
+### Panorama (`Panorama`)
+
+Cuts the incoming collection into image groups (a sweep of overlapping frames per group) and stitches each group into one panorama (see the README section "Panorama"). The output collection is the references (the middle frame of each group in capture order, the lower middle for an even count), in the input order; each output image has the identity of its reference and the size of the panorama, not of the reference frame. A group of one image passes through unchanged. Behind an HDR Merge the groups are formed from the HDR images (HDR panorama). Category: Collection.
+
+- **Inputs:** Images: Images (required)
+- **Outputs:** Images: Images
+
+| Setting | Key | Default | Range or choices |
+| --- | --- | --- | --- |
+| Group by | `group_by` | Capture time | Capture time / Manual / Whole collection |
+| Max gap | `gap_s` | 5 s | 0 to 120 |
+| Max group size | `max_size` | 25 | 2 to 25 (whole numbers; the stitcher accepts 25 frames, a larger group is refused before any frame is loaded) |
+| Group number | `group` | 0 | 0 to 999; per image (Individual), 0 = none; used by Manual |
+| Projection | `projection` | Cylindrical | Cylindrical / Spherical / Planar |
+| Blend | `blend` | Multiband | Multiband / Feather |
+| Blend levels | `levels` | 5 | 2 to 6 |
+| Match exposure | `exposure_comp` | On | Off / On |
+| Crop to content | `crop` | On | Off / On |
+| Focal length | `focal` | From metadata | From metadata / Estimate |
+| Focal length (35 mm equiv.) | `focal_mm_35` | 0 (automatic) | 0 to 400; a value above 0 replaces the metadata and the estimate |
+| Keep typed focal length fixed | `focal_fixed` | Off | Off / On; with a typed value, On keeps it exactly (otherwise it is the start value and the alignment may move it by up to 10 %) |
+| Feature resolution | `work_px` | 1200 px | 600 to 3000 |
+
+Group by, gap and size are read from the All values even in Individual mode. The gap runs from the end of the previous exposure to the start of the next; behind an HDR Merge it runs from the end of a bracket's last exposure to the start of the next bracket's first.
+
 ### Layer (`Layer`)
 
 - **Inputs:** Layer 1: Images (optional); Layer 2: Images (optional); Layer 3: Images (optional); Layer 4: Images (optional); Layer 5: Images (optional); Layer 6: Images (optional); Layer 7: Images (optional); Layer 8: Images (optional)

@@ -1046,6 +1046,13 @@ impl GraphEditor {
                             ui.close();
                         }
                     }
+                    if group == "Collection" {
+                        ui.separator();
+                        if ui.button("HDR panorama (HDR Merge + Panorama)").on_hover_text(HDR_PANORAMA_NOTE).clicked() {
+                            actions.push(Action::AddHdrPanorama(menu_pos));
+                            ui.close();
+                        }
+                    }
                 });
             }
             ui.separator();
@@ -1422,6 +1429,12 @@ impl GraphEditor {
                     }
                     session.set_node_selection(NodeSelection::single(id));
                 }
+                Action::AddHdrPanorama(pos) => {
+                    let (hdr, pano) = insert_hdr_panorama(&mut session.project.graph, pos);
+                    let mut sel = NodeSelection::single(hdr);
+                    sel.add(pano);
+                    session.set_node_selection(sel);
+                }
                 Action::View(id) => { session.viewed_node = None; session.set_node_selection(NodeSelection::single(id)); },
                 Action::Delete(id) => {
                     let result = if session.node_sel.contains(id) && session.node_sel.len() > 1 { session.delete_selected().map(|_| ()) } else { session.delete_node(id) };
@@ -1554,10 +1567,24 @@ enum Action {
     ExposeGroupPort(NodeId, bool, usize),
     GroupColor(NodeId, Option<[u8; 3]>),
     Add(NodeKind, [f32; 2]),
+    /// HDR Merge followed by Panorama, connected.
+    AddHdrPanorama([f32; 2]),
     View(NodeId),
     Delete(NodeId),
     /// An editing command that runs at the start of the next frame.
     Edit(EditOp),
+}
+
+const HDR_PANORAMA_NOTE: &str = "Adds an HDR Merge and a Panorama node, connected: every bracket becomes one HDR image, the HDR images of a sweep become one panorama. Connect a Source to the HDR Merge.";
+
+/// The "HDR panorama" preset: an HDR Merge with a Panorama behind it, side by side at `pos`. Returns
+/// (HDR Merge, Panorama). The HDR Merge's input is left open for the Source.
+fn insert_hdr_panorama(graph: &mut Graph, pos: [f32; 2]) -> (NodeId, NodeId) {
+    let hdr = graph.add_node(NodeKind::HdrMerge, pos);
+    let pano = graph.add_node(NodeKind::Panorama, [pos[0] + 230.0, pos[1]]);
+    // Both are image nodes with one image input and output: this connection cannot fail.
+    let _ = graph.connect(hdr, pano, 0);
+    (hdr, pano)
 }
 
 fn compatible_port(graph: &Graph, conn: ConnDrag, kind: NodeKind) -> Option<usize> {
@@ -2959,5 +2986,28 @@ mod tests {
         let pasted = h.sel();
         assert_eq!(pasted.len(), 1);
         assert_eq!(h.s.project.graph.parent_of(pasted[0]), Some(group), "pasted into the open group");
+    }
+}
+
+#[cfg(test)]
+mod hdr_panorama_preset_tests {
+    use super::*;
+
+    #[test]
+    fn the_preset_adds_an_hdr_merge_with_a_connected_panorama_and_leaves_the_input_open() {
+        let mut g = Graph::new();
+        let before = g.nodes().count();
+        let (hdr, pano) = insert_hdr_panorama(&mut g, [100.0, 40.0]);
+        assert_eq!(g.nodes().count(), before + 2);
+        assert_eq!(g.node(hdr).unwrap().kind, NodeKind::HdrMerge);
+        assert_eq!(g.node(pano).unwrap().kind, NodeKind::Panorama);
+        assert_eq!(g.input_of(pano, 0), Some(hdr), "the panorama takes the HDR images");
+        assert_eq!(g.input_of(hdr, 0), None, "the Source is connected by the user");
+        let (a, b) = (g.node(hdr).unwrap().pos, g.node(pano).unwrap().pos);
+        assert!(b[0] > a[0] && (b[1] - a[1]).abs() < 1e-3, "side by side: {a:?} {b:?}");
+        // A Source connected to the HDR Merge makes the chain a valid graph.
+        let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
+        g.connect(src, hdr, 0).unwrap();
+        assert!(g.upstream_group_node(pano) == Some(pano) && g.upstream_group_node_above(pano) == Some(hdr));
     }
 }

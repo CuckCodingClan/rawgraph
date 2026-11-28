@@ -86,10 +86,41 @@ pub struct CollectionResult {
     pub merges: HashMap<NodeId, MergeStats>,
     pub splits: HashMap<NodeId, SplitStats>,
     pub layers: HashMap<NodeId, LayerStats>,
-    /// Size of the image group each image of the viewed node stands for, when an HDR Merge at or above
-    /// the viewed node makes groups (references only; singletons are left out).
+    /// Size of the image group each image of the viewed node stands for, when a group node (HDR Merge,
+    /// Panorama) at or above the viewed node makes groups (references only; singletons are left out).
+    /// In a chain the nearest group node counts.
     pub view_groups: HashMap<ImageId, usize>,
+    /// For groups that stand for more source frames than images (a panorama of HDR brackets), the
+    /// number of frames; groups without nested groups are not listed.
+    pub view_frames: HashMap<ImageId, usize>,
     pub millis: f32,
+}
+
+impl CollectionResult {
+    /// The group sizes of the viewed node for the filmstrip.
+    pub fn group_sizes(&self) -> GroupSizes<'_> {
+        GroupSizes { images: &self.view_groups, frames: &self.view_frames }
+    }
+}
+
+/// Group sizes the filmstrip shows on the references of the viewed node.
+#[derive(Clone, Copy)]
+pub struct GroupSizes<'a> {
+    /// Images per group (the number on the badge).
+    pub images: &'a HashMap<ImageId, usize>,
+    /// Source frames per group where that is more than the images.
+    pub frames: &'a HashMap<ImageId, usize>,
+}
+
+/// Tooltip of a stack badge: "3 images", or "4 images (12 frames)" when the members are groups themselves.
+pub fn stack_tooltip(images: usize, frames: Option<usize>) -> Option<String> {
+    if images < 2 {
+        return None;
+    }
+    Some(match frames.filter(|f| *f > images) {
+        Some(f) => format!("{images} images ({f} frames)"),
+        None => format!("{images} images"),
+    })
 }
 
 /// The collection entering input `port` of `node` (empty when nothing is connected).
@@ -130,13 +161,14 @@ pub fn compute(graph: &Graph, ids: &[ImageId], captures: &Captures, view_node: O
         r.counts.insert(node.id, n);
         if view_node == Some(node.id) {
             r.view_members = own.iter().copied().collect();
-            if let Some(hdr) = graph.upstream_hdr_merge(node.id) {
-                r.view_groups = graph
-                    .image_groups(hdr, &catalog)
+            if let Some(group_node) = graph.upstream_group_node(node.id) {
+                let groups: Vec<_> = graph
+                    .image_groups_with_frames(group_node, &catalog)
                     .into_iter()
-                    .filter(|g| g.members.len() > 1 && r.view_members.contains(&g.reference))
-                    .map(|g| (g.reference, g.members.len()))
+                    .filter(|(g, _)| g.members.len() > 1 && r.view_members.contains(&g.reference))
                     .collect();
+                r.view_frames = groups.iter().filter(|(g, frames)| *frames > g.members.len()).map(|(g, frames)| (g.reference, *frames)).collect();
+                r.view_groups = groups.into_iter().map(|(g, _)| (g.reference, g.members.len())).collect();
             }
         }
         match node.kind {
@@ -509,6 +541,50 @@ pub mod tests {
         }
         // Upstream of the merge nothing is stacked.
         assert!(compute(&g, &ids, &caps, Some(src)).view_groups.is_empty());
+    }
+
+    #[test]
+    fn panorama_groups_are_counted_and_a_chain_counts_images_and_frames() {
+        // Twelve frames: four brackets of three (EV -2, 0, +2), the brackets 3 s apart.
+        let ids: Vec<ImageId> = (1..=12).map(ImageId).collect();
+        let mut map = HashMap::new();
+        for (k, id) in ids.iter().enumerate() {
+            let (pos, in_bracket) = (k as i64 / 3, k % 3);
+            let shutter = [0.0025f32, 0.01, 0.04][in_bracket];
+            map.insert(*id, CaptureInfo { iso: Some(100.0), shutter_s: Some(shutter), aperture: Some(2.8), captured_unix_ms: Some(pos * 3_000 + in_bracket as i64 * 100), ..Default::default() });
+        }
+        let caps: Captures = Arc::new(map);
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
+        let pano = g.add_node(NodeKind::Panorama, [0.0, 0.0]);
+        g.connect(src, pano, 0).unwrap();
+        // A Panorama straight on the frames: one sweep of twelve images (gap 5 s), middle = image 6.
+        let r = compute(&g, &ids, &caps, Some(pano));
+        assert_eq!(r.view_groups.iter().map(|(i, n)| (i.0, *n)).collect::<Vec<_>>(), vec![(6, 12)]);
+        assert!(r.view_frames.is_empty(), "no nested groups: frames = images");
+        assert_eq!(stack_tooltip(12, None).as_deref(), Some("12 images"));
+        // HDR Merge in front: the badge counts the four HDR images, the tooltip the twelve frames.
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
+        let hdr = g.add_node(NodeKind::HdrMerge, [0.0, 0.0]);
+        let pano = g.add_node(NodeKind::Panorama, [0.0, 0.0]);
+        let exp = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
+        g.connect(src, hdr, 0).unwrap();
+        g.connect(hdr, pano, 0).unwrap();
+        g.connect(pano, exp, 0).unwrap();
+        for view in [pano, exp] {
+            let r = compute(&g, &ids, &caps, Some(view));
+            assert_eq!(r.view_members.len(), 1);
+            assert_eq!(r.view_groups.iter().map(|(i, n)| (i.0, *n)).collect::<Vec<_>>(), vec![(5, 4)], "the panorama stands for four HDR images");
+            assert_eq!(r.view_frames.iter().map(|(i, n)| (i.0, *n)).collect::<Vec<_>>(), vec![(5, 12)]);
+            let sizes = r.group_sizes();
+            assert_eq!(stack_tooltip(sizes.images[&ImageId(5)], sizes.frames.get(&ImageId(5)).copied()).as_deref(), Some("4 images (12 frames)"));
+        }
+        // Viewing the HDR Merge itself shows its own brackets of three.
+        let r = compute(&g, &ids, &caps, Some(hdr));
+        assert_eq!(r.view_groups.values().copied().collect::<Vec<_>>(), vec![3, 3, 3, 3]);
+        assert!(r.view_frames.is_empty());
+        assert_eq!(stack_tooltip(1, None), None);
     }
 
     const MAX_LAYERS_FOR_TEST: usize = rawgraph_core::MAX_LAYERS;

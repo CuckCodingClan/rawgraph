@@ -351,6 +351,8 @@ struct FrameInfo {
     misses: u64,
     path: RenderPath,
     scope_step: usize,
+    /// Findings of nodes behind the viewed picture (a Panorama's stitching warnings).
+    warnings: Vec<String>,
 }
 
 struct Shot {
@@ -1615,7 +1617,7 @@ impl App {
         }
         // Only a frame dump needs the CPU pixels; they are not kept otherwise.
         self.last_cpu_pixels = (self.cli.dump_frame.is_some() && f.gpu.is_none()).then(|| (f.width, f.height, f.rgba8.clone()));
-        self.frame_info = Some(FrameInfo { width: f.width, height: f.height, eval_ms: f.eval_ms, display_ms: f.display_ms, hits: f.hits, misses: f.misses, path: f.path.clone(), scope_step: f.scope_step });
+        self.frame_info = Some(FrameInfo { width: f.width, height: f.height, eval_ms: f.eval_ms, display_ms: f.display_ms, hits: f.hits, misses: f.misses, path: f.path.clone(), scope_step: f.scope_step, warnings: f.warnings.clone() });
         if let Some(prepared) = f.prepared.clone().filter(|_| !self.compare.active()) {
             let t = Instant::now();
             self.scope_panel.set_prepared(ctx, prepared);
@@ -1745,6 +1747,10 @@ impl App {
                 viewer.set_placeholder(self.quick_generation, tex.clone(), edited_geometry(&self.session, node, image, &tex));
                 self.placeholder_edited = true;
                 self.placeholder_src = "edited thumbnail";
+            } else if self.session.project.graph.has_upstream_kind(node, rawgraph_core::NodeKind::Panorama) {
+                // Behind a Panorama the picture is not the frame of this image (other size and aspect): the
+                // proxy, the camera thumbnail and the embedded preview would show the wrong picture.
+                self.placeholder_src = "none (panorama)";
             } else if let Some(proxy) = provider.cached_proxy(image) {
                 let size = (proxy.width(), proxy.height());
                 let tex = crate::quick_preview::proxy_texture(ctx, &proxy, self.session.view.transform());
@@ -1772,6 +1778,7 @@ impl App {
         }
         for (generation, pixels, source) in self.quick_preview.poll() {
             if generation != self.quick_generation || !viewer.awaiting_final() || self.placeholder_edited { continue; }
+            if self.session.project.graph.has_upstream_kind(node, rawgraph_core::NodeKind::Panorama) { continue; }
             let [w, h] = pixels.size;
             let size = crate::quick_preview::estimate_proxy_size(&self.session.provider, image, (w as u32, h as u32));
             let tex = ctx.load_texture("embedded selection preview", pixels, egui::TextureOptions::LINEAR);
@@ -2870,6 +2877,8 @@ impl App {
                     ui.label(RichText::new(text).color(color));
                 } else if let Some(err) = &self.last_error {
                     ui.label(RichText::new(err).color(egui::Color32::from_rgb(255, 150, 120)));
+                } else if let Some((text, all)) = self.frame_info.as_ref().and_then(|f| crate::render::warning_line(&f.warnings)) {
+                    ui.label(RichText::new(text).color(egui::Color32::from_rgb(255, 190, 90))).on_hover_text(all);
                 } else if let Some(first) = self.status.notes().first() {
                     let more = self.status.notes().len() - 1;
                     let text = if more > 0 { format!("Migrated graph: {first} (+{more} more)") } else { format!("Migrated graph: {first}") };
@@ -3160,7 +3169,7 @@ Click to dismiss")).clicked();
                     self.session.entry(id).is_some_and(|e| rawgraph_core::path_in_folder(&e.path.to_string_lossy(), &folder, recursive))
                 }).collect::<std::collections::HashSet<_>>());
             let members = immediate.as_ref().or_else(|| Self::gallery_members(self.gallery_result.as_ref(), target));
-            let groups = self.gallery_result.as_ref().filter(|r| r.view_node.is_some() && r.view_node == target.node).map(|r| &r.view_groups);
+            let groups = self.gallery_result.as_ref().filter(|r| r.view_node.is_some() && r.view_node == target.node).map(|r| r.group_sizes());
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.filmstrip.show(ui, &mut self.session, target, members, groups));
             if let Some(job) = self.scan.as_ref().filter(|j| j.listed && (members.is_some() || target.node.is_none())) {
                 job.prioritize(self.filmstrip.scan_wanted(), self.filmstrip.scan_thumbs_ready());

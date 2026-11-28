@@ -48,6 +48,7 @@ impl View {
             gpu: None,
             path: crate::gpu_path::RenderPath::cpu("test"),
             notice: None,
+            warnings: Vec::new(),
             scope_step: 1,
             display: Arc::new(rawgraph_scopes::DisplayTransform::default().apply(&img)),
             prepared: None,

@@ -8,22 +8,25 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::capture::CaptureInfo;
-use crate::graph::ImageId;
+use crate::graph::{ImageId, NodeKind};
 
-/// Largest group size the settings accept.
-pub const GROUP_MAX_SIZE: usize = 25;
+/// Largest group size any kind of group accepts (every kind has its own, smaller or equal limit,
+/// see [`GroupKindSpec::max_size`]).
+pub const GROUP_MAX_SIZE: usize = 60;
 /// Smallest group size the settings accept.
 pub const GROUP_MIN_SIZE: usize = 2;
-/// Largest time gap (seconds) the settings accept.
-pub const GROUP_MAX_GAP_S: f32 = 60.0;
+/// Largest time gap (seconds) any kind of group accepts.
+pub const GROUP_MAX_GAP_S: f32 = 120.0;
 /// EVs closer than this (stops) count as the same exposure.
 const SAME_EV: f32 = 0.15;
 /// A bracket needs at least this many stops between its darkest and brightest frame; a series
 /// with less (a burst at one exposure) stays single images.
 pub const MIN_BRACKET_SPREAD_EV: f32 = 0.7;
 
-/// Option labels of the rule, in [`GroupRule`] order.
+/// Option labels of the HDR Merge rule list (the order of its [`GroupKindSpec::rules`]).
 pub const GROUP_RULES: [&str; 4] = ["Capture time", "Bracket", "Manual", "Whole collection"];
+/// Option labels of the Panorama rule list (no Bracket).
+pub const PANORAMA_GROUP_RULES: [&str; 3] = ["Capture time", "Manual", "Whole collection"];
 
 /// How a collection is cut into groups.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -38,14 +41,36 @@ pub enum GroupRule {
     Whole,
 }
 
-impl GroupRule {
-    pub fn from_index(i: usize) -> GroupRule {
-        match i {
-            0 => GroupRule::CaptureTime,
-            2 => GroupRule::Manual,
-            3 => GroupRule::Whole,
-            _ => GroupRule::Bracket,
-        }
+/// What a node that cuts its input collection into groups (one output image per group) needs to know.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupKindSpec {
+    /// Which member stands for the group (the output keeps its identity).
+    pub reference: Reference,
+    /// The rules the node offers, in the order of its "Group by" option list.
+    pub rules: &'static [GroupRule],
+    /// The rule a fresh node starts with.
+    pub default_rule: GroupRule,
+    /// Largest group size the node accepts.
+    pub max_size: usize,
+}
+
+impl GroupKindSpec {
+    /// The rule behind option `index` of the node's own list; an index outside the list gives the default.
+    pub fn rule(&self, index: usize) -> GroupRule {
+        self.rules.get(index).copied().unwrap_or(self.default_rule)
+    }
+}
+
+const HDR_RULES: &[GroupRule] = &[GroupRule::CaptureTime, GroupRule::Bracket, GroupRule::Manual, GroupRule::Whole];
+const PANORAMA_RULES: &[GroupRule] = &[GroupRule::CaptureTime, GroupRule::Manual, GroupRule::Whole];
+
+/// The group description of a node kind; `None` for kinds that do not make groups (HDR Merge and
+/// Panorama do).
+pub fn group_kind(kind: NodeKind) -> Option<GroupKindSpec> {
+    match kind {
+        NodeKind::HdrMerge => Some(GroupKindSpec { reference: Reference::MiddleExposure, rules: HDR_RULES, default_rule: GroupRule::Bracket, max_size: 25 }),
+        NodeKind::Panorama => Some(GroupKindSpec { reference: Reference::Middle, rules: PANORAMA_RULES, default_rule: GroupRule::CaptureTime, max_size: 25 }),
+        _ => None,
     }
 }
 
@@ -65,7 +90,7 @@ impl Default for GroupSettings {
 /// Which member represents a group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reference {
-    /// The member with the median exposure value (HDR).
+    /// The member with the median exposure value (HDR Merge).
     MiddleExposure,
     /// The middle member in group order (panorama).
     Middle,

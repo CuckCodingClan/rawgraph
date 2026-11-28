@@ -196,7 +196,7 @@ impl Filmstrip {
         });
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, session: &mut Session, mut target: ViewerTarget, members: Option<&std::collections::HashSet<rawgraph_core::ImageId>>, groups: Option<&std::collections::HashMap<rawgraph_core::ImageId, usize>>) {
+    pub fn show(&mut self, ui: &mut egui::Ui, session: &mut Session, mut target: ViewerTarget, members: Option<&std::collections::HashSet<rawgraph_core::ImageId>>, groups: Option<crate::collection::GroupSizes>) {
         self.scan_wanted.clear();
         self.scan_hash_pending = false;
         session.reconcile_image_selection();
@@ -277,8 +277,9 @@ impl Filmstrip {
                     for &id in ids.iter().skip(row * columns).take(columns) {
                         if let Some(entry) = session.entry(id).cloned() {
                             let tex = self.live.texture(id).or_else(|| self.thumbs.texture(id));
-                            let stack = groups.and_then(|g| g.get(&id)).copied().unwrap_or(1);
-                            let resp = draw_row(ui, width, &entry, target.image == Some(id) || multi.contains(&id), tex.as_ref(), self.thumbs.has_failed(id), false, stack);
+                            let stack = groups.and_then(|g| g.images.get(&id)).copied().unwrap_or(1);
+                            let tip = groups.and_then(|g| crate::collection::stack_tooltip(stack, g.frames.get(&id).copied()));
+                            let resp = draw_row(ui, width, &entry, target.image == Some(id) || multi.contains(&id), tex.as_ref(), self.thumbs.has_failed(id), false, stack, tip);
                             if self.live.stale(id) {
                                 ui.painter().circle_filled(resp.rect.right_top() + egui::vec2(-8.0, 8.0), 2.5, Color32::from_rgb(255, 184, 77));
                             }
@@ -369,7 +370,7 @@ impl Filmstrip {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_row(ui: &mut egui::Ui, width: f32, e: &ImageEntry, selected: bool, tex: Option<&egui::TextureHandle>, failed: bool, dim: bool, stack: usize) -> egui::Response {
+fn draw_row(ui: &mut egui::Ui, width: f32, e: &ImageEntry, selected: bool, tex: Option<&egui::TextureHandle>, failed: bool, dim: bool, stack: usize, stack_tip: Option<String>) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H - 2.0), Sense::click());
     let name = display_name(e);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Image {name}")));
@@ -447,10 +448,11 @@ fn draw_row(ui: &mut egui::Ui, width: f32, e: &ImageEntry, selected: bool, tex: 
             painter.text(Pos2::new(rect.max.x - 6.0, y1 + 17.0), Align2::RIGHT_CENTER, text, FontId::proportional(11.5), Color32::from_gray(140));
         }
     }
-    if line.shown == name {
-        resp
-    } else {
-        resp.on_hover_text(name)
+    match (line.shown == name, stack_tip) {
+        (true, None) => resp,
+        (true, Some(tip)) => resp.on_hover_text(tip),
+        (false, None) => resp.on_hover_text(name),
+        (false, Some(tip)) => resp.on_hover_text(format!("{name}\n{tip}")),
     }
 }
 
