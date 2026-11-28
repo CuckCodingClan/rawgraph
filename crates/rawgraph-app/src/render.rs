@@ -1129,6 +1129,7 @@ pub fn describe_error(graph: &Graph, e: &EvalError) -> String {
         EvalError::UnknownNode(n) => format!("Node {} does not exist", n.0),
         EvalError::Provider(msg) if msg.starts_with("File not found") => msg.clone(),
         EvalError::Provider(msg) => format!("Could not load the image: {msg}"),
+        EvalError::Failed { message, .. } => message.clone(),
         EvalError::Cancelled => "Evaluation was cancelled".to_owned(),
     }
 }

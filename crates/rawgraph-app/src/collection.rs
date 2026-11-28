@@ -86,6 +86,9 @@ pub struct CollectionResult {
     pub merges: HashMap<NodeId, MergeStats>,
     pub splits: HashMap<NodeId, SplitStats>,
     pub layers: HashMap<NodeId, LayerStats>,
+    /// Size of the image group each image of the viewed node stands for, when an HDR Merge at or above
+    /// the viewed node makes groups (references only; singletons are left out).
+    pub view_groups: HashMap<ImageId, usize>,
     pub millis: f32,
 }
 
@@ -106,7 +109,7 @@ fn node_members(graph: &Graph, catalog: &Catalog, node: NodeId, kind: NodeKind) 
 
 pub fn view_members(graph: &Graph, ids: &[ImageId], captures: &Captures, view_node: NodeId) -> HashSet<ImageId> {
     let capture = |i: ImageId| captures.get(&i).cloned();
-    let catalog = Catalog { images: ids, capture: &capture };
+    let catalog = Catalog { images: ids, capture: &capture, memo: None };
     graph.node(view_node).into_iter().flat_map(|node| node_members(graph, &catalog, node.id, node.kind)).collect()
 }
 
@@ -115,7 +118,7 @@ pub fn view_members(graph: &Graph, ids: &[ImageId], captures: &Captures, view_no
 pub fn compute(graph: &Graph, ids: &[ImageId], captures: &Captures, view_node: Option<NodeId>) -> CollectionResult {
     let started = Instant::now();
     let capture = |i: ImageId| captures.get(&i).cloned();
-    let catalog = Catalog { images: ids, capture: &capture };
+    let catalog = Catalog { images: ids, capture: &capture, memo: None };
     let mut r = CollectionResult { view_node, ..Default::default() };
     for node in graph.nodes() {
         let own = node_members(graph, &catalog, node.id, node.kind);
@@ -123,6 +126,14 @@ pub fn compute(graph: &Graph, ids: &[ImageId], captures: &Captures, view_node: O
         r.counts.insert(node.id, n);
         if view_node == Some(node.id) {
             r.view_members = own.iter().copied().collect();
+            if let Some(hdr) = graph.upstream_hdr_merge(node.id) {
+                r.view_groups = graph
+                    .image_groups(hdr, &catalog)
+                    .into_iter()
+                    .filter(|g| g.members.len() > 1 && r.view_members.contains(&g.reference))
+                    .map(|g| (g.reference, g.members.len()))
+                    .collect();
+            }
         }
         match node.kind {
             NodeKind::MetadataFilter => {
@@ -426,7 +437,7 @@ pub mod tests {
     fn counts_are_the_catalog_members_for_folders_merges_and_layers() {
         let (ids, caps) = path_catalog(6);
         let capture = |i: ImageId| caps.get(&i).cloned();
-        let catalog = Catalog { images: &ids, capture: &capture };
+        let catalog = Catalog { images: &ids, capture: &capture, memo: None };
         let mut g = Graph::new();
         let a = folder_source(&mut g, "D:/photos/a", true);
         let b = folder_source(&mut g, "D:\\photos\\B\\", false);
@@ -465,6 +476,35 @@ pub mod tests {
         }
         assert_eq!(l.sources(ImageId(99_999)), None, "an image outside the output has no pairing");
         assert_eq!(r.view_members.len(), 6, "the viewed node's members");
+    }
+
+    #[test]
+    fn hdr_merge_groups_are_counted_and_labelled_downstream() {
+        // Two brackets of three and a lone image.
+        let shutters = [0.25f32, 1.0, 4.0, 0.25, 1.0, 4.0, 1.0];
+        let ids: Vec<ImageId> = (1..=7).map(ImageId).collect();
+        let mut map = HashMap::new();
+        for (k, id) in ids.iter().enumerate() {
+            let time = if k < 3 { Some(k as i64 * 400) } else if k < 6 { Some(30_000 + k as i64 * 400) } else { None };
+            map.insert(*id, CaptureInfo { iso: Some(100.0), shutter_s: Some(shutters[k]), aperture: Some(1.0), captured_unix_ms: time, ..Default::default() });
+        }
+        let caps: Captures = Arc::new(map);
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
+        let hdr = g.add_node(NodeKind::HdrMerge, [0.0, 0.0]);
+        let exp = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
+        g.connect(src, hdr, 0).unwrap();
+        g.connect(hdr, exp, 0).unwrap();
+        for view in [hdr, exp] {
+            let r = compute(&g, &ids, &caps, Some(view));
+            assert_eq!(r.counts[&hdr], 3, "two groups and one single image");
+            assert_eq!(r.view_members.len(), 3);
+            let mut groups: Vec<_> = r.view_groups.iter().map(|(i, n)| (i.0, *n)).collect();
+            groups.sort();
+            assert_eq!(groups, vec![(2, 3), (5, 3)], "references of the brackets; the single image has no badge");
+        }
+        // Upstream of the merge nothing is stacked.
+        assert!(compute(&g, &ids, &caps, Some(src)).view_groups.is_empty());
     }
 
     const MAX_LAYERS_FOR_TEST: usize = rawgraph_core::MAX_LAYERS;

@@ -229,6 +229,7 @@ fn real_main() -> Result<(), String> {
                 ItemStatus::Failed(m) => format!("FAILED {m}"),
                 ItemStatus::Cancelled => "cancelled".into(),
                 ItemStatus::Excluded => "excluded".into(),
+                ItemStatus::MergedInto(r) => format!("merged into image {}", r.0),
             };
             let cap = p.last.as_ref().and_then(|(id, _)| caps.get(&id.0)).cloned().flatten();
             let iso = cap.as_ref().and_then(|c| c.iso).map_or("?".to_string(), |v| format!("{v:.0}"));

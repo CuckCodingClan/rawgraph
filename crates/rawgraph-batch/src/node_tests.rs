@@ -1214,3 +1214,23 @@ fn the_keyword_measure_of_a_filter_sees_the_items_keywords() {
     let status: Vec<bool> = r.run().items.iter().map(|(_, s)| matches!(s, ItemStatus::Written { .. })).collect();
     assert_eq!(status, [false, true, false], "does not contain");
 }
+
+#[test]
+fn hdr_members_are_reported_as_merged_into_their_reference_not_as_excluded() {
+    let mut r = Rig::new(&[("a.png", 8, 8, [10, 10, 10]), ("b.png", 8, 8, [20, 20, 20]), ("c.png", 8, 8, [40, 40, 40])]);
+    let hdr = r.g.add_node(NodeKind::HdrMerge, [0.0; 2]);
+    r.g.disconnect(r.exp, 0);
+    r.g.connect(r.src, hdr, 0).expect("connect");
+    r.g.connect(hdr, r.exp, 0).expect("connect");
+    r.g.node_mut(hdr).expect("hdr").set_param("group_by", A, 3.0); // whole collection: one group, no metadata needed
+    r.p("format", 1.0);
+    let rep = r.run();
+    // No capture times or exposure values: the middle image in input order (2) stands for the group.
+    assert_eq!(rep.items[0].1, ItemStatus::MergedInto(ImageId(2)));
+    assert_eq!(rep.items[2].1, ItemStatus::MergedInto(ImageId(2)));
+    assert!(!matches!(rep.items[1].1, ItemStatus::Excluded | ItemStatus::MergedInto(_)), "{:?}", rep.items[1]);
+    assert_eq!(rep.merged(), 2);
+    assert_eq!(rep.excluded(), 0);
+    let sel: Vec<ExportItem> = r.catalog.clone();
+    assert!(rep.retry_items(&sel).len() <= 1, "merged images are not retried");
+}

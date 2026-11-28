@@ -196,7 +196,7 @@ impl Filmstrip {
         });
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, session: &mut Session, mut target: ViewerTarget, members: Option<&std::collections::HashSet<rawgraph_core::ImageId>>) {
+    pub fn show(&mut self, ui: &mut egui::Ui, session: &mut Session, mut target: ViewerTarget, members: Option<&std::collections::HashSet<rawgraph_core::ImageId>>, groups: Option<&std::collections::HashMap<rawgraph_core::ImageId, usize>>) {
         self.scan_wanted.clear();
         self.scan_hash_pending = false;
         session.reconcile_image_selection();
@@ -277,7 +277,8 @@ impl Filmstrip {
                     for &id in ids.iter().skip(row * columns).take(columns) {
                         if let Some(entry) = session.entry(id).cloned() {
                             let tex = self.live.texture(id).or_else(|| self.thumbs.texture(id));
-                            let resp = draw_row(ui, width, &entry, target.image == Some(id) || multi.contains(&id), tex.as_ref(), self.thumbs.has_failed(id), false);
+                            let stack = groups.and_then(|g| g.get(&id)).copied().unwrap_or(1);
+                            let resp = draw_row(ui, width, &entry, target.image == Some(id) || multi.contains(&id), tex.as_ref(), self.thumbs.has_failed(id), false, stack);
                             if self.live.stale(id) {
                                 ui.painter().circle_filled(resp.rect.right_top() + egui::vec2(-8.0, 8.0), 2.5, Color32::from_rgb(255, 184, 77));
                             }
@@ -367,7 +368,8 @@ impl Filmstrip {
     }
 }
 
-fn draw_row(ui: &mut egui::Ui, width: f32, e: &ImageEntry, selected: bool, tex: Option<&egui::TextureHandle>, failed: bool, dim: bool) -> egui::Response {
+#[allow(clippy::too_many_arguments)]
+fn draw_row(ui: &mut egui::Ui, width: f32, e: &ImageEntry, selected: bool, tex: Option<&egui::TextureHandle>, failed: bool, dim: bool, stack: usize) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, ROW_H - 2.0), Sense::click());
     let name = display_name(e);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Image {name}")));
@@ -422,6 +424,9 @@ fn draw_row(ui: &mut egui::Ui, width: f32, e: &ImageEntry, selected: bool, tex: 
         painter.rect_filled(b, 3.0, Color32::from_rgb(160, 110, 30));
         painter.text(b.center(), Align2::CENTER_CENTER, "JPEG", FontId::proportional(10.5), Color32::WHITE);
     }
+    if stack > 1 {
+        draw_stack_badge(&painter, img_rect, stack);
+    }
     // Text lines: name, then rating.
     let y1 = img_rect.max.y + 10.0;
     let text_color = if dim { Color32::from_gray(110) } else { Color32::from_gray(228) };
@@ -447,6 +452,19 @@ fn draw_row(ui: &mut egui::Ui, width: f32, e: &ImageEntry, selected: bool, tex: 
     } else {
         resp.on_hover_text(name)
     }
+}
+
+/// Stack badge at the bottom right of a thumbnail: two offset frames and the number of images
+/// the picture stands for (an HDR Merge group).
+pub(crate) fn draw_stack_badge(painter: &egui::Painter, img_rect: Rect, count: usize) {
+    let text = count.to_string();
+    let w = text_width(painter, &text, &FontId::proportional(11.0)).max(8.0) + 14.0;
+    let b = Rect::from_min_size(Pos2::new(img_rect.max.x - w - 4.0, img_rect.max.y - 19.0), Vec2::new(w, 15.0));
+    let back = b.translate(Vec2::new(-3.0, -3.0));
+    painter.rect_stroke(back, 3.0, Stroke::new(1.0, Color32::from_gray(150)), StrokeKind::Inside);
+    painter.rect_filled(b, 3.0, Color32::from_rgb(40, 90, 150));
+    painter.rect_stroke(b, 3.0, Stroke::new(1.0, Color32::from_gray(210)), StrokeKind::Inside);
+    painter.text(b.center(), Align2::CENTER_CENTER, text, FontId::proportional(11.0), Color32::WHITE);
 }
 
 const NAME_FONT: FontId = FontId::proportional(12.5);

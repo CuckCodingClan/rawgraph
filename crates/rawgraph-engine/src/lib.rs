@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rawgraph_core::{
-    cdl_params, color, curve_set, develop_settings, develop_tone, iso_noise_scale, layer_settings, ops, CaptureInfo, Catalog, CdlParams,
+    cdl_params, color, curve_set, develop_settings, develop_tone, group_exposure_evs, iso_noise_scale, layer_settings, ops, CaptureInfo, Catalog, CdlParams, QueryMemo,
     DevelopSettings, DevelopTone, Graph, ImageBuf, ImageId, LayerSettings, LensProfile, MaskBuf, NodeData, NodeId, NodeKind, PortType,
     MAX_LAYERS,
 };
@@ -65,6 +65,8 @@ pub enum EvalError {
     /// Connected value has the wrong type.
     WrongType { node: NodeId, port: usize },
     Provider(String),
+    /// A node could not compute its result (for example an HDR Merge of images that differ in size).
+    Failed { node: NodeId, message: String },
     /// The image is filtered out before it reaches `node`.
     NotInCollection { node: NodeId },
     Cancelled,
@@ -81,6 +83,7 @@ impl fmt::Display for EvalError {
                 write!(f, "node {}: input {} received a value of the wrong type", node.0, port)
             }
             EvalError::Provider(e) => write!(f, "could not load image: {e}"),
+            EvalError::Failed { node, message } => write!(f, "node {}: {message}", node.0),
             EvalError::NotInCollection { node } => {
                 write!(f, "this image is not part of the collection at node {}", node.0)
             }
@@ -162,6 +165,8 @@ struct Env<'a> {
     images: &'a [ImageId],
     view_tone: ToneMap,
     control: bool,
+    /// Collection answers shared by every query of this evaluation (group plans below HDR Merge nodes, captures).
+    memo: &'a QueryMemo,
 }
 
 impl Env<'_> {
@@ -170,7 +175,7 @@ impl Env<'_> {
     /// Runs `f` with the catalog of this environment.
     fn cat<R>(&self, f: impl FnOnce(&Catalog) -> R) -> R {
         let capture = |i: ImageId| self.provider.capture(i);
-        let catalog = Catalog { images: self.images, capture: &capture };
+        let catalog = Catalog { images: self.images, capture: &capture, memo: Some(self.memo) };
         f(&catalog)
     }
 
@@ -211,7 +216,7 @@ impl Evaluator {
     /// Pixel-free cache identity for a node and one image, using the same inputs as evaluation.
     pub fn fingerprint(&self, graph: &Graph, node: NodeId, image: ImageId, provider: &dyn ImageProvider) -> Result<u64, EvalError> {
         let images = provider.images();
-        let env = Env { provider, images: &images, view_tone: self.view_tone, control: false };
+        let env = Env { provider, images: &images, view_tone: self.view_tone, control: false, memo: &QueryMemo::default() };
         node_fingerprint(graph, node, image, &env, &mut FingerprintMemo::new(), &mut Vec::new())
     }
 
@@ -226,7 +231,7 @@ impl Evaluator {
         cancel: &CancelToken,
     ) -> Result<Value, EvalError> {
         let images = provider.images();
-        self.eval_env(graph, node, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false }, cancel)
+        self.eval_env(graph, node, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false, memo: &QueryMemo::default() }, cancel)
     }
 
     fn eval_env(&mut self, graph: &Graph, node: NodeId, image: ImageId, env: &Env, cancel: &CancelToken) -> Result<Value, EvalError> {
@@ -246,7 +251,7 @@ impl Evaluator {
         cancel: &CancelToken,
     ) -> Result<Value, EvalError> {
         let images = provider.images();
-        self.eval_output_env(graph, node, port, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false }, cancel)
+        self.eval_output_env(graph, node, port, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false, memo: &QueryMemo::default() }, cancel)
     }
 
     fn eval_output_env(
@@ -332,7 +337,7 @@ impl Evaluator {
 
     fn plan_tail_mode(&self, graph: &Graph, node: NodeId, image: ImageId, provider: &dyn ImageProvider, gpu: bool) -> Result<TailPlan, EvalError> {
         let images = provider.images();
-        let env = Env { provider, images: &images, view_tone: self.view_tone, control: false };
+        let env = Env { provider, images: &images, view_tone: self.view_tone, control: false, memo: &QueryMemo::default() };
         if !env.viewing_member(graph, node, image) {
             return Err(not_a_member_error(graph, node));
         }
@@ -406,7 +411,7 @@ impl Evaluator {
         cancel: &CancelToken,
     ) -> Result<Arc<ImageBuf>, EvalError> {
         let images = provider.images();
-        let env = Env { provider, images: &images, view_tone: self.view_tone, control: false };
+        let env = Env { provider, images: &images, view_tone: self.view_tone, control: false, memo: &QueryMemo::default() };
         if plan.base_before_tone {
             if !env.contains_output(graph, plan.base, plan.base_port, image) {
                 return Err(not_a_member_error(graph, plan.base));
@@ -426,20 +431,20 @@ impl Evaluator {
     /// True if `image` leaves output `port` of `node` (metadata only).
     pub fn contains_output(&self, graph: &Graph, node: NodeId, port: usize, image: ImageId, provider: &dyn ImageProvider) -> bool {
         let images = provider.images();
-        Env { provider, images: &images, view_tone: self.view_tone, control: false }.contains_output(graph, node, port, image)
+        Env { provider, images: &images, view_tone: self.view_tone, control: false, memo: &QueryMemo::default() }.contains_output(graph, node, port, image)
     }
 
     /// True if `image` is part of the collection `node` outputs (metadata only).
     pub fn contains(&self, graph: &Graph, node: NodeId, image: ImageId, provider: &dyn ImageProvider) -> bool {
         let images = provider.images();
-        Env { provider, images: &images, view_tone: self.view_tone, control: false }.cat(|c| graph.contains_in(node, image, c))
+        Env { provider, images: &images, view_tone: self.view_tone, control: false, memo: &QueryMemo::default() }.cat(|c| graph.contains_in(node, image, c))
     }
 
     /// Evaluate the same auxiliary image used by a consumer, including output
     /// aliases, singleton fallback, and Generator data interpretation.
     pub fn eval_control_image(&mut self, graph: &Graph, node: NodeId, port: usize, image: ImageId, provider: &dyn ImageProvider, cancel: &CancelToken) -> Result<Option<Arc<ImageBuf>>, EvalError> {
         let images = provider.images();
-        let env = Env { provider, images: &images, view_tone: self.view_tone, control: true };
+        let env = Env { provider, images: &images, view_tone: self.view_tone, control: true, memo: &QueryMemo::default() };
         if !graph.node(node).is_some_and(|n| n.is_control_input(port)) { return Ok(None); }
         let Some((up, output, image)) = env.control_edge(graph, node, port, image) else { return Ok(None) };
         let (_, value) = self.eval_node(graph, up, image, &env, cancel, &mut Vec::new(), &mut FingerprintMemo::new())?;
@@ -452,7 +457,7 @@ impl Evaluator {
     /// Order depends on the node: catalog for Source, driver for Layer, ports for Merge.
     pub fn members(&self, graph: &Graph, node: NodeId, port: usize, provider: &dyn ImageProvider) -> Vec<ImageId> {
         let images = provider.images();
-        Env { provider, images: &images, view_tone: self.view_tone, control: false }.cat(|c| graph.members(node, port, c))
+        Env { provider, images: &images, view_tone: self.view_tone, control: false, memo: &QueryMemo::default() }.cat(|c| graph.members(node, port, c))
     }
 
     /// When `false`, only the requested node's result stays cached after `eval`
@@ -474,7 +479,7 @@ impl Evaluator {
         cancel: &CancelToken,
     ) -> Result<Arc<ImageBuf>, EvalError> {
         let images = provider.images();
-        self.eval_image_env(graph, node, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false }, cancel)
+        self.eval_image_env(graph, node, image, &Env { provider, images: &images, view_tone: self.view_tone, control: false, memo: &QueryMemo::default() }, cancel)
     }
 
     fn eval_image_env(&mut self, graph: &Graph, node: NodeId, image: ImageId, env: &Env, cancel: &CancelToken) -> Result<Arc<ImageBuf>, EvalError> {
@@ -494,7 +499,7 @@ impl Evaluator {
         progress: &mut dyn FnMut(usize, usize),
     ) -> Vec<(ImageId, Result<Arc<ImageBuf>, EvalError>)> {
         let catalog = provider.images();
-        let env = Env { provider, images: &catalog, view_tone: self.view_tone, control: false };
+        let env = Env { provider, images: &catalog, view_tone: self.view_tone, control: false, memo: &QueryMemo::default() };
         let listed: HashSet<ImageId> = images.iter().copied().collect();
         let total = images.len();
         let mut out = Vec::with_capacity(total);
@@ -655,6 +660,9 @@ impl Evaluator {
         let fingerprint = node_fingerprint(graph, id, image, env, memo, &mut Vec::new())?;
         if node.kind == NodeKind::Layer {
             return self.eval_layer(graph, node, image, fingerprint, env, cancel, visiting);
+        }
+        if node.kind == NodeKind::HdrMerge {
+            return self.eval_group(graph, node, image, fingerprint, env, cancel, visiting);
         }
         let chosen = if node.kind == NodeKind::Merge {
             Some(env.cat(|c| graph.merge_source_in(id, image, c)).ok_or(EvalError::NotInCollection { node: id })?)
@@ -905,6 +913,81 @@ impl Evaluator {
         Ok((fingerprint, value))
     }
 
+    /// HDR Merge: the output image is the reference of an image group; every member is evaluated
+    /// through the input (one after the other, each with its own fingerprint memo), then merged.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_group(
+        &mut self,
+        graph: &Graph,
+        node: &rawgraph_core::Node,
+        image: ImageId,
+        fingerprint: u64,
+        env: &Env,
+        cancel: &CancelToken,
+        visiting: &mut Vec<NodeId>,
+    ) -> Result<(u64, Value), EvalError> {
+        let key: Key = (node.id, image, env.control);
+        if let Some(entry) = self.cache.get(&key) {
+            if entry.fingerprint == fingerprint {
+                self.hits += 1;
+                if let Some(hit) = self.timing_hit.last_mut() { *hit = true; }
+                return Ok((fingerprint, entry.value.clone()));
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(EvalError::Cancelled);
+        }
+        let group = env.cat(|c| graph.image_group(node.id, image, c)).ok_or(EvalError::NotInCollection { node: node.id })?;
+        // The frames are held once: each member's cache entries (and its pre-tone base) go as soon as
+        // the member is evaluated (lean mode), so only this list and, at the end, the result stay.
+        let mut frames: Vec<Arc<ImageBuf>> = Vec::with_capacity(group.members.len());
+        for &member in &group.members {
+            if cancel.is_cancelled() {
+                return Err(EvalError::Cancelled);
+            }
+            // Fingerprints are per image, so a member gets its own memo.
+            let (up, up_port) = env.input_edge(graph, node.id, 0, member).ok_or(EvalError::MissingInput { node: node.id, port: 0 })?;
+            let mut memo = FingerprintMemo::new();
+            let (_, value) = self.eval_node(graph, up, member, env, cancel, visiting, &mut memo)?;
+            self.release(&[up], member);
+            let Value::Images(img) = output_value(graph, up, up_port, value);
+            frames.push(img);
+        }
+        if cancel.is_cancelled() {
+            return Err(EvalError::Cancelled);
+        }
+        let reference = group.members.iter().position(|m| *m == group.reference).unwrap_or(0);
+        let value = if frames.len() == 1 {
+            Value::Images(frames.swap_remove(0))
+        } else {
+            let captures: Vec<Option<CaptureInfo>> = group.members.iter().map(|&m| env.provider.capture(m)).collect();
+            let meta = group_exposure_evs(&captures.iter().map(Option::as_ref).collect::<Vec<_>>());
+            let params = fx::HdrParams {
+                measured: node.choice("exposure", image) == 0,
+                align: node.toggle("align", image),
+                max_shift_pct: node.param("max_shift_pct", image),
+                deghost: node.param("deghost", image),
+                clip: node.param("clip", image),
+                // Without exposure values for every member the planned reference is only the middle
+                // one in capture order: express the result at the median measured exposure instead
+                // (the output keeps the identity of the planned reference).
+                median_exposure: meta.iter().any(Option::is_none),
+            };
+            let refs: Vec<&ImageBuf> = frames.iter().map(|f| f.as_ref()).collect();
+            let cancelled = || cancel.is_cancelled();
+            // Notes ("alignment unsure ...") have no place in the evaluation result yet; they are dropped.
+            let merged = fx::merge_hdr_ex(&refs, reference, &meta, &params, &cancelled, &mut Vec::new()).map_err(|e| match e {
+                fx::HdrError::Cancelled => EvalError::Cancelled,
+                fx::HdrError::Failed(message) => EvalError::Failed { node: node.id, message },
+            })?;
+            Value::Images(Arc::new(merged))
+        };
+        drop(frames);
+        self.misses += 1;
+        self.cache.insert(key, Entry { fingerprint, value: value.clone() });
+        Ok((fingerprint, value))
+    }
+
     /// Evaluates the input of layer `layer` for the image `src` it contributes.
     #[allow(clippy::too_many_arguments)]
     fn eval_layer_input(
@@ -931,6 +1014,7 @@ impl Evaluator {
     fn release(&mut self, nodes: &[NodeId], image: ImageId) {
         if !self.keep_intermediates {
             self.cache.retain(|(n, im, _), _| *im != image || !nodes.contains(n));
+            self.pre_tone.retain(|(n, im, _), _| *im != image || !nodes.contains(n));
         }
     }
 }
@@ -1263,6 +1347,33 @@ fn node_fingerprint_inner(
         return Ok(hasher.finish());
     }
 
+    if node.kind == NodeKind::HdrMerge {
+        // The group members are evaluated through the input, each as its own image.
+        let group = env.cat(|c| graph.image_group(id, image, c)).ok_or(EvalError::NotInCollection { node: id })?;
+        group.reference.hash(&mut hasher);
+        for &member in &group.members {
+            let (up, up_port) = env.input_edge(graph, id, 0, member).ok_or(EvalError::MissingInput { node: id, port: 0 })?;
+            if graph.node(up).and_then(|u| u.kind.output()) != Some(PortType::Images) {
+                return Err(EvalError::WrongType { node: id, port: 0 });
+            }
+            up_port.hash(&mut hasher);
+            output_channel(graph.node(up).unwrap(), up_port).hash(&mut hasher);
+            member.hash(&mut hasher);
+            // The merge never looks at the full-resolution size (decoding it for every member of a
+            // batch would load all of them up front); the revision covers proxy changes.
+            provider.revision(member).hash(&mut hasher);
+            // Exposure ratios may come from the metadata (which of the members have an exposure value
+            // decides whether the output keeps the reference exposure).
+            let capture = provider.capture(member);
+            capture.as_ref().and_then(|c| c.shutter_s).map(f32::to_bits).hash(&mut hasher);
+            capture.as_ref().and_then(|c| c.iso).map(f32::to_bits).hash(&mut hasher);
+            capture.as_ref().and_then(|c| c.aperture).map(f32::to_bits).hash(&mut hasher);
+            let fp = node_fingerprint(graph, up, member, env, &mut FingerprintMemo::new(), visiting)?;
+            fp.hash(&mut hasher);
+        }
+        return Ok(hasher.finish());
+    }
+
     let specs = node.kind.inputs();
     for (port, spec) in specs.iter().enumerate() {
         if chosen.is_some_and(|c| c != port) { continue; }
@@ -1493,7 +1604,7 @@ fn tail_step(graph: &Graph, node: &rawgraph_core::Node, image: ImageId, provider
     let id = node.id;
     let param = |name: &str| node.param(name, image);
     let images = provider.images();
-    let env = Env { provider, images: &images, view_tone: ToneMap::AcesFit, control: false }; // membership only
+    let env = Env { provider, images: &images, view_tone: ToneMap::AcesFit, control: false, memo: &QueryMemo::default() }; // membership only
     let masked = (0..node.kind.inputs().len() + node.exposed_inputs().len()).any(|port| node.is_control_input(port) && env.control_edge(graph, id, port, image).is_some());
     match node.kind {
         NodeKind::Output | NodeKind::Export | NodeKind::MetadataFilter | NodeKind::MetadataSplit | NodeKind::Merge => {
@@ -1938,7 +2049,7 @@ fn compute(
             Ok(if ev == 0.0 { Value::Images(src) } else { modified(&src, |img| ops::apply_gain(img, ev.exp2())) })
         }
         // Develop is computed by `Evaluator::compute_develop` (pre-tone cache), Layer by `Evaluator::eval_layer`.
-        NodeKind::Develop | NodeKind::Layer => Err(EvalError::MissingInput { node: id, port: 0 }),
+        NodeKind::Develop | NodeKind::Layer | NodeKind::HdrMerge => Err(EvalError::MissingInput { node: id, port: 0 }),
         NodeKind::WhiteBalance => {
             let src = input_image(inputs, 0, id)?;
             let (temp, tint) = (param("temp"), param("tint"));
@@ -2418,7 +2529,7 @@ mod tests {
         let port = g.expose_parameter(dev, "exposure", PortType::Images).unwrap();
         g.connect(maps, dev, port).unwrap();
         assert_eq!(*plain, *run(&g, dev, A, &p, &mut ev));
-        let env = Env { provider: &p, images: &[A, B, c], view_tone: ToneMap::AcesFit, control: false };
+        let env = Env { provider: &p, images: &[A, B, c], view_tone: ToneMap::AcesFit, control: false, memo: &QueryMemo::default() };
         assert!(env.control_edge(&g, dev, port, A).is_none());
         assert_eq!(env.cat(|catalog| g.members(dev, 0, catalog)), vec![A, B, c]);
     }
@@ -2490,7 +2601,7 @@ mod tests {
             }
             assert_eq!((display.rgb[0]*1023.0).round() as u32, 0);
             assert_eq!((display.rgb[3069]*1023.0).round() as u32, 1023);
-            let env = Env { provider: &p, images: &[], view_tone: tone, control: true };
+            let env = Env { provider: &p, images: &[], view_tone: tone, control: true, memo: &QueryMemo::default() };
             let (_, value) = ev.eval_node(&g, generator, id, &env, &cancel, &mut vec![], &mut FingerprintMemo::new()).unwrap();
             let Value::Images(control) = value;
             for x in 0..1024 { assert!((control.pixel(x, 0)[0] - x as f32/1023.0).abs() < 1e-6); }
@@ -2678,7 +2789,7 @@ mod tests {
         *p.catalog.lock().unwrap() = vec![A, B];
         p.paths.lock().unwrap().insert(A.0, "/a/yes.jpg".into());
         p.paths.lock().unwrap().insert(B.0, "/b/no.jpg".into());
-        let env = Env { provider: &p, images: &[A, B], view_tone: ToneMap::AcesFit, control: false };
+        let env = Env { provider: &p, images: &[A, B], view_tone: ToneMap::AcesFit, control: false, memo: &QueryMemo::default() };
         assert_eq!(g.node(depth).unwrap().kind.output(), Some(PortType::Images));
         assert_eq!(env.cat(|c| g.members(depth, 0, c)), vec![A]);
         assert!(env.contains_output(&g, depth, 0, A));
@@ -2748,7 +2859,7 @@ mod tests {
         *p.catalog.lock().unwrap() = vec![A, B];
         p.paths.lock().unwrap().insert(A.0, "/a/b/one.jpg".into());
         p.paths.lock().unwrap().insert(B.0, "/a/two.jpg".into());
-        let env = Env { provider: &p, images: &[A, B], view_tone: ToneMap::AcesFit, control: false };
+        let env = Env { provider: &p, images: &[A, B], view_tone: ToneMap::AcesFit, control: false, memo: &QueryMemo::default() };
         assert_eq!(env.cat(|c| g.members(out, 0, c)), vec![A, B]);
         assert_eq!(env.input_edge(&g, out, 0, A), Some((first, 0)));
         assert_eq!(env.input_edge(&g, out, 0, B), Some((second, 0)));
@@ -2806,7 +2917,7 @@ mod tests {
 
     fn fingerprint_of(g: &Graph, n: NodeId, img: ImageId, p: &dyn ImageProvider) -> u64 {
         let images = p.images();
-        node_fingerprint(g, n, img, &Env { provider: p, images: &images, view_tone: ToneMap::AcesFit, control: false }, &mut FingerprintMemo::new(), &mut Vec::new()).unwrap()
+        node_fingerprint(g, n, img, &Env { provider: p, images: &images, view_tone: ToneMap::AcesFit, control: false, memo: &QueryMemo::default() }, &mut FingerprintMemo::new(), &mut Vec::new()).unwrap()
     }
 
     fn set(g: &mut Graph, n: NodeId, name: &str, img: ImageId, v: f32) {
@@ -5839,6 +5950,332 @@ mod tests {
             assert!(ev2.eval(&g, exp, ImageId(id), &p, &c).is_ok());
         }
     }
+
+    // ---- HDR Merge ----
+
+    /// Images 1-3 and 4-6 are brackets (shutter 1/4, 1, 4 s at ISO 100, f/1) 20 s apart, 7 stands alone.
+    /// Every image is flat with the value of its exposure (0.05, 0.2, 0.8 grey).
+    fn bracket_provider() -> TestProvider {
+        let p = TestProvider::default();
+        for i in 1..=7u64 {
+            let shutter = [0.25f32, 1.0, 4.0][((i - 1) % 3) as usize];
+            let t0 = if i <= 3 { 0 } else { 20_000 };
+            let time = if i == 7 { None } else { Some(t0 + (i as i64 % 4) * 500) };
+            p.caps.lock().unwrap().insert(
+                i,
+                CaptureInfo { iso: Some(100.0), shutter_s: Some(shutter), aperture: Some(1.0), captured_unix_ms: time, ..Default::default() },
+            );
+            let v = 0.2 * shutter;
+            p.flat.lock().unwrap().insert(i, [v, v, v]);
+            p.sizes.lock().unwrap().insert(i, (8, 8));
+            p.catalog.lock().unwrap().push(ImageId(i));
+        }
+        p
+    }
+
+    fn hdr_graph() -> (Graph, NodeId, NodeId, NodeId, NodeId) {
+        let mut g = Graph::new();
+        let src = add(&mut g, NodeKind::Source);
+        let exp = add(&mut g, NodeKind::Exposure);
+        let hdr = add(&mut g, NodeKind::HdrMerge);
+        let out = add(&mut g, NodeKind::Output);
+        g.connect(src, exp, 0).unwrap();
+        g.connect(exp, hdr, 0).unwrap();
+        g.connect(hdr, out, 0).unwrap();
+        (g, src, exp, hdr, out)
+    }
+
+    #[test]
+    fn hdr_merge_outputs_one_image_per_group_at_the_reference_exposure() {
+        let (g, _, _, hdr, out) = hdr_graph();
+        let p = bracket_provider();
+        let mut ev = Evaluator::new();
+        assert_eq!(ev.members(&g, out, 0, &p), vec![ImageId(2), ImageId(5), ImageId(7)]);
+        let merged = run(&g, out, ImageId(2), &p, &mut ev);
+        assert_px(merged.pixel(3, 3), [0.2; 3], "merged at the exposure of image 2");
+        // A member that is not the reference is not part of the output collection.
+        let c = CancelToken::new();
+        assert_eq!(ev.eval(&g, hdr, ImageId(1), &p, &c).unwrap_err(), EvalError::NotInCollection { node: hdr });
+        assert!(matches!(ev.eval(&g, out, ImageId(3), &p, &c), Err(EvalError::NotInCollection { .. })));
+        // A lone image passes through unchanged (same pixels as the source).
+        let alone = run(&g, out, ImageId(7), &p, &mut ev);
+        assert_px(alone.pixel(1, 1), [0.05; 3], "singleton passthrough");
+    }
+
+    #[test]
+    fn hdr_merge_fingerprint_follows_the_members_upstream() {
+        let (mut g, _, exp, hdr, _) = hdr_graph();
+        let p = bracket_provider();
+        let ev = Evaluator::new();
+        let fp = |g: &Graph, n: NodeId, i: u64| ev.fingerprint(g, n, ImageId(i), &p).unwrap();
+        let (before2, before5) = (fp(&g, hdr, 2), fp(&g, hdr, 5));
+        let exp_before = fp(&g, exp, 2);
+        // Individual Exposure value for the NON-reference member 1 only.
+        let n = g.node_mut(exp).unwrap();
+        n.mode = rawgraph_core::Mode::Individual;
+        n.set_param("ev", ImageId(1), 0.5);
+        assert_eq!(fp(&g, exp, 2), exp_before, "the Exposure of image 2 itself is unchanged");
+        assert_ne!(fp(&g, hdr, 2), before2, "but the merge of its group depends on member 1");
+        assert_eq!(fp(&g, hdr, 5), before5, "the other bracket does not");
+        // Merge settings change the identity too.
+        let after = fp(&g, hdr, 2);
+        g.node_mut(hdr).unwrap().set_param("deghost", A, 0.9);
+        assert_ne!(fp(&g, hdr, 2), after);
+        // A repeat evaluation is served from the cache.
+        let mut ev = Evaluator::new();
+        let first = run(&g, hdr, ImageId(2), &p, &mut ev);
+        let misses = ev.misses();
+        let again = run(&g, hdr, ImageId(2), &p, &mut ev);
+        assert_eq!(ev.misses(), misses);
+        assert!(Arc::ptr_eq(&first, &again));
+    }
+
+    #[test]
+    fn hdr_merge_in_lean_mode_leaves_no_member_entries() {
+        let (g, _, _, _, out) = hdr_graph();
+        let p = bracket_provider();
+        let mut ev = Evaluator::new();
+        ev.set_keep_intermediates(false);
+        run(&g, out, ImageId(2), &p, &mut ev);
+        for (node, image, _) in ev.cache.keys() {
+            assert!(
+                *image == ImageId(2) && *node == out,
+                "unexpected cache entry {node:?} / {image:?}"
+            );
+        }
+        assert!(ev.cache.contains_key(&(out, ImageId(2), false)));
+        // Each member was loaded once.
+        assert_eq!(p.loaded.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn hdr_merge_can_be_cancelled_between_members() {
+        let (g, _, _, _, out) = hdr_graph();
+        let p = bracket_provider();
+        let mut ev = Evaluator::new();
+        let pre = CancelToken::new();
+        pre.cancel();
+        assert_eq!(ev.eval(&g, out, ImageId(2), &p, &pre).unwrap_err(), EvalError::Cancelled);
+
+        struct CancelAfter {
+            inner: TestProvider,
+            token: CancelToken,
+            loads: AtomicU64,
+        }
+        impl ImageProvider for CancelAfter {
+            fn image(&self, id: ImageId) -> Result<Arc<ImageBuf>, String> {
+                if self.loads.fetch_add(1, Ordering::Relaxed) == 0 {
+                    self.token.cancel();
+                }
+                self.inner.image(id)
+            }
+            fn capture(&self, id: ImageId) -> Option<CaptureInfo> {
+                self.inner.capture(id)
+            }
+            fn images(&self) -> Vec<ImageId> {
+                self.inner.images()
+            }
+        }
+        let token = CancelToken::new();
+        let wrapped = CancelAfter { inner: bracket_provider(), token: token.clone(), loads: AtomicU64::new(0) };
+        let mut ev = Evaluator::new();
+        assert_eq!(ev.eval(&g, out, ImageId(2), &wrapped, &token).unwrap_err(), EvalError::Cancelled);
+        assert_eq!(wrapped.loads.load(Ordering::Relaxed), 1, "stopped after the first member");
+    }
+
+    #[test]
+    fn hdr_merge_of_images_with_different_sizes_reports_it() {
+        let (g, _, _, hdr, _) = hdr_graph();
+        let p = bracket_provider();
+        p.sizes.lock().unwrap().insert(3, (8, 9));
+        let mut ev = Evaluator::new();
+        let e = ev.eval(&g, hdr, ImageId(2), &p, &CancelToken::new()).unwrap_err();
+        assert_eq!(
+            e,
+            EvalError::Failed { node: hdr, message: "HDR Merge: the images of a group differ in size (8x8 vs 8x9)".to_owned() }
+        );
+        assert!(e.to_string().contains("differ in size"));
+    }
+
+    #[test]
+    fn hdr_merge_without_input_is_an_error_and_manual_groups_work() {
+        let mut g = Graph::new();
+        let hdr = add(&mut g, NodeKind::HdrMerge);
+        let p = bracket_provider();
+        let mut ev = Evaluator::new();
+        assert!(ev.eval(&g, hdr, ImageId(2), &p, &CancelToken::new()).is_err());
+        let src = add(&mut g, NodeKind::Source);
+        g.connect(src, hdr, 0).unwrap();
+        let n = g.node_mut(hdr).unwrap();
+        n.set_param("group_by", A, 2.0);
+        n.mode = rawgraph_core::Mode::Individual;
+        for i in [1, 2, 3] {
+            n.set_param("group", ImageId(i), 5.0);
+        }
+        assert_eq!(ev.members(&g, hdr, 0, &p), vec![ImageId(2), ImageId(4), ImageId(5), ImageId(6), ImageId(7)]);
+        assert_px(run(&g, hdr, ImageId(2), &p, &mut ev).pixel(2, 2), [0.2; 3], "manual group");
+    }
+
+    /// Counts what an HDR Merge asks of the provider.
+    struct Counting {
+        inner: TestProvider,
+        images: AtomicU64,
+        full_sizes: AtomicU64,
+    }
+
+    impl Counting {
+        fn new(inner: TestProvider) -> Counting {
+            Counting { inner, images: AtomicU64::new(0), full_sizes: AtomicU64::new(0) }
+        }
+    }
+
+    impl ImageProvider for Counting {
+        fn image(&self, id: ImageId) -> Result<Arc<ImageBuf>, String> {
+            self.images.fetch_add(1, Ordering::Relaxed);
+            self.inner.image(id)
+        }
+        fn capture(&self, id: ImageId) -> Option<CaptureInfo> {
+            self.inner.capture(id)
+        }
+        fn images(&self) -> Vec<ImageId> {
+            self.inner.images()
+        }
+        fn full_size(&self, id: ImageId) -> Option<(u32, u32)> {
+            self.full_sizes.fetch_add(1, Ordering::Relaxed);
+            self.inner.full_size(id)
+        }
+    }
+
+    /// Source -> Develop (a raw base with a non-neutral white balance, so it keeps a pre-tone entry) -> HDR Merge -> Output.
+    fn develop_hdr_graph() -> (Graph, NodeId, NodeId) {
+        let mut g = Graph::new();
+        let src = add(&mut g, NodeKind::Source);
+        let dev = add(&mut g, NodeKind::Develop);
+        let hdr = add(&mut g, NodeKind::HdrMerge);
+        let out = add(&mut g, NodeKind::Output);
+        g.connect(src, dev, 0).unwrap();
+        g.connect(dev, hdr, 0).unwrap();
+        g.connect(hdr, out, 0).unwrap();
+        set(&mut g, dev, "exposure", A, 0.4);
+        set(&mut g, dev, "legacy_tone", A, 1.0);
+        set(&mut g, dev, "wb", A, 1.0);
+        set(&mut g, dev, "temperature", A, 3200.0);
+        (g, dev, out)
+    }
+
+    #[test]
+    fn hdr_merge_batch_loads_each_member_once_and_never_decodes_full_sizes() {
+        let (g, _dev, out) = develop_hdr_graph();
+        let p = bracket_provider();
+        for i in 1..=7u64 {
+            p.caps.lock().unwrap().get_mut(&i).unwrap().raw = Some(true);
+            p.caps.lock().unwrap().get_mut(&i).unwrap().as_shot_kelvin = Some(5200.0);
+            // The full-size lookup would decode the file in the real provider.
+            p.full.lock().unwrap().insert(i, (4000, 3000));
+        }
+        let counting = Counting::new(p);
+        let mut ev = Evaluator::new();
+        ev.set_keep_intermediates(false);
+        let refs = ev.members(&g, out, 0, &counting);
+        assert_eq!(refs, vec![ImageId(2), ImageId(5), ImageId(7)]);
+        let results = ev.render_batch(&g, out, &refs, &counting, &CancelToken::new(), &mut |_, _| {});
+        assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+        assert_eq!(counting.images.load(Ordering::Relaxed), 7, "every member is decoded exactly once");
+        assert_eq!(counting.full_sizes.load(Ordering::Relaxed), 0, "no full-size lookups for group members");
+        assert!(ev.cache.is_empty() && ev.pre_tone.is_empty(), "{} / {}", ev.cache.len(), ev.pre_tone.len());
+    }
+
+    #[test]
+    fn hdr_merge_releases_cache_and_pre_tone_entries_of_each_member_right_away() {
+        let (g, dev, out) = develop_hdr_graph();
+        let p = bracket_provider();
+        for i in 1..=7u64 {
+            p.caps.lock().unwrap().get_mut(&i).unwrap().raw = Some(true);
+            p.caps.lock().unwrap().get_mut(&i).unwrap().as_shot_kelvin = Some(5200.0);
+        }
+        // Only the requested image's own entries may be left (they are dropped by the caller); every other
+        // member was released as soon as it had been evaluated.
+        let mut ev = Evaluator::new();
+        ev.set_keep_intermediates(false);
+        let merged = ev.eval_image(&g, out, ImageId(2), &p, &CancelToken::new()).unwrap();
+        assert_eq!(merged.width(), 8);
+        for (node, image, _) in ev.cache.keys() {
+            assert!(*image == ImageId(2) && *node == out, "cache entry {node:?} / {image:?}");
+        }
+        assert!(
+            ev.pre_tone.keys().all(|(_, image, _)| *image == ImageId(2)),
+            "pre-tone entries of other members stay: {:?}",
+            ev.pre_tone.keys().collect::<Vec<_>>()
+        );
+        assert!(!ev.pre_tone.keys().any(|(n, im, _)| *n == dev && *im != ImageId(2)));
+    }
+
+    #[test]
+    fn hdr_merge_without_exposure_values_keeps_the_identity_and_changes_the_fingerprint_with_them() {
+        let (g, _, _, hdr, _) = hdr_graph();
+        let p = bracket_provider();
+        let ev = Evaluator::new();
+        let before = ev.fingerprint(&g, hdr, ImageId(2), &p).unwrap();
+        // Dropping one member's aperture changes how the group is compared: not the same merge.
+        p.caps.lock().unwrap().get_mut(&1).unwrap().aperture = None;
+        let after = ev.fingerprint(&g, hdr, ImageId(2), &p).unwrap();
+        assert_ne!(before, after);
+    }
+
+
+    /// Ramp images of different brightness (`gain`), capture times only (no exposure values).
+    struct Gains {
+        inner: TestProvider,
+        gain: std::collections::HashMap<u64, f32>,
+    }
+
+    impl ImageProvider for Gains {
+        fn image(&self, id: ImageId) -> Result<Arc<ImageBuf>, String> {
+            let g = self.gain[&id.0];
+            let mut img = ImageBuf::new(8, 8);
+            for y in 0..8 {
+                for x in 0..8 {
+                    let v = g * (0.1 + 0.8 * (x + y) as f32 / 14.0);
+                    img.set_pixel(x, y, [v, v, v, 1.0]);
+                }
+            }
+            Ok(Arc::new(img))
+        }
+        fn capture(&self, id: ImageId) -> Option<CaptureInfo> {
+            self.inner.capture(id)
+        }
+        fn images(&self) -> Vec<ImageId> {
+            self.inner.images()
+        }
+    }
+
+    #[test]
+    fn hdr_merge_without_exposure_values_keeps_the_planned_identity_at_the_median_exposure() {
+        let inner = TestProvider::default();
+        // Capture order 1, 3, 2; the brightness order is 1 < 2 < 3. The planned reference is the middle
+        // one in capture order (image 3, the brightest); without exposure values the result is expressed
+        // at the median measured exposure (image 2) instead.
+        for (i, t, gain) in [(1u64, 0i64, 0.1f32), (3, 500, 0.4), (2, 1000, 0.2)] {
+            inner.caps.lock().unwrap().insert(i, CaptureInfo { captured_unix_ms: Some(t), ..Default::default() });
+            inner.catalog.lock().unwrap().push(ImageId(i));
+            let _ = gain;
+        }
+        let p = Gains { inner, gain: [(1, 0.1), (2, 0.2), (3, 0.4)].into_iter().collect() };
+        let mut g = Graph::new();
+        let src = add(&mut g, NodeKind::Source);
+        let hdr = add(&mut g, NodeKind::HdrMerge);
+        g.connect(src, hdr, 0).unwrap();
+        set(&mut g, hdr, "group_by", A, 0.0); // capture time: no exposure values needed
+        let mut ev = Evaluator::new();
+        assert_eq!(ev.members(&g, hdr, 0, &p), vec![ImageId(3)], "identity of the planned reference");
+        let out = ev.eval_image(&g, hdr, ImageId(3), &p, &CancelToken::new()).unwrap();
+        for (x, y) in [(0u32, 0u32), (3, 4), (7, 7)] {
+            let want = 0.2 * (0.1 + 0.8 * (x + y) as f32 / 14.0);
+            let got = out.pixel(x, y)[0];
+            assert!((got / want - 1.0).abs() < 0.03, "({x},{y}): {got} vs {want}");
+        }
+    }
+
 }
 
 /// Linear RGB encodes tangent XYZ from [-1,1] to [0,1]. Image Y points down.

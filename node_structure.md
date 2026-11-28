@@ -58,6 +58,27 @@ Up to six editable named ranges (name, min, max); range names label their output
 
 With the Keyword measure the ranges are tested as described under Metadata Filter ("contains" / "does not contain" applied to each range name); Missing metadata does not apply (an image without keywords simply fails "contains" and passes "does not contain").
 
+### HDR Merge (`HdrMerge`)
+
+Cuts the incoming collection into image groups (an exposure bracket per group) and merges each group into one scene-linear HDR image at the exposure of the group's reference (the member with the median exposure value; with an unknown value the middle one in capture order, and the result is then expressed at the median measured exposure; the f-number is ignored for the whole group when one member lacks it). The output collection is the references, in the input order. A group of one image passes through unchanged. Category: Collection.
+
+- **Inputs:** Images: Images (required)
+- **Outputs:** Images: Images
+
+| Setting | Key | Default | Range or choices |
+| --- | --- | --- | --- |
+| Group by | `group_by` | Bracket | Capture time / Bracket / Manual / Whole collection |
+| Max gap | `gap_s` | 2 s | 0 to 60 |
+| Max group size | `max_size` | 9 | 2 to 25 (whole numbers) |
+| Group number | `group` | 0 | 0 to 999; per image (Individual), 0 = none; used by Manual |
+| Exposure ratios | `exposure` | Measured | Measured / Metadata |
+| Align frames | `align` | On | Off / On |
+| Max shift | `max_shift_pct` | 3 % of the long side | 0 to 10 |
+| Deghost | `deghost` | 0.5 | 0 to 1 (0 = off) |
+| Clip level | `clip` | 0.95 of each frame's white level | 0.5 to 1 |
+
+Group by, gap and size are read from the All values even in Individual mode. The gap is measured from the end of the previous exposure; a Bracket spreads over at least 0.7 stop, otherwise its images stay single.
+
 ### Layer (`Layer`)
 
 - **Inputs:** Layer 1: Images (optional); Layer 2: Images (optional); Layer 3: Images (optional); Layer 4: Images (optional); Layer 5: Images (optional); Layer 6: Images (optional); Layer 7: Images (optional); Layer 8: Images (optional)
