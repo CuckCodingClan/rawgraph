@@ -961,6 +961,15 @@ impl App {
     }
 
     fn execute(&mut self, p: Pending, ctx: &egui::Context) {
+        // The rename thread relinks and saves the open project when it ends: the document must stay.
+        if self.rename_job.is_some() {
+            if matches!(p, Pending::Quit) {
+                self.cancel_rename_for_close();
+            } else {
+                self.status.error("A rename is running: wait until it has finished (or cancel it in the Rename window)");
+            }
+            return;
+        }
         match p {
             Pending::NewProject => {
                 self.cancel_scan();
@@ -3087,7 +3096,11 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.session.dirty && self.shot.is_none() && self.bench.is_none() && self.first_frame.is_none() {
+        if ctx.input(|i| i.viewport().close_requested()) && self.rename_job.is_some() {
+            // Never leave a rename half done: stop it (it is put back), then the window can close.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.cancel_rename_for_close();
+        } else if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.session.dirty && self.shot.is_none() && self.bench.is_none() && self.first_frame.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.prompt = Some(Pending::Quit);
         }

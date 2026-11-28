@@ -166,6 +166,33 @@ pub struct Outcome {
     pub warning: Option<String>,
 }
 
+/// What [`heal_from_log`] found.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Healed {
+    pub relinked: usize,
+    pub interrupted: usize,
+}
+
+/// For a project opened after a rename it was not saved after: every finished run of the log (oldest
+/// first) whose file is gone from its old name and present at its new one moves the project's image to
+/// the new name. Nothing on disk is touched. Also counts interrupted runs.
+pub fn heal_from_log(session: &mut Session, log_path: &Path) -> Result<Healed, String> {
+    let log = RenameLog::load(log_path)?;
+    let mut healed = Healed { interrupted: log.interrupted(), ..Default::default() };
+    for run in log.runs.iter().filter(|r| matches!(r.state, RunState::Done | RunState::Undone)) {
+        let moves: Vec<Move> = run
+            .entries
+            .iter()
+            .filter(|e| !e.old.exists() && e.new.is_file())
+            .map(|e| Move { old: e.old.clone(), new: e.new.clone(), size: e.size, exact_size: e.exact_size })
+            .collect();
+        if !moves.is_empty() {
+            healed.relinked += relink(session, &moves)?;
+        }
+    }
+    Ok(healed)
+}
+
 /// Points the project at renamed files. All-or-nothing; files that are not images of the project (sidecars,
 /// other formats) are skipped. Marks the project changed.
 pub fn relink(session: &mut Session, moves: &[Move]) -> Result<usize, String> {
@@ -200,7 +227,7 @@ pub fn log_refusal(session: &Session, log: &Path, undo: bool) -> Option<String> 
     let runs: Vec<&rawgraph_rename::RunRecord> = if undo {
         l.last_undoable().into_iter().collect()
     } else {
-        l.runs.iter().filter(|r| matches!(r.state, RunState::Started | RunState::Phase1Done)).collect()
+        l.runs.iter().filter(|r| matches!(r.state, RunState::Started | RunState::Phase1Done | RunState::RollingBack)).collect()
     };
     if runs.iter().any(|r| !belongs_to_project(session, &r.entries)) {
         return Some("The last rename in the log was done for another project (none of its files are images of this project); it is not undone or recovered here".to_owned());
@@ -557,7 +584,7 @@ mod tests {
             kind: rawgraph_rename::RunKind::Rename,
             // the final save of the log never happened
             state: RunState::Phase1Done,
-            entries: vec![LogEntry { old: a.clone(), new: b.clone(), size: sa, exact_size: true }, LogEntry { old: b.clone(), new: a.clone(), size: sb, exact_size: true }],
+            entries: vec![LogEntry { old: a.clone(), new: b.clone(), size: sa, exact_size: true, stamp: None }, LogEntry { old: b.clone(), new: a.clone(), size: sb, exact_size: true, stamp: None }],
         });
         l.save(&log).unwrap();
         // On disk the swap is complete; the project still has the old paths.
@@ -595,7 +622,7 @@ mod tests {
             label: "x".into(),
             kind: rawgraph_rename::RunKind::Rename,
             state: RunState::Started,
-            entries: vec![rawgraph_rename::log::LogEntry { old: job.join("a.png"), new: job.join("b.png"), size: std::fs::metadata(job.join("a.png")).unwrap().len(), exact_size: true }],
+            entries: vec![rawgraph_rename::log::LogEntry { old: job.join("a.png"), new: job.join("b.png"), size: std::fs::metadata(job.join("a.png")).unwrap().len(), exact_size: true, stamp: None }],
         });
         l.save(&log).unwrap();
         std::fs::rename(job.join("a.png"), job.join(".rgrename-crash-0.tmp")).unwrap();
@@ -605,5 +632,38 @@ mod tests {
         assert_eq!(names(&job), vec!["a.png"]);
         assert_eq!(log_state(&log).1, 0);
         assert!(!s.entry(ids[0]).unwrap().missing);
+    }
+
+    #[test]
+    fn opening_a_project_that_was_not_saved_after_a_rename_follows_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut s, job, ids) = setup(tmp.path(), &["a.png", "c.png"]);
+        let log = tmp.path().join("l.json");
+        let size = std::fs::metadata(job.join("a.png")).unwrap().len();
+        let mut l = RenameLog::default();
+        l.runs.push(rawgraph_rename::RunRecord {
+            id: "done".into(),
+            started_unix_ms: 0,
+            label: "x".into(),
+            kind: rawgraph_rename::RunKind::Rename,
+            state: RunState::Done,
+            entries: vec![rawgraph_rename::log::LogEntry { old: job.join("a.png"), new: job.join("b.png"), size, exact_size: true, stamp: None }],
+        });
+        l.save(&log).unwrap();
+        std::fs::rename(job.join("a.png"), job.join("b.png")).unwrap();
+        let h = heal_from_log(&mut s, &log).unwrap();
+        assert_eq!(h, Healed { relinked: 1, interrupted: 0 });
+        assert_eq!(s.entry(ids[0]).unwrap().file_name(), "b.png");
+        assert_eq!(s.entry(ids[1]).unwrap().file_name(), "c.png", "untouched");
+        // A second look changes nothing (the old name is gone, the project already follows).
+        assert_eq!(heal_from_log(&mut s, &log).unwrap().relinked, 0);
+        // Undone runs whose files are back at the old names are not followed.
+        std::fs::rename(job.join("b.png"), job.join("a.png")).unwrap();
+        let mut l = RenameLog::load(&log).unwrap();
+        l.runs[0].state = RunState::Undone;
+        l.save(&log).unwrap();
+        let (mut s2, _, ids2) = setup(&tmp.path().join("second"), &["a.png"]);
+        let _ = ids2;
+        assert_eq!(heal_from_log(&mut s2, &log).unwrap().relinked, 0);
     }
 }
