@@ -1117,7 +1117,7 @@ impl Session {
                 return Some(image);
             }
         }
-        let standalone = rawgraph_core::graph::Catalog { images: &[], capture: &|_| None };
+        let standalone = rawgraph_core::graph::Catalog { images: &[], capture: &|_| None, memo: None };
         graph.members(node, output, &standalone).first().copied().or(self.selected)
     }
 
@@ -1502,7 +1502,7 @@ pub mod tests {
         // A plain chain: every node is fed by the one before it.
         let ids: Vec<NodeId> = g.nodes().map(|n| n.id).collect();
         assert!(matches!(g.node(ids[0]).unwrap().data(ImageId(0)), Some(rawgraph_core::NodeData::Folder(f)) if f.is_empty()));
-        assert!(!g.contains_in(ids[0], ImageId(42), &rawgraph_core::Catalog { images: &[ImageId(42)], capture: &|_| None }));
+        assert!(!g.contains_in(ids[0], ImageId(42), &rawgraph_core::Catalog { images: &[ImageId(42)], capture: &|_| None, memo: None }));
         assert_eq!(g.edges().len(), ids.len() - 1);
         for pair in ids.windows(2) {
             assert_eq!(g.input_of(pair[1], 0), Some(pair[0]));

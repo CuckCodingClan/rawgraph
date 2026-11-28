@@ -3144,7 +3144,8 @@ Click to dismiss")).clicked();
                     self.session.entry(id).is_some_and(|e| rawgraph_core::path_in_folder(&e.path.to_string_lossy(), &folder, recursive))
                 }).collect::<std::collections::HashSet<_>>());
             let members = immediate.as_ref().or_else(|| Self::gallery_members(self.gallery_result.as_ref(), target));
-            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.filmstrip.show(ui, &mut self.session, target, members));
+            let groups = self.gallery_result.as_ref().filter(|r| r.view_node.is_some() && r.view_node == target.node).map(|r| &r.view_groups);
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.filmstrip.show(ui, &mut self.session, target, members, groups));
             if let Some(job) = self.scan.as_ref().filter(|j| j.listed && (members.is_some() || target.node.is_none())) {
                 job.prioritize(self.filmstrip.scan_wanted(), self.filmstrip.scan_thumbs_ready());
             }

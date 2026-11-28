@@ -36,7 +36,7 @@ impl Lib {
 
     fn with<R>(&self, f: impl FnOnce(&Catalog) -> R) -> R {
         let cap = |i: ImageId| self.caps.get(&i).cloned();
-        f(&Catalog { images: &self.images, capture: &cap })
+        f(&Catalog { images: &self.images, capture: &cap, memo: None })
     }
 
     fn members(&self, g: &Graph, node: NodeId, port: usize) -> Vec<u64> {
@@ -361,7 +361,7 @@ fn merge_with_an_empty_catalog_keeps_both() {
     let m = folder_merge(&mut g);
     set_collision(&mut g, m, 1.0);
     let cap = |i: ImageId| lib.caps.get(&i).cloned();
-    let empty = Catalog { images: &[], capture: &cap };
+    let empty = Catalog { images: &[], capture: &cap, memo: None };
     for i in [1, 2, 3, 4, 5] {
         assert!(g.contains_in(m, id(i), &empty), "image {i}");
         assert!(g.contains(m, id(i), &cap));
@@ -658,7 +658,7 @@ fn layer_with_an_empty_catalog() {
     let lib = layer_lib(4, 2);
     let (g, layer) = layer_graph(&[(0, "/x"), (3, "/y")]);
     let cap = |i: ImageId| lib.caps.get(&i).cloned();
-    let empty = Catalog { images: &[], capture: &cap };
+    let empty = Catalog { images: &[], capture: &cap, memo: None };
     // Contained if any connected input contains it.
     for i in 1..=6 {
         assert!(g.contains_in(layer, id(i), &empty), "image {i}");
@@ -1734,7 +1734,7 @@ fn new_kinds_are_in_every_list_and_round_trip() {
     for kind in [NodeKind::Layer, NodeKind::Export] {
         assert!(NodeKind::ALL.contains(&kind));
     }
-    assert_eq!(NodeKind::ALL.len(), 32);
+    assert_eq!(NodeKind::ALL.len(), 33);
     let mut seen = std::collections::HashSet::new();
     for kind in NodeKind::ALL {
         assert!(seen.insert(kind), "{kind:?} listed twice");
@@ -1786,7 +1786,7 @@ fn queries_never_panic_on_nonsense() {
     // A catalog with duplicated and unknown images.
     let images = vec![id(1), id(1), id(404), id(2)];
     let cap = |i: ImageId| lib.caps.get(&i).cloned();
-    let cat = Catalog { images: &images, capture: &cap };
+    let cat = Catalog { images: &images, capture: &cap, memo: None };
     let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
     let _ = g.members(src, 0, &cat);
 }

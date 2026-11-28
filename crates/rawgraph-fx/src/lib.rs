@@ -12,6 +12,7 @@ mod brush;
 mod color;
 mod curve;
 mod geometry;
+mod hdr;
 mod layer;
 mod lens;
 mod local;
@@ -28,6 +29,7 @@ pub use curve::{curve_eval, point_curve, CurveChannel};
 pub use geometry::{
     lens_manual, transform, transform_input_to_output, transform_output_to_input, transform_size, TransformParams,
 };
+pub use hdr::{merge_hdr, merge_hdr_ex, HdrError, HdrParams, HDR_MAX_FRAMES};
 pub use layer::{blend_layer, place_layer};
 pub use lens::{vignette_radial, warp_rectilinear};
 pub use local::local_contrast;

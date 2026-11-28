@@ -100,7 +100,7 @@ Reihenfolge nach meinem Vorschlag.
 5. **Lokale Werkzeuge:** Dunst entfernen, Fleckenentfernung, Lichter/Schatten mit lokaler Anpassung.
 6. **Graph-Bedienung:** Gruppen und Makros, Kommentare, Ausrichten.
 7. **Weitere Nodes:** Körnung, LUT; Masken aus KI (Motiv, Himmel), Tiefe, importiertes Bild.
-8. **Mehrbild-Funktionen:** HDR-Zusammenführung, Panorama, Fokus-Stapel.
+8. **Mehrbild-Funktionen:** HDR-Zusammenführung ist als Node „HDR Merge“ gebaut (Bildgruppen, Ausrichtung nur per Verschiebung, Geisterbilder, Stapel-Marke im Filmstreifen; noch nicht mit echten Reihen von Hand getestet, nur mit Prüfbildern); offen: Panorama, Fokus-Stapel, Drehung/Subpixel-Ausrichtung beim HDR, Gruppen von Hand bilden per Auswahl im Filmstreifen (heute: Zahl „Group number“ je Bild im Inspektor).
 9. **Bibliothek:** Stichwörter, Stapel, XMP schreiben, Benennung aus der Beschriftungs-Excel, Analyse-Filter (Helligkeit).
 10. **Zusammenarbeit:** Zusammenführen gleichzeitiger Änderungen, Sperren, Rechte, geteilter Speicher (Frage 29).
 11. **Scopes:** HDR-Skalen, CIE-Farbtafel, Vergleich mit Resolve an Testbildern.

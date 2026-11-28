@@ -19,11 +19,14 @@ pub mod keywords;
 mod migrate;
 pub mod lut;
 pub mod ops;
+pub mod stack;
 
 #[cfg(test)]
 mod migrate_tests;
 #[cfg(test)]
 mod wave8_tests;
+#[cfg(test)]
+mod hdr_tests;
 
 pub use capture::{path_in_folder, CaptureInfo, Measure};
 pub use color::{OutputSpace, Transfer, OUTPUT_SPACES};
@@ -34,7 +37,7 @@ pub use export::{
 };
 pub use graph::{
     cdl_params, curve_set, default_curve, iso_noise_scale, lut_file, lut_file_status, neutral_curve, BrushStroke, Catalog, CaptureFn, CdlParams,
-    CurveEntry, DataKind, Edge, Graph, GraphError, ImageId, Issue, Mode, NamedRange, Node, NodeData, NodeId, NodeKind,
+    CurveEntry, DataKind, Edge, Graph, GraphError, ImageId, Issue, Mode, NamedRange, Node, NodeData, NodeId, NodeKind, QueryMemo,
     OutputSpec, ParamKind, ParamSpec, PortType, Subgraph, CURVE_CHANNELS, GRAPH_FORMAT_VERSION, KEYWORD_OPS,
 };
 pub use generator::{ColorStop, OpacityStop, GradientRamp};
@@ -44,4 +47,5 @@ pub use layer::{
     MAX_LAYERS,
 };
 pub use lut::{Lut, LutError, LutSpace, LutState};
+pub use stack::{exposure_ev, group_exposure_evs, group_images, GroupRule, GroupSettings, ImageGroup, Reference, GROUP_RULES};
 pub use lens::{LensProfile, VignetteRadial, WarpRectilinear, LENS_MODES};
