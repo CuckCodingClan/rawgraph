@@ -172,6 +172,11 @@ impl<K: PartialEq + Copy, V> Lru<K, V> {
         self.entries.last_mut().map(|(_, v)| v)
     }
 
+    /// Every entry, mutable, without changing the order.
+    pub fn values_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
+        self.entries.iter_mut().map(|(k, v)| (&*k, v))
+    }
+
     /// Without changing the order.
     pub fn peek(&self, key: &K) -> Option<&V> {
         self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)

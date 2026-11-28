@@ -454,6 +454,9 @@ fn worker<B: Backend>(
     let base_ms: Cell<Option<f32>> = Cell::new(None);
     let mut preloader = Preloader::default();
     let mut job: Option<PreloadJob> = None;
+    if let Some(g) = gpu.as_mut() {
+        g.warm_up();
+    }
     loop {
         let refine = gpu.as_ref().and_then(|g| g.scopes.refine_due());
         let preload = preloader.due();
@@ -862,6 +865,9 @@ pub fn preload_step<B: Backend>(
     // A local tone needs its 512 px grid when the neighbour is shown: estimate it now, while the
     // base is in hand (also when the base is on the GPU already), so stepping costs no CPU work.
     for (i, op) in plan.ops.iter().enumerate() {
+        if job.cancel.is_cancelled() {
+            return PreloadOutcome::Abandoned;
+        }
         if matches!(op, rawgraph_engine::TailOp::LocalTone { .. })
             && evaluator.tail_grid(&job.graph, &plan, i, id, provider, &job.cancel).is_err()
         {
