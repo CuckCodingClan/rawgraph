@@ -3406,6 +3406,10 @@ pub fn apply_cli_state(session: &mut Session, cli: &Cli) {
 /// Shows the viewer and lets the tool of the selected node work on top of it.
 pub fn show_viewer(viewer: &mut Viewer, tools: &mut Tools, session: &mut Session, ui: &mut egui::Ui) -> Option<String> {
     crate::tools::prepare_viewer(viewer, session);
+    if tools.handles.claims_pointer(session) {
+        // A handle under the pointer owns the primary button: no pan, no click zoom.
+        viewer.tool_active = true;
+    }
     let geom = viewer.show(ui);
     let result = if viewer.awaiting_final() { None } else { geom.as_ref().and_then(|geom| tools.show(ui, geom, session, viewer.frame_size)) };
     let step = std::mem::take(&mut viewer.navigation_step);

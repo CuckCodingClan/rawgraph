@@ -16,6 +16,8 @@ use crate::viewer::{Geometry, Orient, Viewer};
 pub struct Tools {
     paint: Option<PaintDrag>,
     crop: Option<CropDrag>,
+    /// On-picture handles of the other nodes (gradients, vignette, motion direction, picker).
+    pub handles: crate::handles::Handles,
 }
 
 struct PaintDrag {
@@ -120,7 +122,7 @@ impl Tools {
                 self.crop(ui, geom, session, node, frame);
                 None
             }
-            ToolMode::None => None,
+            ToolMode::None => self.handles.show(ui, geom, session, frame),
         }
     }
 

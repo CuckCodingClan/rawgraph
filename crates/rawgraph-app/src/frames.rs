@@ -180,6 +180,36 @@ impl Mapper {
         }
         [q.0, q.1]
     }
+
+    /// The inverse of [`Mapper::to_consumer`]: normalised point of the consumer's image ->
+    /// normalised point of the viewed picture (outside 0..1 when it is cropped away).
+    pub fn to_viewed(&self, p: [f32; 2]) -> [f32; 2] {
+        let mut q = (p[0], p[1]);
+        for (params, size) in &self.stages {
+            q = rawgraph_fx::transform_input_to_output(size.0, size.1, params, q.0, q.1);
+        }
+        [q.0, q.1]
+    }
+}
+
+/// Crop / Rotate nodes between `node` and the `viewed` node, `node` side first, when the
+/// picture of `viewed` shows what leaves `node` through nothing but Crop / Rotate nodes (the
+/// frame of `node` can then be mapped onto the screen). `None`: `node` is not upstream of (or
+/// equal to) `viewed` along the image inputs, or another geometry node lies in between.
+pub fn handle_chain(graph: &Graph, node: NodeId, viewed: NodeId) -> Option<Vec<NodeId>> {
+    if node == viewed {
+        return Some(Vec::new());
+    }
+    let mut down = vec![viewed];
+    down.extend(ancestors(graph, viewed));
+    let at = down.iter().position(|n| *n == node)?;
+    let geometry: Vec<NodeId> = down[..at].iter().copied().filter(|n| graph.node(*n).is_some_and(|n| is_geometry(n.kind))).collect();
+    if geometry.iter().any(|n| graph.node(*n).is_none_or(|n| n.kind != NodeKind::Transform)) {
+        return None;
+    }
+    let mut chain = geometry;
+    chain.reverse();
+    Some(chain)
 }
 
 /// What the render worker needs to draw the overlay of a drawing on the viewed picture.
