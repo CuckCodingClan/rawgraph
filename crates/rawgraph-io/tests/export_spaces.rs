@@ -311,7 +311,7 @@ fn webp_lossless_and_lossy_decode_alpha_quality_and_exif() {
     assert!(bytes.windows(4).any(|b| b == b"EXIF"));
     let exif = exif_of(&p).expect("read WebP EXIF");
     assert_eq!(text(&exif, exif::Tag::Make).as_deref(), Some("SONY"));
-    assert!(!bytes.windows(4).any(|b| b == b"ICCP"));
+    assert_eq!(webp_icc_profile(&bytes).as_deref(), Some(icc_profile(OutputSpace::Srgb)), "default options tag the file as sRGB");
     assert!(matches!(save_webp8(&p, w, h, &rgba, true, &options), Err(IoError::Exists(_))));
     assert!(save_webp8(&d.file("bad.webp"), w, h, &rgba[..4], true, &options).is_err());
     let mut encodings = Vec::new();
@@ -325,4 +325,59 @@ fn webp_lossless_and_lossy_decode_alpha_quality_and_exif() {
         encodings.push(bytes);
     }
     assert_ne!(encodings[0], encodings[1]);
+}
+
+/// RIFF chunks of a WebP file: (tag, payload).
+fn riff_chunks(bytes: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
+    assert_eq!(&bytes[..4], b"RIFF");
+    assert_eq!(&bytes[8..12], b"WEBP");
+    assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize + 8, bytes.len(), "RIFF size matches the file");
+    let mut at = 12;
+    let mut out = Vec::new();
+    while at < bytes.len() {
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        out.push((bytes[at..at + 4].try_into().unwrap(), bytes[at + 8..at + 8 + size].to_vec()));
+        at += 8 + size + (size & 1);
+    }
+    assert_eq!(at, bytes.len());
+    out
+}
+
+#[test]
+fn webp_embeds_the_icc_profile_of_every_space_lossy_and_lossless() {
+    let d = Dir::new("webp-icc");
+    let (w, h) = (40u32, 30u32);
+    let rgba: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |x| [(x * 6) as u8, (y * 8) as u8, ((x + y) * 3) as u8, if (x + y) % 5 == 0 { 120 } else { 255 }])).collect();
+    for space in [OutputSpace::Srgb, OutputSpace::DisplayP3, OutputSpace::AdobeRgb, OutputSpace::Rec2020] {
+        for lossless in [true, false] {
+            let options = SaveOptions { space, metadata: Some(meta()), ..Default::default() };
+            let p = d.file(&format!("{}-{lossless}.webp", space.label().replace([' ', '.', '(', ')'], "")));
+            save_webp8(&p, w, h, &rgba, lossless, &options).unwrap();
+            let bytes = std::fs::read(&p).unwrap();
+            let chunks = riff_chunks(&bytes);
+            assert_eq!(&chunks[0].0, b"VP8X", "{space:?} lossless={lossless}");
+            assert_eq!(&chunks[1].0, b"ICCP", "ICCP follows VP8X as the specification requires");
+            assert_eq!(chunks[1].1, icc_profile(space), "ICC bytes are stored unchanged");
+            assert!(chunks[0].1[0] & 0x20 != 0, "VP8X ICC flag");
+            assert!(chunks[0].1[0] & 0x08 != 0, "VP8X EXIF flag survives");
+            assert!(chunks.iter().any(|c| &c.0 == b"EXIF"));
+            let canvas = |o: usize| u32::from(chunks[0].1[o]) | u32::from(chunks[0].1[o + 1]) << 8 | u32::from(chunks[0].1[o + 2]) << 16;
+            assert_eq!((canvas(4) + 1, canvas(7) + 1), (w, h));
+            assert_eq!(webp_icc_profile(&bytes).as_deref(), Some(icc_profile(space)));
+            // Two independent decoders still read the file.
+            let own = webp_rust::decode(&bytes).unwrap();
+            assert_eq!((own.width, own.height), (w as usize, h as usize));
+            let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::WebP).expect("`image` decodes the extended container");
+            assert_eq!((img.width(), img.height()), (w, h));
+            if lossless {
+                assert_eq!(img.to_rgba8().into_raw(), rgba, "lossless pixels unchanged by the container rewrite");
+            }
+            let exif = exif_of(&p).expect("EXIF is still readable");
+            assert_eq!(text(&exif, exif::Tag::Make).as_deref(), Some("SONY"));
+            // Without the switch there is no profile (and the file stays a plain container).
+            let q = d.file(&format!("plain-{}-{lossless}.webp", space.label().replace([' ', '.', '(', ')'], "")));
+            save_webp8(&q, w, h, &rgba, lossless, &SaveOptions { embed_profile: false, ..options }).unwrap();
+            assert_eq!(webp_icc_profile(&std::fs::read(q).unwrap()), None);
+        }
+    }
 }

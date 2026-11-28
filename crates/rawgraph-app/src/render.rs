@@ -877,14 +877,16 @@ fn run_cpu(evaluator: &mut Evaluator, req: &Request, provider: &dyn ImageProvide
     }
     let Value::Images(buf) = value;
     let t = Instant::now();
+    let mut codec_note = None;
     let (display, rgba8) = if let Some(node) = req.graph.node(req.node).filter(|n| n.kind == NodeKind::Export) {
         let spec = export_spec(node, req.image);
         match codec_preview(&buf, &spec, req.view.transform()) {
-            Ok(Some(d)) => { let rgba = d.to_rgba8(); (d, rgba) }
-            Ok(None) => return Some(Reply::Excluded { generation: req.generation, message: if spec.format == ExportFileFormat::Xmp { "XMP sidecar has no image preview".into() } else { format!("{} codec preview is not yet supported", spec.format.label()) } }),
+            Ok(Some(p)) => { let rgba = p.image.to_rgba8(); codec_note = p.note; (p.image, rgba) }
+            Ok(None) => return Some(Reply::Excluded { generation: req.generation, message: "XMP sidecar has no image preview".into() }),
             Err(e) => return Some(Reply::Error { generation: req.generation, message: format!("Export preview: {e}") }),
         }
     } else { req.view.transform().apply_with_rgba8(&buf) };
+    let notice = codec_note.or(notice);
     let display_ms = t.elapsed().as_secs_f32() * 1000.0;
     let scope_step = req.scopes.as_ref().map_or(1, |s| s.step.max(1));
     let node_timings = evaluator.timings();
@@ -935,10 +937,37 @@ fn run_cpu(evaluator: &mut Evaluator, req: &Request, provider: &dyn ImageProvide
     })))
 }
 
+/// What an Export node shows: the viewer picture after the export's codec, and a note when that is
+/// not a real encode/decode roundtrip (or the codec could not be run).
+pub(crate) struct CodecPreview {
+    pub image: DisplayImage,
+    pub note: Option<String>,
+}
+
+/// One-line description of what the Export preview of `spec` shows (inspector text and status
+/// note). `None`: a real encode/decode roundtrip of a lossy codec, nothing to explain.
+pub(crate) fn preview_description(spec: &rawgraph_core::ExportSpec) -> Option<&'static str> {
+    Some(match spec.format {
+        ExportFileFormat::Png16 => "PNG 16-bit is lossless: quantising to 16 bits is not visible, so the picture is shown unchanged.",
+        ExportFileFormat::Tiff16 => "TIFF 16-bit is lossless: quantising to 16 bits is not visible, so the picture is shown unchanged.",
+        ExportFileFormat::Png16Data => "PNG 16-bit data map is lossless: the picture is shown as stored, without display transform.",
+        ExportFileFormat::Exr => "EXR is lossless (32-bit float): the picture is shown unchanged.",
+        ExportFileFormat::Avif => "No preview for AVIF: this build has no AVIF decoder, so the picture is shown before encoding.",
+        ExportFileFormat::Webp if spec.webp_lossless => "Lossless WebP: only the 8-bit quantisation is visible.",
+        ExportFileFormat::Xmp => "XMP sidecars have no picture to preview.",
+        _ => return None,
+    })
+}
+
 /// Roundtrip the same rendered samples and codec settings as batch export, without filesystem I/O.
-pub(crate) fn codec_preview(buf: &ImageBuf, spec: &rawgraph_core::ExportSpec, transform: rawgraph_scopes::DisplayTransform) -> Result<Option<DisplayImage>, String> {
-    use rawgraph_core::color::{invert, rec709_to_output, mul_vec, srgb_eotf, srgb_oetf, Transfer};
-    let ext = match spec.format { ExportFileFormat::Jpeg => "jpg", ExportFileFormat::Png => "png", _ => return Ok(None) };
+/// Lossy and 8-bit codecs (JPEG, PNG and TIFF 8-bit, WebP, HEIC through the system decoder) are
+/// encoded and decoded again; lossless wide formats show their (practically identical) picture and
+/// say so; AVIF has no decoder here and says so. `Ok(None)`: XMP, which has no picture.
+pub(crate) fn codec_preview(buf: &ImageBuf, spec: &rawgraph_core::ExportSpec, transform: rawgraph_scopes::DisplayTransform) -> Result<Option<CodecPreview>, String> {
+    use rawgraph_core::color::{invert, mul_vec, rec709_to_output, srgb_eotf, srgb_oetf, Transfer};
+    if spec.format == ExportFileFormat::Xmp {
+        return Ok(None);
+    }
     let settings = rawgraph_batch::settings_from_spec(spec, transform);
     let long = match (settings.long_edge, settings.percent) {
         (Some(n), _) => Some(n),
@@ -947,18 +976,75 @@ pub(crate) fn codec_preview(buf: &ImageBuf, spec: &rawgraph_core::ExportSpec, tr
     };
     let resized = long.map(|n| rawgraph_batch::resize_to_long_edge(buf, n));
     let source = resized.as_deref().unwrap_or(buf);
+    let finite = |v: f32| if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+    let note = preview_description(spec).map(str::to_owned);
+    // Formats without a colour transform of their own.
+    match spec.format {
+        ExportFileFormat::Exr => return Ok(Some(CodecPreview { image: transform.apply(source), note })),
+        ExportFileFormat::Png16Data => {
+            let rgb = source.data().as_chunks::<4>().0.iter().flat_map(|p| [finite(p[0]), finite(p[1]), finite(p[2])]).collect();
+            return Ok(Some(CodecPreview { image: DisplayImage { width: source.width(), height: source.height(), rgb }, note }));
+        }
+        _ => {}
+    }
     let d = transform.apply_in_space(source, spec.space);
-    let rgb: Vec<u8> = d.rgb.iter().map(|v| (if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) } * 255.0).round() as u8).collect();
-    let options = rawgraph_io::SaveOptions { jpeg_quality: spec.quality, embed_profile: spec.embed_profile, space: spec.space, ..Default::default() };
-    let encoded = rawgraph_io::encode_rgb(d.width, d.height, &rgb, image::ExtendedColorType::Rgb8, ext, &options).map_err(|e| e.to_string())?;
-    let decoded = image::load_from_memory(&encoded).map_err(|e| e.to_string())?.to_rgb8();
+    // Output-space codes (0..1) back to the viewer's sRGB, so out-of-gamut clipping shows.
     let inverse = invert(&rec709_to_output(spec.space));
-    let rgb = decoded.as_raw().as_chunks::<3>().0.iter().flat_map(|p| {
-        let linear = [p[0], p[1], p[2]].map(|v| { let x = v as f32 / 255.0; (match spec.space.transfer() { Transfer::Srgb => srgb_eotf(x), Transfer::Gamma(g) => x.powf(g as f32) }) as f64 });
-        let v = mul_vec(&inverse, linear);
-        v.map(|x| srgb_oetf(x as f32))
-    }).collect();
-    Ok(Some(DisplayImage { width: d.width, height: d.height, rgb }))
+    let back = |codes: &mut dyn Iterator<Item = [f32; 3]>| -> Vec<f32> {
+        codes.flat_map(|c| {
+            let linear = c.map(|x| (match spec.space.transfer() { Transfer::Srgb => srgb_eotf(x), Transfer::Gamma(g) => x.powf(g as f32) }) as f64);
+            mul_vec(&inverse, linear).map(|x| srgb_oetf(x as f32))
+        }).collect()
+    };
+    let shown = |codes: Vec<f32>, note: Option<String>| Ok(Some(CodecPreview { image: DisplayImage { width: d.width, height: d.height, rgb: codes }, note }));
+    if matches!(spec.format, ExportFileFormat::Png16 | ExportFileFormat::Tiff16) {
+        let rgb = back(&mut d.rgb.as_chunks::<3>().0.iter().map(|c| [finite(c[0]), finite(c[1]), finite(c[2])]));
+        return shown(rgb, note);
+    }
+    let rgb8: Vec<u8> = d.rgb.iter().map(|v| (finite(*v) * 255.0).round() as u8).collect();
+    let options = rawgraph_io::SaveOptions { jpeg_quality: spec.quality, embed_profile: spec.embed_profile, space: spec.space, ..Default::default() };
+    let mut note = note;
+    let decoded: Vec<u8> = match spec.format {
+        ExportFileFormat::Jpeg | ExportFileFormat::Png | ExportFileFormat::Tiff => {
+            let ext = match spec.format { ExportFileFormat::Jpeg => "jpg", ExportFileFormat::Png => "png", _ => "tif" };
+            let encoded = rawgraph_io::encode_rgb(d.width, d.height, &rgb8, image::ExtendedColorType::Rgb8, ext, &options).map_err(|e| e.to_string())?;
+            image::load_from_memory(&encoded).map_err(|e| e.to_string())?.to_rgb8().into_raw()
+        }
+        ExportFileFormat::Webp => {
+            let alpha = source.data().as_chunks::<4>().0.iter().map(|p| (finite(p[3]) * 255.0).round() as u8);
+            let rgba: Vec<u8> = rgb8.as_chunks::<3>().0.iter().zip(alpha).flat_map(|(c, a)| [c[0], c[1], c[2], a]).collect();
+            let encoded = rawgraph_io::encode_webp8(d.width, d.height, &rgba, spec.webp_lossless, &options).map_err(|e| e.to_string())?;
+            let (w, h, out) = rawgraph_io::decode_webp8(&encoded).map_err(|e| e.to_string())?;
+            if (w, h) != (d.width, d.height) {
+                return Err(format!("WebP preview has the wrong size {w}x{h}"));
+            }
+            out.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect()
+        }
+        ExportFileFormat::Heic => {
+            let attempt = rawgraph_io::heic_available().map_err(|e| e.to_string()).and_then(|()| {
+                let encoded = rawgraph_io::encode_heic8(d.width, d.height, &rgb8, &options).map_err(|e| e.to_string())?;
+                let img = rawgraph_io::decode_heic8(&encoded).map_err(|e| e.to_string())?;
+                if (img.width, img.height) != (d.width, d.height) {
+                    return Err(format!("HEIC preview has the wrong size {}x{}", img.width, img.height));
+                }
+                Ok(img.rgb)
+            });
+            match attempt {
+                Ok(rgb) => rgb,
+                Err(why) => {
+                    note = Some(format!("No HEIC preview: {why}"));
+                    rgb8
+                }
+            }
+        }
+        // AVIF (no decoder in this build) and anything added later: the picture before encoding.
+        _ => rgb8,
+    };
+    if decoded.len() != d.rgb.len() {
+        return Err("the codec returned a picture of a different size".into());
+    }
+    let rgb = back(&mut decoded.as_chunks::<3>().0.iter().map(|p| p.map(|v| f32::from(v) / 255.0)));
+    shown(rgb, note)
 }
 
 /// Message for an image that a node's collection does not contain.
@@ -1133,11 +1219,91 @@ mod tests {
         let png = match render(&mut worker, g.clone()) { Reply::Frame(f) => f.rgba8, _ => panic!("PNG frame missing") };
         assert_eq!(png, display.to_rgba8());
         assert_ne!(jpeg, png, "lossy codec visibly changes the frame");
+        // Every other format previews on the worker too, and none of them writes a file.
+        for index in [2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 9.0, 10.0] {
+            g.node_mut(exp).unwrap().set_param("format", ImageId(1), index);
+            match render(&mut worker, g.clone()) {
+                Reply::Frame(f) => assert_eq!(f.rgba8.len(), 32 * 32 * 4, "format {index}"),
+                Reply::Error { message, .. } => panic!("format {index}: {message}"),
+                _ => panic!("format {index}: no frame"),
+            }
+        }
         g.node_mut(exp).unwrap().set_param("format", ImageId(1), 7.0);
         assert!(matches!(render(&mut worker, g), Reply::Excluded { message, .. } if message.contains("no image")));
         assert_eq!(std::fs::read(&marker).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn preview_rig(format: f32, lossless: bool, quality: f32) -> (ImageBuf, rawgraph_core::ExportSpec) {
+        let pixels: Vec<f32> = (0..48 * 48).flat_map(|i| {
+            let (x, y) = ((i % 48) as f32 / 47.0, (i / 48) as f32 / 47.0);
+            [x * 0.9, y * 0.7, 0.5 * (x + y) * if (i % 7) == 0 { 0.2 } else { 1.0 }, 1.0]
+        }).collect();
+        let img = ImageBuf::from_rgba(48, 48, pixels).unwrap();
+        let mut g = Graph::new();
+        let exp = g.add_node(NodeKind::Export, [0.0; 2]);
+        let n = g.node_mut(exp).unwrap();
+        n.set_param("format", ImageId(1), format);
+        n.set_param("quality", ImageId(1), quality);
+        n.set_param("webp_lossless", ImageId(1), if lossless { 1.0 } else { 0.0 });
+        let spec = export_spec(g.node(exp).unwrap(), ImageId(1));
+        (img, spec)
+    }
+
+    #[test]
+    fn codec_preview_covers_every_lossy_and_depth_reducing_format() {
+        let t = ViewSettings::default().transform();
+        let none = |p: &CodecPreview| p.note.is_none();
+        // Reference: the viewer picture without any codec (sRGB).
+        let (img, spec) = preview_rig(1.0, false, 92.0);
+        let plain = codec_preview(&img, &spec, t).unwrap().unwrap();
+        assert!(none(&plain));
+        let max_diff = |a: &CodecPreview, b: &CodecPreview| a.image.rgb.iter().zip(&b.image.rgb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        // TIFF 8-bit is the same lossless 8-bit quantisation as PNG 8-bit.
+        let (_, tiff) = preview_rig(3.0, false, 92.0);
+        assert_eq!(codec_preview(&img, &tiff, t).unwrap().unwrap().image, plain.image);
+        // WebP lossy visibly changes at low quality and less at high quality; lossless equals PNG and says so.
+        let (_, low) = preview_rig(9.0, false, 5.0);
+        let (_, high) = preview_rig(9.0, false, 95.0);
+        let (low, high) = (codec_preview(&img, &low, t).unwrap().unwrap(), codec_preview(&img, &high, t).unwrap().unwrap());
+        assert!(none(&low) && none(&high));
+        assert!(max_diff(&low, &plain) > max_diff(&high, &plain), "lower quality, larger error");
+        assert!(max_diff(&low, &plain) > 0.02, "{}", max_diff(&low, &plain));
+        let (_, lossless) = preview_rig(9.0, true, 5.0);
+        let lossless = codec_preview(&img, &lossless, t).unwrap().unwrap();
+        assert_eq!(lossless.image, plain.image, "lossless WebP shows only the 8-bit quantisation");
+        assert!(lossless.note.as_deref().is_some_and(|n| n.contains("Lossless WebP")));
+        // 16-bit formats: lossless note; the picture is within half an 8-bit step of the 8-bit one.
+        for index in [2.0, 4.0] {
+            let (_, s) = preview_rig(index, false, 92.0);
+            let p = codec_preview(&img, &s, t).unwrap().unwrap();
+            assert!(p.note.as_deref().is_some_and(|n| n.contains("lossless")), "{:?}", p.note);
+            assert!(max_diff(&p, &plain) < 1.0 / 255.0, "{}", max_diff(&p, &plain));
+        }
+        // AVIF has no decoder here: an explicit note and the 8-bit picture.
+        let (_, avif) = preview_rig(6.0, false, 50.0);
+        let p = codec_preview(&img, &avif, t).unwrap().unwrap();
+        assert!(p.note.as_deref().is_some_and(|n| n.contains("No preview for AVIF")), "{:?}", p.note);
+        assert_eq!(p.image, plain.image);
+        // EXR and the data map are lossless as well; XMP has no picture.
+        for index in [5.0, 8.0] {
+            let (_, s) = preview_rig(index, false, 92.0);
+            let p = codec_preview(&img, &s, t).unwrap().unwrap();
+            assert!(p.note.as_deref().is_some_and(|n| n.contains("lossless")), "{:?}", p.note);
+        }
+        let (_, xmp) = preview_rig(7.0, false, 92.0);
+        assert!(codec_preview(&img, &xmp, t).unwrap().is_none());
+        // HEIC: through the system decoder when it exists, otherwise an explicit note.
+        let (_, heic) = preview_rig(10.0, false, 30.0);
+        let p = codec_preview(&img, &heic, t).unwrap().unwrap();
+        match rawgraph_io::heic_available() {
+            Ok(()) => {
+                assert!(p.note.is_none());
+                assert!(max_diff(&p, &plain) > 0.0 && max_diff(&p, &plain) < 0.5, "HEIC preview differs from the plain picture by {}", max_diff(&p, &plain));
+            }
+            Err(why) => assert_eq!(p.note, Some(format!("No HEIC preview: {why}"))),
+        }
     }
 
     #[test]

@@ -237,7 +237,7 @@ pub fn export_conflict(format: ExportFileFormat, space: OutputSpace) -> Option<&
 
 /// Whether the quality setting applies to `format`.
 pub fn quality_applies(format: ExportFileFormat) -> bool {
-    matches!(format, ExportFileFormat::Jpeg | ExportFileFormat::Avif | ExportFileFormat::Webp)
+    matches!(format, ExportFileFormat::Jpeg | ExportFileFormat::Avif | ExportFileFormat::Webp | ExportFileFormat::Heic)
 }
 
 /// Whether the colour space (and the embedded profile) apply to `format`.
@@ -374,7 +374,7 @@ fn changed_color(changed: bool, text: &str) -> RichText {
 
 /// A combo box over `options` where some options are disabled with a reason. Returns the new
 /// index when the user picked another one.
-fn combo(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::Debug, current: usize, options: &[&str], disabled: &dyn Fn(usize) -> Option<&'static str>, enabled: bool) -> Option<usize> {
+fn combo(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::Debug, current: usize, options: &[&str], disabled: &dyn Fn(usize) -> Option<String>, enabled: bool) -> Option<usize> {
     let mut picked = None;
     ui.add_enabled_ui(enabled, |ui| {
         egui::ComboBox::from_id_salt(salt)
@@ -384,7 +384,7 @@ fn combo(ui: &mut egui::Ui, salt: impl std::hash::Hash + std::fmt::Debug, curren
                 for (i, o) in options.iter().enumerate() {
                     match disabled(i) {
                         Some(why) => {
-                            ui.add_enabled(false, egui::Button::selectable(i == current, *o)).on_disabled_hover_text(why);
+                            ui.add_enabled(false, egui::Button::selectable(i == current, *o)).on_disabled_hover_text(why.as_str());
                         }
                         None => {
                             if ui.selectable_label(i == current, *o).clicked() && i != current {
@@ -650,8 +650,8 @@ pub(crate) fn text_field(ui: &mut egui::Ui, key: egui::Id, current: &str, width:
 
 // The stored format indices remain unchanged for existing projects. PNG/TIFF depth
 // is presented independently, but mapped back to the corresponding legacy index.
-const PHOTO_FORMATS: &[&str] = &["JPEG", "PNG", "TIFF", "EXR", "AVIF", "Adobe XMP sidecar", "PNG 16-bit data map", "WebP"];
-const FORMAT_INDICES: [usize; 8] = [0, 1, 3, 5, 6, 7, 8, 9];
+const PHOTO_FORMATS: &[&str] = &["JPEG", "PNG", "TIFF", "EXR", "AVIF", "Adobe XMP sidecar", "PNG 16-bit data map", "WebP", "HEIC"];
+const FORMAT_INDICES: [usize; 9] = [0, 1, 3, 5, 6, 7, 8, 9, 10];
 
 fn export_format_control(format: ExportFileFormat) -> (usize, usize) {
     match format {
@@ -665,6 +665,7 @@ fn export_format_control(format: ExportFileFormat) -> (usize, usize) {
         ExportFileFormat::Xmp => (5, 0),
         ExportFileFormat::Png16Data => (6, 0),
         ExportFileFormat::Webp => (7, 0),
+        ExportFileFormat::Heic => (8, 0),
     }
 }
 
@@ -691,13 +692,29 @@ pub fn export_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, imag
         egui::Grid::new(("export-grid", id.0)).num_columns(2).spacing([10.0, 5.0]).min_col_width(label_w).show(ui, |ui| {
             let (fmt_i, depth_i) = export_format_control(spec.format);
             let avif_blocked = spec.space == OutputSpace::AdobeRgb;
-            let why_not_avif: &dyn Fn(usize) -> Option<&'static str> =
-                &|i| (i == 4 && avif_blocked).then_some("AVIF cannot carry Adobe RGB (1998); pick another colour space first");
+            // HEIC works only where the operating system can encode it (checked on a worker thread).
+            let heic = crate::export::heic_status();
+            if heic.is_none() {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            let heic_why: Option<String> = match &heic {
+                Some(Err(why)) => Some(why.clone()),
+                None => Some("Checking whether this computer can write HEIC\u{2026}".to_owned()),
+                Some(Ok(())) => None,
+            };
+            let why_not_avif: &dyn Fn(usize) -> Option<String> = &|i| match i {
+                4 if avif_blocked => Some("AVIF cannot carry Adobe RGB (1998); pick another colour space first".to_owned()),
+                8 if spec.format != ExportFileFormat::Heic => heic_why.clone(),
+                _ => None,
+            };
             ui.label("Format");
             ui.vertical(|ui| {
                 ui.set_width(ctrl_w);
                 if let Some(i) = combo(ui, (id.0, "format"), fmt_i, PHOTO_FORMATS, why_not_avif, true) {
                     new_values.push(("format", export_format_index(i, depth_i) as f32));
+                }
+                if let (ExportFileFormat::Heic, Some(why)) = (spec.format, &heic_why) {
+                    ui.label(RichText::new(why.as_str()).color(ERROR));
                 }
             });
             ui.end_row();
@@ -714,7 +731,7 @@ pub fn export_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, imag
             }
 
             let q_ok = quality_applies(spec.format) && !(spec.format == ExportFileFormat::Webp && spec.webp_lossless);
-            ui.label("Quality").on_hover_text("Applies to JPEG, AVIF and lossy WebP");
+            ui.label("Quality").on_hover_text("Applies to JPEG, AVIF, HEIC and lossy WebP");
             ui.vertical(|ui| {
                 ui.set_width(ctrl_w);
                 let mut q = f32::from(spec.quality);
@@ -769,7 +786,7 @@ pub fn export_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, imag
             let space_ok = colour_space_applies(spec.format);
             let space_i = OUTPUT_SPACES.iter().position(|s| *s == spec.space.label()).unwrap_or(0);
             let avif = spec.format == ExportFileFormat::Avif;
-            let why_not_adobe: &dyn Fn(usize) -> Option<&'static str> = &|i| (avif && OutputSpace::from_index(i) == OutputSpace::AdobeRgb).then_some("AVIF cannot carry Adobe RGB (1998)");
+            let why_not_adobe: &dyn Fn(usize) -> Option<String> = &|i| (avif && OutputSpace::from_index(i) == OutputSpace::AdobeRgb).then(|| "AVIF cannot carry Adobe RGB (1998)".to_owned());
             ui.label("Colour space");
             ui.vertical(|ui| {
                 ui.set_width(ctrl_w);
@@ -781,12 +798,10 @@ pub fn export_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, imag
             ui.label("");
             ui.vertical(|ui| {
                 let mut embed = spec.embed_profile;
-                if ui.add_enabled(space_ok && spec.format != ExportFileFormat::Webp, egui::Checkbox::new(&mut embed, "Embed colour profile")).changed() {
+                if ui.add_enabled(space_ok, egui::Checkbox::new(&mut embed, "Embed colour profile")).changed() {
                     new_values.push(("profile", if embed { 1.0 } else { 0.0 }));
                 }
-                if spec.format == ExportFileFormat::Webp {
-                    ui.label(RichText::new("WebP ICC profile embedding is not supported.").weak().small());
-                } else if spec.format == ExportFileFormat::Png16Data {
+                if spec.format == ExportFileFormat::Png16Data {
                     ui.label(RichText::new("Raw RGB data: no colour transform, profile or metadata; use original size for normal maps.").weak().small());
                 } else if !space_ok {
                     ui.label(RichText::new(EXR_SPACE_NOTE).weak().small());
@@ -1130,7 +1145,7 @@ mod tests {
         assert_eq!(export_conflict(ExportFileFormat::Avif, OutputSpace::DisplayP3), None);
         assert_eq!(export_conflict(ExportFileFormat::Jpeg, OutputSpace::AdobeRgb), None);
         for f in ExportFileFormat::ALL {
-            assert_eq!(quality_applies(f), matches!(f, ExportFileFormat::Jpeg | ExportFileFormat::Avif | ExportFileFormat::Webp), "{f:?}");
+            assert_eq!(quality_applies(f), matches!(f, ExportFileFormat::Jpeg | ExportFileFormat::Avif | ExportFileFormat::Webp | ExportFileFormat::Heic), "{f:?}");
             assert_eq!(colour_space_applies(f), !matches!(f, ExportFileFormat::Exr | ExportFileFormat::Png16Data), "{f:?}");
         }
         assert!(EXR_SPACE_NOTE.contains("EXR"));

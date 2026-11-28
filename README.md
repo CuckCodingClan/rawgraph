@@ -182,8 +182,14 @@ The gallery, scopes, and Clean Feed follow the single viewer or the right **Prim
 Each tile uses the Primary viewer's stage and display settings, but renders its
 own photo even when the Primary viewer pins a different photo. Group edits update
 all affected photos; Individual edits only update the affected photo. Camera JPEGs
-are provisional until the editable render is ready. The tile retains its last
-picture while rendering. Depth Map, Pixel Sort and stages measured as slow defer
+are provisional until the editable render is ready. Thumbnails and provisional
+previews honour an embedded input colour profile (Adobe RGB, Display P3 and other
+matrix/TRC RGB profiles, in JPEG, PNG and TIFF files and in the JPEG previews of RAW
+files): they are converted to sRGB the same way as the full decode, after the shrink,
+so the cost is small (about 0.2 ms per 256 px thumbnail). A RAW preview takes the first
+profile found in the file; profiles that cannot be used are ignored, as in the full
+decode. Thumbnails already stored in the disk cache keep their old colours until they
+are regenerated. The tile retains its last picture while rendering. Depth Map, Pixel Sort and stages measured as slow defer
 updates during a drag; a small amber dot means the picture is stale.
 
 **View → Editable thumbnail cache** controls the persistent disk budget (default
@@ -194,7 +200,15 @@ look different from a full viewer proxy or export.
 
 ### Export node preview
 
-Viewing an Export node set to JPEG or 8-bit PNG automatically shows the result of encoding and decoding the viewer image with the node’s settings. It writes no files. The preview can use a reduced-resolution image, so compression artifacts may differ from a full-resolution export. XMP has no image output; other formats do not yet support this preview. For PNG and TIFF, select 8 or 16 bits per channel separately from the format.
+Viewing an Export node automatically shows the result of the node's codec, using the node's settings, on the render worker. It writes no files. The preview can use a reduced-resolution image, so compression artifacts may differ from a full-resolution export.
+
+- **Encode and decode again:** JPEG, PNG and TIFF 8-bit, WebP (lossy shows compression artifacts; lossless shows only the 8-bit quantisation), and HEIC through the system decoder (see HEIC export).
+- **Lossless, shown unchanged with a note:** PNG and TIFF 16-bit (16-bit quantisation is not visible), PNG 16-bit data map (shown as stored, without display transform) and EXR.
+- **AVIF:** this build has no AVIF decoder, so the picture is shown before encoding, with the note "No preview for AVIF".
+- **HEIC without an encoder:** the picture is shown before encoding, with the reason.
+- **XMP** has no image output.
+
+For PNG and TIFF, select 8 or 16 bits per channel separately from the format.
 
 ### Data-map export
 
@@ -422,7 +436,7 @@ the transaction, only on local drives outside sync folders, otherwise the whole 
 with its own 8-thread pool, and undo steps share unchanged nodes instead of copying the graph.
 The interactive preview runs the trailing pointwise operations and the display transform on the GPU
 with automatic CPU fallback; everything else, including export, uses the CPU reference path.
-Not yet built: Layer mode "All combinations", HEIC, a lens database, GPU versions of the
+Not yet built: Layer mode "All combinations", HEIC on macOS/Linux, a lens database, GPU versions of the
 non-pointwise effects, HDR output and ACES output transforms, merging of concurrent edits, node
 groups and macros, installer and signing, macOS/Linux verification. Interactive use with a real
 mouse and keyboard has not been tested by hand yet. Open questions: `docs/offene-punkte.md`.
@@ -466,4 +480,13 @@ blur preserves the source alpha. Other kernels ignore the direction map.
 
 ### WebP export
 
-Export nodes and Quick Export support 8-bit WebP with alpha. Choose lossless or lossy compression; quality affects only lossy encoding. Pixels use the chosen display transform and output colour space. EXIF metadata is supported, but ICC profiles are not embedded in WebP; use sRGB for maximum interoperability.
+Export nodes and Quick Export support 8-bit WebP with alpha. Choose lossless or lossy compression; quality affects only lossy encoding. Pixels use the chosen display transform and output colour space. EXIF metadata is supported. With **Embed colour profile** (default on) the ICC profile of the output colour space is stored in an `ICCP` chunk of the extended (`VP8X`) container, for lossless and lossy files, so Display P3, Adobe RGB and Rec. 2020 files are tagged. Without it the file is a plain untagged WebP, which readers treat as sRGB.
+
+### HEIC export
+
+Export nodes and Quick Export can write 8-bit HEIC (quality 1 to 100). RawGraph bundles no HEVC encoder (patents and licences); it uses the operating system's:
+
+- **Windows:** Windows Imaging Component HEIF encoder. It works while the **HEVC Video Extensions** and the **HEIF Image Extensions** from the Microsoft Store are installed. The ICC profile of the output colour space is embedded and EXIF (camera, lens, exposure, date, artist, copyright, description, software) is written through WIC; GPS is not written. The encoder accepts 8-bit only here; 10-bit is not offered.
+- **macOS, Linux:** not available (no ImageIO implementation could be built and checked yet).
+
+The Export node and Quick Export check this when they open (a trial encode on a worker thread). Without an encoder the HEIC option is greyed out with the reason "HEIC needs the HEVC Video Extensions from the Microsoft Store (or use AVIF)", and a batch that is set to HEIC is refused with the same message before any file is touched. HEIC import is not supported.

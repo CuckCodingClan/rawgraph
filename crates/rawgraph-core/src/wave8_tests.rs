@@ -1197,7 +1197,7 @@ fn export_node_shape() {
     );
     assert_eq!(
         k.param_spec("format").unwrap().kind,
-        ParamKind::Choice(&["JPEG", "PNG", "PNG 16-bit", "TIFF", "TIFF 16-bit", "EXR", "AVIF", "Adobe XMP sidecar", "PNG 16-bit data map", "WebP"])
+        ParamKind::Choice(&["JPEG", "PNG", "PNG 16-bit", "TIFF", "TIFF 16-bit", "EXR", "AVIF", "Adobe XMP sidecar", "PNG 16-bit data map", "WebP", "HEIC"])
     );
     let q = k.param_spec("quality").unwrap();
     assert_eq!((q.min, q.max, q.default), (1.0, 100.0, 92.0));
@@ -1273,7 +1273,8 @@ fn export_spec_reads_every_param() {
         assert_eq!(f.label(), EXPORT_FORMATS[i]);
     }
     assert_eq!(ExportFileFormat::from_index(9), ExportFileFormat::Webp);
-    assert_eq!(ExportFileFormat::from_index(10), ExportFileFormat::Jpeg);
+    assert_eq!(ExportFileFormat::from_index(10), ExportFileFormat::Heic);
+    assert_eq!(ExportFileFormat::from_index(11), ExportFileFormat::Jpeg);
     assert_eq!(ExportFileFormat::from_index(99), ExportFileFormat::Jpeg);
     for (v, expect) in [(1.0, 1u8), (92.4, 92), (92.6, 93), (100.0, 100)] {
         n.set_param("quality", id(1), v);
@@ -1316,7 +1317,7 @@ fn export_spec_reads_every_param() {
     n.mode = Mode::Individual;
     n.set_param("format", id(7), 5.0);
     assert_eq!(export_spec(n, id(7)).format, ExportFileFormat::Exr);
-    assert_eq!(export_spec(n, id(8)).format, ExportFileFormat::Webp, "inherits the All value (last loop value)");
+    assert_eq!(export_spec(n, id(8)).format, ExportFileFormat::Heic, "inherits the All value (last loop value)");
 }
 
 #[test]
@@ -1719,7 +1720,7 @@ fn loading_rejects_invalid_new_data() {
     );
     // Bad parameter values of the new parameters.
     parse_err(load(&|v| v["nodes"]["2"]["all"]["quality"] = serde_json::json!(101)), "outside 1..100");
-    parse_err(load(&|v| v["nodes"]["2"]["all"]["format"] = serde_json::json!(10)), "outside 0..9");
+    parse_err(load(&|v| v["nodes"]["2"]["all"]["format"] = serde_json::json!(11)), "outside 0..10");
     parse_err(load(&|v| v["nodes"]["2"]["all"]["long_edge"] = serde_json::json!(15)), "outside 16..32000");
     parse_err(load(&|v| v["nodes"]["2"]["all"]["percent"] = serde_json::json!(0)), "outside 1..100");
     parse_err(load(&|v| v["nodes"]["1"]["all"]["subfolders"] = serde_json::json!(2)), "outside 0..1");

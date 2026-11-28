@@ -363,7 +363,7 @@ fn cpu(evaluator: &mut Evaluator, job: &Job, id: ImageId, (node, port): Stage, p
     let buf = if buf.width().max(buf.height()) > EDGE { downscaled = buf.downscale_box(EDGE); &downscaled } else { &buf };
     let t = job.state.view.transform();
     let pixels = if let Some(n) = job.graph.node(node).filter(|n| n.kind == NodeKind::Export) {
-        crate::render::codec_preview(buf, &rawgraph_core::export_spec(n, id), t).ok()??.to_rgba8()
+        crate::render::codec_preview(buf, &rawgraph_core::export_spec(n, id), t).ok()??.image.to_rgba8()
     } else { t.apply_with_rgba8(buf).1 };
     Some((buf.width(), buf.height(), pixels))
 }
