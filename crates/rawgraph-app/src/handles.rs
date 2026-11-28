@@ -342,8 +342,18 @@ impl Handles {
                 let provider = session.provider.clone();
                 let tone = session.view.tone.tone_map();
                 let image = f.image;
+                // A Depth Map upstream could keep the pick waiting for the worker: give up after a while.
+                let cancel = rawgraph_engine::CancelToken::new();
+                let (done_tx, done_rx) = channel::<()>();
+                let watchdog = cancel.clone();
                 std::thread::spawn(move || {
-                    let result = pick_values(&graph, provider.as_ref(), tone, node, image, at);
+                    if done_rx.recv_timeout(std::time::Duration::from_secs(8)) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                        watchdog.cancel();
+                    }
+                });
+                std::thread::spawn(move || {
+                    let result = pick_values(&graph, provider.as_ref(), tone, node, image, at, &cancel);
+                    drop(done_tx);
                     let _ = tx.send(Pick { node, image, result });
                 });
                 self.pick = Some(rx);
@@ -404,12 +414,12 @@ pub fn sample_patch(img: &rawgraph_core::ImageBuf, at: [f32; 2]) -> [f32; 3] {
 }
 
 /// Parameter values that make the input of `node` neutral around `at` (normalised).
-pub fn pick_values(graph: &Graph, provider: &dyn ImageProvider, tone: rawgraph_scopes::ToneMap, node: NodeId, image: ImageId, at: [f32; 2]) -> PickResult {
+pub fn pick_values(graph: &Graph, provider: &dyn ImageProvider, tone: rawgraph_scopes::ToneMap, node: NodeId, image: ImageId, at: [f32; 2], cancel: &CancelToken) -> PickResult {
     let n = graph.node(node).ok_or("The node no longer exists")?;
     let (up, port) = graph.input_edge(node, 0).ok_or("Connect an image to pick a neutral point")?;
     let mut evaluator = Evaluator::new();
     evaluator.set_view_tone(tone);
-    let Value::Images(img) = evaluator.eval_output(graph, up, port, image, provider, &CancelToken::new()).map_err(|e| format!("The neutral point could not be read: {e}"))?;
+    let Value::Images(img) = evaluator.eval_output(graph, up, port, image, provider, cancel).map_err(|e| format!("The neutral point could not be read: {e}"))?;
     let c = sample_patch(&img, at);
     if c.iter().any(|v| !v.is_finite() || *v <= 1e-6) {
         return Err("Pick a grey area: every channel must be above black".to_owned());

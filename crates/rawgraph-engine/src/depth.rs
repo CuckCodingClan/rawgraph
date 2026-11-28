@@ -13,6 +13,10 @@
 //!   failed, the worker stays usable).
 //! - `0x03` shutdown (no reply); closing stdin also ends a worker.
 //!
+//! Limits: the whole request is copied once into a byte buffer (16 bytes per pixel, so a
+//! 20 MP image costs about 320 MB extra) and one frame is below 2 GiB, which limits the image to
+//! about 134 MP. A worker that hangs is killed after the timeout (default 120 s) and restarted once.
+//!
 //! Old one-shot mode (`RGD1`): `"RGD1" u32 w u32 h` + RGBA f32 on stdin until EOF; the reply is
 //! `"RGD1" u32 w u32 h` + f32 samples on stdout.
 
@@ -63,9 +67,7 @@ impl DepthConfig {
     pub fn from_env() -> Result<Self, String> {
         let worker = std::env::var_os("RAWGRAPH_DEPTH_WORKER")
             .ok_or("Depth Map: set RAWGRAPH_DEPTH_WORKER to the configured executable; see docs/depth-estimate.md")?;
-        let secs = |name: &str, default: Duration| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|s| s.is_finite() && *s > 0.0).map_or(default, Duration::from_secs_f64)
-        };
+        let secs = |name: &str, default: Duration| parse_secs(std::env::var(name).ok().as_deref(), default);
         let mut config = Self::new(worker);
         config.args.extend(std::env::var_os("RAWGRAPH_DEPTH_SCRIPT"));
         config.model = std::env::var_os("RAWGRAPH_DEPTH_MODEL");
@@ -73,6 +75,22 @@ impl DepthConfig {
         config.handshake_timeout = secs("RAWGRAPH_DEPTH_HANDSHAKE_SECS", Self::DEFAULT_HANDSHAKE_TIMEOUT);
         Ok(config)
     }
+}
+
+/// Longest wait ever used; larger or invalid settings are clamped, never a panic.
+const MAX_WAIT: Duration = Duration::from_secs(24 * 3600);
+
+/// Seconds from an environment variable: positive, finite, at most 24 h; otherwise `default`.
+pub fn parse_secs(value: Option<&str>, default: Duration) -> Duration {
+    match value.and_then(|v| v.trim().parse::<f64>().ok()).filter(|s| *s > 0.0) {
+        Some(s) => Duration::try_from_secs_f64(s).map_or(MAX_WAIT, |d| d.min(MAX_WAIT)),
+        None => default,
+    }
+}
+
+fn deadline_after(wait: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(wait.min(MAX_WAIT)).unwrap_or(now)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,13 +106,21 @@ enum Mode {
     OneShot,
 }
 
+/// How long a one-shot decision holds before the handshake is tried again.
+const REPROBE_AFTER: Duration = Duration::from_secs(600);
+
 struct State {
     config: Option<DepthConfig>,
     mode: Mode,
     worker: Option<Proc>,
+    /// A valid hello reply was seen for this configuration.
+    hello_seen: bool,
+    /// A one-shot request worked for this configuration.
+    oneshot_ok: bool,
+    oneshot_since: Option<Instant>,
 }
 
-static POOL: Mutex<State> = Mutex::new(State { config: None, mode: Mode::Unknown, worker: None });
+static POOL: Mutex<State> = Mutex::new(State { config: None, mode: Mode::Unknown, worker: None, hello_seen: false, oneshot_ok: false, oneshot_since: None });
 /// Bumped by [`shutdown_depth_workers`]; running requests treat a change like a cancel.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -142,6 +168,9 @@ impl State {
         }
         self.config = None;
         self.mode = Mode::Unknown;
+        self.hello_seen = false;
+        self.oneshot_ok = false;
+        self.oneshot_since = None;
     }
 }
 
@@ -174,6 +203,9 @@ pub fn estimate(config: &DepthConfig, width: u32, height: u32, rgba: &[f32], can
         state.shutdown();
         state.config = Some(config.clone());
     }
+    if state.mode == Mode::OneShot && state.oneshot_since.is_some_and(|t| t.elapsed() > REPROBE_AFTER) {
+        state.mode = Mode::Unknown;
+    }
     let mut crashes = 0;
     loop {
         if stop.fired() {
@@ -186,19 +218,33 @@ pub fn estimate(config: &DepthConfig, width: u32, height: u32, rgba: &[f32], can
             persistent_attempt(&mut state, config, &body, width, height, &stop)
         };
         match outcome {
-            Attempt::Done(v) => return Ok(v),
+            Attempt::Done(v) => {
+                if state.mode == Mode::OneShot {
+                    state.oneshot_ok = true;
+                }
+                return Ok(v);
+            }
             Attempt::Stopped => {
                 state.shutdown_keep_config();
                 return Err(DepthError::Cancelled);
             }
-            Attempt::Fatal(msg) => return Err(DepthError::Failed(msg)),
+            Attempt::Fatal(msg) => {
+                state.forget_unproven_one_shot();
+                return Err(DepthError::Failed(msg));
+            }
             Attempt::Retry(msg) => {
                 crashes += 1;
                 if crashes >= 2 {
+                    state.forget_unproven_one_shot();
                     return Err(DepthError::Failed(msg));
                 }
             }
-            Attempt::SwitchToOneShot => state.mode = Mode::OneShot,
+            Attempt::SwitchToOneShot(why) => {
+                eprintln!("Depth Map: the worker did not complete the RGD2 handshake ({why}); using one-shot mode (one process per request), checked again in 10 minutes");
+                state.mode = Mode::OneShot;
+                state.oneshot_since = Some(Instant::now());
+                state.oneshot_ok = false;
+            }
         }
     }
 }
@@ -221,11 +267,19 @@ enum Attempt {
     Retry(String),
     /// Worker answered with an error or garbage: report right away.
     Fatal(String),
-    /// The hello went unanswered: use one-shot mode from now on.
-    SwitchToOneShot,
+    /// The hello was not answered (or the worker exited on it): use one-shot mode.
+    SwitchToOneShot(String),
 }
 
 impl State {
+    /// A one-shot decision that never produced a result may have been a broken worker, not an
+    /// old one: look at the handshake again next time.
+    fn forget_unproven_one_shot(&mut self) {
+        if self.mode == Mode::OneShot && !self.oneshot_ok {
+            self.mode = Mode::Unknown;
+        }
+    }
+
     /// Kill the worker but keep the configuration and the mode decision.
     fn shutdown_keep_config(&mut self) {
         if let Some(mut w) = self.worker.take() {
@@ -241,19 +295,19 @@ fn persistent_attempt(state: &mut State, config: &DepthConfig, body: &Arc<Vec<u8
             Err(e) => return Attempt::Fatal(e),
         };
         proc.send(Arc::new(frame(KIND_HELLO, &[b"RGD2".as_slice(), &[VERSION]].concat())));
-        match proc.read_frame(Instant::now() + config.handshake_timeout, stop) {
+        match proc.read_frame(deadline_after(config.handshake_timeout), stop) {
             Ok(reply) if reply.len() == 6 && reply[0] == KIND_HELLO_REPLY && &reply[1..5] == b"RGD2" => {
                 if reply[5] != VERSION {
                     proc.kill();
                     return Attempt::Fatal(format!("Depth Map worker speaks unsupported protocol version {}", reply[5]));
                 }
                 state.mode = Mode::Persistent;
+                state.hello_seen = true;
                 state.worker = Some(proc);
             }
             Ok(_) => {
                 proc.kill();
-                state.mode = Mode::OneShot;
-                return Attempt::SwitchToOneShot;
+                return if state.hello_seen { Attempt::Retry("Depth Map: invalid worker response".into()) } else { Attempt::SwitchToOneShot("unexpected reply".into()) };
             }
             Err(Fail::Stopped) => {
                 proc.kill();
@@ -261,12 +315,12 @@ fn persistent_attempt(state: &mut State, config: &DepthConfig, body: &Arc<Vec<u8
             }
             Err(Fail::Timeout) => {
                 proc.kill();
-                return Attempt::SwitchToOneShot;
+                let msg = format!("no answer within {:.1} s", config.handshake_timeout.as_secs_f64());
+                return if state.hello_seen { Attempt::Retry(format!("Depth Map worker did not respond ({msg})")) } else { Attempt::SwitchToOneShot(msg) };
             }
             Err(Fail::Closed | Fail::Bad) => {
                 let msg = proc.exit_message();
-                proc.kill();
-                return Attempt::Retry(msg);
+                return if state.hello_seen { Attempt::Retry(msg) } else { Attempt::SwitchToOneShot(msg) };
             }
         }
     }
@@ -276,7 +330,7 @@ fn persistent_attempt(state: &mut State, config: &DepthConfig, body: &Arc<Vec<u8
     let prefix = Arc::new(prefix);
     proc.send(prefix);
     proc.send(body.clone());
-    let result = proc.read_frame(Instant::now() + config.timeout, stop);
+    let result = proc.read_frame(deadline_after(config.timeout), stop);
     match result {
         Ok(reply) => match reply.first() {
             Some(&KIND_RESULT) => match decode_samples(width, height, &reply[1..]) {
@@ -320,11 +374,10 @@ fn one_shot_attempt(config: &DepthConfig, body: &Arc<Vec<u8>>, width: u32, heigh
     proc.send(Arc::new(b"RGD1".to_vec()));
     proc.send(body.clone());
     proc.close_stdin();
-    let out = proc.read_to_end(Instant::now() + config.timeout, stop);
+    let out = proc.read_to_end(deadline_after(config.timeout), stop);
     match out {
         Ok(bytes) => {
-            let status = proc.wait_status();
-            if status != Some(true) {
+            if proc.wait_status() != Some(true) {
                 return Attempt::Retry(proc.exit_message());
             }
             match decode_reply(width, height, &bytes) {
@@ -340,11 +393,7 @@ fn one_shot_attempt(config: &DepthConfig, body: &Arc<Vec<u8>>, width: u32, heigh
             proc.kill();
             Attempt::Retry(format!("Depth Map worker timed out after {:.0} s", config.timeout.as_secs_f64()))
         }
-        Err(Fail::Closed | Fail::Bad) => {
-            let msg = proc.exit_message();
-            proc.kill();
-            Attempt::Retry(msg)
-        }
+        Err(Fail::Closed | Fail::Bad) => Attempt::Retry(proc.exit_message()),
     }
 }
 
@@ -394,7 +443,70 @@ struct Proc {
     out_rx: mpsc::Receiver<Vec<u8>>,
     buf: Vec<u8>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    /// Killed, or exited and reaped: nothing is signalled any more (a reaped process group id
+    /// may already belong to somebody else).
     dead: bool,
+    exit: Option<std::process::ExitStatus>,
+    #[cfg(windows)]
+    job: Option<job::Job>,
+}
+
+/// Windows: every worker runs in a job object that kills all its processes when terminated or
+/// when the last handle closes, which also happens when RawGraph itself dies.
+#[cfg(windows)]
+mod job {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    pub struct Job(HANDLE);
+
+    // SAFETY: a job object handle may be used from any thread.
+    unsafe impl Send for Job {}
+
+    impl Job {
+        pub fn assign(child: &std::process::Child) -> Option<Job> {
+            // SAFETY: plain Win32 calls with valid arguments; the handle is closed on every failure path.
+            unsafe {
+                let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if handle.is_null() {
+                    return None;
+                }
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let set = SetInformationJobObject(
+                    handle,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(&info).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if set == 0 || AssignProcessToJobObject(handle, child.as_raw_handle() as HANDLE) == 0 {
+                    CloseHandle(handle);
+                    return None;
+                }
+                Some(Job(handle))
+            }
+        }
+
+        pub fn terminate(&self) {
+            // SAFETY: the handle is valid until `drop`.
+            unsafe {
+                TerminateJobObject(self.0, 1);
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: closing the handle we own; KILL_ON_JOB_CLOSE ends any survivors.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
 }
 
 impl Proc {
@@ -412,6 +524,8 @@ impl Proc {
             command.process_group(0);
         }
         let mut child = command.spawn().map_err(|e| format!("Depth Map: cannot start worker: {e}"))?;
+        #[cfg(windows)]
+        let job = job::Job::assign(&child);
         let (Some(mut stdin), Some(mut stdout), Some(mut stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take()) else {
             let _ = child.kill();
             return Err("Depth Map: cannot attach to worker pipes".into());
@@ -455,7 +569,17 @@ impl Proc {
                 }
             }
         });
-        Ok(Self { child, stdin_tx: Some(stdin_tx), out_rx, buf: Vec::new(), stderr: tail, dead: false })
+        Ok(Self {
+            child,
+            stdin_tx: Some(stdin_tx),
+            out_rx,
+            buf: Vec::new(),
+            stderr: tail,
+            dead: false,
+            exit: None,
+            #[cfg(windows)]
+            job,
+        })
     }
 
     fn send(&self, chunk: Arc<Vec<u8>>) {
@@ -514,27 +638,34 @@ impl Proc {
         }
     }
 
-    /// `Some(success)` once the process has exited, `None` if it did not within a short grace time.
+    /// Waits briefly for the process to exit on its own. `Some(success)` once it has (it is then
+    /// reaped and nothing is signalled to its id any more), `None` if it did not.
     fn wait_status(&mut self) -> Option<bool> {
+        if self.dead {
+            return self.exit.map(|s| s.success());
+        }
         let until = Instant::now() + Duration::from_secs(2);
         loop {
             match self.child.try_wait() {
-                Ok(Some(status)) => return Some(status.success()),
+                Ok(Some(status)) => {
+                    self.exit = Some(status);
+                    self.dead = true;
+                    return Some(status.success());
+                }
                 Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
                 _ => return None,
             }
         }
     }
 
+    /// Kills the worker (so survivors of a crashed one cannot linger) and describes why it ended.
     fn exit_message(&mut self) -> String {
-        let status = self.wait_status();
+        self.kill();
         // Let the stderr thread catch up with the last lines.
         std::thread::sleep(Duration::from_millis(20));
         let text = self.stderr.lock().map(|t| String::from_utf8_lossy(&t).trim().to_string()).unwrap_or_default();
-        match status {
-            Some(_) => format!("Depth Map worker failed: {}", if text.is_empty() { "process exited without a result" } else { &text }),
-            None => format!("Depth Map worker did not respond{}", if text.is_empty() { String::new() } else { format!(": {text}") }),
-        }
+        let status = self.exit.map_or_else(|| "unknown status".to_owned(), |s| s.to_string());
+        format!("Depth Map worker exited unexpectedly ({status}){}", if text.is_empty() { String::new() } else { format!(": {text}") })
     }
 
     fn shutdown_gracefully(&mut self) {
@@ -543,26 +674,42 @@ impl Proc {
             self.close_stdin();
             let until = Instant::now() + Duration::from_millis(300);
             while Instant::now() < until {
-                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                if let Ok(Some(status)) = self.child.try_wait() {
+                    self.exit = Some(status);
                     self.dead = true;
-                    return;
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
-        self.kill();
+        if self.dead {
+            // It left on its own: whatever it started goes too (Windows job object).
+            #[cfg(windows)]
+            if let Some(job) = self.job.take() {
+                job.terminate();
+            }
+        } else {
+            self.kill();
+        }
     }
 
-    /// Kills the process and everything it started, then reaps it.
+    /// Kills the process and everything it started, then reaps it. The process group is
+    /// signalled before the leader is reaped, so its id cannot have been reused.
     fn kill(&mut self) {
         if self.dead {
             return;
         }
         self.dead = true;
         self.stdin_tx = None;
-        kill_tree(self.child.id());
+        #[cfg(windows)]
+        match self.job.take() {
+            Some(job) => job.terminate(),
+            None => kill_tree_fallback(self.child.id()),
+        }
+        #[cfg(unix)]
+        kill_group(self.child.id());
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.exit = self.child.wait().ok();
     }
 }
 
@@ -572,10 +719,12 @@ impl Drop for Proc {
     }
 }
 
+/// Only used when the job object could not be created.
 #[cfg(windows)]
-fn kill_tree(pid: u32) {
+fn kill_tree_fallback(pid: u32) {
     use std::os::windows::process::CommandExt;
-    let _ = Command::new("taskkill")
+    let root = std::env::var_os("SystemRoot").map_or_else(|| std::path::PathBuf::from(r"C:\Windows"), std::path::PathBuf::from);
+    let _ = Command::new(root.join("System32").join("taskkill.exe"))
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -585,13 +734,11 @@ fn kill_tree(pid: u32) {
 }
 
 #[cfg(unix)]
-fn kill_tree(pid: u32) {
-    // The worker leads its own process group (see `spawn`), so this reaches wrapper scripts' children.
-    let _ = Command::new("kill").args(["-KILL", "--", &format!("-{pid}")]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+fn kill_group(pid: u32) {
+    // The worker leads its own process group (see `spawn`); signal all of it.
+    let Some(kill) = ["/bin/kill", "/usr/bin/kill"].into_iter().map(std::path::Path::new).find(|p| p.exists()) else { return };
+    let _ = Command::new(kill).args(["-s", "KILL", "--", &format!("-{pid}")]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
-
-#[cfg(not(any(windows, unix)))]
-fn kill_tree(_pid: u32) {}
 
 #[cfg(test)]
 mod tests {
@@ -608,6 +755,21 @@ mod tests {
         let n = body.len();
         body[n - 4..].copy_from_slice(&2.0_f32.to_le_bytes());
         assert!(decode_samples(1, 1, &body).is_err());
+    }
+
+    #[test]
+    fn timeouts_from_the_environment_never_panic() {
+        let d = Duration::from_secs(120);
+        assert_eq!(parse_secs(None, d), d);
+        for bad in ["abc", "-5", "0", "NaN", "", "-inf"] {
+            assert_eq!(parse_secs(Some(bad), d), d, "{bad}");
+        }
+        assert_eq!(parse_secs(Some(" 2.5 "), d), Duration::from_millis(2500));
+        for huge in ["inf", "1e30", "1e300", "100000", "18446744073709551616"] {
+            assert_eq!(parse_secs(Some(huge), d), MAX_WAIT, "{huge}");
+        }
+        // A huge configured wait cannot overflow the deadline either.
+        let _ = deadline_after(Duration::MAX);
     }
 
     #[test]

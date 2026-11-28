@@ -12,6 +12,9 @@ rawgraph-fx = { path = "../rawgraph-fx" }
 [dev-dependencies]
 serde_json.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
 # Custom harness: the test executable doubles as the fake depth worker (`--fake <mode> ...`).
 [[test]]
 name = "depth_worker"

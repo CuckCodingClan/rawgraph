@@ -6,14 +6,17 @@ Depth Map takes an Images input and produces an opaque grayscale Images output (
 
 - Optional settings: `RAWGRAPH_DEPTH_SCRIPT` (one script argument for the worker), `RAWGRAPH_DEPTH_TIMEOUT_SECS` (per request including the first model load, default 120) and `RAWGRAPH_DEPTH_HANDSHAKE_SECS` (default 10).
 - Cancelling the evaluation (the engine's `CancelToken`) stops waiting at once, kills the worker and its child processes (`taskkill /T` on Windows, the process group on Unix) and reports Cancelled; the next request starts a fresh worker.
-- A crashed or hung worker (no reply within the timeout) is killed and restarted once; if the second attempt fails too, the error (with the worker's stderr tail) is reported. An error reply from the worker (e.g. invalid input) is reported directly and does not restart anything.
+- A crashed or hung worker (no reply within the timeout, default 120 s) is killed and restarted once, also after a timeout; if the second attempt fails too, the error (with the worker's stderr tail) is reported. An error reply from the worker (e.g. invalid input) is reported directly and does not restart anything.
+- Killing means the whole tree: on Windows each worker runs in a job object (`KILL_ON_JOB_CLOSE`), so grandchildren of a wrapper script die with it and also when RawGraph itself is killed; on Unix the worker's process group is signalled before the worker is reaped.
+- Timeout variables accept seconds (fractions allowed), are clamped to 24 h, and invalid values fall back to the default.
+- Limits: the request is copied once into a byte buffer (16 bytes per pixel, e.g. about 320 MB extra for 20 MP) and a frame is below 2 GiB, so images above about 134 MP are rejected.
 - The worker is stopped when the application exits and when the environment configuration changes (a changed worker, script, model or timeout starts a new process). If RawGraph is killed, the worker sees stdin close and exits.
 
 ## Protocol
 
 `RGD2` (persistent, version byte 1): every message is a frame, `u32 LE length` + payload, first payload byte is the kind. `0x01` hello (`"RGD2"` + version byte) is answered with `0x81` and the same body; `0x02` request (`u32 width, u32 height` + RGBA float32, all little-endian) is answered with `0x82` (`u32 width, u32 height` + one float32 depth sample per pixel in 0..1) or `0xFF` + UTF-8 message; `0x03` asks the worker to exit. `scripts/depth_worker.py` answers the hello before importing numpy/onnxruntime.
 
-Old one-shot `RGD1` workers (stdin: `"RGD1" u32 w u32 h` + float32 RGBA until EOF; stdout: `"RGD1" u32 w u32 h` + samples) keep working: a worker that does not answer the hello within the handshake timeout is killed and used in one-shot mode (one process per request) while the configuration stays unchanged. The bundled script also serves `RGD1` if it receives it.
+Old one-shot `RGD1` workers (stdin: `"RGD1" u32 w u32 h` + float32 RGBA until EOF; stdout: `"RGD1" u32 w u32 h` + samples) keep working: a worker that does not answer the hello within the handshake timeout, or that exits on it without ever having answered a hello (a strict old worker), is used in one-shot mode (one process per request) while the configuration stays unchanged. The switch is logged on stderr and the handshake is tried again after 10 minutes, or at once after a one-shot request failed that never worked. The bundled script also serves `RGD1` if it receives it.
 
 ## Model provenance and setup
 

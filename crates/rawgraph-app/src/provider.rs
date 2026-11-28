@@ -114,6 +114,8 @@ pub struct FileProvider {
     /// Foreground (viewer) decodes in progress. Background decoders (gallery bases,
     /// prefetch) wait while this is non-zero so the viewer gets the disk/NAS and CPU.
     foreground: AtomicUsize,
+    /// Speculative (prefetch) decodes running right now.
+    speculative: AtomicUsize,
     demo: crate::session::TestImages,
 }
 
@@ -132,6 +134,7 @@ impl FileProvider {
             preview: AtomicU32::new(DEFAULT_PREVIEW),
             epoch: AtomicU64::new(0),
             foreground: AtomicUsize::new(0),
+            speculative: AtomicUsize::new(0),
             demo: crate::session::TestImages::new(),
         }
     }
@@ -320,6 +323,7 @@ impl FileProvider {
         self.yield_to_foreground(|| false);
         if self.cache.lock().is_ok_and(|c| c.lru.contains(&key) || c.inflight.contains(&key)) { return; }
         let epoch = self.epoch.load(Ordering::Relaxed);
+        self.speculative.fetch_add(1, Ordering::AcqRel);
         if let Ok(img) = decode(&path, preview) {
             if let Ok(mut c) = self.cache.lock() {
                 if self.epoch.load(Ordering::Relaxed) == epoch && !c.lru.contains(&key) {
@@ -327,6 +331,7 @@ impl FileProvider {
                 }
             }
         }
+        self.speculative.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// True if a proxy for `id` at the current preview size is in memory.
@@ -335,11 +340,20 @@ impl FileProvider {
         self.cache.lock().is_ok_and(|c| c.lru.contains(&key))
     }
 
-    /// Drops every decoded proxy (benchmarks, memory pressure).
+    /// Drops every decoded proxy (benchmarks, memory pressure). A decode that was already running
+    /// cannot put its result back afterwards.
     pub fn clear_cache(&self) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut c) = self.cache.lock() {
             c.lru.clear();
         }
+    }
+
+    /// No viewer decode, no prefetch decode and no claimed in-flight image.
+    pub fn decode_idle(&self) -> bool {
+        self.foreground.load(Ordering::Acquire) == 0
+            && self.speculative.load(Ordering::Acquire) == 0
+            && self.cache.lock().is_ok_and(|c| c.inflight.is_empty())
     }
 
     pub fn cached_bytes(&self) -> usize {
@@ -409,6 +423,7 @@ impl ImageProvider for FileProvider {
                 break;
             }
         }
+        let epoch = self.epoch.load(Ordering::Relaxed);
         self.foreground.fetch_add(1, Ordering::AcqRel);
         let result = self.decode(id, &path, preview);
         self.foreground.fetch_sub(1, Ordering::AcqRel);
@@ -416,7 +431,7 @@ impl ImageProvider for FileProvider {
             c.inflight.remove(&key);
             if let Ok(img) = &result {
                 // Not cached if the preview size changed while decoding.
-                if self.preview_size() == preview {
+                if self.preview_size() == preview && self.epoch.load(Ordering::Relaxed) == epoch {
                     c.lru.insert(key, img.clone());
                 }
             }

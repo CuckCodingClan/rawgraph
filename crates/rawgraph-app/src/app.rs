@@ -1451,11 +1451,17 @@ impl App {
                         self.allow_close = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
+                    if let Some(ff) = &mut self.first_frame {
+                        ff.on_failed(format!("render error: {message}"));
+                    }
                     self.last_error = Some(message.clone());
                     self.viewer.set_error(message);
                     if !self.compare.active() { self.scopes_stale = true; }
                 }
                 Reply::Excluded { message, .. } => {
+                    if let Some(ff) = &mut self.first_frame {
+                        ff.on_failed(format!("not shown: {message}"));
+                    }
                     self.last_error = None;
                     self.viewer.set_excluded(message);
                     if !self.compare.active() { self.scopes_stale = true; }
@@ -1472,7 +1478,7 @@ impl App {
         self.last_error = None;
         self.last_frame_at = Some(Instant::now());
         if let Some(ff) = &mut self.first_frame {
-            ff.on_frame(f.image, f.path.short());
+            ff.on_frame(f.image, f.path.short(), f.eval_ms, f.display_ms);
         }
         if let Some(note) = &f.notice {
             self.status.info(note.clone());
@@ -1515,7 +1521,8 @@ impl App {
             }
         }
         // Step to a neighbour instantly: decode them in the background now.
-        let cold_bench = self.bench.as_ref().is_some_and(|b| matches!(b.phase, BenchPhase::Wait | BenchPhase::Uncached));
+        let cold_bench = self.bench.as_ref().is_some_and(|b| matches!(b.phase, BenchPhase::Wait | BenchPhase::Uncached))
+            || self.first_frame.as_ref().is_some_and(ff_driver::Driver::cold);
         if f.image == self.session.current_image() && !cold_bench {
             self.prefetch.request(self.session.neighbours());
         }
@@ -1630,15 +1637,16 @@ impl App {
             if let Some(tex) = edited {
                 viewer.set_placeholder(self.quick_generation, tex.clone(), edited_geometry(&self.session, node, image, &tex));
                 self.placeholder_edited = true;
+                self.placeholder_src = "edited thumbnail";
             }
         }
-        for (generation, pixels) in self.quick_preview.poll() {
+        for (generation, pixels, source) in self.quick_preview.poll() {
             if generation != self.quick_generation || !viewer.awaiting_final() || self.placeholder_edited { continue; }
             let [w, h] = pixels.size;
             let size = crate::quick_preview::estimate_proxy_size(&self.session.provider, image, (w as u32, h as u32));
             let tex = ctx.load_texture("embedded selection preview", pixels, egui::TextureOptions::LINEAR);
             viewer.set_placeholder(generation, tex, crate::quick_preview::geometry(&self.session, node, image, size));
-            self.placeholder_src = "quick preview";
+            self.placeholder_src = source;
         }
     }
 

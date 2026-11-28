@@ -221,6 +221,11 @@ impl LiveThumbs {
         self.stale.clear();
     }
 
+    /// Forgets the edited gallery picture of one image (it is rendered again when wanted).
+    pub(crate) fn forget(&mut self, id: ImageId) {
+        self.textures.remove(&id);
+    }
+
     pub(crate) fn suspend(&mut self) {
         self.cancel.cancel();
         self.generation += 1;

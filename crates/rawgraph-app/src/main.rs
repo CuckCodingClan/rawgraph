@@ -98,6 +98,12 @@ fn main() {
         return;
     }
 
+    if let Some(folder) = &cli.bench_first_frame {
+        if let Err(e) = first_frame::validate(folder, cli.data_dir.as_deref(), cli.bench_out.as_deref()) {
+            eprintln!("rawgraph-app: {e}");
+            std::process::exit(2);
+        }
+    }
     // The first-frame benchmark empties and refills RawGraph's caches: never in the user's own
     // data folder. Without --data-dir it gets a fresh temporary one (removed again at the end).
     let bench_temp_dir = (cli.bench_first_frame.is_some() && cli.data_dir.is_none()).then(|| std::env::temp_dir().join(format!("rawgraph-bench-{}", std::process::id())));

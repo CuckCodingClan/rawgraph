@@ -89,6 +89,32 @@ impl ThumbCache {
         Ok(())
     }
 
+    /// Removes one entry (every size of one content when `size` is `None`). Returns whether a
+    /// file was deleted.
+    pub fn remove(&self, content_hash: &str, size: Option<u32>) -> bool {
+        let _write = self.writes.lock().unwrap();
+        let mut removed = false;
+        for s in size.map_or_else(|| self.entries_of(content_hash), |s| vec![s]) {
+            if let Some(path) = self.file_for(content_hash, s) {
+                let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+                if std::fs::remove_file(&path).is_ok() {
+                    removed = true;
+                    self.approx_bytes.store(self.approx_bytes.load(Ordering::Relaxed).saturating_sub(len), Ordering::Relaxed);
+                }
+            }
+        }
+        removed
+    }
+
+    /// Sizes stored for one content hash.
+    fn entries_of(&self, content_hash: &str) -> Vec<u32> {
+        let prefix = format!("{}_", content_hash.to_ascii_lowercase());
+        self.entries()
+            .into_iter()
+            .filter_map(|(p, _, _)| p.file_stem()?.to_str()?.strip_prefix(&prefix)?.parse::<u32>().ok())
+            .collect()
+    }
+
     /// Changes the disk budget and immediately trims old entries.
     pub fn set_budget(&self, max_bytes: u64) {
         self.max_bytes.store(max_bytes, Ordering::Relaxed);

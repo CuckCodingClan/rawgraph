@@ -413,6 +413,24 @@ fn discard_refuses_foreign_files() {
 // ---- thumbnail cache ----
 
 #[test]
+fn thumb_cache_removes_one_size_or_all_sizes_of_a_content() {
+    let t = Tmp::new();
+    let c = ThumbCache::new(&t.path("thumbs"), 10_000).unwrap();
+    c.put("abc123", 256, b"hello").unwrap();
+    c.put("abc123", 512, b"world!").unwrap();
+    c.put("abc124", 256, b"other").unwrap();
+    assert!(c.remove("abc123", Some(256)));
+    assert!(!c.remove("abc123", Some(256)));
+    assert_eq!(c.get("abc123", 256), None);
+    assert!(c.get("abc123", 512).is_some());
+    assert!(c.remove("ABC123", None));
+    assert_eq!(c.get("abc123", 512), None);
+    assert_eq!(c.get("abc124", 256).unwrap(), b"other");
+    assert_eq!(c.total_bytes(), 5);
+    assert!(!c.remove("../evil", None) && !c.remove("", Some(1)));
+}
+
+#[test]
 fn thumb_cache_roundtrip_and_validation() {
     let t = Tmp::new();
     let c = ThumbCache::new(&t.path("thumbs"), 10_000).unwrap();

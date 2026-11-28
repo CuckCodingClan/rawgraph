@@ -209,6 +209,11 @@ impl ThumbLoader {
         })
     }
 
+    /// A thumbnail job for `id` is queued or running.
+    pub fn busy_for(&self, id: ImageId) -> bool {
+        self.in_flight.contains_key(&id)
+    }
+
     pub fn has_failed(&self, id: ImageId) -> bool {
         self.failed.contains(&id)
     }

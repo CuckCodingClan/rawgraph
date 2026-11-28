@@ -507,6 +507,8 @@ fn worker<B: Backend>(
                 evaluator.clear();
                 if let Some(g) = gpu.as_mut() {
                     g.forget_bases();
+                    // No exact-scopes reading is pending any more (it would spin the loop).
+                    g.scopes.on_request_without_scopes(Instant::now());
                 }
                 preloader.on_request();
                 job = None;
