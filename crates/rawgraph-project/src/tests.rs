@@ -768,7 +768,7 @@ fn a_project_with_an_old_mask_graph_opens_migrated_and_saves_format_3() {
     p.commit(&out, "migrated").unwrap();
     let conn = rusqlite::Connection::open(&out).unwrap();
     let json: String = conn.query_row("SELECT json FROM graph WHERE id = 1", [], |r| r.get(0)).unwrap();
-    assert!(json.contains("\"format_version\": 3") && json.contains("\"Draw\""));
+    assert!(json.contains("\"format_version\": 4") && json.contains("\"Draw\""));
     assert_eq!(Project::load(&out).unwrap().graph, p.graph);
 }
 

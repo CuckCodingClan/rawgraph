@@ -25,7 +25,7 @@ use crate::lens::LENS_MODES;
 /// Bumped whenever the serialized graph layout changes incompatibly.
 /// Version 2 added the Layer and Export kinds, Source folders, curve sets and
 /// the Develop tone parameters; version 1 files still load.
-pub const GRAPH_FORMAT_VERSION: u32 = 3;
+pub const GRAPH_FORMAT_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -2158,7 +2158,7 @@ impl Graph {
 }
 
 /// Bumped whenever the serialized sub-graph layout changes incompatibly.
-pub const SUBGRAPH_FORMAT_VERSION: u32 = 2;
+pub const SUBGRAPH_FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SubNode {
@@ -2476,7 +2476,7 @@ mod tests {
 
     #[test]
     fn newer_format_versions_are_refused() {
-        let text = Graph::new().to_json().replace("\"format_version\": 3", "\"format_version\": 999");
+        let text = Graph::new().to_json().replace("\"format_version\": 4", "\"format_version\": 999");
         assert_eq!(Graph::from_json(&text), Err(GraphError::UnsupportedVersion(999)));
         assert!(matches!(Graph::from_json("not json"), Err(GraphError::Parse(_))));
     }

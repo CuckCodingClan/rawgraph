@@ -25,6 +25,10 @@ use serde_json::{json, Map, Value};
 use crate::color::AP1_LUMA;
 use crate::graph::{GraphError, GRAPH_FORMAT_VERSION, SUBGRAPH_FORMAT_VERSION};
 
+/// First graph / sub-graph format without the old mask nodes and ports.
+const MASK_FREE_GRAPH_FORMAT: u64 = 3;
+const MASK_FREE_SUBGRAPH_FORMAT: u64 = 2;
+
 type Obj = Map<String, Value>;
 
 /// Grey value of mid-grey on the perceptual axis of the Curves node.
@@ -281,7 +285,15 @@ fn luminance_curve(low: f32, high: f32, feather: f32, invert: bool) -> Vec<[f32;
 // ---------------------------------------------------------------- the working graph
 
 /// The uses of a mask that share one frame source, each with the chain nodes behind it.
-type FrameGroup = ((u64, u64), Vec<(E, BTreeSet<u64>)>);
+/// Frame source, "always copy" (the frame depends on the mask itself), and the uses.
+type FrameGroup = ((u64, u64), bool, Vec<(E, BTreeSet<u64>)>);
+
+/// Node kinds that keep the frame and the collection of their image input (pixels only).
+const FRAME_KEEPING: &[&str] = &[
+    "Exposure", "Contrast", "Saturation", "WhiteBalance", "HighlightsShadows", "ToneCurve", "PointCurve",
+    "HueSaturation", "ColorWheels", "BlackWhite", "Develop", "CaptureEv", "Sharpen", "Clarity", "NoiseReduction",
+    "Blur", "Vignette",
+];
 
 /// Reads one old parameter (name, default) for All or for one image.
 type Param<'a> = &'a dyn Fn(&str, f32) -> f32;
@@ -840,7 +852,13 @@ impl Work {
             self.next_id += 1;
             n.insert("id".into(), json!(id));
             let p = self.pos_of(old);
-            n.insert("pos".into(), json!([p[0], p[1] + 70.0]));
+            let mut y = p[1] + 70.0;
+            while self.nodes.values().any(|m| m.get("pos").and_then(Value::as_array).is_some_and(|a| {
+                a.first().and_then(Value::as_f64) == Some(p[0]) && a.get(1).and_then(Value::as_f64) == Some(y)
+            })) {
+                y += 70.0;
+            }
+            n.insert("pos".into(), json!([p[0], y]));
             self.nodes.insert(id, n);
             self.chain.insert(id);
             if let Some(k) = self.kinds.get(&old).cloned() {
@@ -861,6 +879,23 @@ impl Work {
             }
         }
         map
+    }
+
+    /// The node whose frame and photos a source really carries: walks up through nodes that only
+    /// change pixels (Exposure, Curves, ...), so consumers in one pixel chain share one frame.
+    fn frame_root(&self, mut s: (u64, u64)) -> (u64, u64) {
+        for _ in 0..10_000 {
+            if s.1 != 0 || self.chain.contains(&s.0) {
+                break;
+            }
+            let kind = self.nodes.get(&s.0).and_then(|n| n.get("kind")).and_then(Value::as_str).unwrap_or("");
+            if !FRAME_KEEPING.contains(&kind) {
+                break;
+            }
+            let Some(up) = self.edges.iter().find(|x| x.to == s.0 && x.to_port == 0) else { break };
+            s = (up.from, up.from_port);
+        }
+        s
     }
 
     /// Generated masks take the frame (and so the photos) of the nodes they feed, like the old masks did.
@@ -893,27 +928,35 @@ impl Work {
                 continue;
             }
             let Some(s) = src else { continue };
-            if gens.iter().any(|g| self.reaches(*g, s.0)) {
-                let (a, b) = (self.label(e.to), self.label(gens[0]));
-                self.note(format!("{a}: its frame cannot be used for {b} because that node depends on the mask"));
-                continue;
-            }
-            match groups.iter_mut().find(|g| g.0 == s) {
-                Some(g) => g.1.push((e, anc)),
-                None => groups.push((s, vec![(e, anc)])),
+            let root = self.frame_root(s);
+            // A frame that comes after the mask (e.g. behind Crop / Rotate) cannot frame the original
+            // mask without a cycle: that use gets its own copy, framed by its own input.
+            let (key, forced) = if gens.iter().any(|g| self.reaches(*g, root.0)) { (s, true) } else { (root, false) };
+            match groups.iter_mut().find(|g| g.0 == key && g.1 == forced) {
+                Some(g) => g.2.push((e, anc)),
+                None => groups.push((key, forced, vec![(e, anc)])),
             }
         }
+        // Ordinary groups first, so that a forced copy never takes the original nodes.
+        groups.sort_by_key(|g| g.1);
         let mut used: BTreeSet<u64> = BTreeSet::new();
-        for (src, members) in groups {
+        for (src, forced, members) in groups {
             let union: BTreeSet<u64> = members.iter().flat_map(|(_, a)| a.iter().copied()).collect();
-            let shared = !union.is_disjoint(&used);
-            used.extend(union.iter().copied());
+            let shared = forced || !union.is_disjoint(&used);
+            if !forced {
+                used.extend(union.iter().copied());
+            }
             let map = if shared { self.clone_nodes(&union) } else { HashMap::new() };
             if shared {
                 let masks: Vec<u64> = union.iter().copied().filter(|g| self.kinds.get(g).is_some_and(|k| is_mask_kind(k))).collect();
                 for g in masks {
                     let l = self.label(g);
-                    self.note(format!("{l}: it feeds nodes with different frames; a copy was made for each frame"));
+                    if forced {
+                        let c = members.first().map(|(e, _)| self.label(e.to)).unwrap_or_default();
+                        self.note(format!("{l}: {c} saw it in a frame that comes after the mask (e.g. behind Crop / Rotate); a copy was made in that frame, check its placement"));
+                    } else {
+                        self.note(format!("{l}: it feeds nodes with different frames; a copy was made for each frame"));
+                    }
                 }
                 for (e, _) in &members {
                     if let Some(i) = self.edges.iter().position(|x| x == e) {
@@ -927,6 +970,18 @@ impl Work {
                     self.edges.push(E { from: src.0, from_port: src.1, to: g2, to_port: 0 });
                 }
             }
+        }
+        // A generated mask that still has no image input renders at its own size and is stretched.
+        let unframed: Vec<u64> = self
+            .framed
+            .iter()
+            .copied()
+            .filter(|g| self.nodes.contains_key(g) && !self.edges.iter().any(|x| x.to == *g && x.to_port == 0))
+            .filter(|g| self.edges.iter().any(|x| x.from == *g))
+            .collect();
+        for g in unframed {
+            let l = self.label(g);
+            self.note(format!("{l}: has no image input to take its size and photos from; connect the image it should match"));
         }
     }
 }
@@ -1081,9 +1136,9 @@ fn run(nodes: BTreeMap<u64, Obj>, edges: Vec<E>, next_id: u64) -> Result<Work, G
 }
 
 /// Develop's "Tone processing" choice (Legacy / Local v1, `tone_version`) became the Legacy tone toggle
-/// (`legacy_tone`, off = local). Old files without the choice meant Legacy, so those get the toggle on;
-/// an explicit Local v1 keeps the default (off). Files of format 3 written between the two changes carry
-/// the choice only when it was set, so there an absent value changes nothing.
+/// (`legacy_tone`, off = local). Files up to graph format 3 / sub-graph format 2 without the choice meant
+/// Legacy (the default was stored sparsely), so those get the toggle on; an explicit Local v1 keeps the
+/// default (off). Graph format 4 / sub-graph format 3 mark files written with the toggle.
 fn tone_step<'a>(nodes: impl Iterator<Item = (u64, &'a mut Obj)>, absent_means_legacy: bool, notes: &mut Vec<String>) {
     for (id, n) in nodes {
         if n.get("kind").and_then(Value::as_str) != Some("Develop") {
@@ -1123,13 +1178,16 @@ pub(crate) fn migrate_graph(root: &mut Value) -> Result<Vec<String>, GraphError>
     let Some(obj) = root.as_object_mut() else { return Ok(Vec::new()) };
     let Some(version) = obj.get("format_version").and_then(Value::as_u64) else { return Ok(Vec::new()) };
     let mut tone_notes = Vec::new();
-    if version <= u64::from(GRAPH_FORMAT_VERSION) {
+    if version < u64::from(GRAPH_FORMAT_VERSION) {
         if let Some(Value::Object(nodes)) = obj.get_mut("nodes") {
             let it = nodes.iter_mut().filter_map(|(k, v)| Some((k.parse::<u64>().ok()?, v.as_object_mut()?)));
-            tone_step(it, version < u64::from(GRAPH_FORMAT_VERSION), &mut tone_notes);
+            tone_step(it, true, &mut tone_notes);
         }
     }
-    if version >= u64::from(GRAPH_FORMAT_VERSION) {
+    if version >= MASK_FREE_GRAPH_FORMAT {
+        if version < u64::from(GRAPH_FORMAT_VERSION) {
+            obj.insert("format_version".into(), json!(GRAPH_FORMAT_VERSION));
+        }
         return Ok(tone_notes);
     }
     let (Some(nodes_v), Some(edges_v)) = (obj.get("nodes"), obj.get("edges")) else { return Ok(tone_notes) };
@@ -1161,13 +1219,16 @@ pub(crate) fn migrate_subgraph(root: &mut Value) -> Result<Vec<String>, GraphErr
     let Some(obj) = root.as_object_mut() else { return Ok(Vec::new()) };
     let Some(version) = obj.get("format_version").and_then(Value::as_u64) else { return Ok(Vec::new()) };
     let mut tone_notes = Vec::new();
-    if version <= u64::from(SUBGRAPH_FORMAT_VERSION) {
+    if version < u64::from(SUBGRAPH_FORMAT_VERSION) {
         if let Some(Value::Array(nodes)) = obj.get_mut("nodes") {
             let it = nodes.iter_mut().enumerate().filter_map(|(i, v)| Some((i as u64 + 1, v.as_object_mut()?)));
-            tone_step(it, version < u64::from(SUBGRAPH_FORMAT_VERSION), &mut tone_notes);
+            tone_step(it, true, &mut tone_notes);
         }
     }
-    if version >= u64::from(SUBGRAPH_FORMAT_VERSION) {
+    if version >= MASK_FREE_SUBGRAPH_FORMAT {
+        if version < u64::from(SUBGRAPH_FORMAT_VERSION) {
+            obj.insert("format_version".into(), json!(SUBGRAPH_FORMAT_VERSION));
+        }
         return Ok(tone_notes);
     }
     let (Some(nodes_v), Some(edges_v)) = (obj.get("nodes"), obj.get("edges")) else { return Ok(tone_notes) };

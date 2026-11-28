@@ -29,7 +29,12 @@ impl Status {
         }
         let n = notes.len();
         self.info(format!("{what}: older graph updated, {n} note{}", if n == 1 { "" } else { "s" }));
-        self.notes = notes;
+        // Keep unread notes of an earlier migration (e.g. the project) when a recipe is inserted.
+        for note in notes {
+            if !self.notes.contains(&note) {
+                self.notes.push(note);
+            }
+        }
     }
 
     pub fn notes(&self) -> &[String] {

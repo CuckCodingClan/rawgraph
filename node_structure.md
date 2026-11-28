@@ -1,6 +1,6 @@
 # RawGraph node structure
 
-Current inventory for graph format 3, not a list of what shipped in `2611.001`. Node labels, stable keys, port types, choice order and defaults come from the core graph definitions. Tables describe stored settings; the inspector may group settings or hide ones that do not apply.
+Current inventory for graph format 4, not a list of what shipped in `2611.001`. Node labels, stable keys, port types, choice order and defaults come from the core graph definitions. Tables describe stored settings; the inspector may group settings or hide ones that do not apply.
 
 Graphs of format 1 and 2 (and sub-graphs of format 1) are rewritten to these nodes when loaded; see the README section "Per-pixel image controls" for the mapping of the removed mask kinds and ports.
 

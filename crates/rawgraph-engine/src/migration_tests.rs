@@ -618,7 +618,7 @@ fn old_develop_nodes_keep_the_legacy_tone_curves() {
     let legacy_old = render(&develop_doc(2, tone.clone()));
     let legacy_explicit = render(&develop_doc(2, with_choice(json!({"tone_version": 0.0}))));
     let legacy_now = render(&develop_doc(3, with_choice(json!({"legacy_tone": 1.0}))));
-    let local_now = render(&develop_doc(3, tone.clone()));
+    let local_now = render(&develop_doc(4, tone.clone()));
     assert_eq!(*legacy_old, *legacy_now);
     assert_eq!(*legacy_explicit, *legacy_now);
     assert!(max_diff(&legacy_now, &local_now) > 0.01, "the two tone modes differ visibly in this picture");

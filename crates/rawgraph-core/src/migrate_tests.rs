@@ -39,7 +39,7 @@ fn doc(nodes: Vec<Value>, edges: &[(u64, u64, u64, u64)]) -> String {
 
 fn load(text: &str) -> (Graph, Vec<String>) {
     let (g, notes) = Graph::from_json_with_notes(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
-    assert_eq!(g.to_json().matches("\"format_version\": 3").count(), 1, "saved as format 3");
+    assert_eq!(g.to_json().matches("\"format_version\": 4").count(), 1, "saved as the current format");
     (g, notes)
 }
 
@@ -457,8 +457,8 @@ fn a_shared_chain_and_the_strokes_of_a_shared_brush_are_copied_whole() {
 }
 
 #[test]
-fn a_frame_that_depends_on_the_mask_is_skipped_for_the_next_consumer() {
-    // Exposure 2 takes its image from Exposure 3, which uses the same brush: its frame cannot frame the brush.
+fn consumers_in_one_pixel_chain_share_one_mask_framed_by_the_chain_root() {
+    // Exposure 2 takes its image from Exposure 3, which uses the same brush: both see the Source's frame.
     let nodes = vec![
         node(1, "Source", json!({})),
         node(2, "Exposure", json!({})),
@@ -467,10 +467,36 @@ fn a_frame_that_depends_on_the_mask_is_skipped_for_the_next_consumer() {
         node(9, "Output", json!({})),
     ];
     let (g, notes) = load(&doc(nodes, &[(1, 0, 3, 0), (3, 0, 2, 0), (5, 0, 3, 1), (5, 0, 2, 1), (2, 0, 9, 0)]));
-    assert!(has_edge(&g, 1, 5, 0), "the brush takes the frame of the consumer it can");
+    assert!(has_edge(&g, 1, 5, 0), "the brush takes the frame of the chain's Source");
     assert!(!has_edge(&g, 3, 5, 0));
-    assert!(notes.iter().any(|t| t.contains("depends on the mask")), "{notes:?}");
+    assert_eq!(g.nodes().filter(|n| n.kind == NodeKind::Draw).count(), 1, "no copy for a pure pixel chain");
+    assert!(!notes.iter().any(|t| t.contains("copy")), "{notes:?}");
     assert!(g.validate().is_empty(), "{:?}", g.validate());
+}
+
+#[test]
+fn a_consumer_behind_a_crop_gets_its_own_copy_in_its_frame() {
+    // Source -> Exposure 2 [brush] -> Crop 3 -> Exposure 4 [brush]: the old mask was drawn in each
+    // consumer's frame; the cropped one cannot use the original (its frame depends on the mask).
+    let nodes = vec![
+        node(1, "Source", json!({})),
+        node(2, "Exposure", json!({})),
+        node(3, "Transform", json!({"left": 0.3})),
+        node(4, "Exposure", json!({})),
+        node(5, "BrushMask", json!({})),
+        node(9, "Output", json!({})),
+    ];
+    let (g, notes) = load(&doc(nodes, &[(1, 0, 2, 0), (2, 0, 3, 0), (3, 0, 4, 0), (5, 0, 2, 1), (5, 0, 4, 1), (4, 0, 9, 0)]));
+    let draws: Vec<_> = g.nodes().filter(|n| n.kind == NodeKind::Draw).map(|n| n.id).collect();
+    assert_eq!(draws.len(), 2, "{notes:?}");
+    assert!(has_edge(&g, 1, 5, 0), "the original is framed by the Source");
+    assert!(draws.iter().any(|d| g.input_of(*d, 0) == Some(rawgraph_core_id(3))), "the copy is framed by the crop");
+    assert!(notes.iter().any(|t| t.contains("comes after the mask")), "{notes:?}");
+    assert!(g.validate().is_empty(), "{:?}", g.validate());
+}
+
+fn rawgraph_core_id(n: u64) -> crate::NodeId {
+    crate::NodeId(n)
 }
 
 #[test]
@@ -621,8 +647,11 @@ fn format_3_graphs_with_a_tone_choice_load_and_keep_their_meaning() {
     let (g, notes) = develop_graph(3, json!({"tone_version": 1.0}), json!({}));
     assert_eq!(legacy(&g, 1), 0.0);
     assert!(notes.iter().any(|t| t.contains("Local tone v1")), "{notes:?}");
-    // Without the choice nothing changes: the local tone is the default there.
+    // Without the choice a format-3 file meant Legacy (the default was stored sparsely) ...
     let (g, _) = develop_graph(3, json!({"exposure": 0.1}), json!({}));
+    assert_eq!(legacy(&g, 1), 1.0);
+    // ... while format 4 files are written with the toggle: absent means local.
+    let (g, _) = develop_graph(4, json!({"exposure": 0.1}), json!({}));
     assert_eq!(legacy(&g, 1), 0.0);
     // An explicit toggle wins over a leftover choice.
     let (g, _) = develop_graph(3, json!({"tone_version": 0.0, "legacy_tone": 0.0}), json!({}));
@@ -635,8 +664,9 @@ fn sub_graphs_map_the_tone_choice_too() {
         (1, json!({}), 1.0),
         (1, json!({"tone_version": 1.0}), 0.0),
         (2, json!({"tone_version": 0.0}), 1.0),
-        (2, json!({}), 0.0),
+        (2, json!({}), 1.0),
         (2, json!({"tone_version": 1.0}), 0.0),
+        (3, json!({}), 0.0),
     ] {
         let text = json!({"format_version": version, "nodes": [sub_node("Develop", all.clone())], "edges": []}).to_string();
         let (sub, _) = Subgraph::from_json_with_notes(&text).unwrap_or_else(|e| panic!("{version} {all}: {e}"));
@@ -682,7 +712,7 @@ fn version_1_sub_graphs_with_masks_migrate_and_paste() {
     assert_eq!(ids.len(), 3);
     assert_eq!(g.node(ids[0]).unwrap().exposed_inputs().iter().flatten().count(), 1);
     assert!(g.edges().iter().any(|e| e.from == ids[1] && e.to == ids[0] && e.to_port == 1));
-    assert!(sub.to_json().contains("\"format_version\": 2"));
+    assert!(sub.to_json().contains("\"format_version\": 3"));
 }
 
 #[test]
