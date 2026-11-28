@@ -7,9 +7,15 @@
 //! `frames::handle_chain`). Values are written through the node's per-image API, so Individual
 //! mode only changes the image on screen; the application's history turns every finished
 //! gesture into one undo step. Double-clicking a handle resets what it controls.
+//!
+//! The white-balance picker (White Balance and Develop) is a click instead of a drag: it reads
+//! the node's input around the clicked point on a worker thread and makes it neutral.
 
-use eframe::egui::{self, Color32, CursorIcon, Key, PointerButton, Pos2, Rect, Stroke, Vec2};
+use std::sync::mpsc::{channel, Receiver};
+
+use eframe::egui::{self, Color32, CursorIcon, Key, Modifiers, PointerButton, Pos2, Rect, Stroke, Vec2};
 use rawgraph_core::{Graph, ImageId, Node, NodeId, NodeKind};
+use rawgraph_engine::{CancelToken, Evaluator, ImageProvider, Value};
 
 use crate::frames::{self, Mapper};
 use crate::handles_logic::{self as logic, Gradient, Part};
@@ -197,28 +203,49 @@ struct Drag {
     moved: bool,
 }
 
+/// Parameter values of a white-balance pick and an optional note, or why there are none.
+pub type PickResult = Result<(Vec<(&'static str, f32)>, Option<String>), String>;
+
+/// Result of a white-balance pick for one node and image.
+struct Pick {
+    node: NodeId,
+    image: ImageId,
+    result: PickResult,
+}
+
 /// Pointer state of the handles that lasts longer than a frame.
 #[derive(Default)]
 pub struct Handles {
     drag: Option<Drag>,
     /// The pointer was over a handle last frame: the viewer leaves the primary button to us.
     hot: bool,
+    pick: Option<Receiver<Pick>>,
 }
 
 impl Handles {
     /// Whether the primary button belongs to the handles this frame (no pan / click zoom).
-    pub fn claims_pointer(&self, _session: &Session) -> bool {
-        self.drag.is_some() || self.hot
+    pub fn claims_pointer(&self, session: &Session) -> bool {
+        self.drag.is_some() || self.hot || picking(session).is_some()
+    }
+
+    /// A white-balance pick is being computed.
+    #[cfg(test)]
+    pub fn pick_pending(&self) -> bool {
+        self.pick.is_some()
     }
 
     /// Handles the pointer for the selected node's handles; returns a status message.
     pub fn show(&mut self, ui: &egui::Ui, geom: &Geometry, session: &mut Session, frame_px: [u32; 2]) -> Option<String> {
-        let message = None;
+        let message = self.poll_pick(session);
         self.hot = false;
         let Some(node) = session.selected_node else {
             self.drag = None;
+            session.wb_pick = None;
             return message;
         };
+        if session.wb_pick.is_some_and(|n| n != node) {
+            session.wb_pick = None;
+        }
         let ctx = ui.ctx();
         let typing = ctx.egui_wants_keyboard_input();
         let (pos, latest, space, middle, down, pressed, double) = ctx.input(|i| {
@@ -230,6 +257,10 @@ impl Handles {
             self.drag = None;
             return message;
         };
+
+        if picking(session) == Some(node) {
+            return self.picker(ui, geom, session, node, &f, inside && !space && !middle).or(message);
+        }
 
         let Some(model) = session.project.graph.node(node).and_then(|n| model_of(&session.project.graph, n, f.image, f.size)) else {
             self.drag = None;
@@ -283,6 +314,120 @@ impl Handles {
         paint(ui, geom.viewport, &model, &f, &positions, hot);
         message
     }
+
+    fn picker(&mut self, ui: &egui::Ui, geom: &Geometry, session: &mut Session, node: NodeId, f: &NodeFrame, inside: bool) -> Option<String> {
+        let ctx = ui.ctx();
+        self.drag = None;
+        let (pos, clicked, escape) = ctx.input_mut(|i| (i.pointer.hover_pos(), i.pointer.primary_clicked(), i.consume_key(Modifiers::NONE, Key::Escape)));
+        if escape {
+            session.wb_pick = None;
+            return None;
+        }
+        if !inside {
+            return None;
+        }
+        self.hot = true;
+        ctx.set_cursor_icon(CursorIcon::Crosshair);
+        if let Some(p) = pos {
+            let painter = ui.painter_at(geom.viewport);
+            painter.circle_stroke(p, 7.0, Stroke::new(2.5, Color32::from_black_alpha(150)));
+            painter.circle_stroke(p, 7.0, Stroke::new(1.2, Color32::WHITE));
+            if clicked && self.pick.is_none() {
+                let at = f.to_frame(p);
+                if !(0.0..=1.0).contains(&at[0]) || !(0.0..=1.0).contains(&at[1]) {
+                    return Some("Click on the picture to pick a neutral point".to_owned());
+                }
+                let (tx, rx) = channel();
+                let graph = session.project.graph.clone();
+                let provider = session.provider.clone();
+                let tone = session.view.tone.tone_map();
+                let image = f.image;
+                std::thread::spawn(move || {
+                    let result = pick_values(&graph, provider.as_ref(), tone, node, image, at);
+                    let _ = tx.send(Pick { node, image, result });
+                });
+                self.pick = Some(rx);
+                session.wb_pick = None;
+                ctx.request_repaint();
+            }
+        }
+        None
+    }
+
+    /// Applies a finished white-balance pick (one undo step: no gesture is running).
+    fn poll_pick(&mut self, session: &mut Session) -> Option<String> {
+        let rx = self.pick.as_ref()?;
+        match rx.try_recv() {
+            Ok(pick) => {
+                self.pick = None;
+                match pick.result {
+                    Ok((values, note)) => {
+                        set_params(session, pick.node, pick.image, &values);
+                        note
+                    }
+                    Err(e) => Some(e),
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pick = None;
+                Some("The neutral point could not be read".to_owned())
+            }
+        }
+    }
+}
+
+/// The node whose white-balance picker is armed (it must be the selected node).
+pub fn picking(session: &Session) -> Option<NodeId> {
+    session.wb_pick.filter(|n| session.selected_node == Some(*n))
+}
+
+/// Average linear colour of `img` in a small square around normalised `at`.
+pub fn sample_patch(img: &rawgraph_core::ImageBuf, at: [f32; 2]) -> [f32; 3] {
+    let (w, h) = (img.width(), img.height());
+    let r = (w.max(h) / 300).max(2) as i64;
+    let cx = ((at[0] * w as f32) as i64).clamp(0, w as i64 - 1);
+    let cy = ((at[1] * h as f32) as i64).clamp(0, h as i64 - 1);
+    let (mut sum, mut n) = ([0.0f64; 3], 0.0);
+    for y in (cy - r).max(0)..=(cy + r).min(h as i64 - 1) {
+        for x in (cx - r).max(0)..=(cx + r).min(w as i64 - 1) {
+            let p = img.pixel(x as u32, y as u32);
+            if p[..3].iter().all(|v| v.is_finite()) {
+                for c in 0..3 {
+                    sum[c] += f64::from(p[c]);
+                }
+                n += 1.0;
+            }
+        }
+    }
+    if n == 0.0 { [0.0; 3] } else { sum.map(|s| (s / n) as f32) }
+}
+
+/// Parameter values that make the input of `node` neutral around `at` (normalised).
+pub fn pick_values(graph: &Graph, provider: &dyn ImageProvider, tone: rawgraph_scopes::ToneMap, node: NodeId, image: ImageId, at: [f32; 2]) -> PickResult {
+    let n = graph.node(node).ok_or("The node no longer exists")?;
+    let (up, port) = graph.input_edge(node, 0).ok_or("Connect an image to pick a neutral point")?;
+    let mut evaluator = Evaluator::new();
+    evaluator.set_view_tone(tone);
+    let Value::Images(img) = evaluator.eval_output(graph, up, port, image, provider, &CancelToken::new()).map_err(|e| format!("The neutral point could not be read: {e}"))?;
+    let c = sample_patch(&img, at);
+    if c.iter().any(|v| !v.is_finite() || *v <= 1e-6) {
+        return Err("Pick a grey area: every channel must be above black".to_owned());
+    }
+    let (values, error) = match n.kind {
+        NodeKind::WhiteBalance => {
+            let ((t, tn), e) = logic::neutral_shift(c, (n.param("temp", image), n.param("tint", image))).ok_or("No neutral setting found")?;
+            (vec![("temp", t), ("tint", tn)], e)
+        }
+        NodeKind::Develop => {
+            let s = rawgraph_core::develop_settings(n, image, provider.capture(image).as_ref());
+            let ((k, tn), e) = logic::neutral_absolute(c, s.as_shot, s.effective).ok_or("No neutral setting found")?;
+            (vec![("wb", 1.0), ("temperature", k), ("tint", tn)], e)
+        }
+        _ => return Err("This node has no white balance".to_owned()),
+    };
+    let note = (error > 0.02).then(|| "This colour is beyond the white-balance range; the closest setting was used".to_owned());
+    Ok((values, note))
 }
 
 // ------------------------------------------------------------------- paint

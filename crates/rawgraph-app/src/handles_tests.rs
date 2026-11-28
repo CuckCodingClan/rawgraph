@@ -5,8 +5,9 @@ use crate::history::History;
 use crate::render::Frame;
 use crate::tools::Tools;
 use crate::viewer::Viewer;
-use eframe::egui::{Event, Modifiers};
+use eframe::egui::Event;
 use rawgraph_core::{ImageBuf, Mode};
+use rawgraph_core::Graph;
 use std::sync::Arc;
 
 const FRAME_W: u32 = 300;
@@ -311,4 +312,77 @@ fn handles_map_through_a_downstream_crop() {
     assert!((p.x - 75.0).abs() < 0.6 && (p.y - 100.0).abs() < 0.6, "{p:?}");
     let back = f.to_frame(p);
     assert!((back[0] - 0.75).abs() < 1e-3 && (back[1] - 0.5).abs() < 1e-3);
+}
+
+/// Source -> tinting White Balance -> `kind`; the picked node sees a warm, green grey wedge.
+fn tinted_input(g: &mut Graph, kind: NodeKind) -> NodeId {
+    let src = g.nodes().find(|n| n.kind == NodeKind::Source).unwrap().id;
+    let tint = g.add_node(NodeKind::WhiteBalance, [0.0, 0.0]);
+    g.connect(src, tint, 0).unwrap();
+    let n = g.node_mut(tint).unwrap();
+    n.set_param("temp", IMG, 40.0);
+    n.set_param("tint", IMG, -30.0);
+    let node = g.add_node(kind, [0.0, 0.0]);
+    g.connect(tint, node, 0).unwrap();
+    node
+}
+
+/// A point on the grey wedge of demo image 1.
+const GREY: [f32; 2] = [0.55, 0.7];
+
+fn neutral(c: [f32; 3], tol: f32) -> bool {
+    (c[0] / c[1] - 1.0).abs() < tol && (c[2] / c[1] - 1.0).abs() < tol
+}
+
+#[test]
+fn white_balance_picker_neutralises_the_node_input() {
+    let s = crate::session::tests::demo_session();
+    let mut ev = Evaluator::new();
+    for (kind, tol) in [(NodeKind::WhiteBalance, 0.01), (NodeKind::Develop, 0.02)] {
+        let mut g = s.project.graph.clone();
+        let node = tinted_input(&mut g, kind);
+        let Value::Images(before) = ev.eval(&g, node, IMG, s.provider.as_ref(), &CancelToken::new()).unwrap();
+        assert!(!neutral(sample_patch(&before, GREY), 0.03), "the input is tinted");
+        let (values, note) = pick_values(&g, s.provider.as_ref(), rawgraph_scopes::ToneMap::AcesFit, node, IMG, GREY).unwrap();
+        assert!(note.is_none(), "{note:?}");
+        if kind == NodeKind::Develop {
+            assert_eq!(values[0], ("wb", 1.0), "Develop switches to Custom");
+        }
+        for (name, v) in &values {
+            g.node_mut(node).unwrap().set_param(name, IMG, *v);
+        }
+        let Value::Images(out) = ev.eval(&g, node, IMG, s.provider.as_ref(), &CancelToken::new()).unwrap();
+        let c = sample_patch(&out, GREY);
+        assert!(neutral(c, tol), "{kind:?}: picked area is neutral: {c:?} ({values:?})");
+    }
+    // A colour without one of the channels cannot be balanced: an error, nothing set.
+    let wb = s.project.graph.nodes().find(|n| n.kind == NodeKind::WhiteBalance).unwrap().id;
+    assert!(pick_values(&s.project.graph, s.provider.as_ref(), rawgraph_scopes::ToneMap::AcesFit, wb, IMG, [0.3, 0.3]).is_err(), "pure cyan bar");
+}
+
+#[test]
+fn the_picker_click_applies_one_undo_step_and_disarms() {
+    let mut v = View::new(NodeKind::WhiteBalance);
+    v.s.project.graph.remove_node(v.node);
+    v.node = tinted_input(&mut v.s.project.graph, NodeKind::WhiteBalance);
+    v.s.selected_node = Some(v.node);
+    v.history = History::new(&v.s.project.graph);
+    v.set_frame(v.node);
+    v.s.wb_pick = Some(v.node);
+    v.frame(vec![]);
+    v.move_to(v.at(GREY));
+    v.button(true);
+    v.button(false);
+    for _ in 0..300 {
+        if !v.tools.handles.pick_pending() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        v.frame(vec![]);
+    }
+    v.frame(vec![]);
+    assert!(!v.tools.handles.pick_pending());
+    assert!(v.s.wb_pick.is_none(), "one pick, then the picker is off");
+    assert!((v.param("temp") + 40.0).abs() < 8.0, "undoes the warm shift: {}", v.param("temp"));
+    assert_eq!(v.steps, 1);
 }

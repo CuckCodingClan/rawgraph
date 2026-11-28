@@ -5,6 +5,8 @@
 //! y down), the same space the Generator gradient is defined in. `size` is the frame's pixel
 //! size, needed where a node measures in pixels (Vignette distance, Filter direction).
 
+use rawgraph_core::color::{self, Mat3};
+
 /// A draggable part of a node's handles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
@@ -208,6 +210,83 @@ pub fn motion_angle(p: [f32; 2], size: [f32; 2], fallback: f32) -> f32 {
     dy.atan2(dx).to_degrees().rem_euclid(360.0)
 }
 
+// -------------------------------------------------------------- white balance
+
+/// Log-chroma residual of `m * c` (zero for a neutral result).
+fn residual(m: &Mat3, c: [f64; 3]) -> Option<[f64; 2]> {
+    let o = color::mul_vec(m, c);
+    if o.iter().any(|v| !v.is_finite() || *v <= 0.0) { return None; }
+    Some([(o[0] / o[1]).ln(), (o[2] / o[1]).ln()])
+}
+
+/// Finds the two parameters (within `lo..hi`) for which `matrix(params) * c` is neutral
+/// (r = g = b), by damped Gauss-Newton with numerical derivatives from `start`. `c` must be
+/// positive. Returns the parameters and the remaining log-chroma error.
+pub fn solve_neutral(c: [f32; 3], start: [f64; 2], lo: [f64; 2], hi: [f64; 2], matrix: impl Fn([f64; 2]) -> Mat3) -> Option<([f64; 2], f64)> {
+    let c = c.map(f64::from);
+    if c.iter().any(|v| !v.is_finite() || *v <= 0.0) { return None; }
+    let clamp = |p: [f64; 2]| [p[0].clamp(lo[0], hi[0]), p[1].clamp(lo[1], hi[1])];
+    let err = |r: [f64; 2]| r[0].hypot(r[1]);
+    let mut p = clamp(start);
+    let mut r = residual(&matrix(p), c)?;
+    let mut lambda = 1e-3;
+    for _ in 0..60 {
+        if err(r) < 1e-7 { break; }
+        let h = [(hi[0] - lo[0]) * 1e-5, (hi[1] - lo[1]) * 1e-5];
+        let mut jac = [[0.0; 2]; 2];
+        for k in 0..2 {
+            let mut q = p;
+            q[k] += h[k];
+            let rq = residual(&matrix(q), c)?;
+            jac[0][k] = (rq[0] - r[0]) / h[k];
+            jac[1][k] = (rq[1] - r[1]) / h[k];
+        }
+        // (J^T J + lambda diag) step = -J^T r
+        let jtj = [
+            [jac[0][0] * jac[0][0] + jac[1][0] * jac[1][0], jac[0][0] * jac[0][1] + jac[1][0] * jac[1][1]],
+            [jac[0][1] * jac[0][0] + jac[1][1] * jac[1][0], jac[0][1] * jac[0][1] + jac[1][1] * jac[1][1]],
+        ];
+        let g = [jac[0][0] * r[0] + jac[1][0] * r[1], jac[0][1] * r[0] + jac[1][1] * r[1]];
+        let mut improved = false;
+        for _ in 0..12 {
+            let a = [[jtj[0][0] * (1.0 + lambda), jtj[0][1]], [jtj[1][0], jtj[1][1] * (1.0 + lambda)]];
+            let det = a[0][0] * a[1][1] - a[0][1] * a[1][0];
+            if det.abs() < 1e-300 { lambda *= 10.0; continue; }
+            let step = [-(a[1][1] * g[0] - a[0][1] * g[1]) / det, -(-a[1][0] * g[0] + a[0][0] * g[1]) / det];
+            let q = clamp([p[0] + step[0], p[1] + step[1]]);
+            if let Some(rq) = residual(&matrix(q), c) {
+                if err(rq) < err(r) {
+                    p = q;
+                    r = rq;
+                    lambda = (lambda * 0.3).max(1e-9);
+                    improved = true;
+                    break;
+                }
+            }
+            lambda *= 10.0;
+        }
+        if !improved { break; }
+    }
+    Some((p, err(r)))
+}
+
+/// Temperature / tint shift (mired, tint units) of a White Balance node that makes the
+/// ACEScg colour `c` neutral.
+pub fn neutral_shift(c: [f32; 3], start: (f32, f32)) -> Option<((f32, f32), f64)> {
+    let (p, e) = solve_neutral(c, [f64::from(start.0), f64::from(start.1)], [-150.0, -100.0], [150.0, 100.0], |p| color::white_balance_matrix(p[0], p[1]))?;
+    Some(((p[0] as f32, p[1] as f32), e))
+}
+
+/// Absolute temperature (K) and tint of a Develop node (Custom white balance, `as_shot`
+/// reference) that make the ACEScg colour `c` of its input neutral. Solved in mired.
+pub fn neutral_absolute(c: [f32; 3], as_shot: (f32, f32), start: (f32, f32)) -> Option<((f32, f32), f64)> {
+    let as_shot = (f64::from(as_shot.0), f64::from(as_shot.1));
+    let to_mired = |k: f64| 1.0e6 / k;
+    let start = [to_mired(f64::from(start.0).clamp(2000.0, 25000.0)), f64::from(start.1)];
+    let (p, e) = solve_neutral(c, start, [to_mired(25000.0), -150.0], [to_mired(2000.0), 150.0], |p| color::absolute_white_balance_matrix(as_shot, (1.0e6 / p[0], p[1])))?;
+    Some((((1.0e6 / p[0]) as f32, p[1] as f32), e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +390,25 @@ mod tests {
             assert!((back - angle).abs() < 1e-3, "{angle} -> {back}");
         }
         assert_eq!(motion_angle([0.5, 0.5], size, 42.0), 42.0, "the centre keeps the angle");
+    }
+
+    #[test]
+    fn white_balance_picker_neutralises_a_tinted_patch() {
+        let grey = [0.18f32; 3];
+        // A patch tinted by a known White Balance node setting: the picker finds the inverse.
+        let tint_m = color::to_f32(&color::white_balance_matrix(-60.0, 35.0));
+        let tinted: [f32; 3] = std::array::from_fn(|i| (0..3).map(|j| tint_m[i][j] * grey[j]).sum());
+        let ((t, n), e) = neutral_shift(tinted, (0.0, 0.0)).unwrap();
+        assert!(e < 1e-3, "residual {e}");
+        let m = color::white_balance_matrix(f64::from(t), f64::from(n));
+        let out = color::mul_vec(&m, tinted.map(f64::from));
+        assert!((out[0] / out[1] - 1.0).abs() < 2e-3 && (out[2] / out[1] - 1.0).abs() < 2e-3, "{out:?}");
+        // Develop: absolute temperature / tint against an as-shot reference.
+        let warm = [0.24f32, 0.18, 0.12];
+        let ((k, tn), e) = neutral_absolute(warm, (5000.0, 0.0), (5000.0, 0.0)).unwrap();
+        assert!(e < 1e-2, "residual {e}");
+        let out = color::mul_vec(&color::absolute_white_balance_matrix((5000.0, 0.0), (f64::from(k), f64::from(tn))), warm.map(f64::from));
+        assert!((out[0] / out[1] - 1.0).abs() < 1e-2 && (out[2] / out[1] - 1.0).abs() < 1e-2, "{k} K {tn}: {out:?}");
+        assert!(neutral_shift([0.0, 0.1, 0.1], (0.0, 0.0)).is_none(), "black channels cannot be balanced");
     }
 }

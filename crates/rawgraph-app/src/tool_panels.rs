@@ -250,6 +250,21 @@ pub fn crop_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, size: 
     });
 }
 
+// ------------------------------------------------------------ white-balance picker
+
+/// The eyedropper of White Balance and Develop: arms a click in the viewer that makes the
+/// clicked area of the node's input neutral. Clicking it again (or Escape) disarms it.
+pub fn wb_picker_button(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
+    let armed = crate::handles::picking(session) == Some(id);
+    let r = ui.selectable_label(armed, "Pick neutral").on_hover_text("Click a grey or white area in the viewer to neutralise it (Escape cancels)");
+    if r.clicked() {
+        session.wb_pick = if armed { None } else { Some(id) };
+    }
+    if armed {
+        ui.label(RichText::new("Click a neutral area in the viewer").weak());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

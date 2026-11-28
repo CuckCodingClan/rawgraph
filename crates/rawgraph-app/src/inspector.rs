@@ -224,6 +224,10 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
         NodeKind::Generator if session.project.graph.node(id).is_some_and(|n| n.choice("type", image) == 0) => crate::gradient_editor::show(ui, session, id),
         NodeKind::PointCurve => crate::curve_editor::show(ui, session, id),
         NodeKind::Draw => crate::tool_panels::brush_section(ui, session, id),
+        NodeKind::WhiteBalance => {
+            ui.add_space(6.0);
+            crate::tool_panels::wb_picker_button(ui, session, id);
+        }
         NodeKind::MetadataSplit => crate::tool_panels::split_section(ui, session, id),
         _ => {}
     }
@@ -417,6 +421,7 @@ fn develop_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, image: 
                     }
                 }
                 ui.label(RichText::new(view.as_shot.as_str()).weak());
+                crate::tool_panels::wb_picker_button(ui, session, id);
                 if now_custom {
                     for name in ["temperature", "tint"] {
                         if let Some(spec) = kind.param_spec(name) {

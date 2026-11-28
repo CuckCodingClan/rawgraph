@@ -338,6 +338,11 @@ changes the photo on screen. Space+drag and the middle button still pan.
   faint line through the centre shows the streak length (the radius). Drag the arrow head
   to set Motion angle. Hidden when a Direction (RGB) map is connected or another kernel is
   chosen.
+- **White balance picker:** White Balance and Develop have a **Pick neutral** button. Then
+  click a grey or white area in the viewer: RawGraph averages a small patch of the node's
+  input (not its output) and sets temperature and tint so that patch becomes neutral.
+  Develop switches to Custom white balance. The picker turns itself off after one click;
+  Escape cancels. A colour beyond the slider ranges gets the closest setting and a note.
 
 ### Pixel Sort
 
