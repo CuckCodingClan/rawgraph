@@ -14,6 +14,10 @@ use rawgraph_project::ThumbCache;
 use crate::provider::{FileProvider, DEMO_PREFIX};
 
 pub const THUMB_SIZE: u32 = 256;
+/// Key of the stored thumbnails: the size plus a version of their colour handling. Thumbnails made
+/// before input colour profiles were applied (version 0) are never read again and age out of the
+/// cache; raise the version whenever the colours of a thumbnail change.
+pub const THUMB_CACHE_KEY: u32 = THUMB_SIZE | (1 << 24);
 pub const MAX_TEXTURES: usize = 500;
 const WORKERS: usize = 3;
 const UPLOADS_PER_FRAME: usize = 6;
@@ -159,7 +163,7 @@ impl ThumbLoader {
                 let result = if path.to_string_lossy().starts_with(DEMO_PREFIX) {
                     provider.demo_thumbnail(id, THUMB_SIZE)
                 } else {
-                    let (r, event) = fetch_thumb(cache.as_deref(), &hash, THUMB_SIZE, || rawgraph_io::load_thumbnail(&path, THUMB_SIZE).map_err(|e| e.to_string()));
+                    let (r, event) = fetch_thumb(cache.as_deref(), &hash, THUMB_CACHE_KEY, || rawgraph_io::load_thumbnail(&path, THUMB_SIZE).map_err(|e| e.to_string()));
                     stats.note(event);
                     r
                 };

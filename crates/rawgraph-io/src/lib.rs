@@ -16,6 +16,7 @@ use rawgraph_core::{CaptureInfo, ImageBuf};
 mod avif;
 mod export;
 mod heic;
+mod heif_box;
 mod icc;
 mod lens;
 mod meta;
@@ -24,8 +25,8 @@ mod orient;
 pub mod raw;
 pub mod rendered;
 
-pub use export::{decode_webp8, encode_heic8, encode_rgb, encode_webp8, save_avif8, save_heic8, save_webp8, save_exr, save_srgb16_with, save_srgb8, save_srgb8_with, SaveOptions};
-pub use heic::{embedded_icc, heic_available, HeicImage, HEIC_MISSING_MESSAGE};
+pub use export::{decode_webp8, encode_heic8, encode_heic8_detailed, encode_rgb, encode_webp8, save_avif8, save_heic8, save_webp8, save_exr, save_srgb16_with, save_srgb8, save_srgb8_with, SaveOptions};
+pub use heic::{embedded_icc, heic_available, HeicEncoded, HeicImage, HEIC_MIN_SIDE, HEIC_MISSING_MESSAGE};
 pub use icc::{icc_profile, srgb_icc_profile};
 pub use lens::read_lens_profile;
 /// Decodes a HEIC file with the operating system (Export preview and tests; not an import path).

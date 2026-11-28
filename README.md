@@ -229,10 +229,14 @@ are provisional until the editable render is ready. Thumbnails and provisional
 previews honour an embedded input colour profile (Adobe RGB, Display P3 and other
 matrix/TRC RGB profiles, in JPEG, PNG and TIFF files and in the JPEG previews of RAW
 files): they are converted to sRGB the same way as the full decode, after the shrink,
-so the cost is small (about 0.2 ms per 256 px thumbnail). A RAW preview takes the first
-profile found in the file; profiles that cannot be used are ignored, as in the full
-decode. Thumbnails already stored in the disk cache keep their old colours until they
-are regenerated. The tile retains its last picture while rendering. Depth Map, Pixel Sort and stages measured as slow defer
+so the cost is small (about 0.2 ms per 256 px thumbnail). Camera previews rarely carry
+a profile: a RAW preview is converted only when its own JPEG (found through the file's
+TIFF structure, header read only, at most 256 KB) contains a complete ICC profile and the
+JPEG has the size of the preview that was decoded. An EXIF or Interop colour-space tag
+without a profile is not interpreted, and RAW containers that are not TIFF-based (CR3, RAF
+and others) are shown as sRGB. Profiles that cannot be used are ignored, as in the full
+decode. Thumbnails stored in the disk cache before this change are not read any more
+(the cache key carries a colour version) and are regenerated. The tile retains its last picture while rendering. Depth Map, Pixel Sort and stages measured as slow defer
 updates during a drag; a small amber dot means the picture is stale.
 
 **View → Editable thumbnail cache** controls the persistent disk budget (default
@@ -540,7 +544,7 @@ Export nodes and Quick Export support 8-bit WebP with alpha. Choose lossless or 
 
 Export nodes and Quick Export can write 8-bit HEIC (quality 1 to 100). RawGraph bundles no HEVC encoder (patents and licences); it uses the operating system's:
 
-- **Windows:** Windows Imaging Component HEIF encoder. It works while the **HEVC Video Extensions** and the **HEIF Image Extensions** from the Microsoft Store are installed. The ICC profile of the output colour space is embedded and EXIF (camera, lens, exposure, date, artist, copyright, description, software) is written through WIC; GPS is not written. The encoder accepts 8-bit only here; 10-bit is not offered.
+- **Windows:** Windows Imaging Component HEIF encoder. It works while the **HEVC Video Extensions** and the **HEIF Image Extensions** from the Microsoft Store are installed. The ICC profile of the output colour space is embedded and EXIF (camera, lens, exposure, date, artist, copyright, description, software) is written through WIC; GPS is not written. The encoder accepts 8-bit only here; 10-bit is not offered. The file also states its colour coding (BT.709 matrix, full range, primaries and transfer of the output space) in a `colr nclx` property and in the bitstream, because WIC does not and other decoders (ffmpeg, libheif defaults) would assume BT.601 and shift colours; a patch chart decoded by ffmpeg lies within 2 code values of the source. Pictures with a side below 16 px are refused. Sizes the Windows encoder rejects (a tile remainder of 2 to 10 px above 4096 px, for example 4104x3080) are encoded on a canvas padded to a multiple of 64 and cropped back through the tile grid size (or `clap`), so every reader reports the real size.
 - **macOS, Linux:** not available (no ImageIO implementation could be built and checked yet).
 
-The Export node and Quick Export check this when they open (a trial encode on a worker thread). Without an encoder the HEIC option is greyed out with the reason "HEIC needs the HEVC Video Extensions from the Microsoft Store (or use AVIF)", and a batch that is set to HEIC is refused with the same message before any file is touched. HEIC import is not supported.
+The Export node and Quick Export check this when they open (a trial encode on a worker thread). A failed check is repeated automatically after 30 seconds and with **Check again**, so installing the extensions works without restarting RawGraph. Without an encoder the HEIC option is greyed out with the reason "HEIC needs the HEVC Video Extensions from the Microsoft Store (or use AVIF)", and a batch that is set to HEIC is refused with the same message before any file is touched. HEIC import is not supported.

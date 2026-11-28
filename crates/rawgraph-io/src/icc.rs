@@ -504,43 +504,147 @@ pub(crate) fn thumbnail_to_srgb(icc: Option<&[u8]>, rgba: &mut [u8]) -> bool {
     true
 }
 
-/// The ICC profile of the first JPEG in `file` that has one (APP2 `ICC_PROFILE` marker segments),
-/// for embedded RAW previews: the decoder hands over pixels only, so the container bytes are
-/// searched. Which JPEG the profile belongs to is not checked: camera previews that carry a
-/// profile are tagged consistently.
-pub(crate) fn find_jpeg_icc(file: &[u8]) -> Option<Vec<u8>> {
-    const SIG: &[u8; 12] = b"ICC_PROFILE ";
-    let finder = memchr::memmem::Finder::new(SIG);
-    let mut from = 0usize;
-    while let Some(rel) = finder.find(file.get(from..)?) {
-        let sig_at = from + rel;
-        from = sig_at + SIG.len();
-        // Segment: FF E2, length (2, includes itself), signature, sequence, count, data.
-        let Some(start) = sig_at.checked_sub(4) else { continue };
-        if file.get(start..start + 2) != Some(&[0xFF, 0xE2]) {
+/// Most header bytes of a preview JPEG that are read looking for its ICC profile.
+const PREVIEW_HEADER_LIMIT: usize = 256 * 1024;
+
+/// Reads the header of a JPEG (up to the first scan, at most [`PREVIEW_HEADER_LIMIT`] bytes):
+/// `(width, height, ICC profile)`. The profile is reassembled from the APP2 `ICC_PROFILE`
+/// segments and only returned when the chain is complete. `None`: not a JPEG.
+pub(crate) fn jpeg_header_icc(jpeg: &[u8]) -> Option<(u32, u32, Option<Vec<u8>>)> {
+    const SIG: &[u8; 12] = b"ICC_PROFILE\0";
+    let jpeg = &jpeg[..jpeg.len().min(PREVIEW_HEADER_LIMIT)];
+    if jpeg.get(..2) != Some(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut at = 2usize;
+    let mut size: Option<(u32, u32)> = None;
+    let mut parts: Vec<IccPart> = Vec::new();
+    while let Some(h) = jpeg.get(at..at + 4) {
+        if h[0] != 0xFF {
+            break;
+        }
+        let marker = h[1];
+        if marker == 0xFF {
+            at += 1;
             continue;
         }
-        let mut at = start;
-        let mut profile = Vec::new();
-        let mut expect = 1u8;
-        let mut total = 0u8;
-        while let Some(h) = file.get(at..at + 18) {
-            let len = usize::from(u16::from_be_bytes([h[2], h[3]]));
-            if h[0] != 0xFF || h[1] != 0xE2 || &h[4..16] != SIG || h[16] != expect || len < 16 {
-                break;
-            }
-            total = h[17];
-            let Some(data) = file.get(at + 18..at + 2 + len) else { break };
-            profile.extend_from_slice(data);
-            if expect == total {
-                return Some(profile);
-            }
-            expect += 1;
-            at += 2 + len;
+        let len = usize::from(u16::from_be_bytes([h[2], h[3]]));
+        if len < 2 {
+            break;
         }
-        let _ = total;
+        let body = jpeg.get(at + 4..at + 2 + len);
+        match marker {
+            0xDA => break,
+            0xE2 => {
+                if let Some(b) = body.filter(|b| b.len() > 14 && &b[..12] == SIG) {
+                    parts.push((b[12], b[13], &b[14..]));
+                }
+            }
+            0xC0..=0xCF if !matches!(marker, 0xC4 | 0xC8 | 0xCC) => {
+                if let Some(b) = body.filter(|b| b.len() >= 5) {
+                    size = Some((u32::from(u16::from_be_bytes([b[3], b[4]])), u32::from(u16::from_be_bytes([b[1], b[2]]))));
+                }
+            }
+            _ => {}
+        }
+        at += 2 + len;
     }
-    None
+    let (w, h) = size?;
+    parts.sort_by_key(|p| p.0);
+    let count = parts.first().map_or(0, |p| p.1);
+    let complete = count > 0 && parts.len() == usize::from(count) && parts.iter().enumerate().all(|(i, p)| usize::from(p.0) == i + 1 && p.1 == count);
+    Some((w, h, complete.then(|| parts.iter().flat_map(|p| p.2.iter().copied()).collect())))
+}
+
+/// One APP2 segment of an ICC profile: (sequence number, count, data).
+type IccPart<'a> = (u8, u8, &'a [u8]);
+
+struct Tiff<'a> {
+    d: &'a [u8],
+    le: bool,
+}
+
+impl Tiff<'_> {
+    fn u16(&self, at: usize) -> Option<u32> {
+        let b: [u8; 2] = self.d.get(at..at + 2)?.try_into().ok()?;
+        Some(u32::from(if self.le { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) }))
+    }
+
+    fn u32(&self, at: usize) -> Option<u32> {
+        let b: [u8; 4] = self.d.get(at..at + 4)?.try_into().ok()?;
+        Some(if self.le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+    }
+}
+
+/// Offsets of JPEG streams that the TIFF structure of `file` points at: the thumbnail pair
+/// (tags 0x201/0x202) and strips of preview images stored as JPEG (compression 6, 7 or 34892
+/// with NewSubFileType 1) in IFD0, the following IFDs and their SubIFDs. Bounded: at most 16 IFDs
+/// of at most 512 entries. Files that are not TIFF-based give nothing.
+fn tiff_jpeg_offsets(file: &[u8]) -> Vec<usize> {
+    let le = match file.get(..2) {
+        Some(b"II") => true,
+        Some(b"MM") => false,
+        _ => return Vec::new(),
+    };
+    let t = Tiff { d: file, le };
+    if t.u16(2) != Some(42) {
+        return Vec::new();
+    }
+    let mut todo: Vec<usize> = t.u32(4).into_iter().map(|v| v as usize).collect();
+    let (mut seen, mut out) = (Vec::new(), Vec::new());
+    while let Some(ifd) = todo.pop() {
+        if seen.len() >= 16 || ifd == 0 || seen.contains(&ifd) {
+            continue;
+        }
+        seen.push(ifd);
+        let Some(n) = t.u16(ifd).map(|n| (n as usize).min(512)) else { continue };
+        let (mut thumb, mut strip, mut compression, mut sub_type) = ((None, None), None, None, 0u32);
+        for i in 0..n {
+            let e = ifd + 2 + i * 12;
+            let (Some(tag), Some(kind), Some(count)) = (t.u16(e), t.u16(e + 2), t.u32(e + 4)) else { break };
+            // First value of the entry (inline for SHORT/LONG with count 1 or the first of an array).
+            let value_at = if (kind == 3 && count <= 2) || (kind == 4 && count == 1) { e + 8 } else { t.u32(e + 8).unwrap_or(0) as usize };
+            let value = if kind == 3 { t.u16(value_at) } else { t.u32(value_at) };
+            match tag {
+                0x201 => thumb.0 = value,
+                0x202 => thumb.1 = value,
+                0x103 => compression = value,
+                0xFE => sub_type = value.unwrap_or(0),
+                0x111 => strip = value,
+                0x14A => {
+                    let base = if count == 1 { e + 8 } else { t.u32(e + 8).unwrap_or(0) as usize };
+                    for k in 0..(count as usize).min(8) {
+                        if let Some(v) = t.u32(base + 4 * k) {
+                            todo.push(v as usize);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let (Some(o), Some(_)) = thumb {
+            out.push(o as usize);
+        }
+        if let (Some(o), Some(6 | 7 | 34892), 1) = (strip, compression, sub_type) {
+            out.push(o as usize);
+        }
+        if let Some(next) = t.u32(ifd + 2 + n * 12) {
+            todo.push(next as usize);
+        }
+    }
+    out
+}
+
+/// The ICC profile of the embedded preview JPEG of a RAW file whose decoded size is
+/// `width` x `height` (either orientation): only the header segments of the JPEG streams the
+/// file's TIFF structure points at are read (at most 256 KB each), never the rest of the file, and
+/// only a stream of that size counts. Container formats that are not TIFF-based (CR3, RAF, ...)
+/// give `None`.
+pub(crate) fn find_preview_icc(file: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    tiff_jpeg_offsets(file).into_iter().find_map(|o| {
+        let (w, h, icc) = jpeg_header_icc(file.get(o..)?)?;
+        ((w, h) == (width, height) || (h, w) == (width, height)).then_some(icc).flatten()
+    })
 }
 
 #[cfg(test)]
@@ -937,46 +1041,102 @@ mod input_tests {
 }
 
 #[cfg(test)]
-mod jpeg_icc_tests {
-    use super::find_jpeg_icc;
+mod preview_icc_tests {
+    use super::{find_preview_icc, jpeg_header_icc};
 
-    fn segment(seq: u8, count: u8, data: &[u8]) -> Vec<u8> {
-        let mut s = vec![0xFF, 0xE2];
-        s.extend_from_slice(&((data.len() + 16) as u16).to_be_bytes());
-        s.extend_from_slice(b"ICC_PROFILE\0");
-        s.extend_from_slice(&[seq, count]);
-        s.extend_from_slice(data);
+    fn segment(marker: u8, body: &[u8]) -> Vec<u8> {
+        let mut s = vec![0xFF, marker];
+        s.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
+        s.extend_from_slice(body);
         s
     }
 
+    fn icc_segment(seq: u8, count: u8, data: &[u8]) -> Vec<u8> {
+        segment(0xE2, &[b"ICC_PROFILE\0".as_slice(), &[seq, count], data].concat())
+    }
+
+    fn sof(w: u16, h: u16) -> Vec<u8> {
+        segment(0xC0, &[&[8], &h.to_be_bytes()[..], &w.to_be_bytes()[..], &[1, 1, 0x11, 0]].concat())
+    }
+
+    fn jpeg(w: u16, h: u16, icc: &[&[u8]]) -> Vec<u8> {
+        let mut j = vec![0xFF, 0xD8];
+        for (i, part) in icc.iter().enumerate() {
+            j.extend(icc_segment(i as u8 + 1, icc.len() as u8, part));
+        }
+        j.extend(sof(w, h));
+        j.extend(segment(0xDA, &[0, 0]));
+        j.extend_from_slice(&[0xAA; 50]);
+        j
+    }
+
     #[test]
-    fn profile_split_over_segments_is_reassembled_after_other_bytes() {
-        let mut file = vec![0u8; 100];
-        file.extend_from_slice(&[0xFF, 0xD8]);
-        file.extend(segment(1, 2, &[1, 2, 3]));
-        file.extend(segment(2, 2, &[4, 5]));
-        file.extend_from_slice(&[0xFF, 0xDB, 0, 4, 9, 9]);
-        assert_eq!(find_jpeg_icc(&file), Some(vec![1, 2, 3, 4, 5]));
+    fn jpeg_header_gives_size_and_the_reassembled_profile() {
+        let j = jpeg(640, 400, &[&[1, 2, 3], &[4, 5]]);
+        assert_eq!(jpeg_header_icc(&j), Some((640, 400, Some(vec![1, 2, 3, 4, 5]))));
+        assert_eq!(jpeg_header_icc(&jpeg(10, 20, &[])), Some((10, 20, None)));
+        // A gap in the chain or a cut file: no profile, no panic.
+        let mut gap = vec![0xFF, 0xD8];
+        gap.extend(icc_segment(1, 3, &[1]));
+        gap.extend(icc_segment(3, 3, &[2]));
+        gap.extend(sof(8, 8));
+        assert_eq!(jpeg_header_icc(&gap), Some((8, 8, None)));
+        assert_eq!(jpeg_header_icc(b"not a jpeg"), None);
+        assert_eq!(jpeg_header_icc(&j[..9]), None);
+    }
+
+    /// A little-endian TIFF with IFD0 holding the JPEG thumbnail pair at `jpeg_at`.
+    fn tiff_with(jpeg: &[u8], pad: usize) -> Vec<u8> {
+        let mut f = vec![b'I', b'I', 42, 0, 8, 0, 0, 0];
+        let jpeg_at = 8 + 2 + 2 * 12 + 4 + pad;
+        f.extend_from_slice(&2u16.to_le_bytes());
+        for (tag, v) in [(0x201u16, jpeg_at as u32), (0x202, jpeg.len() as u32)] {
+            f.extend_from_slice(&tag.to_le_bytes());
+            f.extend_from_slice(&4u16.to_le_bytes());
+            f.extend_from_slice(&1u32.to_le_bytes());
+            f.extend_from_slice(&v.to_le_bytes());
+        }
+        f.extend_from_slice(&0u32.to_le_bytes());
+        f.extend(std::iter::repeat_n(0u8, pad));
+        f.extend_from_slice(jpeg);
+        f
+    }
+
+    #[test]
+    fn only_the_jpeg_the_tiff_points_at_with_the_decoded_size_counts() {
+        let j = jpeg(640, 400, &[&[7; 20]]);
+        let file = tiff_with(&j, 1000);
+        assert_eq!(find_preview_icc(&file, 640, 400), Some(vec![7; 20]));
+        assert_eq!(find_preview_icc(&file, 400, 640), Some(vec![7; 20]), "rotated preview");
+        assert_eq!(find_preview_icc(&file, 320, 200), None, "another size is another picture");
+        // A profile somewhere else in the file (not in a JPEG the TIFF points at) is ignored.
+        let mut stray = tiff_with(&jpeg(640, 400, &[]), 0);
+        stray.extend(icc_segment(1, 1, &[9; 10]));
+        assert_eq!(find_preview_icc(&stray, 640, 400), None);
+        // Not TIFF, truncated, hostile offsets: nothing and no panic.
+        assert_eq!(find_preview_icc(b"\0\0\0\x18ftypcrx ", 640, 400), None);
+        for cut in (0..file.len()).step_by(37) {
+            let _ = find_preview_icc(&file[..cut], 640, 400);
+        }
+        let mut loops = file.clone();
+        loops[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(find_preview_icc(&loops, 640, 400), None);
     }
 
     #[test]
     #[ignore = "diagnostic timing, run explicitly with --ignored --nocapture"]
-    fn scan_cost_of_a_file_without_a_profile() {
-        let file: Vec<u8> = (0..60_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+    fn read_cost_on_a_60_mb_file() {
+        let j = jpeg(640, 400, &[&[7; 2000]]);
+        let mut file = tiff_with(&j, 0);
+        file.resize(60_000_000, 0x5A);
+        let path = std::env::temp_dir().join(format!("rawgraph-icc-cost-{}.bin", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
         let t = std::time::Instant::now();
-        assert_eq!(find_jpeg_icc(&file), None);
-        println!("scan of 60 MB: {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
-    }
-
-    #[test]
-    fn broken_or_missing_chains_give_none() {
-        assert_eq!(find_jpeg_icc(&[]), None);
-        assert_eq!(find_jpeg_icc(b"ICC_PROFILE\0"), None);
-        let mut gap = segment(1, 3, &[1]);
-        gap.extend(segment(3, 3, &[2]));
-        assert_eq!(find_jpeg_icc(&gap), None, "segment 2 is missing");
-        let mut cut = segment(1, 1, &[1, 2, 3, 4]);
-        cut.truncate(cut.len() - 2);
-        assert_eq!(find_jpeg_icc(&cut), None);
+        let mapped = std::fs::read(&path).unwrap();
+        let read_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let t = std::time::Instant::now();
+        assert!(find_preview_icc(&mapped, 640, 400).is_some());
+        println!("read of the 60 MB file {read_ms:.1} ms; profile search on it {:.3} ms (touches under 256 KB)", t.elapsed().as_secs_f64() * 1000.0);
+        let _ = std::fs::remove_file(path);
     }
 }

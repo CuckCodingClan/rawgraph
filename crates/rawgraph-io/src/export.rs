@@ -212,7 +212,16 @@ pub fn save_avif8(path: &Path, width: u32, height: u32, rgb8: &[u8], options: &S
 /// `embed_profile` the ICC profile of the space is stored, with `metadata` EXIF is attempted
 /// (best effort, see `heic`). [`IoError::Unsupported`] with the reason when no encoder exists.
 pub fn encode_heic8(width: u32, height: u32, rgb8: &[u8], options: &SaveOptions) -> Result<Vec<u8>, IoError> {
+    encode_heic8_detailed(width, height, rgb8, options).map(|e| e.bytes)
+}
+
+/// [`encode_heic8`] plus how many of the requested EXIF entries the encoder stored. Pictures with a
+/// side below [`crate::HEIC_MIN_SIDE`] are refused.
+pub fn encode_heic8_detailed(width: u32, height: u32, rgb8: &[u8], options: &SaveOptions) -> Result<crate::HeicEncoded, IoError> {
     check_size(width, height, rgb8.len())?;
+    if width < crate::HEIC_MIN_SIDE || height < crate::HEIC_MIN_SIDE {
+        return Err(IoError::Unsupported(format!("HEIC needs at least {} pixels on each side (this picture is {width}x{height})", crate::HEIC_MIN_SIDE)));
+    }
     crate::heic::heic_available().map_err(IoError::Unsupported)?;
     crate::heic::encode(width, height, rgb8, options.jpeg_quality.clamp(1, 100), Some(options.space), options.metadata.as_ref(), options.embed_profile)
 }
@@ -224,8 +233,11 @@ pub fn save_heic8(path: &Path, width: u32, height: u32, rgb8: &[u8], options: &S
     if !options.overwrite && path.exists() {
         return Err(IoError::Exists(path.to_path_buf()));
     }
-    let bytes = encode_heic8(width, height, rgb8, options)?;
-    write_atomic(path, options.overwrite, |tmp| fs::write(tmp, &bytes).map_err(|e| io_err(tmp, e)))
+    let done = encode_heic8_detailed(width, height, rgb8, options)?;
+    if done.exif_written < done.exif_requested {
+        eprintln!("HEIC {}: the encoder stored {} of {} EXIF entries", path.display(), done.exif_written, done.exif_requested);
+    }
+    write_atomic(path, options.overwrite, |tmp| fs::write(tmp, &done.bytes).map_err(|e| io_err(tmp, e)))
 }
 
 /// Writes RGBA WebP. Pixels are already encoded in the selected output space. With `embed_profile`

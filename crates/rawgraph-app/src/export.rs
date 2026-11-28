@@ -33,22 +33,50 @@ pub enum Fmt {
     Heic,
 }
 
-/// Whether the system HEIC encoder works: `None` while the check (a trial encode on a worker
-/// thread, so the first look never stalls the window) is still running.
+struct HeicState {
+    result: Option<Result<(), String>>,
+    checked: Option<std::time::Instant>,
+    probing: bool,
+}
+
+static HEIC: std::sync::Mutex<HeicState> = std::sync::Mutex::new(HeicState { result: None, checked: None, probing: false });
+
+fn start_heic_probe(s: &mut HeicState) {
+    if s.probing {
+        return;
+    }
+    s.probing = true;
+    let spawned = std::thread::Builder::new().name("rawgraph-heic-probe".into()).spawn(|| {
+        let result = rawgraph_io::heic_available();
+        if let Ok(mut s) = HEIC.lock() {
+            s.result = Some(result);
+            s.checked = Some(std::time::Instant::now());
+            s.probing = false;
+        }
+    });
+    if spawned.is_err() {
+        s.probing = false;
+    }
+}
+
+/// Whether the system HEIC encoder works: `None` while the first check (a trial encode on a worker
+/// thread, so the first look never stalls the window) is still running. A success stays; a failure
+/// is looked at again in the background once it is 30 seconds old (the extensions can be installed
+/// while RawGraph runs) and whenever [`heic_recheck`] is called.
 pub fn heic_status() -> Option<Result<(), String>> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::OnceLock;
-    static ANSWER: OnceLock<Result<(), String>> = OnceLock::new();
-    static STARTED: AtomicBool = AtomicBool::new(false);
-    if let Some(a) = ANSWER.get() {
-        return Some(a.clone());
+    let mut s = HEIC.lock().ok()?;
+    let stale = matches!(s.result, Some(Err(_))) && s.checked.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(30));
+    if s.result.is_none() || stale {
+        start_heic_probe(&mut s);
     }
-    if !STARTED.swap(true, Ordering::SeqCst) {
-        let _ = std::thread::Builder::new().name("rawgraph-heic-probe".into()).spawn(|| {
-            let _ = ANSWER.set(rawgraph_io::heic_available());
-        });
+    s.result.clone()
+}
+
+/// "Check again": probes the encoder now.
+pub fn heic_recheck() {
+    if let Ok(mut s) = HEIC.lock() {
+        start_heic_probe(&mut s);
     }
-    None
 }
 
 impl Fmt {
@@ -616,7 +644,12 @@ pub fn show_dialog(ctx: &egui::Context, area: egui::Rect, st: &mut ExportState, 
                 });
                 if st.format == Fmt::Webp { ui.checkbox(&mut st.webp_lossless, "Lossless WebP"); }
                 if let (Fmt::Heic, Some(Err(why))) = (st.format, heic_status()) {
-                    ui.label(RichText::new(why).color(Color32::from_rgb(255, 150, 120)));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(why).color(Color32::from_rgb(255, 150, 120)));
+                        if ui.small_button("Check again").clicked() {
+                            heic_recheck();
+                        }
+                    });
                 }
                 if matches!(st.format, Fmt::Jpeg | Fmt::Heic) || (st.format == Fmt::Webp && !st.webp_lossless) {
                     ui.add(egui::Slider::new(&mut st.quality, 1..=100).text("quality"));
