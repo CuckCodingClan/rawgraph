@@ -173,7 +173,7 @@ impl GraphEditor {
             status.error("The clipboard is empty");
             return false;
         };
-        let sub = match graph_clip::parse_clip(text) {
+        let (sub, notes) = match graph_clip::parse_clip_notes(text) {
             Ok(s) => s,
             Err(why) => {
                 status.error(why);
@@ -194,6 +194,7 @@ impl GraphEditor {
         sel.replace(ids);
         session.set_node_selection(sel);
         status.info(format!("Pasted {}", pluralize(n)));
+        status.migration("Paste", notes);
         true
     }
 
@@ -221,8 +222,8 @@ impl GraphEditor {
 
     pub fn insert_recipe(&mut self, stem: &str, at: Option<[f32; 2]>, session: &mut Session, status: &mut Status) -> bool {
         let Some(dir) = self.recipes_dir.clone() else { return false };
-        match recipes::load(&dir, stem) {
-            Ok(sub) => {
+        match recipes::load_with_notes(&dir, stem) {
+            Ok((sub, notes)) => {
                 let anchor = at.map_or_else(
                     || {
                         let a = Anchor::Offset(self.edit.paste_count);
@@ -237,6 +238,7 @@ impl GraphEditor {
                 sel.replace(ids);
                 session.set_node_selection(sel);
                 status.info(format!("Inserted recipe \"{stem}\" ({})", pluralize(n)));
+                status.migration("Recipe", notes);
                 true
             }
             Err(why) => {

@@ -5426,3 +5426,6 @@ mod normals_tests {
         assert!(normals_map(3,3,y,1.0,0.0,true).pixel(1,1)[1] > 0.5);
     }
 }
+
+#[cfg(test)]
+mod migration_tests;

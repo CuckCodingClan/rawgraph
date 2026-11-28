@@ -750,3 +750,66 @@ fn manual_relink_of_a_pending_entry_checks_size_and_fills_the_hash() {
     project.relink(id, &to, false).unwrap();
     assert_eq!(project.image(id).unwrap().content_hash, content_hash(&to).unwrap().0);
 }
+
+#[test]
+fn a_project_with_an_old_mask_graph_opens_migrated_and_saves_format_3() {
+    let t = Tmp::new();
+    let file = t.path("old.rawgraph");
+    Project::new().save(&file).unwrap();
+    let old = include_str!("../../rawgraph-core/tests/fixtures/graph_v1.json");
+    {
+        let conn = rusqlite::Connection::open(&file).unwrap();
+        conn.execute("UPDATE graph SET json = ?1 WHERE id = 1", [old]).unwrap();
+    }
+    let mut p = Project::load(&file).unwrap();
+    assert!(p.graph.nodes().any(|n| n.kind == NodeKind::Draw) && !p.graph.nodes().any(|n| n.kind.label() == "Brush Mask"));
+    assert!(p.migration_notes().is_empty());
+    let out = t.path("new.rawgraph");
+    p.commit(&out, "migrated").unwrap();
+    let conn = rusqlite::Connection::open(&out).unwrap();
+    let json: String = conn.query_row("SELECT json FROM graph WHERE id = 1", [], |r| r.get(0)).unwrap();
+    assert!(json.contains("\"format_version\": 4") && json.contains("\"Draw\""));
+    assert_eq!(Project::load(&out).unwrap().graph, p.graph);
+}
+
+#[test]
+fn migration_notes_of_an_old_graph_reach_the_project_and_its_history() {
+    let t = Tmp::new();
+    let file = t.path("notes.rawgraph");
+    Project::new().save(&file).unwrap();
+    // Source -> Exposure -> Output, and a Hue Mask (no equivalent) on the Exposure mask port.
+    let old = r#"{"format_version": 2, "next_id": 5, "edges": [
+        {"from": 1, "to": 2, "to_port": 0}, {"from": 2, "to": 3, "to_port": 0},
+        {"from": 1, "to": 4, "to_port": 0}, {"from": 4, "to": 2, "to_port": 1}],
+      "nodes": {
+        "1": {"id": 1, "kind": "Source", "mode": "All", "all": {}, "individual": {}, "pos": [0.0, 0.0]},
+        "2": {"id": 2, "kind": "Exposure", "mode": "All", "all": {"ev": 1.0}, "individual": {}, "pos": [1.0, 0.0]},
+        "3": {"id": 3, "kind": "Output", "mode": "All", "all": {}, "individual": {}, "pos": [2.0, 0.0]},
+        "4": {"id": 4, "kind": "HueMask", "mode": "All", "all": {}, "individual": {}, "pos": [1.0, 1.0]}}}"#;
+    {
+        let conn = rusqlite::Connection::open(&file).unwrap();
+        conn.execute("UPDATE graph SET json = ?1 WHERE id = 1", [old]).unwrap();
+    }
+    let mut p = Project::load(&file).unwrap();
+    assert_eq!(p.migration_notes().len(), 2, "{:?}", p.migration_notes());
+    assert!(p.migration_notes().iter().any(|n| n.starts_with("Hue Mask (node 4):")));
+    assert!(p.graph.nodes().all(|n| n.kind != NodeKind::Generator));
+    // The history snapshot written by the next save is the migrated graph; reading it back has no notes.
+    let out = t.path("saved.rawgraph");
+    p.commit(&out, "migrated").unwrap();
+    let saved = Project::load(&out).unwrap();
+    assert!(saved.migration_notes().is_empty());
+    let (g, notes) = saved.graph_at_with_notes(1).expect("snapshot");
+    assert!(notes.is_empty() && g == saved.graph);
+    // A snapshot stored in the old format reports its notes when it is read.
+    let mut log = history::HistoryLog::default();
+    log.push(
+        HistoryEntry { revision: 1, time_unix_ms: 0, author: String::new(), device: String::new(), summary: String::new(), has_graph: true },
+        old.to_owned(),
+        10,
+        1 << 20,
+    );
+    p.history = log;
+    let (_, notes) = p.graph_at_with_notes(1).expect("old snapshot");
+    assert_eq!(notes.len(), 2);
+}

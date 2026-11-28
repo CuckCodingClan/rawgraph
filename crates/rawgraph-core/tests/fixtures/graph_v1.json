@@ -1,0 +1,255 @@
+{
+  "format_version": 1,
+  "nodes": {
+    "1": {
+      "id": 1,
+      "kind": "Source",
+      "mode": "All",
+      "all": {},
+      "individual": {},
+      "pos": [
+        0.0,
+        0.0
+      ]
+    },
+    "2": {
+      "id": 2,
+      "kind": "Develop",
+      "mode": "All",
+      "all": {
+        "temperature": 5200.0,
+        "wb": 1.0
+      },
+      "individual": {},
+      "pos": [
+        1.0,
+        0.0
+      ]
+    },
+    "3": {
+      "id": 3,
+      "kind": "Exposure",
+      "mode": "All",
+      "all": {
+        "ev": 1.25
+      },
+      "individual": {},
+      "pos": [
+        2.0,
+        0.0
+      ]
+    },
+    "4": {
+      "id": 4,
+      "kind": "PointCurve",
+      "mode": "All",
+      "all": {
+        "channel": 1.0
+      },
+      "individual": {},
+      "data": {
+        "Curve": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            0.4,
+            0.5
+          ],
+          [
+            1.0,
+            1.0
+          ]
+        ]
+      },
+      "pos": [
+        3.0,
+        0.0
+      ]
+    },
+    "5": {
+      "id": 5,
+      "kind": "MetadataFilter",
+      "mode": "Individual",
+      "all": {
+        "min": 100.0
+      },
+      "individual": {
+        "2": {
+          "invert": 1.0,
+          "min": 200.0
+        }
+      },
+      "pos": [
+        4.0,
+        0.0
+      ]
+    },
+    "6": {
+      "id": 6,
+      "kind": "MetadataSplit",
+      "mode": "All",
+      "all": {
+        "measure": 0.0
+      },
+      "individual": {},
+      "data": {
+        "Ranges": [
+          {
+            "name": "low",
+            "min": 0.0,
+            "max": 400.0
+          },
+          {
+            "name": "high",
+            "min": 401.0,
+            "max": 6400.0
+          }
+        ]
+      },
+      "pos": [
+        5.0,
+        0.0
+      ]
+    },
+    "7": {
+      "id": 7,
+      "kind": "Merge",
+      "mode": "All",
+      "all": {},
+      "individual": {},
+      "pos": [
+        6.0,
+        0.0
+      ]
+    },
+    "8": {
+      "id": 8,
+      "kind": "BrushMask",
+      "mode": "Individual",
+      "all": {},
+      "individual": {},
+      "individual_data": {
+        "1": {
+          "Strokes": [
+            {
+              "points": [
+                [
+                  0.1,
+                  0.1
+                ],
+                [
+                  0.5,
+                  0.5
+                ]
+              ],
+              "radius": 0.05,
+              "hardness": 0.5,
+              "flow": 1.0,
+              "erase": false
+            }
+          ]
+        }
+      },
+      "pos": [
+        3.0,
+        1.0
+      ]
+    },
+    "9": {
+      "id": 9,
+      "kind": "Blur",
+      "mode": "All",
+      "all": {},
+      "individual": {},
+      "pos": [
+        7.0,
+        0.0
+      ]
+    },
+    "10": {
+      "id": 10,
+      "kind": "LensManual",
+      "mode": "All",
+      "all": {
+        "distortion": 0.1
+      },
+      "individual": {},
+      "pos": [
+        8.0,
+        0.0
+      ]
+    },
+    "11": {
+      "id": 11,
+      "kind": "Output",
+      "mode": "All",
+      "all": {},
+      "individual": {},
+      "pos": [
+        9.0,
+        0.0
+      ]
+    }
+  },
+  "edges": [
+    {
+      "from": 1,
+      "to": 2,
+      "to_port": 0
+    },
+    {
+      "from": 2,
+      "to": 3,
+      "to_port": 0
+    },
+    {
+      "from": 3,
+      "to": 4,
+      "to_port": 0
+    },
+    {
+      "from": 4,
+      "to": 5,
+      "to_port": 0
+    },
+    {
+      "from": 5,
+      "to": 6,
+      "to_port": 0
+    },
+    {
+      "from": 6,
+      "to": 7,
+      "to_port": 0
+    },
+    {
+      "from": 6,
+      "from_port": 6,
+      "to": 7,
+      "to_port": 1
+    },
+    {
+      "from": 7,
+      "to": 9,
+      "to_port": 0
+    },
+    {
+      "from": 8,
+      "to": 9,
+      "to_port": 1
+    },
+    {
+      "from": 9,
+      "to": 10,
+      "to_port": 0
+    },
+    {
+      "from": 10,
+      "to": 11,
+      "to_port": 0
+    }
+  ],
+  "next_id": 12
+}

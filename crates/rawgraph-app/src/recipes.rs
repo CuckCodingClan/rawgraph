@@ -63,12 +63,16 @@ fn read_limited(path: &Path) -> Result<String, String> {
 }
 
 fn parse_file(path: &Path) -> Result<Subgraph, String> {
+    parse_file_notes(path).map(|(s, _)| s)
+}
+
+fn parse_file_notes(path: &Path) -> Result<(Subgraph, Vec<String>), String> {
     let text = read_limited(path)?;
-    let sub = Subgraph::from_json(&text).map_err(|e| e.to_string())?;
+    let (sub, notes) = Subgraph::from_json_with_notes(&text).map_err(|e| e.to_string())?;
     if sub.is_empty() {
         return Err("the recipe holds no nodes".to_owned());
     }
-    Ok(sub)
+    Ok((sub, notes))
 }
 
 /// All recipe files in `dir`, sorted by name (case-insensitive). A missing
@@ -140,8 +144,13 @@ fn write_new(path: &Path, text: &str) -> Result<(), String> {
 }
 
 pub fn load(dir: &Path, stem: &str) -> Result<Subgraph, String> {
+    load_with_notes(dir, stem).map(|(s, _)| s)
+}
+
+/// Like [`load`], with the notes of the migration of a recipe saved before the mask nodes were removed.
+pub fn load_with_notes(dir: &Path, stem: &str) -> Result<(Subgraph, Vec<String>), String> {
     let stem = checked_stem(stem)?;
-    parse_file(&recipe_path(dir, stem)).map_err(|e| format!("Recipe \"{stem}\" cannot be used: {e}"))
+    parse_file_notes(&recipe_path(dir, stem)).map_err(|e| format!("Recipe \"{stem}\" cannot be used: {e}"))
 }
 
 /// Renames a recipe inside the folder; the new name is made safe first and an

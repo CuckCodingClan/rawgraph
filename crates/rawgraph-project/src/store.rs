@@ -523,7 +523,7 @@ fn read_current(conn: &Connection) -> Result<Project, ProjectError> {
         .optional()
         .map_err(db_err)?
         .ok_or_else(|| ProjectError::Corrupt("missing graph".into()))?;
-    let graph = Graph::from_json(&graph_json).map_err(|e| ProjectError::Corrupt(e.to_string()))?;
+    let (graph, migration_notes) = Graph::from_json_with_notes(&graph_json).map_err(|e| ProjectError::Corrupt(e.to_string()))?;
 
     let mut stmt = conn
         .prepare(
@@ -644,6 +644,7 @@ fn read_current(conn: &Connection) -> Result<Project, ProjectError> {
         history,
         folders,
         migrated_from: None,
+        migration_notes,
         scan_threads: crate::DEFAULT_SCAN_THREADS,
         last_write: None,
     })

@@ -8,3 +8,6 @@ publish.workspace = true
 rawgraph-core.workspace = true
 rawgraph-scopes = { path = "../rawgraph-scopes" }
 rawgraph-fx = { path = "../rawgraph-fx" }
+
+[dev-dependencies]
+serde_json.workspace = true

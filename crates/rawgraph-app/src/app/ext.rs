@@ -800,11 +800,13 @@ impl App {
                 self.after_document_change();
                 self.start_capture_refresh(ctx);
                 self.start_missing_check(ctx);
+                self.status.clear_notes();
                 match opened.note {
                     Some(n) if opened.recovered => self.status.info(format!("{n}; opened {}", path.display())),
                     Some(n) => self.status.info(n),
                     None => self.status.info(format!("Opened {}", path.display())),
                 }
+                self.status.migration("Project", self.session.project.migration_notes().to_vec());
             }
             Err(crate::revisions::OpenError::Unfinished(file)) => self.ask_unfinished(file, Retry::Open(path.to_path_buf())),
             Err(e) => self.status.error(format!("Cannot open {}: {e}", path.display())),

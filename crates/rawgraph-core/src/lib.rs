@@ -15,8 +15,11 @@ pub mod generator;
 pub mod image;
 pub mod layer;
 pub mod lens;
+mod migrate;
 pub mod ops;
 
+#[cfg(test)]
+mod migrate_tests;
 #[cfg(test)]
 mod wave8_tests;
 

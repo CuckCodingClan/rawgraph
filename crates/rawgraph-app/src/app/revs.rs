@@ -272,12 +272,14 @@ impl App {
         }
         if restore {
             if let Some(row) = &selected_row {
-                match revisions::restore_graph(&mut self.session, &mut self.history, row.revision) {
-                    Ok(true) => {
+                match revisions::restore_graph_notes(&mut self.session, &mut self.history, row.revision) {
+                    Ok((true, notes)) => {
                         self.editor.request_frame_all();
+                        self.status.clear_notes();
                         self.status.info(format!("Restored the graph of revision {}; Undo brings the previous graph back", row.revision));
+                        self.status.migration("Restore", notes);
                     }
-                    Ok(false) => self.status.info("That graph is the same as the current one"),
+                    Ok((false, _)) => self.status.info("That graph is the same as the current one"),
                     Err(e) => self.status.error(e),
                 }
             }
