@@ -150,8 +150,12 @@ impl Filmstrip {
         }
         let ids = members.map_or_else(Vec::new, |members| session.gallery_images(members));
         if members.is_some() && !target.image_pinned && target.image.is_none_or(|id| !ids.contains(&id)) {
-            session.selected = ids.first().copied();
+            // Back to the photo last selected in this node's gallery, not to the first one.
+            session.selected = session.gallery_fallback(target.node, &ids);
             target.image = session.selected;
+        }
+        if members.is_some() && !target.image_pinned && target.image.is_some_and(|id| ids.contains(&id)) {
+            session.remember_gallery(target.node, target.image);
         }
         ui.label(RichText::new(format!("{} images", ids.len())).strong());
         if target.node.is_none() {
