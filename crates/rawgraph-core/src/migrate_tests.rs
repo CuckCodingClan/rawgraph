@@ -39,7 +39,7 @@ fn doc(nodes: Vec<Value>, edges: &[(u64, u64, u64, u64)]) -> String {
 
 fn load(text: &str) -> (Graph, Vec<String>) {
     let (g, notes) = Graph::from_json_with_notes(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
-    assert_eq!(g.to_json().matches("\"format_version\": 5").count(), 1, "saved as the current format");
+    assert_eq!(g.to_json().matches(format!("\"format_version\": {}", crate::GRAPH_FORMAT_VERSION).as_str()).count(), 1, "saved as the current format");
     (g, notes)
 }
 
@@ -717,7 +717,7 @@ fn version_1_sub_graphs_with_masks_migrate_and_paste() {
     assert_eq!(ids.len(), 3);
     assert_eq!(g.node(ids[0]).unwrap().exposed_inputs().iter().flatten().count(), 1);
     assert!(g.edges().iter().any(|e| e.from == ids[1] && e.to == ids[0] && e.to_port == 1));
-    assert!(sub.to_json().contains("\"format_version\": 4"));
+    assert!(sub.to_json().contains(&format!("\"format_version\": {}", crate::graph::SUBGRAPH_FORMAT_VERSION)));
 }
 
 #[test]
@@ -783,11 +783,32 @@ fn old_sub_graph_exports_keep_their_metadata_choice_for_keywords() {
 }
 
 #[test]
-fn a_build_before_keywords_reports_this_format_as_newer() {
-    // Main (format 4) refuses what this build (format 5) writes: simulate the check with the numbers.
-    assert_eq!((GRAPH_FORMAT_VERSION, crate::graph::SUBGRAPH_FORMAT_VERSION), (5, 4));
-    let text = Graph::new().to_json().replace("\"format_version\": 5", "\"format_version\": 6");
-    assert!(matches!(Graph::from_json(&text), Err(GraphError::UnsupportedVersion(6))));
+fn a_format_5_file_with_keyword_data_loads_and_saves_as_6() {
+    // Keywords era (graph 5): the Export toggle is stored and must survive; the groups step only re-labels.
+    let off5 = json!({"meta_camera": 0.0, "meta_exposure": 0.0, "meta_date": 0.0, "meta_author": 0.0, "meta_software": 0.0});
+    let mut with_keywords = off5.clone();
+    with_keywords["meta_keywords"] = json!(1.0);
+    let text = doc_v(5, vec![node(1, "Source", json!({})), node(2, "Export", with_keywords)], &[(1, 0, 2, 0)]);
+    let (g, notes) = load(&text);
+    assert!(notes.is_empty(), "{notes:?}");
+    assert!(meta_keywords(&g, 2, 1));
+    assert!(g.to_json().contains("\"format_version\": 6"));
+    // Sub-graph format 4 (keywords) becomes 5.
+    let sub = json!({"format_version": 4, "nodes": [sub_node("Export", json!({"meta_keywords": 1.0}))], "edges": []}).to_string();
+    let sub = Subgraph::from_json(&sub).unwrap();
+    assert!(sub.to_json().contains("\"format_version\": 5"));
+}
+
+#[test]
+fn a_build_before_groups_reports_this_format_as_newer() {
+    // A format-5 build (keywords, no groups) refuses what this build (format 6) writes: simulate the check
+    // with the numbers, on the raw JSON before anything is parsed.
+    assert_eq!((GRAPH_FORMAT_VERSION, crate::graph::SUBGRAPH_FORMAT_VERSION), (6, 5));
+    let text = Graph::new().to_json().replace("\"format_version\": 6", "\"format_version\": 7");
+    assert!(matches!(Graph::from_json(&text), Err(GraphError::UnsupportedVersion(7))));
+    assert!(matches!(Graph::from_json_repaired(&text), Err(GraphError::UnsupportedVersion(7))));
+    let sub = json!({"format_version": 6, "nodes": [], "edges": []}).to_string();
+    assert_eq!(Subgraph::from_json(&sub), Err(GraphError::UnsupportedSubgraphVersion(6)));
 }
 
 #[test]

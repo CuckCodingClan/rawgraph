@@ -55,7 +55,8 @@ pub fn insert_at(graph: &mut Graph, sub: &Subgraph, anchor: Anchor) -> Vec<NodeI
         Anchor::At(p) => {
             let ids = graph.insert_subgraph(sub, [0.0, 0.0]);
             let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
-            for id in &ids {
+            // Only the boxes that are shown count: a pasted group's inner nodes are hidden inside it.
+            for id in &graph.top_level_of(&ids) {
                 if let Some(n) = graph.node(*id) {
                     min_x = min_x.min(n.pos[0]);
                     min_y = min_y.min(n.pos[1]);

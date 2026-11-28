@@ -383,7 +383,7 @@ impl Project {
 
     /// Like [`Project::graph_at`], with the notes of the graph migration when the snapshot is of an older format.
     pub fn graph_at_with_notes(&self, revision: u64) -> Option<(Graph, Vec<String>)> {
-        Graph::from_json_with_notes(self.history.snapshot(revision)?).ok()
+        Graph::from_json_repaired(self.history.snapshot(revision)?).ok()
     }
 
     /// Folders scanned into the project, in the order they were first scanned.

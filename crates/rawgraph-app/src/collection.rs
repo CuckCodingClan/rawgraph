@@ -104,6 +104,10 @@ fn input_members(graph: &Graph, catalog: &Catalog, node: NodeId, port: usize) ->
 /// Membership used by the viewer and gallery. A Split shows its input
 /// collection, regardless of which output port each image leaves through.
 fn node_members(graph: &Graph, catalog: &Catalog, node: NodeId, kind: NodeKind) -> Vec<ImageId> {
+    if kind == NodeKind::Group {
+        // A group carries what leaves its first output port.
+        return graph.view_target(node).map(|(n, port)| graph.members(n, port, catalog)).unwrap_or_default();
+    }
     if kind == NodeKind::MetadataSplit { input_members(graph, catalog, node, 0) } else { graph.members(node, 0, catalog) }
 }
 

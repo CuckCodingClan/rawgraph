@@ -123,6 +123,14 @@ pub struct Cli {
     pub recover_latest: bool,
     /// Node indices to select at start (the last one is the primary node).
     pub select_nodes: Vec<usize>,
+    /// Group the selected nodes into one group with this name at start (after `--select-nodes`).
+    pub group_nodes: Option<String>,
+    /// Publish `<node>:<parameter>[:<label>]` on the group that node is in (after `--group-nodes`).
+    pub publish: Vec<(usize, String, Option<String>)>,
+    /// Open these groups (node indices, outermost first) in the graph editor at start.
+    pub open_group: Vec<usize>,
+    /// Save the group selected at start as a macro with this name.
+    pub save_macro: Option<String>,
     /// Copy the selected nodes (to the editor's own clipboard only) at start.
     pub copy_selection: bool,
     /// Paste what was copied (needs `--copy-selection`) once, offset from the originals.
@@ -203,6 +211,10 @@ Usage: rawgraph-app [options]
   --simulate-crash             write a recovery copy and exit without the clean-quit cleanup
   --recover-latest             recover the newest crashed session at start
   --select-nodes <a,b,c>       select nodes by index (the last one is the primary node)
+  --group-nodes <name>         group the selected nodes into one Group node
+  --publish <n>:<param>[:label]  publish a parameter of node n on its group (repeatable)
+  --open-group <a,b>           open these groups in the editor (node indices, outermost first)
+  --save-macro <name>          save the selected group as a macro
   --copy-selection             copy the selected nodes (internal clipboard only)
   --paste-selection            paste them once, offset from the originals
   --save-recipe <name>         save the selected nodes as a recipe (repeatable)
@@ -266,6 +278,16 @@ fn parse_index(flag: &str, value: Option<String>) -> Result<usize, String> {
 }
 
 /// `1,2,3` as node or image indices.
+/// `<node>:<parameter>[:<label>]`.
+fn parse_publish(value: Option<String>) -> Result<(usize, String, Option<String>), String> {
+    let v = value.ok_or("--publish needs <node>:<parameter>[:<label>]")?;
+    let bad = || format!("--publish: \"{v}\" is not of the form <node>:<parameter>[:<label>]");
+    let mut parts = v.splitn(3, ':');
+    let node = parts.next().and_then(|n| n.trim().parse::<usize>().ok()).ok_or_else(bad)?;
+    let param = parts.next().map(str::trim).filter(|p| !p.is_empty()).ok_or_else(bad)?.to_owned();
+    Ok((node, param, parts.next().map(str::to_owned)))
+}
+
 fn parse_index_list(value: Option<String>) -> Result<Vec<usize>, String> {
     let v = value.ok_or("--select-nodes needs a list like 1,2,3")?;
     let bad = || format!("--select-nodes: \"{v}\" is not a comma-separated list of indices");
@@ -707,6 +729,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String
             "--simulate-crash" => cli.simulate_crash = true,
             "--recover-latest" => cli.recover_latest = true,
             "--select-nodes" => cli.select_nodes = parse_index_list(it.next())?,
+            "--group-nodes" => cli.group_nodes = Some(it.next().ok_or("--group-nodes needs a name")?),
+            "--publish" => cli.publish.push(parse_publish(it.next())?),
+            "--open-group" => cli.open_group = parse_index_list(it.next())?,
+            "--save-macro" => cli.save_macro = Some(it.next().ok_or("--save-macro needs a name")?),
             "--copy-selection" => cli.copy_selection = true,
             "--paste-selection" => cli.paste_selection = true,
             "--save-recipe" => cli.save_recipe.push(it.next().ok_or("--save-recipe needs a name")?),
@@ -950,6 +976,17 @@ mod tests {
     fn the_preload_can_be_switched_off_for_measuring() {
         assert!(!parse("--bench").unwrap().no_gpu_preload);
         assert!(parse("--bench --no-gpu-preload").unwrap().no_gpu_preload);
+    }
+
+    #[test]
+    fn group_flags() {
+        let cli = parse("--select-nodes 2,3 --group-nodes Tone --publish 2:ev:Brightness --publish 3:amount --open-group 7 --save-macro Warm").unwrap();
+        assert_eq!(cli.group_nodes.as_deref(), Some("Tone"));
+        assert_eq!(cli.publish, vec![(2, "ev".to_owned(), Some("Brightness".to_owned())), (3, "amount".to_owned(), None)]);
+        assert_eq!((cli.open_group, cli.save_macro.as_deref()), (vec![7], Some("Warm")));
+        for bad in ["--group-nodes", "--publish", "--publish x:ev", "--publish 2", "--publish 2:", "--open-group", "--save-macro"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
