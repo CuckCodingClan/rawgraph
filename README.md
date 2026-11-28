@@ -359,9 +359,14 @@ Update this section as implementation files are added.
 
 ### Develop local tone
 
-Develop's Lights, Shadows, White and Black use local tone processing by default:
-an edge-aware luminance neighborhood drives highlight/shadow gains, preserving RGB
-detail and unclipped HDR values; White and Black separately affect the endpoints.
+Develop's Lights, Shadows, White and Black use local tone processing by default.
+A two-scale edge-aware base (guided filters at 2 % and 5 % of the long edge, in
+log stops, estimated on a 512 px grid so the preview, thumbnails and the full-size
+export see the same neighbourhood) drives the Lights/Shadows gains: texture inside
+a region keeps its contrast, strong edges do not halo. White and Black act on the
+endpoints. Gains keep hue and RGB ratios and unclipped HDR values; darkened colours
+lose a little chroma so recovered highlights do not oversaturate. Each slider is
+monotonic and neutral sliders leave the pixels bit-identical.
 The **Legacy tone** toggle at the bottom of the Develop controls switches back to
 the older pointwise curves. The standalone Highlights / Shadows node is unchanged.
 This is a Camera Raw-inspired approximation, not Adobe's algorithm or a parity

@@ -733,50 +733,167 @@ pub fn develop_legacy_mapped(img: &mut ImageBuf, values: crate::DevelopTone, map
     });
 }
 
-/// Experimental local Develop tone v1. A self-guided log-luminance base controls
-/// the gains; the original RGB detail is retained. Signed/non-finite luminance is
-/// left untouched. No display clamp is applied. Radius scales with image size.
+/// Local Develop tone: Lights, Shadows, White and Black with an edge-aware base.
+///
+/// Luminance is taken in log2 stops around mid grey (`L = log2(Y / 0.18)`). A
+/// two-scale guided filter (2 % and 5 % of the long edge, computed on a grid of
+/// at most [`LOCAL_GRID`] px so every render size sees the same neighbourhood)
+/// gives the base; the coarse scale is used where it agrees with the fine one,
+/// so large flat areas get a wide, stable neighbourhood while strong edges fall
+/// back to the fine, edge-aware scale (no halo). The weights then come from the
+/// base, so texture inside a region keeps its contrast:
+/// - Lights: `smoothstep(0, 5, base)` stops above grey (midtones stay put);
+/// - Shadows: `smoothstep(0, -5, base)`, faded out again between -5 and -9 stops
+///   so lifted shadows do not grey true blacks;
+/// - White / Black: `smoothstep(±1, ±5, e)` on `e` = mean of the pixel and the
+///   fine base, so the endpoints act mostly pointwise but keep some local texture.
+///
+/// Gains are applied to RGB equally (hue and ratios kept); where the result is
+/// darkened, chroma is reduced slightly (`2^(0.06 * ev)`) around luminance so
+/// recovered highlights do not turn more saturated than Camera Raw's. Each
+/// slider stays monotonic. Signed/non-finite luminance is left untouched, no
+/// display clamp is applied, alpha is kept.
 pub fn develop_local_tone(img: &mut ImageBuf, highlights: f32, shadows: f32, whites: f32, blacks: f32) {
     develop_local_tone_mapped(img, highlights, shadows, whites, blacks, &DevelopControlMaps::default());
 }
 
-/// Local v1 with optional spatial control values; the guidance is computed once.
+/// Long edge of the grid on which the local base is estimated. Larger images are
+/// area-averaged onto it and the filter coefficients are sampled back bilinearly.
+const LOCAL_GRID: usize = 512;
+/// Guided filter radii as fractions of the long edge, and their regularisation (stops²).
+const LOCAL_FINE: (f32, f32) = (0.02, 0.3);
+const LOCAL_COARSE: (f32, f32) = (0.05, 0.4);
+/// Where fine and coarse base differ by more than about this many stops, the fine one wins.
+const LOCAL_SCALE_SIGMA: f32 = 0.6;
+/// Luminance floor relative to mid grey (keeps log2 finite for black pixels).
+const LOCAL_FLOOR: f32 = 1.0 / 4096.0;
+/// Chroma kept per stop of darkening: `2^(LOCAL_CHROMA * ev)` for `ev < 0`.
+const LOCAL_CHROMA: f32 = 0.06;
+
+/// Area-weighted resampling taps: for each of `m` outputs, the first input index and its weights.
+fn area_taps(n: usize, m: usize) -> Vec<(usize, Vec<f32>)> {
+    let s = n as f64 / m as f64;
+    (0..m)
+        .map(|i| {
+            let (x0, x1) = (i as f64 * s, (i + 1) as f64 * s);
+            let (j0, j1) = (x0.floor() as usize, (x1.ceil() as usize).min(n));
+            let w = (j0..j1).map(|j| (((j + 1) as f64).min(x1) - (j as f64).max(x0)).max(0.0) / s).map(|v| v as f32).collect();
+            (j0, w)
+        })
+        .collect()
+}
+
+/// Area average of a `w` x `h` plane onto `lw` x `lh`.
+fn area_resize(src: &[f32], w: usize, h: usize, lw: usize, lh: usize) -> Vec<f32> {
+    let (xt, yt) = (area_taps(w, lw), area_taps(h, lh));
+    let mut rows = vec![0.0f32; h * lw];
+    rows.par_chunks_exact_mut(lw).zip(src.par_chunks_exact(w)).for_each(|(dst, row)| {
+        for (d, (j0, wt)) in dst.iter_mut().zip(&xt) {
+            *d = wt.iter().zip(&row[*j0..]).map(|(a, b)| a * b).sum();
+        }
+    });
+    let mut out = vec![0.0f32; lw * lh];
+    out.par_chunks_exact_mut(lw).zip(yt.par_iter()).for_each(|(dst, (j0, wt))| {
+        for (k, a) in wt.iter().enumerate() {
+            for (d, v) in dst.iter_mut().zip(&rows[(j0 + k) * lw..(j0 + k + 1) * lw]) {
+                *d += a * v;
+            }
+        }
+    });
+    out
+}
+
+/// Bilinear taps from `n` output samples onto `ln` grid samples (pixel centres aligned).
+fn centre_taps(n: usize, ln: usize) -> Vec<(u32, u32, f32)> {
+    let s = ln as f32 / n as f32;
+    (0..n)
+        .map(|x| {
+            let p = ((x as f32 + 0.5) * s - 0.5).max(0.0);
+            let i0 = (p.floor() as usize).min(ln - 1);
+            let i1 = (i0 + 1).min(ln - 1);
+            (i0 as u32, i1 as u32, if i1 > i0 { p - i0 as f32 } else { 0.0 })
+        })
+        .collect()
+}
+
+/// Guided-filter coefficients `[a_fine, b_fine, a_coarse, b_coarse]` of a log
+/// luminance grid, self-guided (`base = a * L + b`).
+fn local_tone_coefficients(l: &[f32], lw: usize, lh: usize) -> Vec<f32> {
+    let long = lw.max(lh) as f32;
+    let moments: Vec<f32> = l.iter().flat_map(|&v| [v, v * v, 0.0, 0.0]).collect();
+    let scale = |(r, eps): (f32, f32)| {
+        let radius = ((long * r).round() as usize).max(1);
+        let mean = box_filter(&moments, lw, lh, radius, 1);
+        let ab: Vec<f32> = mean
+            .chunks_exact(4)
+            .flat_map(|m| {
+                let var = (m[1] - m[0] * m[0]).max(0.0);
+                let a = var / (var + eps);
+                [a, m[0] * (1.0 - a), 0.0, 0.0]
+            })
+            .collect();
+        box_filter(&ab, lw, lh, radius, 1)
+    };
+    let (fine, coarse) = rayon::join(|| scale(LOCAL_FINE), || scale(LOCAL_COARSE));
+    fine.chunks_exact(4).zip(coarse.chunks_exact(4)).flat_map(|(f, c)| [f[0], f[1], c[0], c[1]]).collect()
+}
+
+/// Local tone with optional spatial control values; the base is computed once.
 pub fn develop_local_tone_mapped(img: &mut ImageBuf, highlights: f32, shadows: f32, whites: f32, blacks: f32, maps: &DevelopControlMaps<'_>) {
     maps.validate(img.width() as usize * img.height() as usize);
     if highlights == 0.0 && shadows == 0.0 && whites == 0.0 && blacks == 0.0 && maps.highlights.is_none() && maps.shadows.is_none() && maps.whites.is_none() && maps.blacks.is_none() { return; }
     let (w, h) = (img.width() as usize, img.height() as usize);
     if w == 0 || h == 0 { return; }
-    let n = w * h;
-    let mut moments = vec![0.0f32; n * 4];
-    moments.par_chunks_exact_mut(4).zip(img.data().par_chunks_exact(4)).for_each(|(m, px)| {
+    let lum: Vec<f32> = img.data().par_chunks_exact(4).map(|px| {
         let y = AP1_LUMA[0]*px[0] + AP1_LUMA[1]*px[1] + AP1_LUMA[2]*px[2];
-        let g = if y.is_finite() && y > 0.0 { (1.0 + y / 0.18).ln() } else { 0.0 };
-        m[0] = g; m[1] = g*g;
-    });
-    let radius = ((w.max(h) as f32 * 0.015).round() as usize).max(1);
-    let mean = box_filter(&moments, w, h, radius, 1);
-    let mut coeff = vec![0.0f32; n * 4];
-    coeff.par_chunks_exact_mut(4).zip(mean.par_chunks_exact(4)).for_each(|(c, m)| {
-        let variance = (m[1] - m[0]*m[0]).max(0.0);
-        let a = variance / (variance + 0.25);
-        c[0] = a; c[1] = m[0]*(1.0-a);
-    });
-    let coeff = box_filter(&coeff, w, h, radius, 1);
-    img.data_mut().par_chunks_exact_mut(4).zip(moments.par_chunks_exact(4)).zip(coeff.par_chunks_exact(4)).enumerate().for_each(|(i, ((px, m), c))| {
-        let highlights = DevelopControlMaps::at(maps.highlights, i, highlights); let shadows = DevelopControlMaps::at(maps.shadows, i, shadows);
-        let whites = DevelopControlMaps::at(maps.whites, i, whites); let blacks = DevelopControlMaps::at(maps.blacks, i, blacks);
-        let y = AP1_LUMA[0]*px[0] + AP1_LUMA[1]*px[1] + AP1_LUMA[2]*px[2];
-        if !y.is_finite() || y <= 0.0 { return; }
-        let base = (c[0]*m[0] + c[1]).max(0.0);
-        let t = 1.0 - (-base).exp();
-        let hi = smoothstep(0.5, 1.0, t);
-        let sh = 1.0 - smoothstep(0.0, 0.5, t);
-        // Endpoint controls are independent of the local recovery weights.
-        let u = y / (y + 0.18);
-        let white = smoothstep(0.8, 1.0, u);
-        let black = 1.0 - smoothstep(0.0, 0.2, u);
-        let gain = (2.0*(highlights*hi + shadows*sh) + whites*white + blacks*black).exp2();
-        for v in &mut px[..3] { *v *= gain; }
+        (if y.is_finite() && y > 0.0 { y / 0.18 } else { 0.0 } + LOCAL_FLOOR).log2()
+    }).collect();
+    let long = w.max(h);
+    let (lw, lh) = if long > LOCAL_GRID {
+        let s = LOCAL_GRID as f32 / long as f32;
+        (((w as f32 * s).round() as usize).max(1), ((h as f32 * s).round() as usize).max(1))
+    } else { (w, h) };
+    let coeff = if (lw, lh) == (w, h) {
+        local_tone_coefficients(&lum, w, h)
+    } else {
+        local_tone_coefficients(&area_resize(&lum, w, h, lw, lh), lw, lh)
+    };
+    let (xt, yt) = (centre_taps(w, lw), centre_taps(h, lh));
+    img.data_mut().par_chunks_exact_mut(w * 4).enumerate().for_each(|(y, row)| {
+        let (y0, y1, fy) = yt[y];
+        let (r0, r1) = (&coeff[y0 as usize * lw * 4..][..lw * 4], &coeff[y1 as usize * lw * 4..][..lw * 4]);
+        for (x, px) in row.chunks_exact_mut(4).enumerate() {
+            let i = y * w + x;
+            let hi = DevelopControlMaps::at(maps.highlights, i, highlights); let sh = DevelopControlMaps::at(maps.shadows, i, shadows);
+            let wh = DevelopControlMaps::at(maps.whites, i, whites); let bl = DevelopControlMaps::at(maps.blacks, i, blacks);
+            if hi == 0.0 && sh == 0.0 && wh == 0.0 && bl == 0.0 { continue; }
+            let yl = AP1_LUMA[0]*px[0] + AP1_LUMA[1]*px[1] + AP1_LUMA[2]*px[2];
+            if !yl.is_finite() || yl <= 0.0 { continue; }
+            let (x0, x1, fx) = xt[x];
+            let (x0, x1) = (x0 as usize * 4, x1 as usize * 4);
+            let mut c = [0.0f32; 4];
+            for (k, v) in c.iter_mut().enumerate() {
+                let top = r0[x0 + k] + (r0[x1 + k] - r0[x0 + k]) * fx;
+                let bot = r1[x0 + k] + (r1[x1 + k] - r1[x0 + k]) * fx;
+                *v = top + (bot - top) * fy;
+            }
+            let l = lum[i];
+            let fine = c[0] * l + c[1];
+            let d = c[2] * l + c[3] - fine;
+            let base = fine + d * (-0.5 * (d / LOCAL_SCALE_SIGMA).powi(2)).exp();
+            let lights = smoothstep(0.0, 5.0, base);
+            let darks = smoothstep(0.0, -5.0, base) * (1.0 - smoothstep(-5.0, -9.0, base));
+            let e = 0.5 * (l + fine);
+            let ev = 2.0 * (hi * lights + sh * darks) + wh * smoothstep(1.0, 5.0, e) + bl * smoothstep(-1.0, -5.0, e);
+            if ev == 0.0 { continue; }
+            let gain = ev.exp2();
+            for v in &mut px[..3] { *v *= gain; }
+            if ev < 0.0 {
+                // Darkened colours: pull chroma slightly towards the new luminance.
+                let (k, yo) = ((LOCAL_CHROMA * ev).exp2(), yl * gain);
+                for v in &mut px[..3] { *v = yo + (*v - yo) * k; }
+            }
+        }
     });
 }
 
@@ -1388,5 +1505,237 @@ mod local_develop_tests {
         develop_local_tone(&mut hdr, 0.0, 0.0, 0.5, 0.0); assert!(hdr.pixel(0, 0)[0] > 8.0);
         let mut black = ImageBuf::from_rgba(1, 1, vec![0.001, 0.001, 0.001, 1.0]).unwrap();
         develop_local_tone(&mut black, 0.0, 0.0, 0.0, 0.5); assert!(black.pixel(0, 0)[0] > 0.001);
+    }
+
+    fn luma(px: [f32; 4]) -> f32 {
+        AP1_LUMA[0] * px[0] + AP1_LUMA[1] * px[1] + AP1_LUMA[2] * px[2]
+    }
+
+    fn grey(w: u32, h: u32, f: impl Fn(u32, u32) -> f32) -> ImageBuf {
+        let mut img = ImageBuf::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = f(x, y);
+                img.set_pixel(x, y, [v, v, v, 1.0]);
+            }
+        }
+        img
+    }
+
+    /// Largest deviation (stops) of the output luminance from the far-field
+    /// level on either side of a vertical step edge: 0 means no halo.
+    fn halo(lo: f32, hi: f32, s: [f32; 4]) -> f32 {
+        let (w, h) = (1024u32, 32u32);
+        let mut img = grey(w, h, |x, _| if x < w / 2 { lo } else { hi });
+        develop_local_tone(&mut img, s[0], s[1], s[2], s[3]);
+        let row: Vec<f32> = (0..w).map(|x| luma(img.pixel(x, h / 2)).log2()).collect();
+        let (left, right) = row.split_at(w as usize / 2);
+        let far = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        let (fl, fr) = (far(&left[..w as usize / 8]), far(&right[right.len() - w as usize / 8..]));
+        let dl = left.iter().map(|v| (v - fl).abs()).fold(0.0, f32::max);
+        let dr = right.iter().map(|v| (v - fr).abs()).fold(0.0, f32::max);
+        dl.max(dr)
+    }
+
+    #[test]
+    fn local_tone_halo_across_a_step_edge() {
+        let mut worst = 0.0f32;
+        for (lo, hi) in [(0.02, 2.0), (0.09, 0.36), (0.005, 0.5)] {
+            for s in [[0.0, 1.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [-1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, -1.0, -1.0]] {
+                let v = halo(lo, hi, s);
+                println!("halo {lo}->{hi} {s:?}: {v:.3} stops");
+                worst = worst.max(v);
+            }
+        }
+        println!("halo worst: {worst:.3} stops");
+        assert!(worst < 0.2, "halo {worst}");
+    }
+
+    /// 4x4 supersampled analytic scene: a -4..+4 stop ramp, dark/bright blocks,
+    /// a bright disc, a dark disc and a fine texture band. `w` = 2 * height.
+    fn scene(w: u32) -> ImageBuf {
+        let h = w / 2;
+        let mut img = ImageBuf::new(w, h);
+        let n = w as f32;
+        let f = |x: f32, y: f32| -> f32 {
+            let mut v = 0.18 * (-4.0 + 8.0 * x).exp2();
+            if y > 0.25 { v = if x < 0.5 { 0.02 } else { 2.5 }; }
+            if (x - 0.3).powi(2) + (y - 0.25).powi(2) < 0.01 { v = 1.5; }
+            if (x - 0.75).powi(2) + (y - 0.25).powi(2) < 0.006 { v = 0.01; }
+            if y > 0.4 { v *= 1.0 + 0.4 * (x * 120.0).sin() * (y * 90.0).sin(); }
+            v
+        };
+        for py in 0..h {
+            for px in 0..w {
+                let mut s = 0.0;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        s += f((px as f32 + (sx as f32 + 0.5) / 4.0) / n, (py as f32 + (sy as f32 + 0.5) / 4.0) / n);
+                    }
+                }
+                let v = s / 16.0;
+                img.set_pixel(px, py, [v, 0.8 * v, 0.6 * v, 1.0]);
+            }
+        }
+        img
+    }
+
+    /// Mean and 99th percentile of |gain(512) - downscaled gain(2048)| in stops.
+    fn resolution_difference(s: [f32; 4]) -> (f32, f32) {
+        let big = scene(2048);
+        let small = scene(512);
+        let gain = |img: &ImageBuf| {
+            let mut out = img.clone();
+            develop_local_tone(&mut out, s[0], s[1], s[2], s[3]);
+            out.data().chunks_exact(4).zip(img.data().chunks_exact(4)).map(|(o, i)| (luma([o[0], o[1], o[2], 0.0]) / luma([i[0], i[1], i[2], 0.0])).log2()).collect::<Vec<f32>>()
+        };
+        let (gb, gs) = (gain(&big), gain(&small));
+        let mut d: Vec<f32> = (0..256usize)
+            .flat_map(|y| (0..512usize).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let mut m = 0.0;
+                for yy in 0..4 { for xx in 0..4 { m += gb[(y * 4 + yy) * 2048 + x * 4 + xx]; } }
+                (m / 16.0 - gs[y * 512 + x]).abs()
+            })
+            .collect();
+        d.sort_by(f32::total_cmp);
+        (d.iter().sum::<f32>() / d.len() as f32, d[d.len() * 99 / 100])
+    }
+
+    #[test]
+    fn local_tone_is_resolution_independent() {
+        for s in [[-1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, -1.0]] {
+            let (mean, p99) = resolution_difference(s);
+            println!("512 vs 2048 {s:?}: mean {mean:.4} p99 {p99:.4} stops");
+            assert!(mean < 0.01 && p99 < 0.03, "{s:?}: {mean} {p99}");
+        }
+    }
+
+    #[test]
+    fn neutral_sliders_and_zero_maps_are_bit_exact() {
+        let mut img = scene(256);
+        img.set_pixel(3, 3, [-0.2, 0.1, 0.4, 0.5]);
+        img.set_pixel(4, 3, [f32::NAN, 0.1, f32::INFINITY, 1.0]);
+        img.set_pixel(5, 3, [0.0, 0.0, 0.0, 0.0]);
+        let orig = img.clone();
+        develop_local_tone(&mut img, 0.0, 0.0, 0.0, 0.0);
+        assert!(img.data().iter().zip(orig.data()).all(|(a, b)| a.to_bits() == b.to_bits()));
+        // Maps that are 0 everywhere change nothing either, whatever the sliders say.
+        let zeros = vec![0.0f32; 256 * 128];
+        let maps = DevelopControlMaps { highlights: Some(&zeros), shadows: Some(&zeros), whites: Some(&zeros), blacks: Some(&zeros), ..Default::default() };
+        develop_local_tone_mapped(&mut img, -1.0, 1.0, 1.0, 1.0, &maps);
+        assert!(img.data().iter().zip(orig.data()).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
+    #[test]
+    fn more_shadows_never_darkens_and_more_recovery_never_brightens() {
+        let img = scene(512);
+        let run = |s: [f32; 4]| { let mut o = img.clone(); develop_local_tone(&mut o, s[0], s[1], s[2], s[3]); o };
+        let steps = [0.0, 0.25, 0.5, 0.75, 1.0];
+        for pair in steps.windows(2) {
+            let l = |p: &[f32]| luma([p[0], p[1], p[2], 0.0]);
+            for (a, b) in run([0.0, pair[0], 0.0, 0.0]).data().chunks_exact(4).zip(run([0.0, pair[1], 0.0, 0.0]).data().chunks_exact(4)) {
+                assert!(l(b) >= l(a), "shadows {pair:?}");
+            }
+            for (a, b) in run([-pair[0], 0.0, 0.0, 0.0]).data().chunks_exact(4).zip(run([-pair[1], 0.0, 0.0, 0.0]).data().chunks_exact(4)) {
+                assert!(l(b) <= l(a), "highlights {pair:?}");
+            }
+        }
+        // Pointwise, the tone response stays monotonic for every slider extreme:
+        // a brighter flat field never comes out darker.
+        for s in [[-1.0, 1.0, -1.0, 1.0], [1.0, -1.0, 1.0, -1.0], [-1.0, -1.0, -1.0, -1.0], [1.0, 1.0, 1.0, 1.0]] {
+            let mut prev = 0.0f32;
+            for k in 0..=200 {
+                let v = 0.18 * (-12.0 + 20.0 * k as f32 / 200.0).exp2();
+                let mut px = grey(8, 8, |_, _| v);
+                develop_local_tone(&mut px, s[0], s[1], s[2], s[3]);
+                let o = luma(px.pixel(4, 4));
+                assert!(o >= prev, "{s:?} at {v}: {o} < {prev}");
+                prev = o;
+            }
+        }
+    }
+
+    /// Display saturation (max-min)/max of pixel (4, 4): ACEScg -> Rec.709, the
+    /// per-channel ACES fit curve of the viewer, sRGB encoding.
+    fn display_saturation(img: &ImageBuf) -> f32 {
+        let m = crate::color::to_f32(&crate::color::acescg_to_rec709());
+        let px = img.pixel(4, 4);
+        let p: Vec<f32> = (0..3).map(|r| {
+            let v = (m[r][0] * px[0] + m[r][1] * px[1] + m[r][2] * px[2]).max(0.0);
+            let t = (v * (v + 0.024_578_6) - 0.000_090_537) / (v * (0.983_729 * v + 0.432_951) + 0.238_081);
+            crate::color::srgb_oetf(t.clamp(0.0, 1.0))
+        }).collect();
+        let (mx, mn) = (p[0].max(p[1]).max(p[2]), p[0].min(p[1]).min(p[2]));
+        (mx - mn) / mx.max(1e-9)
+    }
+
+    #[test]
+    fn coloured_patches_keep_their_saturation_under_strong_pushes() {
+        let mut worst = 0.0f32;
+        for rgb in [[0.05, 0.01, 0.005], [0.02, 0.03, 0.12], [2.0, 0.6, 0.1], [0.1, 0.2, 3.0], [1.2, 1.0, 0.2], [0.6, 0.15, 0.4]] {
+            for s in [[0.0, 1.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 0.0, 0.0, 1.0]] {
+                let mut img = ImageBuf::new(16, 16);
+                for y in 0..16 { for x in 0..16 { img.set_pixel(x, y, [rgb[0], rgb[1], rgb[2], 1.0]); } }
+                let before = display_saturation(&img);
+                let y0 = luma(img.pixel(4, 4));
+                develop_local_tone(&mut img, s[0], s[1], s[2], s[3]);
+                if (luma(img.pixel(4, 4)) / y0).log2().abs() < 0.05 { continue; }
+                let d = display_saturation(&img) - before;
+                println!("saturation {rgb:?} {s:?}: {before:.3} -> {:.3}", before + d);
+                worst = worst.max(d.abs());
+            }
+        }
+        println!("saturation worst change: {worst:.3}");
+        assert!(worst < 0.05, "{worst}");
+    }
+
+    #[test]
+    fn constant_maps_match_the_scalar_sliders() {
+        let img = scene(256);
+        let n = 256 * 128;
+        for (k, s) in [[-0.8f32, 0.0, 0.0, 0.0], [0.0, 0.6, 0.0, 0.0], [0.0, 0.0, 0.7, 0.0], [0.0, 0.0, 0.0, -0.5]].iter().enumerate() {
+            let mut scalar = img.clone();
+            develop_local_tone(&mut scalar, s[0], s[1], s[2], s[3]);
+            let map = vec![s[k]; n];
+            let mut maps = DevelopControlMaps::default();
+            match k { 0 => maps.highlights = Some(&map), 1 => maps.shadows = Some(&map), 2 => maps.whites = Some(&map), _ => maps.blacks = Some(&map) }
+            let mut mapped = img.clone();
+            develop_local_tone_mapped(&mut mapped, 0.0, 0.0, 0.0, 0.0, &maps);
+            assert_eq!(mapped, scalar, "slider {k}");
+            // Half the map value: an effect between neutral and the full slider.
+            let half = vec![s[k] * 0.5; n];
+            let mut maps = DevelopControlMaps::default();
+            match k { 0 => maps.highlights = Some(&half), 1 => maps.shadows = Some(&half), 2 => maps.whites = Some(&half), _ => maps.blacks = Some(&half) }
+            let mut halfway = img.clone();
+            develop_local_tone_mapped(&mut halfway, 0.0, 0.0, 0.0, 0.0, &maps);
+            let mut moved = 0;
+            for ((h, f), o) in halfway.data().chunks_exact(4).zip(scalar.data().chunks_exact(4)).zip(img.data().chunks_exact(4)) {
+                let (lh, lf, lo) = (luma([h[0], h[1], h[2], 0.0]), luma([f[0], f[1], f[2], 0.0]), luma([o[0], o[1], o[2], 0.0]));
+                assert!((lh - lo) * (lf - lo) >= 0.0 && (lh - lo).abs() <= (lf - lo).abs() * 1.0001 + 1e-7);
+                if (lf - lo).abs() > 1e-4 { moved += 1; }
+            }
+            assert!(moved > 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "timing; run with --release -- --ignored --nocapture"]
+    fn timing_local_tone_2560x1707() {
+        let (w, h) = (2560u32, 1707u32);
+        let mut img = ImageBuf::new(w, h);
+        for (i, v) in img.data_mut().iter_mut().enumerate() {
+            *v = ((i * 2654435761) % 1000) as f32 / 500.0;
+        }
+        let mut ms: Vec<f64> = (0..15)
+            .map(|_| {
+                let mut a = img.clone();
+                let t = std::time::Instant::now();
+                develop_local_tone(&mut a, -0.6, 0.5, 0.2, -0.2);
+                t.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect();
+        ms.sort_by(f64::total_cmp);
+        println!("develop_local_tone 2560x1707: min {:.1} ms, median {:.1} ms", ms[0], ms[7]);
     }
 }
