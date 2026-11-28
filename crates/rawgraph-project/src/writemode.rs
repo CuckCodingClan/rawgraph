@@ -250,15 +250,19 @@ pub(crate) fn cloud_by_name(key: &str) -> Option<&'static str> {
     None
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 const ATTR_RECALL_ON_OPEN: u32 = 0x0004_0000;
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 const ATTR_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
 
 /// A Windows "files on demand" placeholder (OneDrive incl. business, Google Drive, iCloud for Windows ...).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) fn cloud_attributes(attrs: u32) -> bool {
     attrs & (ATTR_RECALL_ON_OPEN | ATTR_RECALL_ON_DATA_ACCESS) != 0
 }
 
 /// `IO_REPARSE_TAG_CLOUD` (0x9000001A) and `IO_REPARSE_TAG_CLOUD_1` ... `_F` (0x9000X01A).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) fn cloud_reparse_tag(tag: u32) -> bool {
     tag & 0xFFFF_0FFF == 0x9000_001A
 }
@@ -267,7 +271,9 @@ pub(crate) fn cloud_reparse_tag(tag: u32) -> bool {
 #[repr(C)]
 struct FindDataW {
     attributes: u32,
-    times: [u64; 3],
+    // Three FILETIMEs: pairs of u32 with 4-byte alignment (a u64 here would add padding and shift
+    // every later field).
+    times: [u32; 6],
     size_high: u32,
     size_low: u32,
     reserved0: u32,
@@ -275,6 +281,12 @@ struct FindDataW {
     file_name: [u16; 260],
     alternate: [u16; 14],
 }
+
+// WIN32_FIND_DATAW is 592 bytes; `reserved0` (dwReserved0, the reparse tag) sits at offset 36.
+#[cfg(windows)]
+const _: () = assert!(std::mem::size_of::<FindDataW>() == 592);
+#[cfg(windows)]
+const _: () = assert!(std::mem::offset_of!(FindDataW, reserved0) == 36);
 
 #[cfg(windows)]
 fn cloud_placeholder(dir: &Path) -> bool {
