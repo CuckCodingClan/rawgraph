@@ -936,6 +936,7 @@ impl App {
                 self.discard_own_recovery();
                 self.session.new_project();
                 self.after_document_change();
+                self.status.clear_notes();
                 self.status.info("New project");
             }
             Pending::OpenProject => self.open_dialog(DialogKind::OpenProject),

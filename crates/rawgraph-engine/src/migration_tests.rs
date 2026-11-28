@@ -399,7 +399,7 @@ fn every_consumer_port_applies_the_map_like_the_old_port() {
             px[..3].iter_mut().for_each(|c| *c *= gain);
         }
     }
-    assert!(max_diff(&eval(&g, 2), &want) < 0.01, "contrast");
+    assert!(max_diff(&eval(&g, 2), &want) < 0.004, "contrast");
 
     // Saturation: 1 + (amount - 1) * m.
     let g = load(&consumer_doc("Saturation", json!({"amount": 1.8}), vec![gradient_node(3)], &[(3, 0, 2, 1)]));
@@ -409,23 +409,24 @@ fn every_consumer_port_applies_the_map_like_the_old_port() {
         let y = 0.272_228_7 * px[0] + 0.674_081_8 * px[1] + 0.053_689_5 * px[2];
         px[..3].iter_mut().for_each(|c| *c = y + (*c - y) * s);
     }
-    assert!(max_diff(&eval(&g, 2), &want) < 0.01, "saturation");
+    assert!(max_diff(&eval(&g, 2), &want) < 0.001, "saturation");
 
     // Sharpen: the old call with the mask.
     let g = load(&consumer_doc("Sharpen", json!({"amount": 2.0, "radius": 1.0}), vec![gradient_node(3)], &[(3, 0, 2, 1)]));
     let want = fx::sharpen(&src, 2.0, 1.0 / 1000.0 * W.max(H) as f32, 0.0, Some(&mask));
-    assert!(max_diff(&eval(&g, 2), &want) < 0.02, "sharpen");
+    assert!(max_diff(&eval(&g, 2), &want) < 1e-5, "sharpen");
 
     // Filter radius: the old modulated blur with the slider as the maximum.
     let g = load(&consumer_doc("Blur", json!({"radius": 30.0}), vec![gradient_node(3)], &[(3, 0, 2, 1)]));
     let want = ops::blur_modulated(&src, 30.0 / 1000.0 * W.max(H) as f32, &mask);
-    assert!(max_diff(&eval(&g, 2), &want) < 0.02, "filter radius");
+    assert!(max_diff(&eval(&g, 2), &want) < 3e-4, "filter radius");
     assert_ne!(*eval(&g, 2), *eval(&load(&consumer_doc("Blur", json!({"radius": 30.0}), vec![], &[])), 2));
 }
 
 fn max_diff(a: &ImageBuf, b: &ImageBuf) -> f32 {
     assert_eq!((a.width(), a.height()), (b.width(), b.height()));
-    a.data().iter().zip(b.data()).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    let m = a.data().iter().zip(b.data()).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+    m
 }
 
 #[test]
@@ -464,4 +465,182 @@ fn the_version_1_fixture_renders_through_its_brush_mask() {
     }
     let run = |g: &Graph| Evaluator::new().eval_image(g, NodeId(9), A, &Iso, &CancelToken::new()).unwrap();
     assert!(max_diff(&run(&g), &run(&plain)) > 1e-4, "the brush strokes change the filter result");
+}
+
+// ---- nested combines keep the old clamping -------------------------------------------------
+
+fn clamp01(v: f32) -> f32 {
+    v.clamp(0.0, 1.0)
+}
+
+fn gradient_b_node(id: u64) -> Value {
+    node(id, "GradientMask", json!({"angle": 30.0, "center": 0.2, "width": 0.4}))
+}
+
+fn old_gradient_b(x: u32, y: u32) -> f32 {
+    old_gradient(W, H, 30.0, 0.2, 0.4, x, y)
+}
+
+fn old_radial_c(x: u32, y: u32) -> f32 {
+    old_radial(W, H, 0.5, 0.5, 0.35, 0.35, 0.6, 0.0, false, x, y)
+}
+
+fn radial_c_node(id: u64) -> Value {
+    node(id, "RadialMask", json!({"radius_x": 0.35, "radius_y": 0.35, "feather": 0.6}))
+}
+
+#[test]
+fn multiply_of_a_clamped_sum_matches_the_old_nested_combine() {
+    // Multiply(Add(A, A), C): the sum is clamped to 1 before the product.
+    let add = node(5, "MaskCombine", json!({"mode": 1.0}));
+    let mul = node(6, "MaskCombine", json!({"mode": 0.0}));
+    let g = exposure_doc(
+        vec![gradient_node(3), gradient_node(4), radial_c_node(7), add, mul],
+        &[(3, 0, 5, 0), (4, 0, 5, 1), (5, 0, 6, 0), (7, 0, 6, 1), (6, 0, 2, 1)],
+    );
+    let want = plane(W, H, |x, y| {
+        let a = old_gradient(W, H, GRADIENT.0, GRADIENT.1, GRADIENT.2, x, y);
+        clamp01(a + a) * old_radial_c(x, y)
+    });
+    let unclamped = plane(W, H, |x, y| {
+        let a = old_gradient(W, H, GRADIENT.0, GRADIENT.1, GRADIENT.2, x, y);
+        2.0 * a * old_radial_c(x, y)
+    });
+    assert!(stats(&want, &unclamped).0 > 0.05, "the clamp matters in this picture");
+    expect_close(&strength(&eval(&g, 2), &eval(&g, 1)), &want, 0.006, 0.06, "multiply(add)");
+}
+
+#[test]
+fn add_of_a_clamped_difference_matches_the_old_nested_combine() {
+    // Add(Subtract(A, B), C): a negative difference is clamped to 0 before C is added.
+    let sub = node(5, "MaskCombine", json!({"mode": 2.0}));
+    let add = node(6, "MaskCombine", json!({"mode": 1.0}));
+    let g = exposure_doc(
+        vec![gradient_node(3), gradient_b_node(4), radial_c_node(7), sub, add],
+        &[(3, 0, 5, 0), (4, 0, 5, 1), (5, 0, 6, 0), (7, 0, 6, 1), (6, 0, 2, 1)],
+    );
+    let want = plane(W, H, |x, y| {
+        let a = old_gradient(W, H, GRADIENT.0, GRADIENT.1, GRADIENT.2, x, y);
+        clamp01(clamp01(a - old_gradient_b(x, y)) + old_radial_c(x, y))
+    });
+    let unclamped = plane(W, H, |x, y| {
+        let a = old_gradient(W, H, GRADIENT.0, GRADIENT.1, GRADIENT.2, x, y);
+        clamp01(a - old_gradient_b(x, y) + old_radial_c(x, y))
+    });
+    assert!(stats(&want, &unclamped).0 > 0.02, "the clamp matters in this picture");
+    expect_close(&strength(&eval(&g, 2), &eval(&g, 1)), &want, 0.006, 0.06, "add(subtract)");
+}
+
+#[test]
+fn radial_mask_with_a_hard_edge_only_differs_on_the_edge() {
+    let all = json!({"center_x": 0.4, "center_y": 0.55, "radius_x": 0.3, "radius_y": 0.3, "feather": 0.0});
+    let g = exposure_doc(vec![node(3, "RadialMask", all)], &[(3, 0, 2, 1)]);
+    let got = strength(&eval(&g, 2), &eval(&g, 1));
+    let want = plane(W, H, |x, y| old_radial(W, H, 0.4, 0.55, 0.3, 0.3, 0.0, 0.0, false, x, y));
+    let wrong = got.iter().zip(&want).filter(|(a, b)| (**a - **b).abs() > 0.05).count();
+    assert!(wrong * 200 < got.len(), "{wrong} of {} pixels differ (edge pixels only)", got.len());
+}
+
+// ---- a mask used on different photo collections ----------------------------------------------
+
+struct Iso;
+
+impl ImageProvider for Iso {
+    fn image(&self, id: ImageId) -> Result<Arc<ImageBuf>, String> {
+        Picture.image(id)
+    }
+
+    fn capture(&self, id: ImageId) -> Option<CaptureInfo> {
+        Some(CaptureInfo { iso: Some(if id.0 == 3 { 800.0 } else { 100.0 }), ..Default::default() })
+    }
+
+    fn images(&self) -> Vec<ImageId> {
+        vec![ImageId(1), ImageId(2), ImageId(3)]
+    }
+}
+
+#[test]
+fn a_mask_shared_by_two_split_branches_applies_on_both() {
+    let split = with_data(
+        node(6, "MetadataSplit", json!({"measure": 0.0})),
+        json!({"Ranges": [{"name": "low", "min": 0.0, "max": 400.0}, {"name": "high", "min": 401.0, "max": 6400.0}]}),
+    );
+    let nodes = vec![
+        node(1, "Source", json!({})),
+        split,
+        node(2, "Exposure", json!({"ev": 1.0})),
+        node(4, "Exposure", json!({"ev": 1.0})),
+        gradient_node(5),
+        node(8, "Output", json!({})),
+        node(9, "Output", json!({})),
+    ];
+    let g = load(&doc(nodes, &[(1, 0, 6, 0), (6, 0, 2, 0), (6, 1, 4, 0), (5, 0, 2, 1), (5, 0, 4, 1), (2, 0, 9, 0), (4, 0, 8, 0)]));
+    let run = |node: u64, image: u64| {
+        let out = Evaluator::new().eval_image(&g, NodeId(node), ImageId(image), &Iso, &CancelToken::new()).unwrap();
+        let src = Evaluator::new().eval_image(&g, NodeId(1), ImageId(image), &Iso, &CancelToken::new()).unwrap();
+        strength(&out, &src)
+    };
+    let want = gradient_plane(W, H);
+    expect_close(&run(2, 1), &want, 0.003, 0.012, "low branch, photo 1");
+    expect_close(&run(2, 2), &want, 0.003, 0.012, "low branch, photo 2");
+    expect_close(&run(4, 3), &want, 0.003, 0.012, "high branch, photo 3");
+}
+
+fn with_data(mut n: Value, data: Value) -> Value {
+    n["data"] = data;
+    n
+}
+
+// ---- the tone choice of Develop --------------------------------------------------------------
+
+fn develop_doc(version: u32, all: Value) -> Graph {
+    let mut text: Value = serde_json::from_str(&doc(
+        vec![node(1, "Source", json!({})), node(2, "Develop", all), node(9, "Output", json!({}))],
+        &[(1, 0, 2, 0), (2, 0, 9, 0)],
+    ))
+    .unwrap();
+    text["format_version"] = json!(version);
+    load(&text.to_string())
+}
+
+#[test]
+fn old_develop_nodes_keep_the_legacy_tone_curves() {
+    let tone = json!({"highlights": -0.6, "shadows": 0.6, "whites": 0.3, "blacks": -0.3, "contrast": 0.3});
+    let with_choice = |extra: Value| {
+        let mut all = tone.clone();
+        for (k, v) in extra.as_object().unwrap() {
+            all[k] = v.clone();
+        }
+        all
+    };
+    let render = |g: &Graph| eval(g, 2);
+    // Format 2 without a tone choice, and with Legacy, is the Legacy pointwise tone.
+    let legacy_old = render(&develop_doc(2, tone.clone()));
+    let legacy_explicit = render(&develop_doc(2, with_choice(json!({"tone_version": 0.0}))));
+    let legacy_now = render(&develop_doc(3, with_choice(json!({"legacy_tone": 1.0}))));
+    let local_now = render(&develop_doc(3, tone.clone()));
+    assert_eq!(*legacy_old, *legacy_now);
+    assert_eq!(*legacy_explicit, *legacy_now);
+    assert!(max_diff(&legacy_now, &local_now) > 0.01, "the two tone modes differ visibly in this picture");
+    // Local v1 maps to the local tone, in a format-2 and in a format-3 file.
+    assert_eq!(*render(&develop_doc(2, with_choice(json!({"tone_version": 1.0})))), *local_now);
+    assert_eq!(*render(&develop_doc(3, with_choice(json!({"tone_version": 1.0})))), *local_now);
+    assert_eq!(*render(&develop_doc(3, with_choice(json!({"tone_version": 0.0})))), *legacy_now);
+}
+
+// ---- an exposed radius with a radius mask ------------------------------------------------------
+
+#[test]
+fn radius_mask_and_exposed_radius_multiply_like_the_old_blur() {
+    let mut blur = node(2, "Blur", json!({"radius": 12.0}));
+    blur["exposed_inputs"] = json!([{"parameter": "radius", "ty": "Mask"}]);
+    let nodes = vec![node(1, "Source", json!({})), blur, gradient_node(3), radial_c_node(4), node(9, "Output", json!({}))];
+    // Old ports: 1 radius mask, 3 first exposed input.
+    let g = load(&doc(nodes, &[(1, 0, 2, 0), (3, 0, 2, 1), (4, 0, 2, 3), (2, 0, 9, 0)]));
+    let src = Picture.image(A).unwrap();
+    let data = plane(W, H, |x, y| {
+        clamp01(old_gradient(W, H, GRADIENT.0, GRADIENT.1, GRADIENT.2, x, y)) * old_radial_c(x, y)
+    });
+    let want = ops::blur_modulated(&src, 1000.0 / 1000.0 * W.max(H) as f32, &MaskBuf { width: W, height: H, data });
+    assert!(max_diff(&eval(&g, 2), &want) < 0.03, "both maps scale the maximum radius");
 }

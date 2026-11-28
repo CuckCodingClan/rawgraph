@@ -226,24 +226,52 @@ fn mask_adjust_becomes_rgb_curves_and_a_neutral_adjust_is_an_empty_curve_set() {
     assert!(has_edge(&g, 1, 3, 0), "the chain's generator takes the consumer's frame");
 }
 
+fn combine_doc(mode: f32) -> String {
+    let nodes = vec![
+        node(1, "Source", json!({})),
+        node(2, "Exposure", json!({})),
+        node(9, "Output", json!({})),
+        node(3, "GradientMask", json!({})),
+        node(4, "RadialMask", json!({})),
+        node(5, "MaskCombine", json!({"mode": mode})),
+    ];
+    doc(nodes, &[(1, 0, 2, 0), (2, 0, 9, 0), (3, 0, 5, 0), (4, 0, 5, 1), (5, 0, 2, 1)])
+}
+
 #[test]
-fn mask_combine_becomes_a_layer_with_the_matching_blend() {
-    for (mode, blend) in [(0.0, 3.0), (1.0, 1.0), (2.0, 2.0), (3.0, 7.0), (4.0, 6.0)] {
-        let nodes = vec![
-            node(1, "Source", json!({})),
-            node(2, "Exposure", json!({})),
-            node(9, "Output", json!({})),
-            node(3, "GradientMask", json!({})),
-            node(4, "RadialMask", json!({})),
-            node(5, "MaskCombine", json!({"mode": mode})),
-        ];
-        let (g, notes) = load(&doc(nodes, &[(1, 0, 2, 0), (2, 0, 9, 0), (3, 0, 5, 0), (4, 0, 5, 1), (5, 0, 2, 1)]));
+fn multiply_maximum_and_minimum_combine_become_one_layer() {
+    for (mode, blend) in [(0.0, 3.0), (3.0, 7.0), (4.0, 6.0)] {
+        let (g, notes) = load(&combine_doc(mode));
         assert!(notes.is_empty(), "{notes:?}");
         let layer = n(&g, 5);
         assert_eq!(layer.kind, NodeKind::Layer);
         assert_eq!((layer.param("l2_blend", A), layer.param("l2_fit", A)), (blend, 3.0), "mode {mode}");
         assert!(has_edge(&g, 3, 5, 0) && has_edge(&g, 4, 5, 1) && has_edge(&g, 5, 2, 1));
     }
+}
+
+#[test]
+fn add_combine_is_clamped_to_one_behind_the_layer() {
+    let (g, _) = load(&combine_doc(1.0));
+    let layer = g.nodes().find(|x| x.kind == NodeKind::Layer).expect("the adding layer");
+    assert_eq!(layer.param("l2_blend", A), 1.0);
+    assert!(has_edge(&g, 3, layer.id.0, 0) && has_edge(&g, 4, layer.id.0, 1));
+    assert_eq!(n(&g, 5).kind, NodeKind::PointCurve, "the old id keeps the output");
+    assert!(has_edge(&g, layer.id.0, 5, 0) && has_edge(&g, 5, 2, 1));
+    let entries = curve_set(n(&g, 5), A);
+    assert_eq!(entries.len(), 3);
+    let last = entries[0].points.last().unwrap();
+    assert!(last[0] == 1.0 && last[1] < 0.85, "flat above a mask value of 1");
+}
+
+#[test]
+fn subtract_combine_is_a_minus_min_a_b() {
+    let (g, _) = load(&combine_doc(2.0));
+    let helper = g.nodes().find(|x| x.kind == NodeKind::Layer && x.id.0 != 5).expect("the minimum layer");
+    assert_eq!(helper.param("l2_blend", A), 6.0, "Darken");
+    assert_eq!(n(&g, 5).param("l2_blend", A), 2.0, "Subtract");
+    assert!(has_edge(&g, 3, helper.id.0, 0) && has_edge(&g, 4, helper.id.0, 1));
+    assert!(has_edge(&g, 3, 5, 0) && has_edge(&g, helper.id.0, 5, 1) && has_edge(&g, 5, 2, 1));
 }
 
 #[test]
@@ -372,19 +400,137 @@ fn per_image_values_of_old_mask_nodes_are_converted_per_image() {
 }
 
 #[test]
-fn a_mask_shared_by_several_consumers_with_different_frames_reports_it() {
+fn a_mask_shared_by_consumers_with_different_frames_is_copied_per_frame() {
     let nodes = vec![
         node(1, "Source", json!({})),
         node(2, "Exposure", json!({})),
         node(3, "Transform", json!({"left": 0.1})),
         node(4, "Exposure", json!({})),
-        node(5, "GradientMask", json!({})),
+        node(5, "GradientMask", json!({"angle": 20.0})),
         node(9, "Output", json!({})),
         node(8, "Output", json!({})),
     ];
     let (g, notes) = load(&doc(nodes, &[(1, 0, 2, 0), (1, 0, 3, 0), (3, 0, 4, 0), (5, 0, 2, 1), (5, 0, 4, 1), (2, 0, 9, 0), (4, 0, 8, 0)]));
-    assert!(has_edge(&g, 1, 5, 0), "the first consumer decides");
-    assert!(notes.iter().any(|t| t.starts_with("Gradient Mask (node 5):") && t.contains("different frames")), "{notes:?}");
+    assert!(has_edge(&g, 1, 5, 0), "the first consumer keeps the original");
+    let clone = g.input_of(NodeId(4), 1).expect("the second Exposure has a mask").0;
+    assert_ne!(clone, 5, "the second consumer has its own copy");
+    assert!(has_edge(&g, 3, clone, 0), "the copy takes the second frame");
+    assert_eq!(n(&g, clone).kind, NodeKind::Generator);
+    assert_eq!(n(&g, clone).param("gradient_angle", A), 20.0);
+    assert_eq!(g.nodes().filter(|x| x.kind == NodeKind::Generator).count(), 2);
+    assert!(notes.iter().any(|t| t.starts_with("Gradient Mask (node 5):") && t.contains("copy was made")), "{notes:?}");
+    assert!(g.validate().is_empty(), "{:?}", g.validate());
+}
+
+#[test]
+fn a_shared_chain_and_the_strokes_of_a_shared_brush_are_copied_whole() {
+    let stroke = json!({"Strokes": [{"points": [[0.1, 0.1]], "radius": 0.05, "hardness": 0.5, "flow": 1.0, "erase": false}]});
+    let brush = with(with(node(6, "BrushMask", json!({})), "mode", json!("Individual")), "individual_data", json!({"1": stroke, "3": {"Strokes": []}}));
+    let nodes = vec![
+        node(1, "Source", json!({})),
+        node(2, "Exposure", json!({})),
+        node(7, "Source", json!({})),
+        node(4, "Exposure", json!({})),
+        node(5, "GradientMask", json!({})),
+        brush,
+        node(10, "MaskCombine", json!({"mode": 0.0})),
+        node(9, "Output", json!({})),
+        node(8, "Output", json!({})),
+    ];
+    let (g, _) = load(&doc(
+        nodes,
+        &[(1, 0, 2, 0), (7, 0, 4, 0), (5, 0, 10, 0), (6, 0, 10, 1), (10, 0, 2, 1), (10, 0, 4, 1), (2, 0, 9, 0), (4, 0, 8, 0)],
+    ));
+    let copy = g.input_of(NodeId(4), 1).unwrap().0;
+    assert_ne!(copy, 10);
+    assert_eq!(n(&g, copy).kind, NodeKind::Layer);
+    let inputs: Vec<NodeId> = (0..2).filter_map(|p| g.input_of(NodeId(copy), p)).collect();
+    assert_eq!(inputs.len(), 2);
+    let draws: Vec<&Node> = g.nodes().filter(|x| x.kind == NodeKind::Draw).collect();
+    assert_eq!(draws.len(), 2);
+    for d in draws {
+        assert!(matches!(d.data(A), Some(NodeData::Strokes(s)) if s.len() == 1), "each copy keeps the strokes per photo");
+        assert!(d.data(ImageId(3)).is_some());
+        assert!(g.input_of(d.id, 0).is_some(), "and has a frame");
+    }
+    assert!(g.validate().is_empty(), "{:?}", g.validate());
+}
+
+#[test]
+fn a_frame_that_depends_on_the_mask_is_skipped_for_the_next_consumer() {
+    // Exposure 2 takes its image from Exposure 3, which uses the same brush: its frame cannot frame the brush.
+    let nodes = vec![
+        node(1, "Source", json!({})),
+        node(2, "Exposure", json!({})),
+        node(3, "Exposure", json!({})),
+        node(5, "BrushMask", json!({})),
+        node(9, "Output", json!({})),
+    ];
+    let (g, notes) = load(&doc(nodes, &[(1, 0, 3, 0), (3, 0, 2, 0), (5, 0, 3, 1), (5, 0, 2, 1), (2, 0, 9, 0)]));
+    assert!(has_edge(&g, 1, 5, 0), "the brush takes the frame of the consumer it can");
+    assert!(!has_edge(&g, 3, 5, 0));
+    assert!(notes.iter().any(|t| t.contains("depends on the mask")), "{notes:?}");
+    assert!(g.validate().is_empty(), "{:?}", g.validate());
+}
+
+#[test]
+fn a_mask_that_only_feeds_a_normal_map_takes_the_frame_of_the_source() {
+    let nodes = vec![node(1, "Source", json!({})), node(3, "GradientMask", json!({})), node(4, "Normals", json!({})), node(9, "Output", json!({}))];
+    let (g, _) = load(&doc(nodes, &[(3, 0, 4, 0), (4, 0, 9, 0)]));
+    assert!(has_edge(&g, 1, 3, 0));
+    assert!(has_edge(&g, 3, 4, 0));
+}
+
+#[test]
+fn a_radius_mask_and_an_exposed_radius_are_multiplied() {
+    let mut blur = node(2, "Blur", json!({"radius": 12.0}));
+    blur["exposed_inputs"] = json!([{"parameter": "radius", "ty": "Mask"}]);
+    let nodes = vec![
+        node(1, "Source", json!({})),
+        blur,
+        node(3, "GradientMask", json!({})),
+        node(4, "RadialMask", json!({})),
+        node(9, "Output", json!({})),
+    ];
+    // Old ports: 1 radius mask, 3 first exposed input.
+    let (g, notes) = load(&doc(nodes, &[(1, 0, 2, 0), (3, 0, 2, 1), (4, 0, 2, 3), (2, 0, 9, 0)]));
+    assert_eq!(n(&g, 2).param("radius", A), 1000.0);
+    let layer = g.input_of(NodeId(2), 1).unwrap();
+    assert_eq!(n(&g, layer.0).kind, NodeKind::Layer);
+    assert_eq!(n(&g, layer.0).param("l2_blend", A), 3.0, "Multiply");
+    assert!(has_edge(&g, 3, layer.0, 0) && has_edge(&g, 4, layer.0, 1));
+    assert!(notes.iter().any(|t| t.contains("multiplied")), "{notes:?}");
+    assert!(g.validate().is_empty(), "{:?}", g.validate());
+}
+
+#[test]
+fn an_exposure_with_both_inputs_says_that_the_result_differs() {
+    let mut exp = node(2, "Exposure", json!({}));
+    exp["exposed_inputs"] = json!([{"parameter": "ev", "ty": "Images"}]);
+    let nodes = vec![node(1, "Source", json!({})), exp, node(3, "GradientMask", json!({})), node(4, "RadialMask", json!({})), node(9, "Output", json!({}))];
+    let (_, notes) = load(&doc(nodes, &[(1, 0, 2, 0), (3, 0, 2, 1), (4, 0, 2, 2), (2, 0, 9, 0)]));
+    assert!(notes.iter().any(|t| t.contains("connected twice") && t.contains("differs")), "{notes:?}");
+}
+
+#[test]
+fn per_image_values_keep_only_what_differs_and_report_per_image_approximations() {
+    let mut mask = node(3, "RadialMask", json!({"radius_x": 0.3, "radius_y": 0.3}));
+    mask["mode"] = json!("Individual");
+    mask["individual"] = json!({"2": {"radius_x": 0.4, "radius_y": 0.1}});
+    let (g, notes) = load(&consumer_doc("Exposure", json!({}), vec![mask], &[(3, 0, 2, 1)]));
+    assert!(notes.iter().any(|t| t.starts_with("Radial Mask (node 3): image 2:") && t.contains("geometric mean")), "{notes:?}");
+    let v: Value = serde_json::from_str(&g.to_json()).unwrap();
+    let image2 = v["nodes"]["3"]["individual"]["2"].as_object().expect("the override");
+    assert!(image2.contains_key("gradient_scale") && !image2.contains_key("output") && !image2.contains_key("gradient_style"), "{image2:?}");
+    assert!(v["nodes"]["3"].get("individual_data").is_none(), "the ramp is the same for every image");
+
+    let mut mask = node(3, "GradientMask", json!({}));
+    mask["mode"] = json!("Individual");
+    mask["individual"] = json!({"2": {"width": 0.0}});
+    let (g, notes) = load(&consumer_doc("Exposure", json!({}), vec![mask], &[(3, 0, 2, 1)]));
+    assert!(notes.iter().any(|t| t.contains("image 2:") && t.contains("hard edge")), "{notes:?}");
+    assert_eq!(n(&g, 3).param("gradient_scale", ImageId(2)), 1.0);
+    assert_eq!(n(&g, 3).param("gradient_scale", ImageId(1)), 50.0);
 }
 
 #[test]
@@ -426,12 +572,78 @@ fn format_3_documents_are_not_touched_and_report_nothing() {
     assert_eq!(g.nodes().count(), 11);
 }
 
+fn develop_graph(version: u32, all: Value, individual: Value) -> (Graph, Vec<String>) {
+    let mut dev = with(node(2, "Develop", all), "individual", individual);
+    dev["mode"] = json!("Individual");
+    load(&doc_v(version, vec![node(1, "Source", json!({})), dev], &[(1, 0, 2, 0)]))
+}
+
+fn legacy(g: &Graph, image: u64) -> f32 {
+    n(g, 2).param("legacy_tone", ImageId(image))
+}
+
 #[test]
-fn the_tone_version_choice_of_old_develop_nodes_is_ignored() {
-    let dev = with(node(2, "Develop", json!({"tone_version": 1.0, "exposure": 0.5})), "individual", json!({"1": {"tone_version": 0.0}}));
-    let (g, notes) = load(&doc(vec![node(1, "Source", json!({})), dev], &[(1, 0, 2, 0)]));
+fn old_files_without_a_tone_choice_were_legacy() {
+    for version in [1, 2] {
+        let (g, notes) = develop_graph(version, json!({"exposure": 0.5}), json!({}));
+        assert_eq!(legacy(&g, 1), 1.0, "format {version}");
+        assert_eq!(n(&g, 2).param("exposure", A), 0.5);
+        assert!(notes.is_empty());
+    }
+}
+
+#[test]
+fn tone_version_maps_to_the_legacy_toggle_in_old_files() {
+    let (g, notes) = develop_graph(2, json!({"tone_version": 0.0}), json!({}));
+    assert_eq!(legacy(&g, 1), 1.0);
     assert!(notes.is_empty());
-    assert_eq!(n(&g, 2).param("exposure", A), 0.5);
+    let (g, notes) = develop_graph(2, json!({"tone_version": 1.0}), json!({}));
+    assert_eq!(legacy(&g, 1), 0.0, "Local v1 is the local tone");
+    assert!(notes.iter().any(|t| t.starts_with("Develop (node 2):") && t.contains("Local tone v1")), "{notes:?}");
+}
+
+#[test]
+fn per_image_tone_choices_are_kept() {
+    // All: Legacy (absent). Image 2: Local v1. Image 3: Legacy again over a Local v1 default.
+    let (g, _) = develop_graph(2, json!({}), json!({"2": {"tone_version": 1.0}}));
+    assert_eq!((legacy(&g, 1), legacy(&g, 2)), (1.0, 0.0));
+    let (g, _) = develop_graph(2, json!({"tone_version": 1.0}), json!({"3": {"tone_version": 0.0}}));
+    assert_eq!((legacy(&g, 1), legacy(&g, 3)), (0.0, 1.0));
+}
+
+#[test]
+fn format_3_graphs_with_a_tone_choice_load_and_keep_their_meaning() {
+    // Written between the graph format 3 and the Legacy toggle.
+    let (g, notes) = develop_graph(3, json!({"tone_version": 0.0, "contrast": 0.2}), json!({}));
+    assert_eq!(legacy(&g, 1), 1.0);
+    assert_eq!(n(&g, 2).param("contrast", A), 0.2);
+    assert!(notes.is_empty());
+    let (g, notes) = develop_graph(3, json!({"tone_version": 1.0}), json!({}));
+    assert_eq!(legacy(&g, 1), 0.0);
+    assert!(notes.iter().any(|t| t.contains("Local tone v1")), "{notes:?}");
+    // Without the choice nothing changes: the local tone is the default there.
+    let (g, _) = develop_graph(3, json!({"exposure": 0.1}), json!({}));
+    assert_eq!(legacy(&g, 1), 0.0);
+    // An explicit toggle wins over a leftover choice.
+    let (g, _) = develop_graph(3, json!({"tone_version": 0.0, "legacy_tone": 0.0}), json!({}));
+    assert_eq!(legacy(&g, 1), 0.0);
+}
+
+#[test]
+fn sub_graphs_map_the_tone_choice_too() {
+    for (version, all, want) in [
+        (1, json!({}), 1.0),
+        (1, json!({"tone_version": 1.0}), 0.0),
+        (2, json!({"tone_version": 0.0}), 1.0),
+        (2, json!({}), 0.0),
+        (2, json!({"tone_version": 1.0}), 0.0),
+    ] {
+        let text = json!({"format_version": version, "nodes": [sub_node("Develop", all.clone())], "edges": []}).to_string();
+        let (sub, _) = Subgraph::from_json_with_notes(&text).unwrap_or_else(|e| panic!("{version} {all}: {e}"));
+        let mut g = Graph::new();
+        let ids = g.insert_subgraph(&sub, [0.0, 0.0]);
+        assert_eq!(g.node(ids[0]).unwrap().param("legacy_tone", A), want, "sub-graph format {version} {all}");
+    }
 }
 
 #[test]

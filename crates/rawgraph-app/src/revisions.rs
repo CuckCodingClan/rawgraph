@@ -203,17 +203,24 @@ pub fn rows(project: &Project) -> Vec<Row> {
 
 /// Replaces the current graph with the graph of `revision` as one undoable step. Ratings,
 /// flags, labels and the image list stay as they are. `Ok(false)`: it was the same graph.
+#[cfg(test)]
 pub fn restore_graph(session: &mut Session, history: &mut History, revision: u64) -> Result<bool, String> {
-    let graph = session.project.graph_at(revision).ok_or_else(|| format!("The graph of revision {revision} was not kept"))?;
+    restore_graph_notes(session, history, revision).map(|(changed, _)| changed)
+}
+
+/// Like [`restore_graph`], and returns the notes of the migration of a snapshot saved in an older graph format.
+pub fn restore_graph_notes(session: &mut Session, history: &mut History, revision: u64) -> Result<(bool, Vec<String>), String> {
+    let (graph, notes) =
+        session.project.graph_at_with_notes(revision).ok_or_else(|| format!("The graph of revision {revision} was not kept"))?;
     // Edits that are still waiting for their own undo step must not end up inside the restore step.
     history.commit_if_changed(&session.project.graph, false);
     if graph == session.project.graph {
-        return Ok(false);
+        return Ok((false, notes));
     }
     session.set_graph(graph);
     history.commit_if_changed(&session.project.graph, false);
     session.sanitize();
-    Ok(true)
+    Ok((true, notes))
 }
 
 // ------------------------------------------------------------------ opening and conflicts

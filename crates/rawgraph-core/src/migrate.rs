@@ -232,6 +232,14 @@ fn rgb_curve_set(points: &[[f32; 2]]) -> Value {
     json!({ "CurveSet": entries })
 }
 
+/// Curves data that clamps values above 1 (a mask value of 1 is t = 0.847 on the perceptual axis).
+fn clamp_curve_set() -> Value {
+    // Dense near the corner: a monotone spline flattens before a plateau.
+    let mut knots: Vec<f32> = (0..=12).map(|k| to_t(k as f32 / 12.0 * 0.9)).collect();
+    knots.extend([0.95, 0.98, 0.99, 1.0].map(to_t));
+    rgb_curve_set(&curve_through(knots, |x| to_v(x).min(1.0)))
+}
+
 fn adjust_curve(low: f32, high: f32, gamma: f32, invert: bool) -> Vec<[f32; 2]> {
     let (low, high) = (low.clamp(0.0, 1.0), high.clamp(0.0, 1.0));
     if low == 0.0 && high == 1.0 && gamma == 1.0 && !invert {
@@ -271,6 +279,9 @@ fn luminance_curve(low: f32, high: f32, feather: f32, invert: bool) -> Vec<[f32;
 }
 
 // ---------------------------------------------------------------- the working graph
+
+/// The uses of a mask that share one frame source, each with the chain nodes behind it.
+type FrameGroup = ((u64, u64), Vec<(E, BTreeSet<u64>)>);
 
 /// Reads one old parameter (name, default) for All or for one image.
 type Param<'a> = &'a dyn Fn(&str, f32) -> f32;
@@ -360,21 +371,37 @@ impl Work {
         };
         node.insert("kind".into(), json!(new_kind));
         node.insert("all".into(), to_obj(&all.params));
-        node.insert("individual".into(), Value::Object(per_image.iter().map(|(i, c)| (i.clone(), to_obj(&c.params))).collect()));
-        match all.data {
-            Some(d) => node.insert("data".into(), d),
+        // An image keeps only what differs from All.
+        let mut individual = Obj::new();
+        let mut individual_data = Obj::new();
+        for (img, c) in &per_image {
+            let diff: Vec<(&'static str, f32)> =
+                c.params.iter().filter(|(k, v)| all.params.iter().find(|(k2, _)| k2 == k).is_none_or(|(_, v2)| v2 != v)).copied().collect();
+            if !diff.is_empty() {
+                individual.insert(img.clone(), to_obj(&diff));
+            }
+            if let Some(d) = c.data.as_ref().filter(|d| all.data.as_ref() != Some(*d)) {
+                individual_data.insert(img.clone(), d.clone());
+            }
+        }
+        node.insert("individual".into(), Value::Object(individual));
+        match &all.data {
+            Some(d) => node.insert("data".into(), d.clone()),
             None => node.remove("data"),
         };
-        let individual_data: Obj = per_image.iter().filter_map(|(i, c)| Some((i.clone(), c.data.clone()?))).collect();
         if individual_data.is_empty() {
             node.remove("individual_data");
         } else {
             node.insert("individual_data".into(), Value::Object(individual_data));
         }
-        let notes = all.notes;
         let label = self.label(id);
-        for n in notes {
+        for n in &all.notes {
             self.note(format!("{label}: {n}"));
+        }
+        for (img, c) in &per_image {
+            for n in c.notes.iter().filter(|n| !all.notes.contains(n)) {
+                self.note(format!("{label}: image {img}: {n}"));
+            }
         }
         self.chain.insert(id);
     }
@@ -556,19 +583,53 @@ impl Work {
         let (Some((sa, pa)), Some((sb, pb))) = (a, b) else {
             return self.drop_node(id, "one of its input masks was removed, so it was removed too");
         };
-        self.rebuild(id, "Layer", &|p| {
-            // Multiply, Add, Subtract, Maximum, Minimum -> Layer blend index.
-            let blend = match p("mode", 0.0).round() as i32 {
-                1 => 1.0,
-                2 => 2.0,
-                3 => 7.0,
-                4 => 6.0,
-                _ => 3.0,
-            };
-            Conv { params: vec![("l2_blend", blend), ("l2_fit", 3.0)], data: None, notes: Vec::new() }
-        });
-        self.produced.push(E { from: sa, from_port: pa, to: id, to_port: 0 });
-        self.produced.push(E { from: sb, from_port: pb, to: id, to_port: 1 });
+        let images = self.images_of(id);
+        let node = self.nodes.get(&id)?;
+        let mode = param_of(node, None, "mode", 0.0).round() as i32;
+        let differs = images.iter().any(|i| param_of(node, Some(i), "mode", 0.0).round() as i32 != mode);
+        let pos = self.pos_of(id);
+        if differs {
+            let label = self.label(id);
+            self.note(format!("{label}: the per-image mode is not kept; the mode for All images is used"));
+        }
+        let layer = |blend: f32| move |_: Param| Conv { params: vec![("l2_blend", blend), ("l2_fit", 3.0)], data: None, notes: Vec::new() };
+        match mode {
+            // The old combine clamped to 0..1 after every step; a Layer does not.
+            // Subtract: a - min(a, b) is never negative.
+            2 => {
+                let h = self.new_node("Layer", [pos[0] - 180.0, pos[1] + 60.0]);
+                if let Some(n) = self.nodes.get_mut(&h) {
+                    n.insert("all".into(), json!({"l2_blend": 6.0, "l2_fit": 3.0}));
+                }
+                self.produced.push(E { from: sa, from_port: pa, to: h, to_port: 0 });
+                self.produced.push(E { from: sb, from_port: pb, to: h, to_port: 1 });
+                self.rebuild(id, "Layer", &layer(2.0));
+                self.produced.push(E { from: sa, from_port: pa, to: id, to_port: 0 });
+                self.produced.push(E { from: h, from_port: 0, to: id, to_port: 1 });
+            }
+            // Add: the Layer, then a curve that clamps at 1.
+            1 => {
+                let l = self.new_node("Layer", [pos[0] - 180.0, pos[1]]);
+                if let Some(n) = self.nodes.get_mut(&l) {
+                    n.insert("all".into(), json!({"l2_blend": 1.0, "l2_fit": 3.0}));
+                }
+                self.produced.push(E { from: sa, from_port: pa, to: l, to_port: 0 });
+                self.produced.push(E { from: sb, from_port: pb, to: l, to_port: 1 });
+                self.rebuild(id, "PointCurve", &|_| Conv { params: Vec::new(), data: Some(clamp_curve_set()), notes: Vec::new() });
+                self.produced.push(E { from: l, from_port: 0, to: id, to_port: 0 });
+            }
+            // Multiply, Maximum and Minimum of masks within 0..1 stay within 0..1.
+            m => {
+                let blend = match m {
+                    3 => 7.0,
+                    4 => 6.0,
+                    _ => 3.0,
+                };
+                self.rebuild(id, "Layer", &layer(blend));
+                self.produced.push(E { from: sa, from_port: pa, to: id, to_port: 0 });
+                self.produced.push(E { from: sb, from_port: pb, to: id, to_port: 1 });
+            }
+        }
         Some(id)
     }
 
@@ -598,7 +659,6 @@ impl Work {
         let mut taken: HashSet<(u64, usize)> = HashSet::new();
         // Blur nodes whose exposed radius was wired in the old file.
         let mut blur_range: BTreeSet<u64> = BTreeSet::new();
-        let mut blur_fixed: BTreeSet<u64> = BTreeSet::new();
 
         let ordered: Vec<(bool, E)> = old_edges
             .iter()
@@ -626,9 +686,6 @@ impl Work {
                     let slot = self.ensure_slot(e.to, param);
                     taken.insert((e.to, slot));
                     out.push(E { from: s, from_port: sp, to: e.to, to_port: new_len + slot as u64 });
-                    if to_kind == "Blur" && param == "radius" {
-                        blur_fixed.insert(e.to);
-                    }
                 } else if e.to_port < old_len {
                     // An ordinary image input keeps its number.
                     if let Some((s, sp)) = src {
@@ -649,8 +706,29 @@ impl Work {
                         continue;
                     };
                     if taken.contains(&(e.to, slot)) {
+                        let port = new_len + slot as u64;
+                        if to_kind == "Blur" && param == "radius" {
+                            // Old: radius = maximum * exposed map * mask. Multiply the two maps.
+                            if let Some(idx) = out.iter().position(|o| o.to == e.to && o.to_port == port) {
+                                let fixed = out[idx];
+                                let pos = self.pos_of(e.to);
+                                let l = self.new_node("Layer", [pos[0] - 200.0, pos[1] + 80.0]);
+                                if let Some(n) = self.nodes.get_mut(&l) {
+                                    n.insert("all".into(), json!({"l2_blend": 3.0, "l2_fit": 3.0}));
+                                }
+                                out[idx] = E { from: l, from_port: 0, to: e.to, to_port: port };
+                                out.push(E { from: fixed.from, from_port: fixed.from_port, to: l, to_port: 0 });
+                                out.push(E { from: s, from_port: sp, to: l, to_port: 1 });
+                                blur_range.insert(e.to);
+                                self.note(format!(
+                                    "{to_label}: the exposed radius input and the radius mask port were both connected; the two maps are multiplied and the radius slider is at its maximum, as before"
+                                ));
+                                continue;
+                            }
+                        }
+                        let extra = if param == "ev" { "; the old result (the exposed map set the stops, the mask the strength) cannot be expressed in format 3 and differs" } else { "" };
                         self.note(format!(
-                            "{to_label}: the exposed input \"{param}\" was connected twice (fixed mask port and exposed input); only the mask port is kept"
+                            "{to_label}: the exposed input \"{param}\" was connected twice (fixed mask port and exposed input); only the mask port is kept{extra}"
                         ));
                         continue;
                     }
@@ -667,8 +745,8 @@ impl Work {
                 }
             }
         }
-        // Old Blur with an exposed radius: the slider was the maximum, now it scales the map.
-        for id in blur_range.difference(&blur_fixed) {
+        // Old Blur with an exposed radius: the slider was the maximum (1000), now it scales the map.
+        for id in &blur_range {
             if let Some(n) = self.nodes.get_mut(id) {
                 if let Some(Value::Object(all)) = n.get_mut("all") {
                     all.insert("radius".into(), json!(1000.0));
@@ -740,39 +818,114 @@ impl Work {
         false
     }
 
-    /// Generated masks take the frame of the first consumer they feed, like the old masks did.
-    fn wire_frames(&mut self) {
-        let framed = self.framed.clone();
-        for g in framed {
-            if !self.nodes.contains_key(&g) {
+    /// Chain nodes upstream of `q`, `q` included.
+    fn chain_ancestors(&self, q: u64) -> BTreeSet<u64> {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![q];
+        while let Some(n) = stack.pop() {
+            if !self.chain.contains(&n) || !seen.insert(n) {
                 continue;
             }
-            // Walk down through the migrated chain to the nodes that use the mask.
-            let mut sources: Vec<(u64, u64, u64)> = Vec::new();
-            let mut seen = HashSet::new();
-            let mut stack = vec![g];
-            while let Some(n) = stack.pop() {
-                if !seen.insert(n) {
-                    continue;
+            stack.extend(self.edges.iter().filter(|e| e.to == n).map(|e| e.from));
+        }
+        seen
+    }
+
+    /// Copies the nodes of `set` (and the edges into them); returns old id -> new id.
+    fn clone_nodes(&mut self, set: &BTreeSet<u64>) -> HashMap<u64, u64> {
+        let mut map = HashMap::new();
+        for &old in set {
+            let Some(mut n) = self.nodes.get(&old).cloned() else { continue };
+            let id = self.next_id;
+            self.next_id += 1;
+            n.insert("id".into(), json!(id));
+            let p = self.pos_of(old);
+            n.insert("pos".into(), json!([p[0], p[1] + 70.0]));
+            self.nodes.insert(id, n);
+            self.chain.insert(id);
+            if let Some(k) = self.kinds.get(&old).cloned() {
+                self.kinds.insert(id, k);
+            }
+            if self.framed.contains(&old) {
+                self.framed.push(id);
+            }
+            map.insert(old, id);
+        }
+        for e in self.edges.clone() {
+            // The frame of a generated mask is wired per copy afterwards.
+            if self.framed.contains(&e.to) && e.to_port == 0 {
+                continue;
+            }
+            if let Some(&to) = map.get(&e.to) {
+                self.edges.push(E { from: map.get(&e.from).copied().unwrap_or(e.from), from_port: e.from_port, to, to_port: e.to_port });
+            }
+        }
+        map
+    }
+
+    /// Generated masks take the frame (and so the photos) of the nodes they feed, like the old masks did.
+    /// A mask used with different frames is duplicated, one copy per frame source.
+    fn wire_frames(&mut self) {
+        // The only Source of the graph frames a Normal Map that is fed by a mask alone.
+        let sources: Vec<u64> =
+            self.nodes.iter().filter(|(_, n)| n.get("kind").and_then(Value::as_str) == Some("Source")).map(|(id, _)| *id).collect();
+        let single_source = (sources.len() == 1).then(|| (sources[0], 0));
+        let mut uses: Vec<(E, Option<(u64, u64)>)> = Vec::new();
+        for e in &self.edges {
+            if !self.chain.contains(&e.from) || self.chain.contains(&e.to) {
+                continue;
+            }
+            let kind = self.nodes.get(&e.to).and_then(|n| n.get("kind")).and_then(Value::as_str).unwrap_or("");
+            let src = if kind == "NormalMap" && e.to_port == 0 {
+                single_source
+            } else {
+                self.edges.iter().find(|x| x.to == e.to && x.to_port == 0 && e.to_port != 0).map(|x| (x.from, x.from_port))
+            };
+            uses.push((*e, src));
+        }
+        uses.sort_by_key(|(e, _)| (e.to, e.to_port, e.from));
+        // Each use with the frame source it can take (one the mask does not depend on).
+        let mut groups: Vec<FrameGroup> = Vec::new();
+        for (e, src) in uses {
+            let anc = self.chain_ancestors(e.from);
+            let gens: Vec<u64> = anc.iter().copied().filter(|g| self.framed.contains(g)).collect();
+            if gens.is_empty() {
+                continue;
+            }
+            let Some(s) = src else { continue };
+            if gens.iter().any(|g| self.reaches(*g, s.0)) {
+                let (a, b) = (self.label(e.to), self.label(gens[0]));
+                self.note(format!("{a}: its frame cannot be used for {b} because that node depends on the mask"));
+                continue;
+            }
+            match groups.iter_mut().find(|g| g.0 == s) {
+                Some(g) => g.1.push((e, anc)),
+                None => groups.push((s, vec![(e, anc)])),
+            }
+        }
+        let mut used: BTreeSet<u64> = BTreeSet::new();
+        for (src, members) in groups {
+            let union: BTreeSet<u64> = members.iter().flat_map(|(_, a)| a.iter().copied()).collect();
+            let shared = !union.is_disjoint(&used);
+            used.extend(union.iter().copied());
+            let map = if shared { self.clone_nodes(&union) } else { HashMap::new() };
+            if shared {
+                let masks: Vec<u64> = union.iter().copied().filter(|g| self.kinds.get(g).is_some_and(|k| is_mask_kind(k))).collect();
+                for g in masks {
+                    let l = self.label(g);
+                    self.note(format!("{l}: it feeds nodes with different frames; a copy was made for each frame"));
                 }
-                for e in self.edges.iter().filter(|e| e.from == n).copied().collect::<Vec<_>>() {
-                    if self.chain.contains(&e.to) && !self.framed.contains(&e.to) {
-                        stack.push(e.to);
-                    } else if let Some(img) = self.edges.iter().find(|x| x.to == e.to && x.to_port == 0 && x.to_port != e.to_port) {
-                        sources.push((e.to, img.from, img.from_port));
+                for (e, _) in &members {
+                    if let Some(i) = self.edges.iter().position(|x| x == e) {
+                        self.edges[i].from = map.get(&e.from).copied().unwrap_or(e.from);
                     }
                 }
             }
-            sources.sort();
-            let Some(&(consumer, s, sp)) = sources.first() else { continue };
-            let distinct: BTreeSet<(u64, u64)> = sources.iter().map(|x| (x.1, x.2)).collect();
-            if self.reaches(g, s) {
-                continue;
-            }
-            self.edges.push(E { from: s, from_port: sp, to: g, to_port: 0 });
-            if distinct.len() > 1 {
-                let (gl, cl) = (self.label(g), self.label(consumer));
-                self.note(format!("{gl}: feeds nodes with different frames; it takes the frame of {cl}"));
+            for g in union.iter().filter(|g| self.framed.contains(g)) {
+                let g2 = map.get(g).copied().unwrap_or(*g);
+                if !self.edges.iter().any(|x| x.to == g2 && x.to_port == 0) {
+                    self.edges.push(E { from: src.0, from_port: src.1, to: g2, to_port: 0 });
+                }
             }
         }
     }
@@ -904,21 +1057,6 @@ fn run(nodes: BTreeMap<u64, Obj>, edges: Vec<E>, next_id: u64) -> Result<Work, G
         framed: Vec::new(),
         chain: BTreeSet::new(),
     };
-    // Develop no longer has the tone-version choice; its value is ignored.
-    for (id, n) in w.nodes.iter_mut() {
-        if w.kinds.get(id).is_some_and(|k| k == "Develop") {
-            if let Some(Value::Object(all)) = n.get_mut("all") {
-                all.remove("tone_version");
-            }
-            if let Some(Value::Object(ind)) = n.get_mut("individual") {
-                for v in ind.values_mut() {
-                    if let Value::Object(p) = v {
-                        p.remove("tone_version");
-                    }
-                }
-            }
-        }
-    }
     // Exposed inputs carry images only.
     for n in w.nodes.values_mut() {
         if let Some(Value::Array(list)) = n.get_mut("exposed_inputs") {
@@ -942,23 +1080,67 @@ fn run(nodes: BTreeMap<u64, Obj>, edges: Vec<E>, next_id: u64) -> Result<Work, G
     Ok(w)
 }
 
+/// Develop's "Tone processing" choice (Legacy / Local v1, `tone_version`) became the Legacy tone toggle
+/// (`legacy_tone`, off = local). Old files without the choice meant Legacy, so those get the toggle on;
+/// an explicit Local v1 keeps the default (off). Files of format 3 written between the two changes carry
+/// the choice only when it was set, so there an absent value changes nothing.
+fn tone_step<'a>(nodes: impl Iterator<Item = (u64, &'a mut Obj)>, absent_means_legacy: bool, notes: &mut Vec<String>) {
+    for (id, n) in nodes {
+        if n.get("kind").and_then(Value::as_str) != Some("Develop") {
+            continue;
+        }
+        let mut local_v1 = false;
+        if let Some(Value::Object(all)) = n.get_mut("all") {
+            let tv = all.remove("tone_version").and_then(|v| num(&v));
+            local_v1 |= tv.is_some_and(|v| v >= 0.5);
+            let legacy = tv.map_or(absent_means_legacy, |v| v < 0.5);
+            if legacy && !all.contains_key("legacy_tone") {
+                all.insert("legacy_tone".into(), json!(1.0));
+            }
+        }
+        if let Some(Value::Object(ind)) = n.get_mut("individual") {
+            for v in ind.values_mut() {
+                if let Value::Object(p) = v {
+                    if let Some(tv) = p.remove("tone_version").and_then(|v| num(&v)) {
+                        local_v1 |= tv >= 0.5;
+                        p.entry("legacy_tone").or_insert_with(|| json!(if tv < 0.5 { 1.0 } else { 0.0 }));
+                    }
+                }
+            }
+        }
+        if local_v1 {
+            let text = format!("Develop (node {id}): Local tone v1 now uses the improved local tone operator; the look can differ slightly");
+            if !notes.contains(&text) {
+                notes.push(text);
+            }
+        }
+    }
+}
+
 /// Rewrites a graph document of format 1 or 2 in place into format 3 and returns the notes.
 /// Documents of format 3 and later are left untouched.
 pub(crate) fn migrate_graph(root: &mut Value) -> Result<Vec<String>, GraphError> {
     let Some(obj) = root.as_object_mut() else { return Ok(Vec::new()) };
-    match obj.get("format_version").and_then(Value::as_u64) {
-        Some(v) if v < u64::from(GRAPH_FORMAT_VERSION) => {}
-        _ => return Ok(Vec::new()),
+    let Some(version) = obj.get("format_version").and_then(Value::as_u64) else { return Ok(Vec::new()) };
+    let mut tone_notes = Vec::new();
+    if version <= u64::from(GRAPH_FORMAT_VERSION) {
+        if let Some(Value::Object(nodes)) = obj.get_mut("nodes") {
+            let it = nodes.iter_mut().filter_map(|(k, v)| Some((k.parse::<u64>().ok()?, v.as_object_mut()?)));
+            tone_step(it, version < u64::from(GRAPH_FORMAT_VERSION), &mut tone_notes);
+        }
     }
-    let (Some(nodes_v), Some(edges_v)) = (obj.get("nodes"), obj.get("edges")) else { return Ok(Vec::new()) };
-    let Some(nodes_o) = nodes_v.as_object() else { return Ok(Vec::new()) };
+    if version >= u64::from(GRAPH_FORMAT_VERSION) {
+        return Ok(tone_notes);
+    }
+    let (Some(nodes_v), Some(edges_v)) = (obj.get("nodes"), obj.get("edges")) else { return Ok(tone_notes) };
+    let Some(nodes_o) = nodes_v.as_object() else { return Ok(tone_notes) };
     let mut nodes = BTreeMap::new();
     for (key, v) in nodes_o {
         let Some(o) = v.as_object() else { return bad(format!("node {key} is not an object")) };
         let id: u64 = o.get("id").and_then(Value::as_u64).or_else(|| key.parse().ok()).ok_or_else(|| GraphError::Parse(format!("node {key} has no id")))?;
         if key.parse::<u64>().ok() != Some(id) {
             // Leave the mismatch to the normal consistency check.
-            return Ok(Vec::new());
+            return Ok(tone_notes);
         }
         nodes.insert(id, o.clone());
     }
@@ -970,18 +1152,26 @@ pub(crate) fn migrate_graph(root: &mut Value) -> Result<Vec<String>, GraphError>
     obj.insert("edges".into(), edges_json(&w.edges, &|i| i));
     obj.insert("next_id".into(), json!(w.next_id));
     obj.insert("format_version".into(), json!(GRAPH_FORMAT_VERSION));
-    Ok(w.notes)
+    tone_notes.extend(w.notes);
+    Ok(tone_notes)
 }
 
 /// Rewrites a sub-graph document of format 1 in place into format 2 and returns the notes.
 pub(crate) fn migrate_subgraph(root: &mut Value) -> Result<Vec<String>, GraphError> {
     let Some(obj) = root.as_object_mut() else { return Ok(Vec::new()) };
-    match obj.get("format_version").and_then(Value::as_u64) {
-        Some(v) if v < u64::from(SUBGRAPH_FORMAT_VERSION) => {}
-        _ => return Ok(Vec::new()),
+    let Some(version) = obj.get("format_version").and_then(Value::as_u64) else { return Ok(Vec::new()) };
+    let mut tone_notes = Vec::new();
+    if version <= u64::from(SUBGRAPH_FORMAT_VERSION) {
+        if let Some(Value::Array(nodes)) = obj.get_mut("nodes") {
+            let it = nodes.iter_mut().enumerate().filter_map(|(i, v)| Some((i as u64 + 1, v.as_object_mut()?)));
+            tone_step(it, version < u64::from(SUBGRAPH_FORMAT_VERSION), &mut tone_notes);
+        }
     }
-    let (Some(nodes_v), Some(edges_v)) = (obj.get("nodes"), obj.get("edges")) else { return Ok(Vec::new()) };
-    let Some(list) = nodes_v.as_array() else { return Ok(Vec::new()) };
+    if version >= u64::from(SUBGRAPH_FORMAT_VERSION) {
+        return Ok(tone_notes);
+    }
+    let (Some(nodes_v), Some(edges_v)) = (obj.get("nodes"), obj.get("edges")) else { return Ok(tone_notes) };
+    let Some(list) = nodes_v.as_array() else { return Ok(tone_notes) };
     let mut nodes = BTreeMap::new();
     for (i, v) in list.iter().enumerate() {
         let Some(o) = v.as_object() else { return bad(format!("sub-graph node {i} is not an object")) };
@@ -1010,5 +1200,6 @@ pub(crate) fn migrate_subgraph(root: &mut Value) -> Result<Vec<String>, GraphErr
     obj.insert("nodes".into(), Value::Array(nodes_out));
     obj.insert("edges".into(), edges_json(&w.edges, &|i| index.get(&i).copied().unwrap_or(0)));
     obj.insert("format_version".into(), json!(SUBGRAPH_FORMAT_VERSION));
-    Ok(w.notes)
+    tone_notes.extend(w.notes);
+    Ok(tone_notes)
 }

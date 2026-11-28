@@ -364,7 +364,12 @@ impl Project {
 
     /// The graph as it was at `revision`, if that entry and its snapshot are still stored.
     pub fn graph_at(&self, revision: u64) -> Option<Graph> {
-        Graph::from_json(self.history.snapshot(revision)?).ok()
+        self.graph_at_with_notes(revision).map(|(g, _)| g)
+    }
+
+    /// Like [`Project::graph_at`], with the notes of the graph migration when the snapshot is of an older format.
+    pub fn graph_at_with_notes(&self, revision: u64) -> Option<(Graph, Vec<String>)> {
+        Graph::from_json_with_notes(self.history.snapshot(revision)?).ok()
     }
 
     /// Folders scanned into the project, in the order they were first scanned.
