@@ -3,6 +3,7 @@
 
 use super::*;
 
+use eframe::Storage as _;
 use super::workspaces::startup_workspace;
 use crate::workspace::{DisplayRef, DisplayTarget, WindowSpec};
 
@@ -12,7 +13,7 @@ fn headless_app(dir: &std::path::Path) -> App {
 }
 
 fn mon(name: &str, x: i32, primary: bool) -> MonitorInfo {
-    MonitorInfo { id: format!("{name}|2560x1440@{x},0"), pos: [x, 0], size: [2560, 1440], scale: 1.0, primary }
+    MonitorInfo { id: format!("{name}|2560x1440@{x},0"), pos: [x, 0], size: [2560, 1440], scale: 1.0, primary, device: None }
 }
 
 #[derive(Default)]
@@ -40,11 +41,10 @@ fn presets_open_and_close_the_right_windows() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = headless_app(dir.path());
     assert!(open_roles(&app).is_empty() && app.workspace == Workspace::Single);
-    let epoch = app.layout_epoch;
     app.apply_key("dual-scopes-clean");
     assert_eq!(open_roles(&app), vec![WindowRole::Viewer, WindowRole::Scopes, WindowRole::CleanFeed]);
     assert_eq!((app.workspace, app.scopes_pos), (Workspace::Dual, ScopesPos::Window));
-    assert!(app.layout_epoch > epoch, "panels take the new sizes");
+    assert!(app.ws.reset_panels, "panels take the new sizes");
     app.apply_key("clean-feed");
     assert_eq!(open_roles(&app), vec![WindowRole::CleanFeed]);
     assert_eq!((app.workspace, app.scopes_pos), (Workspace::Single, ScopesPos::BottomRight), "the docked scopes come back");
@@ -113,7 +113,7 @@ fn windows_fall_back_to_the_primary_display_and_return_without_losing_state() {
     assert!(app.viewer_win.fallback && !app.viewer_win.state.fullscreen, "windowed on the primary display, not covering the editor");
     assert_eq!(app.viewer_win.state.monitor.as_deref(), Some(a.id.as_str()));
     assert!(app.viewer_win.is_open() && app.scopes_win.is_open(), "nothing was closed");
-    assert_ne!(app.viewer_win.initial_for_test(), app.scopes_win.initial_for_test(), "the two fallback windows are cascaded");
+    assert_ne!(app.viewer_win.target_for_test(), app.scopes_win.target_for_test(), "the two fallback windows are cascaded");
     assert!(app.status.current().is_some_and(|(t, _)| t.contains("moved to the primary display")));
     assert_eq!(app.ws.intent.target(WindowRole::Viewer), Some(&DisplayTarget::Slot(2)), "the intended display is remembered");
     assert_eq!((app.workspace, app.scopes_pos, app.session.viewed_node), before, "the rest of the state is untouched");
@@ -163,37 +163,109 @@ fn workspaces_survive_a_restart() {
     app.shutdown();
 
     let settings: Settings = eframe::get_value(&storage, SETTINGS_KEY).unwrap();
-    assert_eq!(settings.workspaces.custom.len(), 1);
-    assert_eq!(settings.workspaces.session.as_ref().map(|s| s.windows.len()), Some(0), "the last session was Single");
+    let store = WorkspaceStore::from_json(&storage.get_string(WORKSPACES_KEY).unwrap());
+    assert_eq!(store.custom.len(), 1);
+    assert_eq!(store.session.as_ref().map(|s| s.windows.len()), Some(0), "the last session was Single");
     // The default beats the last session.
-    let (start, note) = startup_workspace(&settings, &Cli::default());
+    let (start, note) = startup_workspace(&settings, &store, &Cli::default());
     assert_eq!((start, note), (spec.clone(), None));
     // --workspace beats the default; clean feed and scopes options add to it.
     let cli = Cli { workspace: Some("dual".into()), clean_feed: true, ..Cli::default() };
-    let (start, _) = startup_workspace(&settings, &cli);
+    let (start, _) = startup_workspace(&settings, &store, &cli);
     assert_eq!(start.windows.iter().map(|w| w.role).collect::<Vec<_>>(), vec![WindowRole::Viewer, WindowRole::CleanFeed]);
     let cli = Cli { workspace: Some("wall".into()), scopes: Some(ScopesPos::Hidden), ..Cli::default() };
-    let (start, _) = startup_workspace(&settings, &cli);
+    let (start, _) = startup_workspace(&settings, &store, &cli);
     assert!(!start.has(WindowRole::Scopes) && start.layout.scopes_pos == ScopesPos::Hidden && start.has(WindowRole::Viewer));
     // An unknown name is reported and the normal choice applies.
     let cli = Cli { workspace: Some("nope".into()), ..Cli::default() };
-    let (start, note) = startup_workspace(&settings, &cli);
+    let (start, note) = startup_workspace(&settings, &store, &cli);
     assert_eq!(start, spec);
     assert!(note.unwrap().contains("nope"));
     // Without a default the last session comes back.
-    let mut no_default = settings;
-    no_default.workspaces.set_default(None).unwrap();
-    let (start, _) = startup_workspace(&no_default, &Cli::default());
+    let mut no_default = store;
+    no_default.set_default(None).unwrap();
+    let (start, _) = startup_workspace(&settings, &no_default, &Cli::default());
     assert!(start.windows.is_empty());
-    assert!(startup_workspace(&Settings::default(), &Cli::default()).0.windows.is_empty());
+    assert!(startup_workspace(&Settings::default(), &WorkspaceStore::default(), &Cli::default()).0.windows.is_empty());
     // Settings from before workspaces existed.
     let old = Settings { workspace: Workspace::Dual, scopes_pos: ScopesPos::Window, clean: AuxState { open: true, ..AuxState::default() }, ..Settings::default() };
-    let (start, _) = startup_workspace(&old, &Cli::default());
+    let (start, _) = startup_workspace(&old, &WorkspaceStore::default(), &Cli::default());
     assert_eq!(start.windows.iter().map(|w| w.role).collect::<Vec<_>>(), vec![WindowRole::Viewer, WindowRole::Scopes, WindowRole::CleanFeed]);
     let mut old_text = Mem::default();
     old_text.0.insert(SETTINGS_KEY.to_owned(), "(workspace: Dual)".to_owned());
     let loaded: Settings = eframe::get_value(&old_text, SETTINGS_KEY).unwrap();
-    assert_eq!(startup_workspace(&loaded, &Cli::default()).0.windows.len(), 1);
+    assert_eq!(startup_workspace(&loaded, &WorkspaceStore::default(), &Cli::default()).0.windows.len(), 1);
+}
+
+#[test]
+fn damaged_workspace_text_never_touches_the_other_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut storage = Mem::default();
+    let mut app = headless_app(dir.path());
+    app.filmstrip.live.set_budget(23);
+    app.ws.store.save_as("Keep", Preset::Dual.spec()).unwrap();
+    eframe::App::save(&mut app, &mut storage);
+    app.shutdown();
+    // A newer build wrote a window role this one does not know, and part of the text is garbage.
+    storage.0.insert(WORKSPACES_KEY.to_owned(), r#"{"custom":[{"name":"Keep","spec":{"windows":[]}},{"name":"New","spec":{"windows":[{"role":"Waveform3D","target":{"Slot":2}}]}}],"session":42}"#.to_owned());
+    let settings: Settings = eframe::get_value(&storage, SETTINGS_KEY).unwrap();
+    assert_eq!(settings.editable_thumb_gib, 23, "the other settings are intact");
+    let store = WorkspaceStore::from_json(&storage.get_string(WORKSPACES_KEY).unwrap());
+    assert_eq!(store.custom.len(), 2, "the readable entries stay");
+    assert!(store.session.is_none());
+    storage.0.insert(WORKSPACES_KEY.to_owned(), "\u{0}{{{ broken".to_owned());
+    assert_eq!(WorkspaceStore::from_json(&storage.get_string(WORKSPACES_KEY).unwrap()), WorkspaceStore::default());
+}
+
+#[test]
+fn an_unplugged_primary_display_and_a_missing_primary_flag_pick_a_sensible_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = headless_app(dir.path());
+    // Wayland style: no display is flagged primary; the editor sits on the second one.
+    let (a, b) = (mon("DELL", 0, false), mon("LG", 2560, false));
+    app.monitors = vec![a, b.clone()];
+    app.cached_main_monitor = Some(1);
+    app.apply_key("dual-scopes");
+    // Display 2 is the DELL (the only other one); display 3 is missing: fallback next to the editor, on the LG.
+    assert_eq!(app.scopes_win.state.monitor.as_deref(), Some(b.id.as_str()), "without a primary display the fallback is the display of the editor");
+    assert!(app.scopes_win.fallback);
+    app.shutdown();
+}
+
+#[test]
+fn a_hand_opened_window_goes_to_a_free_display() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = headless_app(dir.path());
+    let (a, b, c) = (mon("DELL", 0, true), mon("LG", 2560, false), mon("BenQ", 5120, false));
+    app.monitors = vec![a, b.clone(), c.clone()];
+    app.cached_main_monitor = Some(0);
+    app.set_role_display(WindowRole::Viewer, Some(DisplayTarget::Display(DisplayRef::of(&b))));
+    app.run(Command::SetWorkspace(Workspace::Dual), &egui::Context::default());
+    assert_eq!(app.viewer_win.state.monitor.as_deref(), Some(b.id.as_str()));
+    app.run(Command::ToggleClean, &egui::Context::default());
+    assert_eq!(app.clean_win.state.monitor.as_deref(), Some(c.id.as_str()), "the feed must not share the viewer's display");
+    assert!(!app.clean_win.fallback);
+    app.shutdown();
+}
+
+#[test]
+fn a_fallback_feed_is_not_raised_and_the_main_display_decides_after_it_settled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = headless_app(dir.path());
+    let (a, b) = (mon("DELL", 0, true), mon("LG", 2560, false));
+    app.monitors = vec![a.clone(), b.clone()];
+    app.cached_main_monitor = Some(0);
+    app.apply_key("dual");
+    assert_eq!(app.viewer_win.state.monitor.as_deref(), Some(b.id.as_str()));
+    // The editor is moved onto the viewer's display; once that has settled the viewer takes the free one.
+    let t0 = Instant::now();
+    assert!(app.ws.watch.observe(&app.monitors, Some(0), t0));
+    assert!(!app.ws.watch.observe(&app.monitors, Some(1), t0 + Duration::from_millis(100)));
+    assert!(app.ws.watch.observe(&app.monitors, Some(1), t0 + Duration::from_millis(1500)));
+    app.cached_main_monitor = app.ws.watch.main_index(&app.monitors);
+    app.reconcile_windows();
+    assert_eq!(app.viewer_win.state.monitor.as_deref(), Some(a.id.as_str()), "display 2 is now the other one");
+    app.shutdown();
 }
 
 #[test]

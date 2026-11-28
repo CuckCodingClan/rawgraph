@@ -6,6 +6,8 @@
 //! Nothing in here touches egui or winit; the application feeds in the monitor
 //! list (`MonitorInfo`) and carries out the resulting actions.
 
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 
 use crate::app::ScopesPos;
@@ -34,18 +36,39 @@ impl WindowRole {
     }
 }
 
-/// A display as remembered in a saved workspace: name, resolution and position
-/// (what winit exposes for a monitor; there is no stable hardware id).
+/// A display as remembered in a saved workspace: name, resolution and position as the window
+/// system reports them, plus a device identity where the platform has one (on Windows the
+/// monitor's device path, which survives the renumbering of the GDI names).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayRef {
     pub name: String,
     pub size: [u32; 2],
     pub pos: [i32; 2],
+    #[serde(default)]
+    pub device: Option<String>,
+}
+
+/// Two device identities that are both known must be equal; an unknown one does not decide.
+fn device_compatible(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
 }
 
 impl DisplayRef {
     pub fn of(m: &MonitorInfo) -> Self {
-        Self { name: m.name().to_owned(), size: m.size, pos: m.pos }
+        Self { name: m.name().to_owned(), size: m.size, pos: m.pos, device: m.device.clone() }
+    }
+
+    /// Name, resolution and position equal, and no known device identity contradicts it.
+    pub fn is_exactly(&self, m: &MonitorInfo) -> bool {
+        self.name == m.name() && self.size == m.size && self.pos == m.pos && device_compatible(&self.device, &m.device)
+    }
+
+    /// Both identities are known and equal: the same physical monitor, wherever it sits now.
+    pub fn is_same_device(&self, m: &MonitorInfo) -> bool {
+        self.device.is_some() && self.device == m.device
     }
 
     pub fn label(&self) -> String {
@@ -368,12 +391,39 @@ impl WorkspaceStore {
                 self.default = None;
             }
         }
-        let mut seen = Vec::new();
-        self.preferred.retain(|w| {
-            let first = !seen.contains(&w.role);
-            seen.push(w.role);
-            first
-        });
+        retain_usable_windows(&mut self.preferred);
+        for w in &mut self.custom {
+            retain_usable_windows(&mut w.spec.windows);
+        }
+        if let Some(s) = &mut self.session {
+            retain_usable_windows(&mut s.windows);
+        }
+    }
+
+    /// The settings text. Workspaces have their own storage key so that one unreadable entry
+    /// can never reset the other settings.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Reads settings text leniently: an entry that cannot be read (a window role or target from
+    /// a newer build, a damaged value) is dropped and the rest is kept. Never fails.
+    pub fn from_json(text: &str) -> Self {
+        let value: serde_json::Value = serde_json::from_str(text).unwrap_or(serde_json::Value::Null);
+        let mut store = WorkspaceStore::default();
+        if let Some(list) = value.get("custom").and_then(|v| v.as_array()) {
+            store.custom = list
+                .iter()
+                .filter_map(|e| Some(NamedWorkspace { name: e.get("name")?.as_str()?.to_owned(), spec: spec_from_value(e.get("spec")?) }))
+                .collect();
+        }
+        store.default = value.get("default").and_then(|v| v.as_str()).map(str::to_owned);
+        store.session = value.get("session").filter(|v| v.is_object()).map(spec_from_value);
+        if let Some(list) = value.get("preferred").and_then(|v| v.as_array()) {
+            store.preferred = windows_from_values(list);
+        }
+        store.sanitize();
+        store
     }
 
     pub fn preferred_target(&self, role: WindowRole) -> Option<&DisplayTarget> {
@@ -389,6 +439,30 @@ impl WorkspaceStore {
     }
 }
 
+fn windows_from_values(list: &[serde_json::Value]) -> Vec<WindowSpec> {
+    list.iter().filter_map(|w| serde_json::from_value::<WindowSpec>(w.clone()).ok()).collect()
+}
+
+fn spec_from_value(v: &serde_json::Value) -> WorkspaceSpec {
+    WorkspaceSpec {
+        layout: v.get("layout").and_then(|l| serde_json::from_value::<MainLayout>(l.clone()).ok()).unwrap_or_default(),
+        windows: v.get("windows").and_then(|w| w.as_array()).map(|a| windows_from_values(a)).unwrap_or_default(),
+    }
+}
+
+/// Keeps the first window of each role and drops slots that cannot exist (0 and 1: display 1 is
+/// the main window's own display).
+fn retain_usable_windows(windows: &mut Vec<WindowSpec>) {
+    let mut seen = Vec::new();
+    windows.retain(|w| {
+        if matches!(w.target, DisplayTarget::Slot(n) if n < 2) || seen.contains(&w.role) {
+            return false;
+        }
+        seen.push(w.role);
+        true
+    });
+}
+
 // ----------------------------------------------------------------- display matching
 
 /// How a window found its display.
@@ -398,6 +472,8 @@ pub enum MatchKind {
     Slot,
     /// Name, resolution and position all equal.
     Exact,
+    /// The same physical monitor (device identity), at another position or resolution.
+    SameDevice,
     /// Same name (the position or resolution changed).
     SameName,
     /// Same resolution only.
@@ -427,8 +503,9 @@ fn other_monitors(monitors: &[MonitorInfo], main: Option<usize>) -> Vec<usize> {
     v
 }
 
-/// The monitor of `slot`: 2 = first other display, 3 = second, ... Slot 1 is the main
-/// display, which is never used for a secondary window by slot.
+/// The monitor of `slot` when nothing else is in use: 2 = first other display, 3 = second, ...
+/// Slot 1 is the main display, which is never used for a secondary window by slot.
+#[cfg(test)]
 pub fn slot_monitor(monitors: &[MonitorInfo], main: Option<usize>, slot: u8) -> Option<usize> {
     let n = usize::from(slot).checked_sub(2)?;
     other_monitors(monitors, main).get(n).copied()
@@ -440,12 +517,15 @@ fn distance2(a: [i32; 2], b: [i32; 2]) -> i64 {
     dx * dx + dy * dy
 }
 
-/// Finds the monitor for a remembered display. Order: exact (name, size, position),
-/// same name (same size preferred, then nearest position), same resolution (nearest
-/// position), otherwise none. Monitors in `taken` are skipped except for an exact match.
+/// Finds the monitor for a remembered display. Order: exact (name, size, position), same
+/// physical device, same name (same size preferred, then nearest position), same resolution
+/// (nearest position), otherwise none. Monitors in `taken` are skipped by the last two.
 pub fn match_display(monitors: &[MonitorInfo], want: &DisplayRef, taken: &[usize]) -> Option<(usize, MatchKind)> {
-    if let Some(i) = monitors.iter().position(|m| &DisplayRef::of(m) == want) {
+    if let Some(i) = monitors.iter().position(|m| want.is_exactly(m)) {
         return Some((i, MatchKind::Exact));
+    }
+    if let Some(i) = monitors.iter().position(|m| want.is_same_device(m)) {
+        return Some((i, MatchKind::SameDevice));
     }
     let free = |i: &usize| !taken.contains(i);
     let by_name = (0..monitors.len())
@@ -464,28 +544,29 @@ pub fn match_display(monitors: &[MonitorInfo], want: &DisplayRef, taken: &[usize
 
 /// Decides the display of every window. `main` is the monitor of the main window.
 ///
-/// Slots resolve first (never onto the main display). Remembered displays follow in
-/// three passes - exact, same name, same resolution - so a window with an exact match
-/// is never robbed by a looser match of another window, and two identical monitors are
-/// told apart by their positions. A looser match never takes the main display or a
-/// display another window already uses.
+/// Remembered displays resolve first, in four passes - exact, same device, same name, same
+/// resolution - so a window with a better match is never robbed by a looser match of another
+/// window, and two identical monitors are told apart by device or position. Slots follow: slot
+/// n starts at the n-th display other than the main one and moves on to the next free display
+/// when that one is used by another window, so a window opened by hand never lands on a display
+/// that is already in use. A looser match or a slot never takes the main display.
 pub fn plan(windows: &[WindowSpec], monitors: &[MonitorInfo], main: Option<usize>) -> Vec<(WindowRole, Placement)> {
     let mut out: Vec<(WindowRole, Placement)> = windows.iter().map(|w| (w.role, Placement::Fallback)).collect();
     let mut taken: Vec<usize> = main.into_iter().collect();
-    for (i, w) in windows.iter().enumerate() {
-        if let DisplayTarget::Slot(n) = w.target {
-            if let Some(m) = slot_monitor(monitors, main, n) {
-                out[i].1 = Placement::On { monitor: m, how: MatchKind::Slot };
-                taken.push(m);
+    // Exact and same-device matches are deliberate (they may sit on the main display).
+    for pass in [MatchKind::Exact, MatchKind::SameDevice] {
+        for (i, w) in windows.iter().enumerate() {
+            let DisplayTarget::Display(want) = &w.target else { continue };
+            if out[i].1 != Placement::Fallback {
+                continue;
             }
-        }
-    }
-    // Exact matches first. They may sit on the main display (a deliberate choice) and
-    // are claimed before any looser match is considered.
-    for (i, w) in windows.iter().enumerate() {
-        if let DisplayTarget::Display(want) = &w.target {
-            if let Some(m) = monitors.iter().position(|m| &DisplayRef::of(m) == want) {
-                out[i].1 = Placement::On { monitor: m, how: MatchKind::Exact };
+            let found = if pass == MatchKind::Exact {
+                monitors.iter().position(|m| want.is_exactly(m))
+            } else {
+                monitors.iter().position(|m| want.is_same_device(m))
+            };
+            if let Some(m) = found {
+                out[i].1 = Placement::On { monitor: m, how: pass };
                 taken.push(m);
             }
         }
@@ -502,6 +583,20 @@ pub fn plan(windows: &[WindowSpec], monitors: &[MonitorInfo], main: Option<usize
                     taken.push(m);
                 }
             }
+        }
+    }
+    let others = other_monitors(monitors, main);
+    let mut slots: Vec<(u8, usize)> = windows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, w)| if let DisplayTarget::Slot(n) = w.target { Some((n, i)) } else { None })
+        .collect();
+    slots.sort_unstable();
+    for (n, i) in slots {
+        let Some(start) = usize::from(n).checked_sub(2) else { continue };
+        if let Some(m) = others.iter().skip(start).copied().find(|m| !taken.contains(m)) {
+            out[i].1 = Placement::On { monitor: m, how: MatchKind::Slot };
+            taken.push(m);
         }
     }
     out
@@ -522,6 +617,8 @@ pub enum Change {
     Restored,
     /// It moved to another display (rearranged or replaced).
     Moved,
+    /// Its own display changed position or resolution; nothing to tell, only to remember.
+    Refreshed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -624,7 +721,13 @@ impl Intent {
                 (Some(old), new) if old == *new => continue,
                 (Some(Some(_)), None) => Change::Lost,
                 (Some(None), Some(_)) => Change::Restored,
-                (Some(Some(_)), Some(_)) => Change::Moved,
+                (Some(Some(old)), Some(new)) => {
+                    if same_display(&old, new, monitors) {
+                        Change::Refreshed
+                    } else {
+                        Change::Moved
+                    }
+                }
                 (Some(None), None) => continue,
             };
             self.placed.retain(|(r, _)| *r != role);
@@ -635,15 +738,87 @@ impl Intent {
     }
 }
 
+/// True when `new` is the monitor `old` described, whose position or resolution has changed:
+/// the same device identity, or - without identities - the same name when only one connected
+/// monitor carries it.
+fn same_display(old: &DisplayRef, new: &DisplayRef, monitors: &[MonitorInfo]) -> bool {
+    if old.device.is_some() && new.device.is_some() {
+        return old.device == new.device;
+    }
+    old.name == new.name && monitors.iter().filter(|m| m.name() == new.name).count() == 1
+}
+
 /// Text for the status bar.
 pub fn describe(action: &Action) -> Option<String> {
     let name = action.role.label();
     match action.change {
-        Change::Placed => None,
+        Change::Placed | Change::Refreshed => None,
         Change::Missing => Some(format!("{name}: its display is not connected, shown on the primary display for now")),
         Change::Lost => Some(format!("{name}: its display was disconnected, moved to the primary display")),
         Change::Restored => Some(format!("{name}: its display is back, moved there again")),
         Change::Moved => Some(format!("{name}: moved to another display")),
+    }
+}
+
+/// How long the main window must stay on a new display before the windows are re-planned
+/// (dragging across displays must not make the secondary windows jump around).
+pub const MAIN_MOVE_DEBOUNCE: Duration = Duration::from_millis(1000);
+
+/// Decides when the monitor situation has changed enough to reconcile the windows again: the
+/// list of displays, the primary display or (debounced) the display of the main window.
+#[derive(Debug, Default)]
+pub struct DisplayWatch {
+    seen: bool,
+    ids: Vec<String>,
+    primary: Option<usize>,
+    main: Option<String>,
+    pending: Option<(String, Instant)>,
+}
+
+impl DisplayWatch {
+    /// `main` is the index of the display the main window sits on now, if known. Returns true when
+    /// the windows must be reconciled. An empty list (enumeration failed) never triggers.
+    pub fn observe(&mut self, monitors: &[MonitorInfo], main: Option<usize>, now: Instant) -> bool {
+        if monitors.is_empty() {
+            return false;
+        }
+        let ids: Vec<String> = monitors.iter().map(|m| m.id.clone()).collect();
+        let primary = monitors.iter().position(|m| m.primary);
+        if !self.seen || ids != self.ids || primary != self.primary {
+            self.seen = true;
+            self.main = main.map(|i| monitors[i].id.clone()).or_else(|| self.main.take().filter(|m| ids.contains(m)));
+            self.ids = ids;
+            self.primary = primary;
+            self.pending = None;
+            return true;
+        }
+        // Unknown (some compositors report no display for a window before it was shown): keep the last one.
+        let Some(main_id) = main.map(|i| monitors[i].id.clone()) else { return false };
+        if self.main.as_ref() == Some(&main_id) {
+            self.pending = None;
+            return false;
+        }
+        match &self.pending {
+            Some((id, since)) if *id == main_id => {
+                if now.duration_since(*since) >= MAIN_MOVE_DEBOUNCE {
+                    self.main = Some(main_id);
+                    self.pending = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => {
+                self.pending = Some((main_id, now));
+                false
+            }
+        }
+    }
+
+    /// Index of the settled main display in `monitors`.
+    pub fn main_index(&self, monitors: &[MonitorInfo]) -> Option<usize> {
+        let id = self.main.as_ref()?;
+        monitors.iter().position(|m| &m.id == id)
     }
 }
 
@@ -652,7 +827,7 @@ mod tests {
     use super::*;
 
     fn mon(name: &str, x: i32, w: u32, h: u32, primary: bool) -> MonitorInfo {
-        MonitorInfo { id: format!("{name}|{w}x{h}@{x},0"), pos: [x, 0], size: [w, h], scale: 1.0, primary }
+        MonitorInfo { id: format!("{name}|{w}x{h}@{x},0"), pos: [x, 0], size: [w, h], scale: 1.0, primary, device: None }
     }
 
     fn two() -> Vec<MonitorInfo> {
@@ -663,35 +838,6 @@ mod tests {
         DisplayTarget::Display(DisplayRef::of(m))
     }
 
-    /// eframe stores settings as RON text; use the same path as the application.
-    #[derive(Default)]
-    struct Mem(std::collections::HashMap<String, String>);
-
-    impl eframe::Storage for Mem {
-        fn get_string(&self, key: &str) -> Option<String> {
-            self.0.get(key).cloned()
-        }
-        fn set_string(&mut self, key: &str, value: String) {
-            self.0.insert(key.to_owned(), value);
-        }
-        fn remove_string(&mut self, key: &str) {
-            self.0.remove(key);
-        }
-        fn flush(&mut self) {}
-    }
-
-    fn round_trip<T: Serialize + serde::de::DeserializeOwned>(v: &T) -> T {
-        let mut m = Mem::default();
-        eframe::set_value(&mut m, "k", v);
-        eframe::get_value(&m, "k").expect("settings text must load again")
-    }
-
-    fn parse<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
-        let mut m = Mem::default();
-        m.0.insert("k".to_owned(), text.to_owned());
-        eframe::get_value(&m, "k")
-    }
-
     fn spec(role: WindowRole, target: DisplayTarget) -> WindowSpec {
         WindowSpec { role, target }
     }
@@ -699,7 +845,7 @@ mod tests {
     #[test]
     fn exact_match_wins_over_name_and_resolution() {
         let ms = vec![mon("LG", 0, 1920, 1080, true), mon("LG", 1920, 1920, 1080, false), mon("DELL", 3840, 1920, 1080, false)];
-        let r = DisplayRef { name: "LG".into(), size: [1920, 1080], pos: [1920, 0] };
+        let r = DisplayRef { name: "LG".into(), size: [1920, 1080], pos: [1920, 0], device: None };
         assert_eq!(match_display(&ms, &r, &[]), Some((1, MatchKind::Exact)));
         // An exact match is honoured even when the monitor is listed as taken.
         assert_eq!(match_display(&ms, &r, &[1]), Some((1, MatchKind::Exact)));
@@ -708,19 +854,19 @@ mod tests {
     #[test]
     fn same_name_prefers_same_size_then_nearest_position() {
         let ms = vec![mon("LG", 0, 1920, 1080, true), mon("LG", 5000, 2560, 1440, false), mon("LG", 2000, 2560, 1440, false)];
-        let r = DisplayRef { name: "LG".into(), size: [2560, 1440], pos: [4500, 0] };
+        let r = DisplayRef { name: "LG".into(), size: [2560, 1440], pos: [4500, 0], device: None };
         assert_eq!(match_display(&ms, &r, &[]), Some((1, MatchKind::SameName)), "same size, nearest to the old position");
         assert_eq!(match_display(&ms, &r, &[1]), Some((2, MatchKind::SameName)), "the next free one");
-        let r2 = DisplayRef { name: "LG".into(), size: [3840, 2160], pos: [0, 0] };
+        let r2 = DisplayRef { name: "LG".into(), size: [3840, 2160], pos: [0, 0], device: None };
         assert_eq!(match_display(&ms, &r2, &[0]), Some((2, MatchKind::SameName)), "no same-size LG: nearest free LG");
     }
 
     #[test]
     fn same_resolution_when_the_name_is_unknown() {
         let ms = vec![mon("A", 0, 1920, 1080, true), mon("B", 1920, 3840, 2160, false)];
-        let r = DisplayRef { name: "Gone".into(), size: [3840, 2160], pos: [9999, 0] };
+        let r = DisplayRef { name: "Gone".into(), size: [3840, 2160], pos: [9999, 0], device: None };
         assert_eq!(match_display(&ms, &r, &[]), Some((1, MatchKind::SameResolution)));
-        let none = DisplayRef { name: "Gone".into(), size: [800, 600], pos: [0, 0] };
+        let none = DisplayRef { name: "Gone".into(), size: [800, 600], pos: [0, 0], device: None };
         assert_eq!(match_display(&ms, &none, &[]), None, "nothing similar: the caller falls back");
         assert_eq!(match_display(&[], &none, &[]), None);
     }
@@ -737,8 +883,8 @@ mod tests {
     #[test]
     fn identical_monitors_rearranged_get_distinct_displays() {
         // Saved at x=1920 and x=3840; now the same two monitors sit at x=-1920 and x=1920.
-        let saved_a = DisplayRef { name: "LG".into(), size: [1920, 1080], pos: [1920, 0] };
-        let saved_b = DisplayRef { name: "LG".into(), size: [1920, 1080], pos: [3840, 0] };
+        let saved_a = DisplayRef { name: "LG".into(), size: [1920, 1080], pos: [1920, 0], device: None };
+        let saved_b = DisplayRef { name: "LG".into(), size: [1920, 1080], pos: [3840, 0], device: None };
         let ms = vec![mon("LG", 0, 1920, 1080, true), mon("LG", -1920, 1920, 1080, false), mon("LG", 1920, 1920, 1080, false)];
         let wins = vec![
             spec(WindowRole::Scopes, DisplayTarget::Display(saved_a)),
@@ -753,7 +899,7 @@ mod tests {
     #[test]
     fn a_loose_match_never_takes_the_main_display_or_a_used_one() {
         let ms = vec![mon("LG", 0, 1920, 1080, true), mon("LG", 1920, 1920, 1080, false)];
-        let moved = DisplayRef { name: "LG".into(), size: [1920, 1080], pos: [5000, 0] };
+        let moved = DisplayRef { name: "LG".into(), size: [1920, 1080], pos: [5000, 0], device: None };
         let wins = vec![spec(WindowRole::Scopes, DisplayTarget::Display(moved.clone())), spec(WindowRole::CleanFeed, DisplayTarget::Display(moved))];
         let p = plan(&wins, &ms, Some(0));
         assert_eq!(p[0].1, Placement::On { monitor: 1, how: MatchKind::SameName });
@@ -763,7 +909,7 @@ mod tests {
     #[test]
     fn exact_match_is_not_robbed_by_a_looser_one() {
         let ms = vec![mon("A", 0, 1920, 1080, true), mon("LG", 1920, 1920, 1080, false)];
-        let loose = DisplayRef { name: "LG".into(), size: [1920, 1080], pos: [9000, 0] };
+        let loose = DisplayRef { name: "LG".into(), size: [1920, 1080], pos: [9000, 0], device: None };
         // The loose window comes first in the list, but the exact one claims the display.
         let wins = vec![spec(WindowRole::Scopes, DisplayTarget::Display(loose)), spec(WindowRole::CleanFeed, want(&ms[1]))];
         let p = plan(&wins, &ms, Some(0));
@@ -866,10 +1012,121 @@ mod tests {
         assert!(!intent.in_fallback(WindowRole::CleanFeed));
         // The LG moves to the left of the main display.
         let moved = vec![mon("DELL", 0, 2560, 1440, true), mon("LG", -3840, 3840, 2160, false)];
-        assert_eq!(run(&mut intent, &moved), vec![(WindowRole::CleanFeed, Change::Moved)]);
+        // The only LG is the same monitor at another place: remembered, not reported as a move.
+        assert_eq!(run(&mut intent, &moved), vec![(WindowRole::CleanFeed, Change::Refreshed)]);
+        assert_eq!(run(&mut intent, &moved), vec![], "settled");
         // The intent still names the original display, so a return to the old layout is exact again.
-        assert_eq!(run(&mut intent, &full), vec![(WindowRole::CleanFeed, Change::Moved)]);
+        assert_eq!(run(&mut intent, &full), vec![(WindowRole::CleanFeed, Change::Refreshed)]);
         assert_eq!(intent.placed_on(WindowRole::CleanFeed), Some(&DisplayRef::of(&full[1])));
+        assert!(describe(&Action { role: WindowRole::CleanFeed, placement: Placement::Fallback, change: Change::Refreshed }).is_none());
+    }
+
+    #[test]
+    fn a_resolution_change_of_the_own_display_is_not_a_move() {
+        let full = two();
+        let mut intent = Intent::from_spec(&WorkspaceSpec { layout: MainLayout::default(), windows: vec![spec(WindowRole::Scopes, want(&full[1]))] });
+        run(&mut intent, &full);
+        let mut changed = full.clone();
+        changed[1] = mon("LG", 2560, 2560, 1440, false);
+        assert_eq!(run(&mut intent, &changed), vec![(WindowRole::Scopes, Change::Refreshed)]);
+        // Two monitors with that name: without a device identity it cannot be told, so it counts as a move.
+        let mut twins = changed.clone();
+        twins.push(mon("LG", 5120, 2560, 1440, false));
+        let mut intent = Intent::from_spec(&WorkspaceSpec { layout: MainLayout::default(), windows: vec![spec(WindowRole::Scopes, want(&full[1]))] });
+        run(&mut intent, &full);
+        assert_eq!(run(&mut intent, &twins), vec![(WindowRole::Scopes, Change::Moved)]);
+    }
+
+    fn dev(name: &str, x: i32, device: &str) -> MonitorInfo {
+        MonitorInfo { device: Some(device.to_owned()), ..mon(name, x, 1920, 1080, false) }
+    }
+
+    #[test]
+    fn the_device_identity_tells_identical_monitors_apart_even_when_positions_swap() {
+        // Two identical monitors; the user swapped their places in the display settings.
+        let a_old = dev("LG", 1920, "UID-A");
+        let b_old = dev("LG", 3840, "UID-B");
+        let saved_b = DisplayRef::of(&b_old);
+        let swapped = vec![mon("MAIN", 0, 1920, 1080, true), dev("LG", 1920, "UID-B"), dev("LG", 3840, "UID-A")];
+        // Name, size and position alone would pick monitor 2 (the one now at 3840); the device says monitor 1.
+        let wins = vec![spec(WindowRole::Scopes, DisplayTarget::Display(saved_b.clone()))];
+        assert_eq!(plan(&wins, &swapped, Some(0))[0].1, Placement::On { monitor: 1, how: MatchKind::SameDevice });
+        assert!(!saved_b.is_exactly(&swapped[2]), "same name, size and position but another device");
+        assert_eq!(match_display(&swapped, &saved_b, &[]), Some((1, MatchKind::SameDevice)));
+        // Unknown identities (other platforms) do not contradict a position match.
+        assert!(saved_b.is_exactly(&mon("LG", 3840, 1920, 1080, false)));
+        let _ = a_old;
+        // The device wins over a position match that belongs to another device.
+        let mut intent = Intent::from_spec(&WorkspaceSpec { layout: MainLayout::default(), windows: wins });
+        let before = vec![mon("MAIN", 0, 1920, 1080, true), dev("LG", 1920, "UID-A"), dev("LG", 3840, "UID-B")];
+        assert_eq!(run(&mut intent, &before), vec![(WindowRole::Scopes, Change::Placed)]);
+        assert_eq!(run(&mut intent, &swapped), vec![(WindowRole::Scopes, Change::Refreshed)], "same device, new place: quietly remembered");
+    }
+
+    #[test]
+    fn a_window_opened_by_hand_never_lands_on_a_display_that_is_in_use() {
+        let ms = vec![mon("A", 0, 1920, 1080, true), mon("B", 1920, 1920, 1080, false), mon("C", 3840, 1920, 1080, false)];
+        // Viewer on the concrete display B; a clean feed opened by hand asks for the first free slot (2 = B).
+        let mut intent = Intent::default();
+        intent.set(WindowRole::Viewer, want(&ms[1]));
+        let target = intent.default_target(WindowRole::CleanFeed);
+        assert_eq!(target, DisplayTarget::Slot(2));
+        intent.set(WindowRole::CleanFeed, target);
+        let p = plan(&intent.windows, &ms, Some(0));
+        assert_eq!(p[0].1, Placement::On { monitor: 1, how: MatchKind::Exact });
+        assert_eq!(p[1].1, Placement::On { monitor: 2, how: MatchKind::Slot }, "B is taken, so C");
+        // With only B connected there is no free display: the primary display (fallback).
+        let two = &ms[..2];
+        assert_eq!(plan(&intent.windows, two, Some(0))[1].1, Placement::Fallback);
+        // Slot windows keep their absolute numbers when nothing is in the way.
+        let wins = Preset::DualScopes.spec().windows;
+        assert_eq!(plan(&wins, &ms, Some(0)).iter().map(|(_, p)| p.monitor()).collect::<Vec<_>>(), vec![Some(1), Some(2)]);
+        // A stale remembered display resolves before the slots, which then move on.
+        let stale = DisplayRef { name: "B".into(), size: [1920, 1080], pos: [9999, 0], device: None };
+        let wins = vec![spec(WindowRole::Viewer, DisplayTarget::Display(stale)), spec(WindowRole::Scopes, DisplayTarget::Slot(2))];
+        let p = plan(&wins, &ms, Some(0));
+        assert_eq!((p[0].1.monitor(), p[1].1.monitor()), (Some(1), Some(2)));
+    }
+
+    #[test]
+    fn the_watch_triggers_on_list_primary_and_settled_main_changes() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut w = DisplayWatch::default();
+        let two = two();
+        assert!(!w.observe(&[], Some(0), at(0)), "an empty list never triggers");
+        assert!(w.observe(&two, Some(0), at(0)), "first sight");
+        assert!(!w.observe(&two, Some(0), at(2000)));
+        assert_eq!(w.main_index(&two), Some(0));
+        // The editor is dragged to the second display: only after it stayed there.
+        assert!(!w.observe(&two, Some(1), at(2100)), "first sighting starts the debounce");
+        assert!(!w.observe(&two, Some(1), at(2600)), "too early");
+        assert!(w.observe(&two, Some(1), at(3200)), "settled");
+        assert_eq!(w.main_index(&two), Some(1));
+        assert!(!w.observe(&two, Some(1), at(5000)));
+        // A drag across and back inside the debounce time changes nothing.
+        assert!(!w.observe(&two, Some(0), at(6000)));
+        assert!(!w.observe(&two, Some(1), at(6300)));
+        assert!(!w.observe(&two, Some(1), at(9000)));
+        // An unknown main display (Wayland before the first enter event) keeps the last one.
+        assert!(!w.observe(&two, None, at(10_000)));
+        assert_eq!(w.main_index(&two), Some(1));
+        // The primary display changes while a window is in fallback.
+        let mut other_primary = two.clone();
+        other_primary[0].primary = false;
+        other_primary[1].primary = true;
+        assert!(w.observe(&other_primary, Some(1), at(11_000)));
+        // The list changes.
+        let one = vec![two[0].clone()];
+        assert!(w.observe(&one, Some(0), at(12_000)));
+        assert_eq!(w.main_index(&one), Some(0));
+        // Unknown main on the very first look: remembered as unknown, then settles.
+        let mut w = DisplayWatch::default();
+        assert!(w.observe(&two, None, at(0)));
+        assert_eq!(w.main_index(&two), None);
+        assert!(!w.observe(&two, Some(1), at(100)));
+        assert!(w.observe(&two, Some(1), at(1200)));
+        assert_eq!(w.main_index(&two), Some(1));
     }
 
     #[test]
@@ -969,7 +1226,7 @@ mod tests {
     fn store_round_trip_through_json_and_old_settings() {
         let mut s = WorkspaceStore::default();
         let mut spec = Preset::DualScopesClean.spec();
-        spec.windows[1].target = DisplayTarget::Display(DisplayRef { name: "LG UltraFine".into(), size: [3840, 2160], pos: [-3840, 0] });
+        spec.windows[1].target = DisplayTarget::Display(DisplayRef { name: "LG UltraFine".into(), size: [3840, 2160], pos: [-3840, 0], device: None });
         spec.layout.show_inspector = false;
         spec.layout.scopes_pos = ScopesPos::RightColumn;
         s.save_as("Wall", spec.clone()).unwrap();
@@ -978,15 +1235,64 @@ mod tests {
         s.prefer(WindowRole::CleanFeed, Some(DisplayTarget::Slot(3)));
         s.prefer(WindowRole::CleanFeed, Some(DisplayTarget::Slot(4)));
         assert_eq!(s.preferred_target(WindowRole::CleanFeed), Some(&DisplayTarget::Slot(4)), "one entry per role");
-        let back: WorkspaceStore = round_trip(&s);
+        let back = WorkspaceStore::from_json(&s.to_json());
         assert_eq!(back, s);
         assert_eq!(back.resolve("wall"), Some(spec));
         // Empty and partial documents (settings written before workspaces existed) still load.
-        let empty: WorkspaceStore = parse("()").unwrap();
-        assert_eq!(empty, WorkspaceStore::default());
-        let partial: WorkspaceSpec = parse("(windows: [(role: Scopes, target: Slot(3))])").unwrap();
-        assert_eq!(partial.layout, MainLayout::default());
-        assert!(partial.has(WindowRole::Scopes));
+        assert_eq!(WorkspaceStore::from_json("{}"), WorkspaceStore::default());
+        assert_eq!(WorkspaceStore::from_json(""), WorkspaceStore::default(), "empty text");
+        assert_eq!(WorkspaceStore::from_json("not json at all"), WorkspaceStore::default());
+        assert_eq!(WorkspaceStore::from_json("[1,2]"), WorkspaceStore::default());
+        let partial = WorkspaceStore::from_json(r#"{"custom":[{"name":"P","spec":{"windows":[{"role":"Scopes","target":{"Slot":3}}]}}]}"#);
+        let p = partial.resolve("p").unwrap();
+        assert_eq!(p.layout, MainLayout::default());
+        assert!(p.has(WindowRole::Scopes));
+    }
+
+    #[test]
+    fn one_unreadable_entry_loses_only_itself() {
+        let text = r#"{
+            "custom": [
+                {"name": "Good", "spec": {"windows": [{"role": "Viewer", "target": {"Slot": 2}}]}},
+                {"name": "FromNewerBuild", "spec": {"windows": [
+                    {"role": "Waveform3D", "target": {"Slot": 3}},
+                    {"role": "Scopes", "target": {"Teleport": [1, 2]}},
+                    {"role": "CleanFeed", "target": {"Slot": 4}},
+                    {"role": "CleanFeed", "target": {"Slot": 2}},
+                    {"role": "Scopes", "target": {"Slot": 0}},
+                    {"role": "Scopes", "target": {"Slot": 1}}
+                ], "layout": {"scopes_pos": "SomethingNew"}}},
+                {"name": 17},
+                {"spec": {}},
+                "garbage",
+                {"name": "Display", "spec": {"windows": [{"role": "Scopes", "target": {"Display": {"name": "LG", "size": [1920, 1080], "pos": [0, 0]}}}]}}
+            ],
+            "default": "Good",
+            "session": {"windows": [{"role": "Viewer", "target": {"Slot": 2}}, {"role": 5}]},
+            "preferred": [{"role": "Scopes", "target": {"Slot": 3}}, {"nonsense": true}, {"role": "Scopes", "target": {"Slot": 4}}]
+        }"#;
+        let s = WorkspaceStore::from_json(text);
+        let names: Vec<&str> = s.custom.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, vec!["Good", "FromNewerBuild", "Display"]);
+        assert_eq!(s.default.as_deref(), Some("Good"));
+        let newer = s.resolve("FromNewerBuild").unwrap();
+        assert_eq!(newer.windows, vec![WindowSpec { role: WindowRole::CleanFeed, target: DisplayTarget::Slot(4) }], "unknown role/target, duplicate role and slots 0/1 dropped");
+        assert_eq!(newer.layout, MainLayout::default(), "an unreadable layout falls back to the default one");
+        assert_eq!(s.session.as_ref().map(|x| x.windows.len()), Some(1));
+        assert_eq!(s.preferred_target(WindowRole::Scopes), Some(&DisplayTarget::Slot(3)));
+        match &s.resolve("Display").unwrap().windows[0].target {
+            DisplayTarget::Display(d) => assert_eq!(d.device, None, "settings written before device identities still load"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_remembered_device_round_trips() {
+        let mut s = WorkspaceStore::default();
+        let mut spec = Preset::Dual.spec();
+        spec.windows[0].target = DisplayTarget::Display(DisplayRef { name: "DELL U2720Q".into(), size: [2560, 1440], pos: [0, 0], device: Some("\\\\?\\DISPLAY#DELA0B1#5&2&UID4352".into()) });
+        s.save_as("Dev", spec.clone()).unwrap();
+        assert_eq!(WorkspaceStore::from_json(&s.to_json()).resolve("dev"), Some(spec));
     }
 
     #[test]

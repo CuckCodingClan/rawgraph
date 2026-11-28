@@ -6,7 +6,7 @@
 use super::*;
 
 use crate::windows::Placing;
-use crate::workspace::{self, Action, DisplayRef, DisplayTarget, Intent, MainLayout, NamedWorkspace, Preset, WindowRole, WorkspaceSpec, WorkspaceStore};
+use crate::workspace::{self, Action, Change, DisplayRef, DisplayTarget, DisplayWatch, Intent, MainLayout, NamedWorkspace, Preset, WindowRole, WorkspaceSpec, WorkspaceStore};
 
 /// Interval of the display poll while a workspace with secondary windows is active.
 pub(super) const MONITOR_POLL: Duration = Duration::from_secs(2);
@@ -18,8 +18,10 @@ pub(super) struct Workspaces {
     pub intent: Intent,
     /// Panel sizes and visibility of the main window, as last measured.
     pub layout: MainLayout,
-    /// The monitor list the windows were last reconciled with.
-    pub monitor_key: Vec<String>,
+    /// Notices changes of the display list, the primary display and the display of the main window.
+    pub watch: DisplayWatch,
+    /// Panels forget their remembered sizes in the next frame (a workspace was applied).
+    pub reset_panels: bool,
     pub pending: Vec<WsAction>,
     pub dialog: Option<WsDialog>,
 }
@@ -41,7 +43,7 @@ pub(super) enum WsDialog {
 impl Workspaces {
     pub fn new(mut store: WorkspaceStore, spec: &WorkspaceSpec) -> Self {
         store.sanitize();
-        Self { store, intent: Intent::from_spec(spec), layout: spec.layout.clone().sanitized(), monitor_key: Vec::new(), pending: Vec::new(), dialog: None }
+        Self { store, intent: Intent::from_spec(spec), layout: spec.layout.clone().sanitized(), watch: DisplayWatch::default(), reset_panels: false, pending: Vec::new(), dialog: None }
     }
 }
 
@@ -56,9 +58,7 @@ fn add_window(spec: &mut WorkspaceSpec, role: WindowRole) {
 /// Chooses the workspace to start with: `--workspace`, else the default workspace, else the
 /// one of the last session, else what older settings describe. Returns the spec and a note
 /// when the requested name does not exist.
-pub(super) fn startup_workspace(settings: &Settings, cli: &Cli) -> (WorkspaceSpec, Option<String>) {
-    let mut store = settings.workspaces.clone();
-    store.sanitize();
+pub(super) fn startup_workspace(settings: &Settings, store: &WorkspaceStore, cli: &Cli) -> (WorkspaceSpec, Option<String>) {
     let mut note = None;
     let requested = cli.workspace.as_deref().and_then(|name| {
         let found = store.resolve(name);
@@ -146,8 +146,8 @@ impl App {
         self.ws.layout = spec.layout.clone().sanitized();
         self.workspace = if spec.has(WindowRole::Viewer) { Workspace::Dual } else { Workspace::Single };
         self.scopes_pos = if spec.has(WindowRole::Scopes) { ScopesPos::Window } else { self.ws.layout.scopes_pos };
-        // New defaults for every panel.
-        self.layout_epoch += 1;
+        // The panels take the sizes of the workspace (their remembered sizes are dropped).
+        self.ws.reset_panels = true;
         self.editor.request_frame_all();
     }
 
@@ -168,24 +168,45 @@ impl App {
         }
     }
 
+    /// The display of the main window; unknown (some compositors) falls back to the primary display.
+    fn main_monitor(&self) -> Option<usize> {
+        self.cached_main_monitor.or_else(|| self.monitors.iter().position(|m| m.primary))
+    }
+
     /// Places every window whose display assignment changed (see `Intent::reconcile`).
     pub(super) fn reconcile_windows(&mut self) {
-        let actions = self.ws.intent.reconcile(&self.monitors, self.cached_main_monitor);
+        let main = self.main_monitor();
+        let actions = self.ws.intent.reconcile(&self.monitors, main);
         if actions.is_empty() {
             return;
         }
-        let primary = self.monitors.iter().position(|m| m.primary).unwrap_or(0);
+        // Where a window goes when its display is missing: the primary display; without one
+        // (Wayland reports none) the display of the main window; else the first one.
+        let primary = self.monitors.iter().position(|m| m.primary).or(main).unwrap_or(0);
+        let monitors = std::mem::take(&mut self.monitors);
         let mut notes = Vec::new();
         for a in &actions {
             if !self.aux(a.role).is_open() {
                 continue;
             }
+            if a.change == Change::Refreshed {
+                // The own display changed its place or resolution: a fullscreen window follows it,
+                // a normal window stays where it is.
+                if let Some(index) = a.placement.monitor() {
+                    if self.aux(a.role).state.fullscreen {
+                        let placing = self.placing_for(a, primary);
+                        self.aux_mut(a.role).place(&monitors, placing);
+                    } else {
+                        self.aux_mut(a.role).retarget_monitor(&monitors, index);
+                    }
+                }
+                continue;
+            }
             let placing = self.placing_for(a, primary);
-            let monitors = std::mem::take(&mut self.monitors);
             self.aux_mut(a.role).place(&monitors, placing);
-            self.monitors = monitors;
             notes.extend(workspace::describe(a));
         }
+        self.monitors = monitors;
         if !notes.is_empty() {
             self.status.info(notes.join("; "));
         }
@@ -207,8 +228,10 @@ impl App {
         }
     }
 
-    /// The first frame after the monitor list is known and whenever the list changes. Polled at a
-    /// low rate, and only while a workspace has secondary windows.
+    /// Looks at the displays: right away on the first frame, then every 2 seconds while a workspace has
+    /// secondary windows (otherwise every second, only when the interface is updated anyway). The
+    /// windows are placed again when the list of displays or the primary display changes, or when
+    /// the main window has settled on another display.
     pub(super) fn poll_displays(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
         let has_windows = !self.ws.intent.windows.is_empty();
         let interval = if has_windows { MONITOR_POLL } else { Duration::from_secs(1) };
@@ -216,16 +239,25 @@ impl App {
         if due {
             self.monitors_at = Some(Instant::now());
             self.monitors = windows::enumerate_monitors(frame);
-            self.cached_main_monitor = windows::current_monitor_index(frame, &self.monitors);
-            let key: Vec<String> = self.monitors.iter().map(|m| m.id.clone()).collect();
-            if key != self.ws.monitor_key {
-                self.ws.monitor_key = key;
+            let main = windows::current_monitor_index(frame, &self.monitors);
+            if self.ws.watch.observe(&self.monitors, main, Instant::now()) {
+                self.cached_main_monitor = self.ws.watch.main_index(&self.monitors);
                 self.reconcile_windows();
             }
         }
         if has_windows {
             // egui sleeps without input; wake up to look at the displays again.
             ctx.request_repaint_after(MONITOR_POLL);
+        }
+    }
+
+    /// Drops the remembered size of a panel when a workspace was just applied, so that it takes
+    /// the size of that workspace. The panel keeps its id, so switching workspaces does not leave
+    /// a new set of panel states behind in egui's memory every time.
+    pub(super) fn reset_panel(&self, ui: &egui::Ui, name: &'static str, epoch: u32) {
+        if self.ws.reset_panels {
+            let id = ui.scope_id().with((name, epoch));
+            ui.ctx().data_mut(|d| d.remove::<egui::containers::panel::PanelState>(id));
         }
     }
 

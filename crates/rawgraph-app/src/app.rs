@@ -59,6 +59,9 @@ mod workspaces_tests;
 pub static EXIT_CODE: AtomicI32 = AtomicI32::new(0);
 
 const SETTINGS_KEY: &str = "rawgraph.settings.v2";
+/// Workspaces live under their own key (JSON, read leniently) so that one unreadable entry can
+/// never reset the other settings.
+const WORKSPACES_KEY: &str = "rawgraph.workspaces.v1";
 const GRAPH_EXT: &str = ".rawgraph.json";
 const PROJECT_EXT: &str = ".rawgraph";
 const MIN_FRAMES_BEFORE_SHOT: u64 = 30;
@@ -105,7 +108,6 @@ struct Settings {
     viewer: AuxState,
     clean: AuxState,
     scopes: AuxState,
-    workspaces: WorkspaceStore,
     preview_size: u32,
     renderer: RendererMode,
     click_zoom: f32,
@@ -121,7 +123,6 @@ impl Default for Settings {
             viewer: AuxState::default(),
             clean: AuxState::default(),
             scopes: AuxState::default(),
-            workspaces: WorkspaceStore::default(),
             preview_size: DEFAULT_PREVIEW,
             renderer: RendererMode::Auto,
             click_zoom: 2.0,
@@ -636,7 +637,12 @@ impl App {
         editor.use_system_clipboard = !screenshot_mode;
         let prefetch = Prefetcher::new(provider);
 
-        let (start_spec, start_note) = workspaces::startup_workspace(&settings, &cli);
+        let store = if screenshot_mode {
+            WorkspaceStore::default()
+        } else {
+            cc.storage.and_then(|s| s.get_string(WORKSPACES_KEY)).map(|text| WorkspaceStore::from_json(&text)).unwrap_or_default()
+        };
+        let (start_spec, start_note) = workspaces::startup_workspace(&settings, &store, &cli);
         if let Some(note) = start_note {
             status.error(note.clone());
             eprintln!("--workspace: {note}");
@@ -652,7 +658,7 @@ impl App {
         // A restored clean feed is always fullscreen.
         clean_state.fullscreen = true;
         clean_state.open = start_spec.has(WindowRole::CleanFeed);
-        let ws = workspaces::Workspaces::new(settings.workspaces, &start_spec);
+        let ws = workspaces::Workspaces::new(store, &start_spec);
         let cli_open_export = cli.open_export_dialog;
         let cli_mask_overlay = cli.mask_overlay;
         let (cli_export_format, cli_no_profile, cli_no_metadata) = (cli.export_format.unwrap_or(export::Fmt::Jpeg), cli.export_no_profile, cli.export_no_metadata);
@@ -886,7 +892,7 @@ impl App {
             Command::ResetLayout => {
                 let defaults = if self.workspace == Workspace::Dual { MainLayout::dual() } else { MainLayout::default() };
                 self.ws.layout = MainLayout { scopes_pos: self.ws.layout.scopes_pos, ..defaults };
-                self.layout_epoch += 1;
+                self.ws.reset_panels = true;
                 self.editor.request_frame_all();
                 self.viewer.fit();
                 self.status.info("Layout reset");
@@ -1747,6 +1753,13 @@ impl App {
             && (self.late_disconnect_done || self.cli.late_disconnect.is_empty())
             && self.last_key.is_some() == expects_frame
             && self.curve_hist_ready()
+            && self.scopes_ready()
+    }
+
+    /// The scopes are computed after the picture; a screenshot waits until their data was uploaded.
+    fn scopes_ready(&self) -> bool {
+        let wanted = self.single_viewer_request().is_some() && !self.compare.active() && self.scopes_pos != ScopesPos::Hidden;
+        !wanted || !self.scope_panel.needs_refresh()
     }
 
     /// A selected Curve node gets its histogram a moment after the frame: screenshots wait for it.
@@ -2600,6 +2613,7 @@ impl App {
             // than a third of the graph strip (they would squeeze the node graph).
             let max = if self.workspace == Workspace::Dual { w / 3.0 } else { w * 0.75 };
             let default = w * self.ws.layout.scopes_frac;
+            self.reset_panel(ui, "scopes-br", epoch);
             let panel = egui::Panel::right(("scopes-br", epoch))
                 .resizable(true)
                 .default_size(default.max(220.0))
@@ -2765,6 +2779,7 @@ impl App {
         let layout = self.ws.layout.clone();
         // Without the node graph the strip below the viewer only holds docked scopes (bottom right).
         if layout.show_graph || self.scopes_pos == ScopesPos::BottomRight {
+            self.reset_panel(ui, "graph", epoch);
             let graph = egui::Panel::bottom(("graph", epoch))
                 .resizable(true)
                 .default_size((total * layout.graph_frac).max(200.0))
@@ -2801,8 +2816,10 @@ impl App {
         if !layout.show_inspector && !scopes_column {
             return;
         }
+        self.reset_panel(ui, "right", epoch);
         let panel = egui::Panel::right(("right", epoch)).resizable(true).default_size(layout.inspector_w).size_range(300.0..=900.0).show(ui, |ui| {
             if scopes_column && layout.show_inspector {
+                self.reset_panel(ui, "scopes-col", epoch);
                 let scopes = egui::Panel::bottom(("scopes-col", epoch)).resizable(true).default_size((height * layout.scopes_frac).max(220.0)).size_range(120.0..=(height * 0.8).max(200.0)).show(ui, |ui| self.scopes_ui(ui));
                 if height > 1.0 {
                     self.ws.layout.scopes_frac = (scopes.response.rect.height() / height).clamp(0.1, 0.75);
@@ -2821,6 +2838,7 @@ impl App {
         if !self.ws.layout.show_filmstrip {
             return;
         }
+        self.reset_panel(ui, "filmstrip", epoch);
         let panel = egui::Panel::left(("filmstrip", epoch)).resizable(true).default_size(self.ws.layout.filmstrip_w).size_range(170.0..=420.0).show(ui, |ui| {
             let target = self.primary_target();
             egui::Panel::bottom(("filmstrip-info", epoch)).resizable(false).show_separator_line(true).show(ui, |ui| {
@@ -2892,7 +2910,9 @@ impl App {
                 viewer::paint_clean(ui, texture, size, uv);
             });
         });
-        if self.clean_win.state.open && !clean_out.close && editor_refocused {
+        // Not while the feed is a movable window on the primary display (its display is missing):
+        // raising it would pop it over the editor again and again.
+        if self.clean_win.state.open && !clean_out.close && editor_refocused && !self.clean_win.fallback {
             // Raise without taking keyboard focus from the editor. Immediately
             // restore normal stacking so the feed won't cover other apps later.
             ctx.send_viewport_cmd_to(clean_id, egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
@@ -3006,10 +3026,17 @@ impl eframe::App for App {
         self.resolve_compare_pins();
         self.refresh_gallery();
         self.update_selection_preview(&ctx);
+        if self.frames == 2 && self.cli.capture() {
+            // With --scale the very first frame is laid out in a window of unknown size (thousands of
+            // points), and the panels keep the sizes they got then. Capture runs do not keep panel
+            // sizes anyway, so lay them out again once the window has its requested size.
+            self.ws.reset_panels = true;
+        }
         match self.workspace {
             Workspace::Single => self.layout_single(ui, &mut cmds),
             Workspace::Dual => self.layout_dual(ui, &mut cmds),
         }
+        self.ws.reset_panels = false;
         self.handle_ui_requests(&ctx);
         self.update_selection_preview(&ctx);
         self.shortcuts_window(&ctx);
@@ -3100,8 +3127,8 @@ impl eframe::App for App {
         }
         let mut workspaces = self.ws.store.clone();
         workspaces.session = Some(self.current_spec());
+        storage.set_string(WORKSPACES_KEY, workspaces.to_json());
         let settings = Settings {
-            workspaces,
             workspace: self.workspace,
             viewer: self.viewer_win.state.clone(),
             clean: self.clean_win.state.clone(),
