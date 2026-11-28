@@ -43,6 +43,11 @@ pub trait Backend {
     fn wait_idle(&self);
     /// Frees caches that live outside the images (uploaded grids): the GPU is being released.
     fn free_caches(&mut self) {}
+    /// Frees the scratch textures of a display class that is not being rendered (an idle picture
+    /// size must not hold up to three full-size float textures).
+    fn trim_class(&mut self, _class: &mut Self::Class) {}
+    /// Called once when the session starts: compile what the first drag would otherwise compile.
+    fn warm_up(&mut self) {}
 }
 
 /// `TailOp` -> the GPU crate's `PointOp` (same variants, same meaning; no wildcard on purpose).
@@ -214,7 +219,10 @@ pub struct GpuSession<B: Backend> {
 
 impl<B: Backend> GpuSession<B> {
     /// `unavailable`: why the GPU cannot be used at all (for example no wgpu render state).
-    pub fn new(backend: B, mode: RendererMode, unavailable: Option<String>) -> Self {
+    pub fn new(mut backend: B, mode: RendererMode, unavailable: Option<String>) -> Self {
+        if unavailable.is_none() {
+            backend.warm_up();
+        }
         Self {
             backend,
             bases: Lru::new(MAX_BASES),
@@ -232,6 +240,11 @@ impl<B: Backend> GpuSession<B> {
     /// not there yet, and speculative uploads have not been switched off.
     pub fn wants_preload(&self, key: &BaseKey) -> bool {
         !self.preload_off && !self.backend.device_lost() && matches!(self.fallback.decide(key), Attempt::Try) && !self.bases.contains(key)
+    }
+
+    /// Whether the base of key is on the GPU.
+    pub fn holds(&self, key: &BaseKey) -> bool {
+        self.bases.contains(key)
     }
 
     /// Uploads the base of a neighbour image into a free slot (or the slot of the least recently
@@ -404,6 +417,14 @@ impl<B: Backend> GpuSession<B> {
         // The UI shows the picture as soon as it is told: make sure the work is done.
         self.backend.wait_idle();
         let texture = self.backend.texture_id(class);
+        // Idle display classes (another picture size) give their scratch textures back.
+        for other in self.classes.keys_oldest_first() {
+            if other != (w, h) {
+                if let Some(c) = self.classes.get_mut(&other) {
+                    self.backend.trim_class(c);
+                }
+            }
+        }
         self.last = Some(Last { key: *key, class: (w, h), ops_empty: nodes.is_empty(), display });
         Ok(GpuPicture { texture, width: w, height: h })
     }
@@ -497,6 +518,9 @@ pub mod fake {
         pub fail_class: Option<GpuError>,
         pub fail_render: Option<GpuError>,
         pub lost: Cell<bool>,
+        /// Display classes that were told to give their scratch textures back.
+        pub trims: Vec<(u32, u32)>,
+        pub warmed_up: bool,
         pub max_dim: u32,
         pub next_id: u64,
     }
@@ -569,6 +593,12 @@ pub mod fake {
             Ok(vec![7; c.size.0 as usize * c.size.1 as usize * 4])
         }
         fn wait_idle(&self) {}
+        fn trim_class(&mut self, class: &mut FakeClass) {
+            self.trims.push(class.size);
+        }
+        fn warm_up(&mut self) {
+            self.warmed_up = true;
+        }
     }
 }
 

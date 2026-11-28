@@ -849,13 +849,27 @@ pub fn preload_step<B: Backend>(
     let Some((plan, key)) = preload_key(evaluator, job, id, provider) else {
         return PreloadOutcome::Skipped("the neighbour is not part of the viewed collection");
     };
-    if !gpu.wants_preload(&key) {
+    let wanted = gpu.wants_preload(&key);
+    let has_grid = plan.ops.iter().any(|o| matches!(o, rawgraph_engine::TailOp::LocalTone { .. })) && (wanted || gpu.holds(&key));
+    if !wanted && !has_grid {
         return PreloadOutcome::Skipped("not wanted");
     }
     // The base must be cheap: the decoded proxy itself, or something the CPU made quickly before.
     let is_source = job.graph.node(plan.base).is_some_and(|n| n.kind == rawgraph_core::NodeKind::Source);
     if !is_source && !last_base_ms.is_some_and(|ms| ms <= CHEAP_BASE_MS) {
         return PreloadOutcome::Skipped("the base needs more CPU work than a background upload may cost");
+    }
+    // A local tone needs its 512 px grid when the neighbour is shown: estimate it now, while the
+    // base is in hand (also when the base is on the GPU already), so stepping costs no CPU work.
+    for (i, op) in plan.ops.iter().enumerate() {
+        if matches!(op, rawgraph_engine::TailOp::LocalTone { .. })
+            && evaluator.tail_grid(&job.graph, &plan, i, id, provider, &job.cancel).is_err()
+        {
+            return PreloadOutcome::Abandoned;
+        }
+    }
+    if !wanted {
+        return PreloadOutcome::Skipped("already on the GPU");
     }
     // Protected: the picture on screen and both neighbours.
     let mut protect = Vec::new();

@@ -141,7 +141,8 @@ pub struct Evaluator {
     timing_children: Vec<std::time::Duration>,
     timing_hit: Vec<bool>,
     /// Local tone grids by (image, grid id), see [`Evaluator::tail_grid`].
-    grids: HashMap<(ImageId, u64), Arc<ops::LocalToneGrid>>,
+    /// Least recently used last; kept across images (see `MAX_GRIDS`).
+    grids: Vec<((ImageId, u64), Arc<ops::LocalToneGrid>)>,
 }
 
 /// Local tone grids kept (each is about 0.7 MB at most).
@@ -149,7 +150,7 @@ const MAX_GRIDS: usize = 16;
 
 impl Default for Evaluator {
     fn default() -> Self {
-        Self { cache: HashMap::new(), view_tone: ToneMap::AcesFit, pre_tone: HashMap::new(), grids: HashMap::new(), hits: 0, misses: 0, keep_intermediates: true, timings: None, timing_children: Vec::new(), timing_hit: Vec::new() }
+        Self { cache: HashMap::new(), view_tone: ToneMap::AcesFit, pre_tone: HashMap::new(), grids: Vec::new(), hits: 0, misses: 0, keep_intermediates: true, timings: None, timing_children: Vec::new(), timing_hit: Vec::new() }
     }
 }
 
@@ -520,7 +521,8 @@ impl Evaluator {
     pub fn retain_image(&mut self, image: ImageId) {
         self.cache.retain(|(_, im, _), _| *im == image);
         self.pre_tone.retain(|(_, im, _), _| *im == image);
-        self.grids.retain(|(im, _), _| *im == image);
+        // The grids stay: they are small, keyed by image and base, and stepping A -> B -> A would
+        // otherwise re-evaluate A on the CPU just to rebuild one (they age out in `tail_grid`).
     }
 
     pub fn clear(&mut self) {
@@ -547,9 +549,12 @@ impl Evaluator {
             return Err(EvalError::WrongType { node: plan.base, port: 0 });
         };
         let key = (image, *id);
-        if let Some(g) = self.grids.get(&key) {
+        if let Some(pos) = self.grids.iter().position(|(k, _)| *k == key) {
             self.hits += 1;
-            return Ok(Arc::clone(g));
+            let entry = self.grids.remove(pos);
+            let g = Arc::clone(&entry.1);
+            self.grids.push(entry);
+            return Ok(g);
         }
         let base = self.eval_base(graph, plan, image, provider, cancel)?;
         if cancel.is_cancelled() {
@@ -558,12 +563,12 @@ impl Evaluator {
         let before = apply_tail_cpu(&base, &plan.ops[..index]);
         let grid = ops::local_tone_grid(&before).ok_or(EvalError::Provider("local tone: the image is empty".into()))?;
         self.misses += 1;
-        // A handful of grids (a few images, one per exposure step of a drag) is plenty.
+        // Least recently used out: a few images and one grid per exposure step of a drag fit.
         if self.grids.len() >= MAX_GRIDS {
-            self.grids.clear();
+            self.grids.remove(0);
         }
         let grid = Arc::new(grid);
-        self.grids.insert(key, Arc::clone(&grid));
+        self.grids.push((key, Arc::clone(&grid)));
         Ok(grid)
     }
 
@@ -5717,8 +5722,13 @@ mod tests {
         let moved = ev.tail_grid(&g, &tp3, 1, A, &p, &c).unwrap();
         assert!(!Arc::ptr_eq(&grid, &moved));
         assert_ne!(*grid, *moved);
+        // Stepping to another image and back keeps the grid: no CPU evaluation for it.
         ev.retain_image(B);
-        assert!(Arc::strong_count(&moved) == 1, "retain_image drops the grids of other images");
+        ev.retain_image(A);
+        let calls_before = p.calls();
+        let again = ev.tail_grid(&g, &tp3, 1, A, &p, &c).unwrap();
+        assert!(Arc::ptr_eq(&moved, &again), "the grid survives retain_image");
+        assert_eq!(p.calls(), calls_before, "and costs no provider call or base evaluation");
     }
 
     #[test]

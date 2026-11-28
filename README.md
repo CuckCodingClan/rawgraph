@@ -300,15 +300,17 @@ the CPU for that frame; the status bar then says why.
 | --- | --- | --- |
 | Capture EV, Exposure, White Balance, Saturation, Contrast, Highlights / Shadows, Color Wheels, Tone Curve, Curves (all channels), Hue / Saturation, Vignette, Black & White | pointwise tail, fused into **one pass** | without a connected control map |
 | Develop (exposure, contrast, vibrance, saturation, Legacy tone, white/black, dynamic) | pointwise tail | the base part (white balance, baseline) is the cached CPU base |
-| Develop **Lights / Shadows / White / Black** (non-Legacy local tone) | neighbourhood node | the 512 px guided-filter grid is estimated on the CPU from the base with the exposure gain applied, cached by an id and uploaded once; the per-pixel part runs on the GPU. Dragging Lights, Shadows, White, Black, Contrast or Saturation only re-runs that pass; changing Exposure or the base re-estimates the grid |
+| Develop **Lights / Shadows / White / Black** (non-Legacy local tone) | neighbourhood node | the 512 px guided-filter grid is estimated on the CPU from the base with the exposure gain applied, cached by an id (16 grids, kept across images and also estimated for the neighbours that are preloaded) and uploaded once; the per-pixel part runs on the GPU. Dragging Lights, Shadows, White, Black, Contrast or Saturation re-runs the GPU chain but not the CPU estimate; changing Exposure or the base re-estimates the grid |
 | Filter: Gaussian and Box, low and high pass | neighbourhood node | separable passes; radii from 16 px on use the same box-downscaled approximation as the CPU |
 | Sharpen | neighbourhood node | log-luminance guide, true Gaussian below 4 px, box blur above, soft limiter |
 | Filter with a connected radius map, Filter Lens/Motion/Radial/Diamond/Median/Bilateral, Sharpen with an amount map | CPU base | |
 | Clarity, Noise Reduction, Layer, Lens Correction, Transform, Depth Map, Pixel Sort, anything with a connected control map | CPU base | everything behind such a node still runs on the GPU |
 
-Measured on an RTX 3070 (1280 px picture, slider to frame without the window, median of nine
-moves; `cargo test -p rawgraph-app slider_to_frame -- --ignored --nocapture`, `RG_BENCH_EDGE`
-sets the size): Develop Lights CPU 23.7 ms, GPU 2.5 ms; Filter radius CPU 7.5 ms, GPU 4.9 ms;
+Measured on an RTX 3070 with the headless `slider_to_frame_cpu_against_gpu` test (1280 px
+picture, median of nine slider moves, evaluator time for the CPU, plan + chain + display for the
+GPU, no window; `cargo test -p rawgraph-app slider_to_frame -- --ignored --nocapture`,
+`RG_BENCH_EDGE` sets the size). Dragging Lights re-runs the whole GPU chain every frame; only the
+CPU estimate of the 512 px grid is skipped: Develop Lights CPU 23.7 ms, GPU 2.5 ms; Filter radius CPU 7.5 ms, GPU 4.9 ms;
 Sharpen amount CPU 8.2 ms, GPU 3.0 ms. CPU and GPU pictures of a generated 2560 px test image
 (`cargo run -p rawgraph-app --example gentest`, `--dump-frame`, `--example pngdiff`) differ by at
 most one code value in under 0.07 % of the pixels.
@@ -317,8 +319,16 @@ Intermediate textures: the base is never written. Passes ping-pong between a few
 textures of the base's size that belong to the display class; a third one exists only while an
 operation needs the original next to its blurred copy (high pass, Sharpen after another node), and
 a low-resolution pair only while a blur radius of 16 px or more is in the chain. A frame that needs
-fewer textures frees the rest. An out-of-memory error while allocating one follows the usual rules
-(everything is released, this image is shown on the CPU).
+fewer textures frees the rest, a failed frame frees all of them, and a display class that is not
+being rendered (another preview size) gives its whole pool back after every frame of the active
+class. An out-of-memory error while allocating one first frees this class's pool and the uploaded
+grids and tries once more; only if that fails too, the usual rules apply (everything is released,
+this image is shown on the CPU). The six neighbourhood shaders are compiled when the GPU session
+starts, so the first drag of Lights, Filter or Sharpen does not stall on a shader compile.
+
+Non-finite pixels: the CPU box blur keeps one running sum per row, so a NaN or infinite pixel
+spreads along the rest of its row (and then column); the GPU sums each window separately, so the
+damage stays within the blur radius. Finite pictures (all of them in practice) are not affected.
 
 ### Per-node timing
 

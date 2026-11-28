@@ -105,6 +105,14 @@ fn check(ctx: &GpuContext, name: &str, img: &ImageBuf, nodes: &[GpuNode], cpu: &
     let raw = got.data().iter().zip(cpu.data()).map(|(a, b)| (a - b).abs() / b.abs().max(1.0)).fold(0.0f32, f32::max);
     println!("{name}: max code diff {d}, max relative float diff {raw:.2e}");
     assert!(d <= 1, "{name}: {d} code values off the CPU");
+    // The float result too, not only its 8-bit picture (measured: below 2e-6 everywhere).
+    assert!(raw <= 1e-4, "{name}: relative float difference {raw:.2e}");
+}
+
+/// A grid id that no other test (or image size) shares.
+fn unique_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 fn cpu_high(img: &ImageBuf, sigma: f32, box_kernel: bool) -> ImageBuf {
@@ -133,7 +141,8 @@ fn local_tone_matches_the_cpu() {
         for (i, v) in [[-0.6, 0.5, 0.2, -0.2], [0.0, 0.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, -1.0], [1.0, -1.0, -0.5, 0.7]].into_iter().enumerate() {
             let mut cpu = img.clone();
             ops::develop_local_tone(&mut cpu, v[0], v[1], v[2], v[3]);
-            check(ctx, &format!("local tone {w}x{h} {v:?}"), &img, &[local_tone_node(100 + i as u64, &img, v)], &cpu);
+            let _ = i;
+            check(ctx, &format!("local tone {w}x{h} {v:?}"), &img, &[local_tone_node(unique_id(), &img, v)], &cpu);
         }
     }
 }
@@ -268,4 +277,107 @@ fn a_changed_grid_id_uploads_the_new_grid() {
     assert_eq!((grid.width, grid.height), (120, 80));
     ops::develop_local_tone(&mut cpu, v[0], v[1], v[2], v[3]);
     assert!(display_diff(ctx, &a, &cpu) <= 1);
+}
+
+/// Negative and out-of-gamut pixels in the picture (scene-referred data can have them).
+fn with_negatives(mut img: ImageBuf) -> ImageBuf {
+    let (w, h) = (img.width(), img.height());
+    for y in 0..h {
+        for x in 0..w {
+            if (x * 7 + y * 3) % 17 == 0 {
+                img.set_pixel(x, y, [-0.2, 0.05, 0.4, 1.0]);
+            }
+        }
+    }
+    img
+}
+
+#[test]
+fn the_low_resolution_filter_path_handles_awkward_sizes() {
+    let (ctx, _g) = gpu!();
+    // Odd sizes (partial border blocks), a scale of 8 and 16, images narrower than the scale, one pixel wide or high.
+    for (w, h, sigma) in [(301u32, 203u32, 20.0f32), (257, 131, 33.0), (300, 200, 70.0), (310, 190, 140.0), (3, 200, 70.0), (5, 120, 40.0), (200, 3, 70.0), (1, 64, 20.0), (64, 1, 20.0), (1, 1, 20.0), (2, 2, 16.0)] {
+        let img = with_negatives(photo_like(w.max(2), h.max(2)).clone());
+        let img = if w == 1 || h == 1 { crop_to(&img, w, h) } else { img };
+        for (box_kernel, high) in [(false, false), (true, true), (false, true)] {
+            let cpu = if high { cpu_high(&img, sigma, box_kernel) } else { ops::filter_low(&img, sigma, box_kernel) };
+            check(ctx, &format!("{w}x{h} sigma {sigma} box {box_kernel} high {high}"), &img, &[GpuNode::Filter(FilterOp { sigma, box_kernel, high })], &cpu);
+        }
+    }
+}
+
+fn crop_to(img: &ImageBuf, w: u32, h: u32) -> ImageBuf {
+    let mut out = ImageBuf::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            out.set_pixel(x, y, img.pixel(x, y));
+        }
+    }
+    out
+}
+
+#[test]
+fn small_and_negative_inputs_match_for_the_other_operations() {
+    let (ctx, _g) = gpu!();
+    for (w, h) in [(1u32, 40u32), (40, 1), (7, 5), (301, 203)] {
+        let img = crop_to(&with_negatives(photo_like(301.max(w), 203.max(h))), w, h);
+        let cpu = rawgraph_fx::sharpen(&img, 0.9, 6.0, 0.1, None);
+        check(ctx, &format!("sharpen {w}x{h}"), &img, &[GpuNode::Sharpen(SharpenOp { amount: 0.9, radius_px: 6.0, threshold: 0.1 })], &cpu);
+        let cpu = rawgraph_fx::sharpen(&img, 0.9, 2.0, 0.0, None);
+        check(ctx, &format!("sharpen small radius {w}x{h}"), &img, &[GpuNode::Sharpen(SharpenOp { amount: 0.9, radius_px: 2.0, threshold: 0.0 })], &cpu);
+        let mut cpu = img.clone();
+        ops::develop_local_tone(&mut cpu, -0.5, 0.6, 0.2, -0.3);
+        check(ctx, &format!("local tone {w}x{h}"), &img, &[local_tone_node(unique_id(), &img, [-0.5, 0.6, 0.2, -0.3])], &cpu);
+    }
+}
+
+#[test]
+fn a_failed_frame_frees_the_pool_and_a_released_pool_comes_back() {
+    let (ctx, _g) = gpu!();
+    let img = photo_like(64, 48);
+    let base = GpuImage::upload(ctx, &img).unwrap();
+    let mut sc = ChainScratch::new();
+    // A grid whose data does not match its size fails after the first node has taken a texture.
+    let bad = GpuNode::LocalTone(LocalToneOp {
+        id: unique_id(),
+        grid: Arc::new(ops::LocalToneGrid { width: 4, height: 4, coeff: vec![0.0; 3] }),
+        highlights: 0.1,
+        shadows: 0.0,
+        whites: 0.0,
+        blacks: 0.0,
+    });
+    let nodes = [GpuNode::Point(vec![PointOp::Gain(2.0)]), GpuNode::Filter(FilterOp { sigma: 20.0, box_kernel: false, high: true }), bad];
+    assert!(run_chain(ctx, &base, &mut sc, &nodes).is_err());
+    assert_eq!(sc.image_count(), 0, "an error leaves nothing allocated");
+    assert!(!sc.has_small());
+    run_chain(ctx, &base, &mut sc, &nodes[..2]).unwrap();
+    assert!(sc.image_count() > 0);
+    sc.release();
+    assert_eq!((sc.image_count(), sc.has_small()), (0, false));
+    // And the pool works again after a release.
+    assert_eq!(run_chain(ctx, &base, &mut sc, &nodes[..1]).unwrap(), Loc::Scratch(0));
+}
+
+#[test]
+fn warm_up_compiles_the_neighbourhood_pipelines_once() {
+    let _g = exclusive();
+    let Ok(ctx) = GpuContext::new() else {
+        println!("skipped: no GPU adapter");
+        return;
+    };
+    let before = ctx.pipelines_created();
+    rawgraph_gpu::warm_up_neighbourhood(&ctx);
+    assert_eq!(ctx.pipelines_created() - before, 6);
+    let img = photo_like(300, 200);
+    let base = GpuImage::upload(&ctx, &img).unwrap();
+    let nodes = [
+        local_tone_node(unique_id(), &img, [0.3, 0.2, 0.1, 0.0]),
+        GpuNode::Filter(FilterOp { sigma: 20.0, box_kernel: false, high: true }),
+        GpuNode::Sharpen(SharpenOp { amount: 0.5, radius_px: 6.0, threshold: 0.0 }),
+    ];
+    let after = ctx.pipelines_created();
+    apply_chain_to_cpu(&ctx, &base, &nodes).unwrap();
+    assert_eq!(ctx.pipelines_created(), after, "the first drag and the first 16 px crossing compile nothing");
+    rawgraph_gpu::warm_up_neighbourhood(&ctx);
+    assert_eq!(ctx.pipelines_created(), after, "a second warm-up is free");
 }

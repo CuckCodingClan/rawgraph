@@ -3,7 +3,7 @@
 //! the secondary windows.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -391,6 +391,41 @@ struct Bench {
     /// Path of the newest bench frame ("GPU" / "CPU").
     path_label: String,
     done_deadline: Option<Instant>,
+    /// The graph before the Lights / Filter / Sharpen phases, put back before the Steps phase so
+    /// that it measures the same graph as before those phases existed.
+    graph_snapshot: Option<Graph>,
+}
+
+/// How long `--bench` waits for the first picture before it gives up.
+const BENCH_WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+/// Frames the UI has drawn and whether the benchmark got past its Wait phase (read by the watchdog,
+/// which also fires when no frame is drawn at all, e.g. for a minimized or locked window).
+static BENCH_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BENCH_STARTED: AtomicBool = AtomicBool::new(false);
+/// What the Wait phase last saw: bit 0 CLI options applied, 1 scan finished, 2 no render pending, 3 images listed, 4 a render was requested.
+static BENCH_WAIT_BITS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `--bench` gives up with a clear message and exit code 2 when the first picture does not appear.
+fn bench_watchdog() {
+    let _ = std::thread::Builder::new().name("bench-watchdog".into()).spawn(|| {
+        std::thread::sleep(BENCH_WAIT_LIMIT);
+        if !BENCH_STARTED.load(Ordering::Relaxed) {
+            eprintln!(
+                "BENCH gave up: no picture was shown {} s after the start ({} frames drawn; waiting for: {}). Use a folder with images, \
+--select-image 0 and a window that is visible and not minimized (a hidden window gets no frames).",
+                BENCH_WAIT_LIMIT.as_secs(),
+                BENCH_FRAMES.load(Ordering::Relaxed),
+                {
+                    let bits = BENCH_WAIT_BITS.load(Ordering::Relaxed);
+                    let names = ["CLI options applied", "folder scan finished", "render queue idle", "images in the list", "first render request"];
+                    let missing: Vec<&str> = names.iter().enumerate().filter(|(i, _)| bits & (1 << i) == 0).map(|(_, n)| *n).collect();
+                    if missing.is_empty() { "nothing".to_owned() } else { missing.join(", ") }
+                }
+            );
+            std::process::exit(2);
+        }
+    });
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -694,6 +729,9 @@ impl App {
         let cli_export_folder = cli.export_folder.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
         let shot = cli.capture().then(|| Shot { path: cli.screenshot.clone(), dump: cli.dump_frame.clone(), dump_sent: false, dump_done: false, requested: false, rx: None, reply_at: None, started: Instant::now() });
         let cli_first_frame = cli.bench_first_frame.is_some().then(|| ff_driver::Driver::new(&cli));
+        if cli.bench {
+            bench_watchdog();
+        }
         let bench = cli.bench.then(|| Bench {
             phase: BenchPhase::Wait,
             idx: 0,
@@ -721,6 +759,7 @@ impl App {
             drag_scopes: Vec::new(),
             path_label: String::new(),
             done_deadline: None,
+            graph_snapshot: None,
         });
 
         let app_autosave_secs = cli.autosave_interval.unwrap_or(60);
@@ -1938,16 +1977,32 @@ impl App {
     fn bench_step(&mut self, ctx: &egui::Context) {
         let Some(mut b) = self.bench.take() else { return };
         ctx.request_repaint();
+        // A minimized (or occluded) window gets no frames, so the run would never advance.
+        if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        }
         let phase_before = b.phase;
         let n = self.session.visible().len();
         let event = b.event.take();
         let matches = |ev: Option<(ImageId, f32, f32)>, id: ImageId| ev.filter(|e| e.0 == id);
         match b.phase {
             BenchPhase::Wait => {
+                let bits = [self.cli_applied, self.scan.is_none(), !self.renderer.pending(), n > 0, self.last_key.is_some()];
+                BENCH_WAIT_BITS.store(bits.iter().enumerate().fold(0u8, |a, (i, b)| a | (u8::from(*b) << i)), Ordering::Relaxed);
+                // Nothing is rendered without a node to view (this is why a plain `--bench --open-folder`
+                // run never started): view the Output node, or else the last node of the graph.
+                if self.cli_applied && self.session.selected_node.is_none() {
+                    let g = &self.session.project.graph;
+                    let pick = g.nodes().find(|n| n.kind == NodeKind::Output).or_else(|| g.nodes().last()).map(|n| n.id);
+                    if pick.is_some() {
+                        self.session.selected_node = pick;
+                    }
+                }
                 if self.cli_applied && self.scan.is_none() && !self.renderer.pending() && n > 0 && self.last_key.is_some() {
                     self.session.select_index(stride_index(0, n));
                     b.idx = 0;
                     b.phase = BenchPhase::Uncached;
+                    BENCH_STARTED.store(true, Ordering::Relaxed);
                     self.session.provider.clear_cache();
                     self.prefetch.forget();
                     // Render even if the first image is already selected.
@@ -1955,6 +2010,18 @@ impl App {
                     b.event = None;
                 } else {
                     b.event = event;
+                    if b.started.elapsed() > BENCH_WAIT_LIMIT {
+                        eprintln!(
+                            "BENCH gave up: no picture was shown {} s after the start ({} images in the list, scan {}, CLI options {}, a render request {}). \
+Use a folder with images, --select-image 0 and a visible window (a minimized window gets no frames).",
+                            BENCH_WAIT_LIMIT.as_secs(),
+                            n,
+                            if self.scan.is_none() { "finished" } else { "still running" },
+                            if self.cli_applied { "applied" } else { "not applied" },
+                            if self.last_key.is_some() { "was made" } else { "was never made" },
+                        );
+                        std::process::exit(2);
+                    }
                 }
             }
             BenchPhase::Uncached | BenchPhase::Cached => {
@@ -2303,6 +2370,14 @@ impl App {
     /// Starts `phase` when the graph has a node of the kind it changes, else goes on to the next one.
     fn bench_enter(&mut self, b: &mut Bench, mut phase: BenchPhase) {
         loop {
+            if matches!(phase, BenchPhase::DevelopLights | BenchPhase::FilterRadius | BenchPhase::SharpenAmount) && b.graph_snapshot.is_none() {
+                b.graph_snapshot = Some(self.session.project.graph.clone());
+            }
+            if phase == BenchPhase::Steps {
+                if let Some(graph) = b.graph_snapshot.take() {
+                    self.session.project.graph = graph;
+                }
+            }
             let kind = match phase {
                 BenchPhase::Develop | BenchPhase::DevelopExposure | BenchPhase::DevelopContrast | BenchPhase::DevelopLights => Some(NodeKind::Develop),
                 BenchPhase::ToneCurve => Some(NodeKind::ToneCurve),
@@ -2356,13 +2431,24 @@ impl App {
         if let Some(n) = g.nodes().find(|n| n.kind == kind) {
             return Some(n.id);
         }
-        let out = g.nodes().find(|n| n.kind == NodeKind::Output).map(|n| n.id)?;
-        let (up, up_port) = g.input_edge(out, 0)?;
-        let node = g.add_node(kind, [200.0, 140.0]);
-        g.connect(up, node, 0).ok()?;
-        g.connect(node, out, 0).ok()?;
-        let _ = up_port;
-        Some(node)
+        let node_pos = [200.0, 140.0];
+        let output = g.nodes().find(|n| n.kind == NodeKind::Output).map(|n| n.id);
+        match output {
+            Some(out) => {
+                let (up, up_port) = g.input_edge(out, 0)?;
+                let node = g.add_node(kind, node_pos);
+                g.connect_ports(up, up_port, node, 0).ok()?;
+                g.connect(node, out, 0).ok()?;
+                Some(node)
+            }
+            // The default graph has no Output node: continue after its last node.
+            None => {
+                let last = g.nodes().last().map(|n| n.id)?;
+                let node = g.add_node(kind, node_pos);
+                g.connect(last, node, 0).ok()?;
+                Some(node)
+            }
+        }
     }
 
     /// One slider / point move of the Tone Curve, Curve or Hue / Saturation phase of the benchmark.
@@ -3100,12 +3186,17 @@ impl eframe::App for App {
         crate::splash::finish();
         let ctx = ui.ctx().clone();
         self.frames += 1;
+        BENCH_FRAMES.store(self.frames, Ordering::Relaxed);
         if self.frames == 20 && self.shot.is_some() {
             eprintln!("window content rect (points): {:?}, pixels per point {}", ctx.content_rect(), ctx.pixels_per_point());
         }
         self.poll_displays(frame, &ctx);
         if !self.startup_done {
             self.startup();
+            if self.cli.bench {
+                // A benchmark started from a script may get a minimized window, which gets no frames.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            }
             if let Some((w, h)) = self.cli.size {
                 // The builder size alone is not always honoured; ask again.
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
