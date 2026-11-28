@@ -3089,6 +3089,8 @@ impl eframe::App for App {
         self.session.reconcile_image_selection();
         let mut cmds = self.handle_shortcuts(&ctx);
         if self.prompt.is_none() && !self.save_flow.is_open() {
+            // A K request of the last frame for a keyword panel that was not drawn is dropped.
+            self.filmstrip.end_frame();
             self.handle_culling(&ctx);
             self.handle_compare_keys(&ctx);
         }

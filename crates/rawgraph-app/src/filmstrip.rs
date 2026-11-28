@@ -54,6 +54,8 @@ pub struct Filmstrip {
     pub xmp_banner: Option<usize>,
     /// The keyword panel under the list (K focuses its add field).
     pub keyword_panel: crate::keyword_panel::KeywordPanel,
+    /// The keyword panel was drawn since the last [`Filmstrip::end_frame`].
+    keyword_panel_drawn: bool,
     /// The tree of the keyword filter popup, rebuilt only when the images change and the popup is open.
     keyword_tree: crate::keyword_panel::Memo<(u64, usize, usize), Vec<crate::keyword_panel::TreeRow>>,
 }
@@ -65,7 +67,7 @@ pub(crate) fn gallery_keyboard_available(ctx: &egui::Context) -> bool {
 
 impl Filmstrip {
     pub fn with_thumbs(thumbs: ThumbLoader, live: crate::live_thumbs::LiveThumbs) -> Self {
-        Self { thumbs, live, live_wanted: Vec::new(), live_visible: 0, last_selected: None, last_range: 0..0, scan_wanted: Vec::new(), scan_hash_pending: false, actions: Vec::new(), xmp_banner: None, keyword_panel: Default::default(), keyword_tree: Default::default() }
+        Self { thumbs, live, live_wanted: Vec::new(), live_visible: 0, last_selected: None, last_range: 0..0, scan_wanted: Vec::new(), scan_hash_pending: false, actions: Vec::new(), xmp_banner: None, keyword_panel: Default::default(), keyword_panel_drawn: false, keyword_tree: Default::default() }
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
@@ -331,6 +333,16 @@ impl Filmstrip {
     /// The keyword panel for the selected images, shown under the details.
     pub fn keywords_ui(&mut self, ui: &mut egui::Ui, session: &mut Session) {
         self.keyword_panel.show(ui, session);
+        self.keyword_panel_drawn = true;
+    }
+
+    /// Called once per frame after the panels: a K request for a panel that was not drawn is dropped
+    /// (it must not grab the focus later, when the panel appears).
+    pub fn end_frame(&mut self) {
+        if !self.keyword_panel_drawn {
+            self.keyword_panel.focus_add = false;
+        }
+        self.keyword_panel_drawn = false;
     }
 
     /// Details of the selected image, shown under the list.

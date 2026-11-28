@@ -101,11 +101,15 @@ pub fn rows(selection: &[&ImageEntry]) -> Vec<Row> {
     use std::collections::{HashMap, HashSet};
     let mut within: HashMap<String, usize> = HashMap::new();
     let mut exact: HashMap<String, usize> = HashMap::new();
-    let mut all: HashSet<&str> = HashSet::new();
+    // In selection order, so the spelling shown for keywords that differ only in case is always the first one.
+    let mut all: Vec<&str> = Vec::new();
+    let mut listed: HashSet<&str> = HashSet::new();
     for e in selection {
         let mut seen: HashSet<String> = HashSet::new();
         for k in &e.keywords {
-            all.insert(k);
+            if listed.insert(k) {
+                all.push(k);
+            }
             let key = keyword_key(k);
             for (i, _) in key.match_indices('|') {
                 if seen.insert(key[..i].to_owned()) {

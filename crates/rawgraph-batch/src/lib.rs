@@ -1015,7 +1015,8 @@ fn run_batch(
             let status = catch_unwind(AssertUnwindSafe(|| run_item(&ctx, &mut ev, &provider, job, &plan, &reserved, &mut item_warnings)))
                 .unwrap_or_else(|_| ItemStatus::Failed("internal error while processing this image".into()));
             if matches!(status, ItemStatus::Written { .. }) {
-                report.warnings.extend(item_warnings.into_iter().map(|w| (job.item.id, w)));
+                let name = job.item.source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                report.warnings.extend(item_warnings.into_iter().map(|w| (job.item.id, if name.is_empty() { w } else { format!("{name}: {w}") })));
             }
             status
         };

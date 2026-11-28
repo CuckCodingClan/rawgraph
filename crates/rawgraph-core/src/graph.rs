@@ -1241,6 +1241,8 @@ pub enum GraphError {
     TypeMismatch { expected: PortType, found: PortType },
     WouldCycle,
     UnsupportedVersion(u32),
+    /// A sub-graph (clipboard, recipe) of a newer format.
+    UnsupportedSubgraphVersion(u32),
     Parse(String),
 }
 
@@ -1256,6 +1258,9 @@ impl std::fmt::Display for GraphError {
             GraphError::WouldCycle => write!(f, "connection would create a cycle"),
             GraphError::UnsupportedVersion(v) => {
                 write!(f, "graph format version {v} is newer than this build supports ({GRAPH_FORMAT_VERSION})")
+            }
+            GraphError::UnsupportedSubgraphVersion(v) => {
+                write!(f, "sub-graph format version {v} is newer than this build supports ({SUBGRAPH_FORMAT_VERSION})")
             }
             GraphError::Parse(e) => write!(f, "graph file is not valid: {e}"),
         }
@@ -2153,6 +2158,10 @@ impl Graph {
     /// The list is empty for a graph that needed no changes.
     pub fn from_json_with_notes(text: &str) -> Result<(Self, Vec<String>), GraphError> {
         let mut value: serde_json::Value = serde_json::from_str(text).map_err(|e| GraphError::Parse(e.to_string()))?;
+        // Before anything is parsed: a newer file may hold node kinds or data this build does not know.
+        if let Some(v) = value.get("format_version").and_then(serde_json::Value::as_u64).filter(|v| *v > u64::from(GRAPH_FORMAT_VERSION)) {
+            return Err(GraphError::UnsupportedVersion(u32::try_from(v).unwrap_or(u32::MAX)));
+        }
         let notes = crate::migrate::migrate_graph(&mut value)?;
         let mut graph: Graph = serde_json::from_value(value).map_err(|e| GraphError::Parse(e.to_string()))?;
         if graph.format_version > GRAPH_FORMAT_VERSION {
@@ -2345,10 +2354,13 @@ impl Subgraph {
     /// (copied or saved as a recipe before the mask nodes were removed).
     pub fn from_json_with_notes(text: &str) -> Result<(Subgraph, Vec<String>), GraphError> {
         let mut value: serde_json::Value = serde_json::from_str(text).map_err(|e| GraphError::Parse(e.to_string()))?;
+        if let Some(v) = value.get("format_version").and_then(serde_json::Value::as_u64).filter(|v| *v > u64::from(SUBGRAPH_FORMAT_VERSION)) {
+            return Err(GraphError::UnsupportedSubgraphVersion(u32::try_from(v).unwrap_or(u32::MAX)));
+        }
         let notes = crate::migrate::migrate_subgraph(&mut value)?;
         let sub: Subgraph = serde_json::from_value(value).map_err(|e| GraphError::Parse(e.to_string()))?;
         if sub.format_version > SUBGRAPH_FORMAT_VERSION {
-            return Err(GraphError::UnsupportedVersion(sub.format_version));
+            return Err(GraphError::UnsupportedSubgraphVersion(sub.format_version));
         }
         for (i, e) in sub.edges.iter().enumerate() {
             if e.from >= sub.nodes.len() || e.to >= sub.nodes.len() {
@@ -4117,7 +4129,7 @@ mod tests {
         };
         assert!(matches!(Subgraph::from_json("nope"), Err(GraphError::Parse(_))));
         assert!(matches!(Subgraph::from_json("{}"), Err(GraphError::Parse(_))));
-        assert_eq!(load(&|v| v["format_version"] = json!(99)), Err(GraphError::UnsupportedVersion(99)));
+        assert_eq!(load(&|v| v["format_version"] = json!(99)), Err(GraphError::UnsupportedSubgraphVersion(99)));
         parse_err(load(&|v| v["nodes"][0]["kind"] = json!("Teleporter")), "Teleporter");
         parse_err(load(&|v| v["nodes"][0]["all"]["ev"] = json!(9.0)), "outside -6..6");
         parse_err(load(&|v| v["nodes"][0]["all"]["nope"] = json!(1.0)), "unknown parameter");

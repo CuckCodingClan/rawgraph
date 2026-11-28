@@ -1082,7 +1082,8 @@ fn a_huge_keyword_list_is_cut_for_jpeg_and_reported() {
     let report = run(&g, out, &items, &s);
     assert_eq!(report.written(), 1, "{:?}", report.items);
     let fit = rawgraph_io::jpeg_embeddable_keywords(&keywords).len();
-    assert_eq!(report.warnings, vec![(ImageId(1), format!("{} keywords not embedded (JPEG XMP limit)", 2000 - fit))]);
+    let name = items[0].source.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(report.warnings, vec![(ImageId(1), format!("{name}: {} keywords not embedded (JPEG XMP limit)", 2000 - fit))], "the warning names the image");
     let packet = rawgraph_io::read_xmp_packet(&written_path(&report.items[0].1)).unwrap_or_default();
     assert!(packet.contains("keyword number 00000") && !packet.contains("keyword number 01999"), "the end of the list is dropped");
 }

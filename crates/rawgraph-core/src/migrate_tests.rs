@@ -789,3 +789,15 @@ fn a_build_before_keywords_reports_this_format_as_newer() {
     let text = Graph::new().to_json().replace("\"format_version\": 5", "\"format_version\": 6");
     assert!(matches!(Graph::from_json(&text), Err(GraphError::UnsupportedVersion(6))));
 }
+
+#[test]
+fn a_newer_file_is_refused_before_its_contents_are_read() {
+    // A future node kind or data variant must give "newer", not "not valid".
+    let g = format!(r#"{{"format_version": {}, "nodes": {{"1": {{"kind": "SomethingFromTheFuture"}}}}, "edges": []}}"#, crate::GRAPH_FORMAT_VERSION + 1);
+    assert_eq!(Graph::from_json(&g), Err(GraphError::UnsupportedVersion(crate::GRAPH_FORMAT_VERSION + 1)));
+    let sub = format!(r#"{{"format_version": {}, "nodes": [{{"kind": "SomethingFromTheFuture"}}], "edges": []}}"#, crate::graph::SUBGRAPH_FORMAT_VERSION + 1);
+    let err = crate::Subgraph::from_json(&sub).unwrap_err();
+    assert_eq!(err, GraphError::UnsupportedSubgraphVersion(crate::graph::SUBGRAPH_FORMAT_VERSION + 1));
+    assert!(err.to_string().contains(&format!("({})", crate::graph::SUBGRAPH_FORMAT_VERSION)), "{err}");
+}
+
