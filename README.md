@@ -330,6 +330,10 @@ changes the photo on screen. Space+drag and the middle button still pan.
   centre-to-half-diagonal metric): the bright ring is the midpoint, the faint inner and
   outer rings are where the feather starts and reaches full strength. Drag the midpoint
   knob (top right) or a feather knob (bottom right).
+- **Filter (Motion kernel):** an arrow from the image centre points along the blur; the
+  faint line through the centre shows the streak length (the radius). Drag the arrow head
+  to set Motion angle. Hidden when a Direction (RGB) map is connected or another kernel is
+  chosen.
 
 ### Pixel Sort
 

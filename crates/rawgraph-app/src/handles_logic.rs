@@ -24,6 +24,8 @@ pub enum Part {
     FeatherInner,
     /// Vignette outer feather ring (full effect).
     FeatherOuter,
+    /// Filter motion direction arrow.
+    Motion,
 }
 
 // ------------------------------------------------------------------ gradient
@@ -188,6 +190,24 @@ pub fn vignette_drag(part: Part, d: f32, midpoint: f32, feather: f32) -> (f32, f
     }
 }
 
+// --------------------------------------------------------------- filter arrow
+
+/// Unit direction of the motion blur in normalised frame units for a `angle` in degrees
+/// (pixel space, positive y down, as `filter_sampled_direction` samples) scaled to `len`
+/// pixels.
+pub fn motion_vector(angle_deg: f32, len_px: f32, size: [f32; 2]) -> [f32; 2] {
+    let (s, c) = angle_deg.to_radians().sin_cos();
+    if size[0] <= 0.0 || size[1] <= 0.0 { return [0.0, 0.0]; }
+    [c * len_px / size[0], s * len_px / size[1]]
+}
+
+/// Motion angle (0..360 degrees) pointing from the frame centre to `p`.
+pub fn motion_angle(p: [f32; 2], size: [f32; 2], fallback: f32) -> f32 {
+    let (dx, dy) = ((p[0] - 0.5) * size[0], (p[1] - 0.5) * size[1]);
+    if dx.hypot(dy) < 1e-3 { return fallback; }
+    dy.atan2(dx).to_degrees().rem_euclid(360.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +300,16 @@ mod tests {
         let (m, f) = vignette_drag(Part::FeatherOuter, 0.8, 0.5, 0.4);
         assert!((m - 0.5).abs() < 1e-6 && (f - 0.6).abs() < 1e-6);
         assert_eq!(vignette_drag(Part::FeatherInner, 2.0, 0.5, 0.4).1, 1.0);
+    }
+
+    #[test]
+    fn motion_arrow_angle_round_trips() {
+        let size = [300.0, 200.0];
+        for angle in [0.0f32, 30.0, 90.0, 200.0, 315.0] {
+            let v = motion_vector(angle, 50.0, size);
+            let back = motion_angle([0.5 + v[0], 0.5 + v[1]], size, 0.0);
+            assert!((back - angle).abs() < 1e-3, "{angle} -> {back}");
+        }
+        assert_eq!(motion_angle([0.5, 0.5], size, 42.0), 42.0, "the centre keeps the angle");
     }
 }

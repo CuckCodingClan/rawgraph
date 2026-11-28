@@ -18,6 +18,8 @@ use crate::viewer::Geometry;
 
 /// Hit radius of a handle, in screen points.
 const HIT: f32 = 10.0;
+/// Screen length of the motion direction arrow.
+const ARROW: f32 = 56.0;
 const HOT: Color32 = Color32::from_rgb(255, 210, 90);
 
 /// The settings a node's handles stand for.
@@ -25,11 +27,13 @@ const HOT: Color32 = Color32::from_rgb(255, 210, 90);
 pub enum Model {
     Gradient(Gradient),
     Vignette { midpoint: f32, feather: f32 },
+    /// Motion angle in degrees; `radius` of the blur in pixels of the node's frame.
+    Motion { angle: f32, radius: f32 },
 }
 
 /// The handle settings of `node` for `image`, `None` when the node has no handles (or they
 /// mean nothing in its current state). `size`: pixel size of the node's frame.
-pub fn model_of(_graph: &Graph, node: &Node, image: ImageId, _size: [f32; 2]) -> Option<Model> {
+pub fn model_of(graph: &Graph, node: &Node, image: ImageId, size: [f32; 2]) -> Option<Model> {
     let p = |name: &str| node.param(name, image);
     match node.kind {
         NodeKind::Generator if node.choice("type", image) == 0 => Some(Model::Gradient(Gradient {
@@ -40,8 +44,16 @@ pub fn model_of(_graph: &Graph, node: &Node, image: ImageId, _size: [f32; 2]) ->
             vertical: node.toggle("vertical", image),
         })),
         NodeKind::Vignette => Some(Model::Vignette { midpoint: p("midpoint"), feather: p("feather") }),
+        NodeKind::Blur if node.choice("kernel", image) == 3 && !direction_connected(graph, node) => {
+            Some(Model::Motion { angle: p("angle"), radius: p("radius") / 1000.0 * size[0].max(size[1]) })
+        }
         _ => None,
     }
+}
+
+/// A connected Direction (RGB) map overrides the motion angle.
+fn direction_connected(graph: &Graph, node: &Node) -> bool {
+    node.exposed_inputs().iter().enumerate().any(|(i, e)| e.as_ref().is_some_and(|e| e.parameter == "direction") && graph.input_edge(node.id, node.kind.inputs().len() + i).is_some())
 }
 
 /// The parts of a model, in hit priority order.
@@ -49,6 +61,7 @@ fn parts(model: &Model) -> &'static [Part] {
     match model {
         Model::Gradient(g) => g.parts(),
         Model::Vignette { .. } => &[Part::Midpoint, Part::FeatherOuter, Part::FeatherInner],
+        Model::Motion { .. } => &[Part::Motion],
     }
 }
 
@@ -63,6 +76,7 @@ pub fn drag_values(start: &Model, part: Part, n: [f32; 2], size: [f32; 2]) -> Ve
             let (m, f) = logic::vignette_drag(part, logic::vignette_distance(n, size), midpoint, feather);
             vec![("midpoint", m), ("feather", f)]
         }
+        Model::Motion { angle, .. } => vec![("angle", logic::motion_angle(n, size, angle))],
     }
 }
 
@@ -74,6 +88,7 @@ pub fn reset_names(model: &Model, part: Part) -> &'static [&'static str] {
         (Model::Gradient(_), _) => &["gradient_angle", "gradient_scale"],
         (Model::Vignette { .. }, Part::Midpoint) => &["midpoint"],
         (Model::Vignette { .. }, _) => &["feather"],
+        (Model::Motion { .. }, _) => &["angle"],
     }
 }
 
@@ -152,7 +167,19 @@ fn part_position(model: &Model, part: Part, f: &NodeFrame) -> Pos2 {
             let (d, upper) = match part { Part::Midpoint => (m, true), Part::FeatherInner => (e0, false), _ => (e1, false) };
             f.to_screen(logic::vignette_knob(d, f.size, upper))
         }
+        Model::Motion { angle, .. } => {
+            let (c, dir) = motion_screen(*angle, f);
+            c + dir * ARROW
+        }
     }
+}
+
+/// Screen centre and screen unit direction of the motion blur.
+fn motion_screen(angle: f32, f: &NodeFrame) -> (Pos2, Vec2) {
+    let c = f.to_screen([0.5, 0.5]);
+    let v = logic::motion_vector(angle, f.size[0].max(f.size[1]) * 0.1, f.size);
+    let d = f.to_screen([0.5 + v[0], 0.5 + v[1]]) - c;
+    (c, if d.length() > 1e-6 { d.normalized() } else { Vec2::X })
 }
 
 fn hit(positions: &[(Part, Pos2)], p: Pos2) -> Option<Part> {
@@ -344,6 +371,22 @@ fn paint(ui: &egui::Ui, viewport: Rect, model: &Model, f: &NodeFrame, positions:
             for (part, p) in positions {
                 knob(&painter, *p, *part == Part::Midpoint, hot == Some(*part), if *part == Part::Midpoint { 5.5 } else { 4.5 });
             }
+        }
+        Model::Motion { angle, radius } => {
+            let (c, dir) = motion_screen(*angle, f);
+            // The streak: how far the blur reaches on either side, in the picture's pixels.
+            let v = logic::motion_vector(*angle, *radius, f.size);
+            let (a, b) = (f.to_screen([0.5 - v[0], 0.5 - v[1]]), f.to_screen([0.5 + v[0], 0.5 + v[1]]));
+            if a.distance(b) > 2.0 {
+                line(&painter, a, b, false);
+            }
+            let tip = c + dir * ARROW;
+            line(&painter, c, tip, true);
+            let n = Vec2::new(-dir.y, dir.x);
+            let color = if hot == Some(Part::Motion) { HOT } else { Color32::WHITE };
+            let head = vec![tip + dir * 4.0, tip - dir * 7.0 + n * 5.5, tip - dir * 7.0 - n * 5.5];
+            painter.add(egui::Shape::convex_polygon(head, color, Stroke::new(1.0, Color32::from_black_alpha(160))));
+            knob(&painter, c, false, false, 3.5);
         }
     }
 }

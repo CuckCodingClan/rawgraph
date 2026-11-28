@@ -274,6 +274,25 @@ fn feather_ring_sets_the_feather_and_double_click_resets_it() {
 }
 
 #[test]
+fn the_motion_arrow_appears_only_for_motion_blur_and_sets_the_angle() {
+    let mut v = View::new(NodeKind::Blur);
+    assert!(v.model().is_none(), "Gaussian has no direction");
+    v.set("kernel", 3.0);
+    assert!(matches!(v.model(), Some(Model::Motion { .. })));
+    let c = v.at([0.5, 0.5]);
+    let tip = c + Vec2::new(ARROW, 0.0);
+    v.drag_screen(tip, c + Vec2::new(0.0, ARROW));
+    assert!((v.param("angle") - 90.0).abs() < 1.0, "pointing down is 90 degrees: {}", v.param("angle"));
+    v.double_click(c + Vec2::new(0.0, ARROW));
+    assert_eq!(v.param("angle"), 0.0);
+    // A connected Direction (RGB) map overrides the angle: no arrow.
+    let port = v.s.project.graph.expose_parameter(v.node, "direction", rawgraph_core::PortType::Images).unwrap();
+    let map = v.s.project.graph.add_node(NodeKind::Generator, [0.0, 0.0]);
+    v.s.project.graph.connect(map, v.node, port).unwrap();
+    assert!(v.model().is_none());
+}
+
+#[test]
 fn handles_map_through_a_downstream_crop() {
     let mut v = View::new(NodeKind::Generator);
     v.s.project.graph.disconnect(v.node, 0);
