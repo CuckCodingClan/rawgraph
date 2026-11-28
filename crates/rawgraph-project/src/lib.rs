@@ -33,6 +33,8 @@ mod tests;
 mod tests_extra;
 #[cfg(test)]
 mod tests_project;
+#[cfg(test)]
+mod tests_inplace;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -342,6 +344,54 @@ impl Project {
     /// Folders scanned into the project, in the order they were first scanned.
     pub fn folders(&self) -> &[SourceFolder] {
         &self.folders
+    }
+
+    /// Makes this copy of the project continue where `from` is in its commit
+    /// history: revision, history and the "migrated from" note are taken over.
+    ///
+    /// A background scan works on a copy of the project and hands it back when
+    /// it is done. If the original was saved (committed) meanwhile, the copy
+    /// still carries the old revision and history; swapping it in unchanged
+    /// would make the next save conflict with the file the user saved
+    /// themselves. Call this before swapping.
+    pub fn inherit_versioning(&mut self, from: &Project) {
+        self.revision = from.revision;
+        self.history = from.history.clone();
+        self.migrated_from = from.migrated_from;
+    }
+
+    /// Adds the images a running scan has found so far (`found`, any order) and
+    /// replaces the entries it has already changed. Entries for ids that are
+    /// older than the newest entry and unknown here are ignored (the image was
+    /// removed meanwhile). Keeps ids strictly ascending and the id counter ahead
+    /// of every id. Returns how many entries were added or replaced.
+    pub fn merge_found(&mut self, found: &[ImageEntry]) -> usize {
+        let mut sorted: Vec<&ImageEntry> = found.iter().collect();
+        sorted.sort_by_key(|e| e.id);
+        let mut merged = 0;
+        for entry in sorted {
+            if let Some(i) = self.index_of(entry.id) {
+                if self.images[i] != *entry {
+                    self.images[i] = entry.clone();
+                    merged += 1;
+                }
+            } else if self.images.last().is_none_or(|last| last.id < entry.id) {
+                self.next_image_id = self.next_image_id.max(entry.id.0 + 1);
+                self.images.push(entry.clone());
+                merged += 1;
+            }
+        }
+        merged
+    }
+
+    /// Records `folder` as scanned (what a scan does first), for a project that
+    /// is saved while the scan is still running.
+    pub fn note_scanned_folder(&mut self, folder: &Path, recursive: bool) {
+        if let Ok(absolute) = std::path::absolute(folder) {
+            if absolute.is_dir() {
+                self.note_folder(&absolute, recursive);
+            }
+        }
     }
 
     fn note_folder(&mut self, folder: &Path, recursive: bool) {
@@ -709,9 +759,11 @@ impl Project {
     /// Writes the current state (images, graph, folders, revision and history,
     /// schema 2) into one SQLite file, replacing its previous content, without
     /// a new revision and without any conflict check (see [`Project::commit`]).
-    /// The new file is written next to the target and swapped in, so a failure
-    /// leaves an existing project file untouched. An existing file of another
-    /// schema version is first copied to `<name>.v<N>.bak`.
+    /// An existing file of this project in the current schema is updated in
+    /// place in one transaction (only what differs is written); any other
+    /// target gets a complete new file that is written next to it and swapped
+    /// in, so a failure leaves an existing project file untouched. An existing
+    /// file of another schema version is first copied to `<name>.v<N>.bak`.
     pub fn save(&self, path: &Path) -> Result<(), ProjectError> {
         store::save(self, path)
     }
@@ -727,12 +779,13 @@ impl Project {
     /// project with a higher revision than [`Project::revision`] gives
     /// [`ProjectError::Conflict`], a file of another project gives
     /// [`ProjectError::Mismatch`]; nothing is written then. A missing target
-    /// is simply created. Everything is written in one transaction and the
-    /// file is swapped in atomically; if the write fails the project stays
+    /// is simply created. An existing file of this project in the current
+    /// schema is updated in place, in one transaction (rollback journal): the
+    /// conflict check runs inside that transaction under the write lock, so
+    /// check and write are one atomic step. Any other existing target is
+    /// replaced by a complete new file that is swapped in atomically. If the
+    /// write fails the file keeps its old content and the project stays
     /// unchanged. Returns the new revision.
-    ///
-    /// The check and the swap are not one atomic step: two commits at the very
-    /// same moment can both pass the check (there is no locking).
     pub fn commit(&mut self, path: &Path, summary: &str) -> Result<u64, ProjectError> {
         self.commit_impl(path, summary, false)
     }
@@ -743,10 +796,50 @@ impl Project {
         self.commit_impl(path, summary, true)
     }
 
+    /// The history with the entry of `revision` appended (limits applied).
+    fn log_with_commit(&self, revision: u64, summary: &str) -> history::HistoryLog {
+        let mut log = self.history.clone();
+        log.push(
+            HistoryEntry {
+                revision,
+                time_unix_ms: ids::now_ms(),
+                author: ids::author_name(),
+                device: ids::device_name(),
+                summary: summary.to_string(),
+                has_graph: true,
+            },
+            self.graph.to_json(),
+            history::MAX_HISTORY_ENTRIES,
+            history::MAX_SNAPSHOT_BYTES,
+        );
+        log
+    }
+
     fn commit_impl(&mut self, path: &Path, summary: &str, overwrite: bool) -> Result<u64, ProjectError> {
         let mut base = self.revision;
-        match std::fs::metadata(path) {
-            Ok(meta) if meta.is_file() => {
+        let meta = std::fs::metadata(path);
+        if meta.as_ref().is_ok_and(|m| m.is_file()) {
+            // Fast path: the file is a current-schema file of this project. It is
+            // updated in place in one transaction, and the conflict check runs
+            // inside that transaction (atomic with the write).
+            let own = self.revision;
+            let outcome = store::update_in_place(self, path, &mut |disk| {
+                if !overwrite && disk.revision > own {
+                    return Err(ProjectError::Conflict { disk_revision: disk.revision, loaded_revision: own });
+                }
+                let base = if overwrite { own.max(disk.revision) } else { own };
+                let revision = base.checked_add(1).ok_or_else(|| ProjectError::Database("revision overflow".into()))?;
+                Ok((revision, self.log_with_commit(revision, summary)))
+            })?;
+            if let store::InPlace::Written { revision, log } = outcome {
+                self.revision = revision;
+                self.history = log;
+                self.migrated_from = None;
+                return Ok(revision);
+            }
+        }
+        match meta {
+            Ok(m) if m.is_file() => {
                 let disk = store::read_identity(path);
                 if overwrite {
                     if let Ok(d) = disk {
@@ -792,20 +885,7 @@ impl Project {
         }
 
         let revision = base.checked_add(1).ok_or_else(|| ProjectError::Database("revision overflow".into()))?;
-        let mut log = self.history.clone();
-        log.push(
-            HistoryEntry {
-                revision,
-                time_unix_ms: ids::now_ms(),
-                author: ids::author_name(),
-                device: ids::device_name(),
-                summary: summary.to_string(),
-                has_graph: true,
-            },
-            self.graph.to_json(),
-            history::MAX_HISTORY_ENTRIES,
-            history::MAX_SNAPSHOT_BYTES,
-        );
+        let log = self.log_with_commit(revision, summary);
         store::write_file(self, &store::Versioning { revision, log: &log }, path, &[], true)?;
         self.revision = revision;
         self.history = log;

@@ -15,13 +15,14 @@
 //! never damages the file on disk; the test `migration_chain_is_complete`
 //! fails if a step is missing.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rawgraph_core::{CaptureInfo, Graph, ImageId};
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, ErrorCode, OpenFlags, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use crate::history::{HistoryEntry, HistoryLog};
 use crate::{ids, ColorLabel, Flag, ImageEntry, Project, ProjectError, SourceFolder, SCHEMA_VERSION};
@@ -216,8 +217,16 @@ fn write_all(
     tx.commit().map_err(db_err)
 }
 
-/// Writes the project's current state (its own revision and history).
+/// Writes the project's current state (its own revision and history). An
+/// existing file of the same project and the current schema is updated in
+/// place (only what differs); anything else is written as a whole new file.
 pub(crate) fn save(project: &Project, path: &Path) -> Result<(), ProjectError> {
+    if path.is_file() {
+        let own = (project.revision, project.history.clone());
+        if let InPlace::Written { .. } = update_in_place(project, path, &mut |_| Ok(own.clone()))? {
+            return Ok(());
+        }
+    }
     let ver = Versioning { revision: project.revision, log: &project.history };
     write_file(project, &ver, path, &[], true)
 }
@@ -262,7 +271,7 @@ pub(crate) fn write_file(
 
 /// Schema version recorded in a project file, `None` if it is not readable as one.
 fn file_schema_version(path: &Path) -> Option<u32> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let conn = open_read(path).ok()?;
     let text: String = conn
         .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
         .optional()
@@ -314,7 +323,7 @@ pub(crate) struct DiskIdentity {
 }
 
 pub(crate) fn read_identity(path: &Path) -> Result<DiskIdentity, ProjectError> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db_err)?;
+    let conn = open_read(path).map_err(db_err)?;
     let version = read_version(&conn)?;
     // Schema 1 has no project id; a newer schema is not interpreted.
     if !(2..=SCHEMA_VERSION).contains(&version) {
@@ -370,7 +379,7 @@ pub(crate) fn load(path: &Path) -> Result<Project, ProjectError> {
     if !meta.is_file() {
         return Err(ProjectError::Io(format!("{} is not a file", path.display())));
     }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db_err)?;
+    let conn = open_read(path).map_err(db_err)?;
     let version = read_version(&conn)?;
     if version > SCHEMA_VERSION {
         return Err(ProjectError::TooNew { file_version: version, supported: SCHEMA_VERSION });
@@ -617,7 +626,7 @@ fn read_current(conn: &Connection) -> Result<Project, ProjectError> {
 
 /// All `meta` rows of a project file plus its image count, read-only.
 pub(crate) fn read_meta(path: &Path) -> Result<(std::collections::HashMap<String, String>, usize), ProjectError> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db_err)?;
+    let conn = open_read(path).map_err(db_err)?;
     let mut map = std::collections::HashMap::new();
     {
         let mut stmt = conn.prepare("SELECT key, value FROM meta").map_err(db_err)?;
@@ -634,4 +643,362 @@ pub(crate) fn read_meta(path: &Path) -> Result<(std::collections::HashMap<String
 #[cfg(test)]
 pub(crate) fn migration_steps() -> Vec<u32> {
     MIGRATIONS.iter().map(|(f, _)| *f).collect()
+}
+
+// ------------------------------------------------------------------ in-place update
+
+/// How long a writer waits for another process that holds the file locked.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+// Test hook (per thread): the next in-place update fails after all rows were written but
+// before the transaction is committed (crash-safety tests).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Decides revision and history of an in-place update from the identity of the file (or refuses).
+pub(crate) type Prepare<'a> = dyn FnMut(&DiskIdentity) -> Result<(u64, HistoryLog), ProjectError> + 'a;
+
+/// Outcome of [`update_in_place`].
+pub(crate) enum InPlace {
+    /// The file now holds the project, with this revision and history.
+    Written { revision: u64, log: HistoryLog },
+    /// The target is not a current-schema file of this project (or cannot be
+    /// updated row by row): the caller writes the whole file instead.
+    NotApplicable,
+}
+
+/// Internal: why a row-by-row update stopped.
+enum DiffError {
+    /// A constraint did not allow the row-wise change; a full rewrite will do it.
+    Fallback,
+    Fatal(ProjectError),
+}
+
+impl From<rusqlite::Error> for DiffError {
+    fn from(e: rusqlite::Error) -> Self {
+        if matches!(&e, rusqlite::Error::SqliteFailure(f, _) if f.code == ErrorCode::ConstraintViolation) {
+            DiffError::Fallback
+        } else {
+            DiffError::Fatal(db_err(e))
+        }
+    }
+}
+
+impl From<ProjectError> for DiffError {
+    fn from(e: ProjectError) -> Self {
+        DiffError::Fatal(e)
+    }
+}
+
+fn identity_in(conn: &Connection) -> Option<DiskIdentity> {
+    let version = read_version(conn).ok()?;
+    if version != SCHEMA_VERSION {
+        return None;
+    }
+    let uuid = get_meta(conn, "project_uuid").ok()??;
+    let revision = parse_revision(conn).ok()?;
+    Some(DiskIdentity { version, uuid: Some(uuid), revision })
+}
+
+/// Updates an existing project file of the current schema in place, in ONE
+/// transaction of SQLite's rollback journal: only the image rows, the graph,
+/// the folders and the `meta` values that differ are written, history entries
+/// are appended (pruned ones deleted), old ones are not rewritten.
+///
+/// The transaction takes the write lock first (`BEGIN IMMEDIATE`), reads the
+/// file's identity under that lock and hands it to `prepare`, which decides
+/// the new revision and history or refuses (the revision/conflict check). So
+/// the check and the write are one atomic step with respect to other writers.
+/// A failure of any kind rolls the transaction back and leaves the old content.
+///
+/// The rollback journal (not WAL) is used on purpose: WAL needs shared memory
+/// and does not work on network shares (SMB/NFS) or synced folders; the
+/// rollback journal is a plain file next to the project file.
+pub(crate) fn update_in_place(
+    project: &Project,
+    path: &Path,
+    prepare: &mut Prepare<'_>,
+) -> Result<InPlace, ProjectError> {
+    let Ok(mut conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE) else {
+        return Ok(InPlace::NotApplicable);
+    };
+    let _ = conn.busy_timeout(BUSY_TIMEOUT);
+    let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+        Ok(tx) => tx,
+        Err(e) => {
+            return match &e {
+                rusqlite::Error::SqliteFailure(f, _) if matches!(f.code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) => Ok(InPlace::NotApplicable),
+                _ => Err(db_err(e)),
+            };
+        }
+    };
+    let Some(identity) = identity_in(&tx) else { return Ok(InPlace::NotApplicable) };
+    if identity.uuid.as_deref() != Some(project.uuid.as_str()) {
+        return Ok(InPlace::NotApplicable);
+    }
+    let (revision, log) = prepare(&identity)?;
+    match apply_diff(&tx, project, &Versioning { revision, log: &log }) {
+        Ok(()) => {}
+        Err(DiffError::Fallback) => return Ok(InPlace::NotApplicable),
+        Err(DiffError::Fatal(e)) => return Err(e),
+    }
+    #[cfg(test)]
+    if FAIL_BEFORE_COMMIT.with(|f| f.replace(false)) {
+        return Err(ProjectError::Database("injected failure before commit".into()));
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(InPlace::Written { revision, log })
+}
+
+/// One `images` row without its position.
+#[derive(PartialEq)]
+struct ImageRow {
+    uuid: String,
+    path: String,
+    hash: String,
+    size: i64,
+    mtime: Option<i64>,
+    capture: String,
+    rating: i64,
+    flag: String,
+    label: Option<String>,
+    missing: i64,
+}
+
+fn image_row(e: &ImageEntry) -> Result<ImageRow, ProjectError> {
+    let path = e
+        .path
+        .to_str()
+        .ok_or_else(|| ProjectError::Io(format!("path {} is not valid UTF-8", e.path.display())))?;
+    Ok(ImageRow {
+        uuid: e.uuid.clone(),
+        path: path.to_owned(),
+        hash: e.content_hash.clone(),
+        size: to_i64(e.file_size, "file size")?,
+        mtime: e.modified_unix_ms,
+        capture: serde_json::to_string(&e.capture).map_err(|err| ProjectError::Corrupt(err.to_string()))?,
+        rating: i64::from(e.rating),
+        flag: flag_to_text(e.flag).to_owned(),
+        label: e.color_label.map(label_to_text).map(str::to_owned),
+        missing: i64::from(e.missing),
+    })
+}
+
+fn apply_diff(tx: &Connection, project: &Project, ver: &Versioning<'_>) -> Result<(), DiffError> {
+    {
+        let mut up = tx.prepare(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value IS NOT excluded.value",
+        )?;
+        up.execute(params!["application", "rawgraph"])?;
+        up.execute(params!["schema_version", SCHEMA_VERSION.to_string()])?;
+        up.execute(params!["next_image_id", project.next_image_id.to_string()])?;
+        up.execute(params!["project_uuid", project.uuid])?;
+        up.execute(params!["revision", ver.revision.to_string()])?;
+    }
+    diff_images(tx, project)?;
+    diff_graph(tx, project)?;
+    diff_folders(tx, project)?;
+    diff_history(tx, ver)?;
+    Ok(())
+}
+
+fn diff_images(tx: &Connection, project: &Project) -> Result<(), DiffError> {
+    let mut old: HashMap<i64, (i64, ImageRow)> = HashMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, position, uuid, path, content_hash, file_size, modified_unix_ms, capture, rating, flag, color_label, missing FROM images",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                ImageRow {
+                    uuid: r.get(2)?,
+                    path: r.get(3)?,
+                    hash: r.get(4)?,
+                    size: r.get(5)?,
+                    mtime: r.get(6)?,
+                    capture: r.get(7)?,
+                    rating: r.get(8)?,
+                    flag: r.get(9)?,
+                    label: r.get(10)?,
+                    missing: r.get(11)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, pos, fields) = row?;
+            old.insert(id, (pos, fields));
+        }
+    }
+    let mut new: Vec<(i64, i64, ImageRow)> = Vec::with_capacity(project.images.len());
+    for (pos, e) in project.images.iter().enumerate() {
+        new.push((to_i64(e.id.0, "image id")?, to_i64(pos as u64, "position")?, image_row(e)?));
+    }
+    // 1. Rows that are gone.
+    {
+        let keep: HashSet<i64> = new.iter().map(|(id, _, _)| *id).collect();
+        let mut del = tx.prepare("DELETE FROM images WHERE id = ?1")?;
+        for id in old.keys().filter(|id| !keep.contains(id)) {
+            del.execute(params![id])?;
+        }
+    }
+    // 2. Rows that change position leave their old slot first, so no two rows
+    //    ever share a position (the key) halfway through.
+    {
+        let mut park = tx.prepare("UPDATE images SET position = ?1 WHERE id = ?2")?;
+        for (id, pos, _) in &new {
+            if old.get(id).is_some_and(|(old_pos, _)| old_pos != pos) {
+                park.execute(params![-pos - 1, id])?;
+            }
+        }
+    }
+    // 3. New rows, changed rows, rows that only moved.
+    let mut ins = tx.prepare(
+        "INSERT INTO images (position, id, uuid, path, content_hash, file_size, capture, rating, flag, color_label, missing, modified_unix_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )?;
+    let mut upd = tx.prepare(
+        "UPDATE images SET position = ?1, uuid = ?3, path = ?4, content_hash = ?5, file_size = ?6, capture = ?7, rating = ?8, flag = ?9,
+                color_label = ?10, missing = ?11, modified_unix_ms = ?12 WHERE id = ?2",
+    )?;
+    let mut mv = tx.prepare("UPDATE images SET position = ?1 WHERE id = ?2")?;
+    for (id, pos, r) in &new {
+        let values = params![pos, id, r.uuid, r.path, r.hash, r.size, r.capture, r.rating, r.flag, r.label, r.missing, r.mtime];
+        match old.get(id) {
+            None => {
+                ins.execute(values)?;
+            }
+            Some((_, old_fields)) if old_fields != r => {
+                upd.execute(values)?;
+            }
+            Some((old_pos, _)) if old_pos != pos => {
+                mv.execute(params![pos, id])?;
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn diff_graph(tx: &Connection, project: &Project) -> Result<(), DiffError> {
+    let json = project.graph.to_json();
+    let old: Option<String> = tx.query_row("SELECT json FROM graph WHERE id = 1", [], |r| r.get(0)).optional()?;
+    match old {
+        Some(old) if old == json => {}
+        Some(_) => {
+            tx.execute("UPDATE graph SET json = ?1 WHERE id = 1", params![json])?;
+        }
+        None => {
+            tx.execute("INSERT INTO graph (id, json) VALUES (1, ?1)", params![json])?;
+        }
+    }
+    Ok(())
+}
+
+fn diff_folders(tx: &Connection, project: &Project) -> Result<(), DiffError> {
+    let mut new: Vec<(String, i64)> = Vec::new();
+    for f in &project.folders {
+        let path = f
+            .path
+            .to_str()
+            .ok_or_else(|| ProjectError::Io(format!("path {} is not valid UTF-8", f.path.display())))?;
+        new.push((path.to_owned(), i64::from(f.recursive)));
+    }
+    let old: Vec<(String, i64)> = {
+        let mut stmt = tx.prepare("SELECT path, recursive FROM folders ORDER BY position")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    if old == new {
+        return Ok(());
+    }
+    tx.execute("DELETE FROM folders", [])?;
+    let mut ins = tx.prepare("INSERT INTO folders (position, path, recursive) VALUES (?1, ?2, ?3)")?;
+    for (pos, (path, recursive)) in new.iter().enumerate() {
+        ins.execute(params![to_i64(pos as u64, "position")?, path, recursive])?;
+    }
+    Ok(())
+}
+
+fn diff_history(tx: &Connection, ver: &Versioning<'_>) -> Result<(), DiffError> {
+    /// What a stored history row looks like without reading its snapshot.
+    #[derive(PartialEq)]
+    struct Meta {
+        time: i64,
+        author: String,
+        device: String,
+        summary: String,
+    }
+    let mut old: HashMap<i64, (Meta, Option<i64>)> = HashMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT revision, time_unix_ms, author, device, summary, length(CAST(graph_json AS BLOB)) FROM history",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                Meta { time: r.get(1)?, author: r.get(2)?, device: r.get(3)?, summary: r.get(4)? },
+                r.get::<_, Option<i64>>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (revision, meta, len) = row?;
+            old.insert(revision, (meta, len));
+        }
+    }
+    let mut revisions = HashSet::new();
+    for e in &ver.log.entries {
+        revisions.insert(to_i64(e.revision, "revision")?);
+    }
+    {
+        let mut del = tx.prepare("DELETE FROM history WHERE revision = ?1")?;
+        for revision in old.keys().filter(|r| !revisions.contains(r)) {
+            del.execute(params![revision])?;
+        }
+    }
+    let mut put = tx.prepare(
+        "INSERT OR REPLACE INTO history (revision, time_unix_ms, author, device, summary, graph_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    let mut drop_snapshot = tx.prepare("UPDATE history SET graph_json = NULL WHERE revision = ?1")?;
+    for (e, snap) in ver.log.entries.iter().zip(&ver.log.snapshots) {
+        let revision = to_i64(e.revision, "revision")?;
+        let meta = Meta { time: e.time_unix_ms, author: e.author.clone(), device: e.device.clone(), summary: e.summary.clone() };
+        let new_len = snap.as_ref().map(|s| i64::try_from(s.len()).unwrap_or(i64::MAX));
+        match old.get(&revision) {
+            Some((old_meta, old_len)) if *old_meta == meta && *old_len == new_len => {}
+            Some((old_meta, Some(_))) if *old_meta == meta && snap.is_none() => {
+                drop_snapshot.execute(params![revision])?;
+            }
+            _ => {
+                put.execute(params![revision, e.time_unix_ms, e.author, e.device, e.summary, snap.as_deref()])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Opens a project file for reading. A rollback journal next to it (`<name>-journal`)
+/// means a commit was interrupted (crash, power loss): SQLite then has to roll
+/// the file back before anyone reads it, which needs write access, so the file is
+/// opened read-write first (nothing is written unless a rollback is needed).
+/// Without such a journal, or when the file is not writable, it is opened read-only.
+fn open_read(path: &Path) -> rusqlite::Result<Connection> {
+    let mut journal: OsString = path.as_os_str().to_owned();
+    journal.push("-journal");
+    if Path::new(&journal).exists() {
+        if let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE) {
+            let _ = conn.busy_timeout(BUSY_TIMEOUT);
+            // Any read triggers the rollback of a hot journal.
+            if conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).is_ok() {
+                return Ok(conn);
+            }
+        }
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let _ = conn.busy_timeout(BUSY_TIMEOUT);
+    Ok(conn)
 }

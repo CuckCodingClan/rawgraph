@@ -233,14 +233,15 @@ fn quitting_with_unsaved_changes_and_a_conflict_does_not_close() {
 }
 
 #[test]
-fn a_save_during_a_scan_waits() {
+fn a_save_during_a_scan_goes_through_and_saves_what_was_found() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session_with_images(dir.path(), 1);
     s.begin_scan();
     let mut flow: SaveFlow<Act> = SaveFlow::default();
     let out = flow.save(&mut s, &dir.path().join("x.rawgraph"), None);
-    assert!(matches!(out, Outcome::Failed(ref m) if m.contains("scan")), "{out:?}");
-    assert!(!dir.path().join("x.rawgraph").exists());
+    assert!(matches!(out, Outcome::Saved { revision: 1, .. }), "{out:?}");
+    assert!(dir.path().join("x.rawgraph").exists());
+    assert!(s.scanning, "the scan goes on");
 }
 
 // ------------------------------------------------------------------ A3: another project's file

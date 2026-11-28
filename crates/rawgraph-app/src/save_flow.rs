@@ -57,10 +57,6 @@ impl<P: Clone> SaveFlow<P> {
     }
 
     fn attempt(&mut self, session: &mut Session, target: &Path, then: Option<P>, overwrite: bool) -> Outcome<P> {
-        if session.scanning {
-            self.stage = Stage::Idle;
-            return Outcome::Failed("Wait until the folder scan has finished, then save".to_owned());
-        }
         match session.commit_project(target, overwrite) {
             Ok(revision) => {
                 self.stage = Stage::Idle;

@@ -14,8 +14,50 @@ part of it.
 | `folders` | `position` INTEGER PK, `path` TEXT, `recursive` 0/1: folders that were scanned into the project |
 | `history` | `revision` INTEGER PK, `time_unix_ms`, `author`, `device`, `summary` (all NOT NULL), `graph_json` TEXT NULL (the graph of that revision, NULL once dropped) |
 
-A file is always written as a whole, in one transaction, into `<name>.saving`
-and then renamed over the target. A failed write leaves the old file in place.
+## How a file is written
+
+Two ways, both all-or-nothing:
+
+- **In place** (`commit`, `commit_overwrite`, `save` onto an existing file that
+  belongs to the same project and has the current schema version): one SQLite
+  transaction updates the file where it lies. Only rows that differ are written:
+  changed or new `images` rows (matched by `id`; rows that only moved get a new
+  `position`), the `graph` row if its JSON changed, `folders` if the list changed,
+  the `meta` values that changed, and the new `history` entry. Old history entries
+  are not rewritten; pruned ones are deleted; a snapshot dropped for size is set to
+  NULL. What differs is found by reading the file's rows inside the transaction
+  and comparing them with the project (a few MB for thousands of images), not by
+  tracking edits, so the result is the same as a full write whatever happened
+  before. A failure (error, crash, power loss) rolls the transaction back and the
+  file keeps its old content. If a row-wise change is impossible (a constraint
+  fails) the full write below is used instead.
+- **Full write** (new file, "save as" to a new path, another project's file,
+  schema migration, recovery copies): the whole database is written into
+  `<name>.saving` in one transaction and renamed over the target. A failed write
+  leaves the old file in place. A file of an older schema is first copied to
+  `<name>.v<N>.bak`.
+
+### Journal mode
+
+In-place updates use SQLite's default **rollback journal** (`journal_mode = DELETE`),
+with the write lock taken up front (`BEGIN IMMEDIATE`) and a 5 s busy timeout.
+WAL is deliberately not used: it needs shared memory (`-shm`) that does not work
+across machines, so it is unsafe on SMB/NFS shares and on synced folders
+(Nextcloud, Dropbox). The rollback journal is a plain file `<name>.rawgraph-journal`
+next to the project that exists only during a commit; a copy of the file taken
+while it exists must be taken together with it. If a commit is interrupted the
+journal stays, and the next opener rolls the file back: the loaders open a file
+that has a journal read-write once so SQLite can do this (nothing is written when
+there is nothing to roll back; a read-only share gives an error instead of reading
+a half-written file). Deleted history entries leave free pages inside the file;
+they are reused by later commits, but the file does not shrink until it is written
+in full (e.g. "save as").
+
+Measured (dev build, local SSD): a project with 4,000 images and 100 history
+entries of a 300 KB graph (a 31 MB file), one parameter change saved: full
+rewrite about 60 ms and 32 MB written; in place about 30 ms and about 0.6 MB of
+changed pages plus the same amount in the journal. On a network share the written
+volume matters far more than the time on a local disk.
 
 ## What is stored, what is not
 
@@ -66,7 +108,7 @@ and then renamed over the target. A failed write leaves the old file in place.
 ## Revisions, history, limits
 
 - `revision` starts at 0 and is the number of the last commit. `commit(path, summary)`
-  writes images, graph, folders and history in one transaction, increments the
+  writes images, graph, folders and history in one transaction (in place, see "How a file is written"), increments the
   revision and appends a history entry: revision, time, author (OS user name from
   `USERNAME`/`USER`/`LOGNAME`), device (`COMPUTERNAME`/`HOSTNAME`, else `/etc/hostname`;
   `unknown` if none), summary, and a snapshot of the graph JSON.
@@ -91,8 +133,27 @@ an existing file first reads that file's `project_uuid` and `revision`:
 - schema 1 file: accepted only for a project that was loaded from a schema 1 file.
 
 `commit_overwrite` skips these checks; its revision is `max(own, disk) + 1`, so a number is
-not reused. The check and the rename are separate steps, so two commits at the same
-instant can both pass. After a `Conflict` the caller reloads, or uses `commit_overwrite`.
+not reused. For an in-place commit the check runs inside the write transaction, after the
+write lock is taken: check and write are one atomic step, so of several commits from the same
+base revision exactly one succeeds and the others get `Conflict` (tested with parallel
+writers). The check and the swap of a full write (new file, other project, old schema) are
+still separate steps; two of those at the same instant can both pass. After a `Conflict` the
+caller reloads, or uses `commit_overwrite`.
+
+An application that works on a copy of the project in the background (the folder scan) must
+hand the commit state back: `Project::inherit_versioning` takes revision and history from the
+original before the copy replaces it, otherwise a save made in the meantime looks like a
+foreign change at the next save.
+
+### Saving during a folder scan
+
+The scan runs on a copy of the project. A save while it runs first takes the images
+found so far (`Project::merge_found`) and the scanned folder into the project, so the
+file holds what the user sees; entries whose hash or metadata is not read yet are stored
+as pending (empty hash, `scan_pending` in `capture`) and are picked up by the next scan
+of that folder. When the scan finishes, its copy inherits revision and history
+(`Project::inherit_versioning`), so the next save is a normal commit, not a conflict.
+Recovery copies written by autosave during a scan contain the images found so far too.
 
 ## Collaboration foundations
 
@@ -109,7 +170,7 @@ or shared store, no asset-availability handling beyond the per-image `missing` f
 - Works with the current revision check, no server. Whole-file replacement means the
   last writer to pass the check wins; sync tools that copy files while SQLite is
   being written, or that create "conflicted copy" files, bypass the check.
-- A file of 2000+ images is rewritten per commit; two people editing different images
+- A commit rewrites only the changed rows (see "How a file is written"); two people editing different images
   still conflict. Data model consequences: none needed now; per-row timestamps would
   allow a three-way merge of ratings/flags later.
 

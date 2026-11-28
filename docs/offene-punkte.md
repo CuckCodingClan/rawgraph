@@ -60,14 +60,14 @@ Offen geblieben und nicht begonnen: Frage 15 (Benennung aus deiner Beschriftungs
 - **GPU-Vorschau:** Develop-Regler, Belichtung, Kontrast, Kurven (alle sieben Arten), Farbton/Sättigung, Farbräder, Vignette und die Anzeige laufen auf der GPU. Layer, Lens Correction, Weichzeichner, Rauschminderung, Schärfen, Klarheit, Zuschneiden, alles mit Maske, die Vergleichsansicht und der Export laufen auf der CPU.
 - **Bildwechsel** wird durch das Vorladen der Nachbarbilder nur um 7–11 ms schneller.
 - **Pinsel reagiert träge:** rund 50 ms von der Mausbewegung bis zum Bild bei 30 Strichen; im Fenster nicht nachgemessen.
-- **Speichern während eines Ordner-Scans** wird abgelehnt („erst nach dem Scan“). Bei einem langen NAS-Scan heißt das warten.
-- **Jedes Speichern schreibt die ganze Projektdatei neu,** samt Verlauf bis 32 MB.
+- **Speichern während eines Ordner-Scans** geht jetzt: gespeichert wird, was bis dahin gefunden ist; der Scan läuft weiter und ergänzt danach ohne falschen Konflikt (Revision und Verlauf werden übernommen). Noch nicht fertig gehashte Bilder stehen als „ausstehend“ in der Datei und werden beim nächsten Scan nachgeholt.
+- **Speichern schreibt nur Geändertes:** eine vorhandene Projektdatei (gleiches Projekt, aktuelles Schema) wird in einer Transaktion im Rollback-Journal an Ort und Stelle aktualisiert (geänderte Bildzeilen, Graph, neuer Verlaufseintrag). Die Datei wird dabei gelesen (Bildzeilen und Graph zum Vergleich), das kostet auf dem NAS einige MB Leseverkehr. Gelöschte Verlaufseinträge verkleinern die Datei nicht; „Speichern unter“ schreibt sie neu und kompakt.
 - **Statuszeile:** Der Text „autosave“ wird bei langen Meldungen rechts überdeckt.
 - **Schärfen in der verkleinerten Vorschau kaum sichtbar;** beurteilen lässt es sich nur bei 100 %.
 - **Weichzeichner mit großem Radius** rechnet auf einem verkleinerten Bild; Abweichung 1–2 %, vor allem am Rand.
-- **Rückgängig-Speicher** hält bis zu 200 vollständige Graph-Kopien; mit Tausenden Pinselstrichen wird das groß.
+- **Rückgängig-Speicher** teilt unveränderte Knoten zwischen den bis zu 200 Schritten (Arc, Kopie beim Schreiben). Wird derselbe Knoten in jedem Schritt geändert (z. B. Strich für Strich in einem Draw-Knoten mit Tausenden Strichen), hält jeder Schritt weiterhin eine Kopie dieses einen Knotens; Teilen auf Strichebene wäre der nächste Schritt.
 - **Erster Scan auf dem NAS:** rund 35 ms je Datei, also etwa zwei Minuten für 3.700 Bilder.
-- **XMP-Import** liest Begleitdateien nacheinander; auf dem NAS bei Tausenden Bildern langsam.
+- **XMP-Import** liest Begleitdateien mit einem eigenen Pool aus 8 Threads (nicht mehr auf dem Render-Pool); Ergebnis und Reihenfolge sind unabhängig vom Tempo der einzelnen Dateien.
 - **Arbeitsspeicher beim Export:** 1,4 GB je Bild, mit Rauschminderung in voller Größe 3,1 GB; ein Layer-Bild braucht das je Ebene.
 - **Vorschaubilder** beachten Farbprofile der Eingabedatei nicht.
 - **Weitergabe-Paket:** nicht signiert (Windows warnt beim Start), kein Installer, auf keinem zweiten Rechner gestartet.

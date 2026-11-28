@@ -177,10 +177,10 @@ impl App {
             }
         }
         let token = (self.history.changes() << 32) ^ self.session.edit_gen;
-        let tick = Tick { now, dirty: self.session.dirty && !self.session.demo && !self.session.scanning, token, focused: ctx.input(|i| i.viewport().focused.unwrap_or(true)) };
+        let tick = Tick { now, dirty: self.session.dirty && !self.session.demo, token, focused: ctx.input(|i| i.viewport().focused.unwrap_or(true)) };
         if self.autosave.due(tick) && self.autosave_job.is_none() {
             self.autosave.started(token);
-            self.autosave_job = Some(WriteJob::start(self.session.project.clone(), self.dirs.recovery(), self.session.project_path.clone(), self.session_key.clone(), ctx.clone()));
+            self.autosave_job = Some(WriteJob::start(self.session.saveable_project(), self.dirs.recovery(), self.session.project_path.clone(), self.session_key.clone(), ctx.clone()));
         }
         if self.autosave.busy() || self.session.dirty {
             ctx.request_repaint_after(Duration::from_secs(1));

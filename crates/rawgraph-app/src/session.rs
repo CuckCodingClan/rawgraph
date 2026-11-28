@@ -196,6 +196,8 @@ pub struct Session {
     scan_map: HashMap<ImageId, ImageEntry>,
     pub scan_count: Option<(String, bool, usize)>,
     scan_edits: HashMap<ImageId, Edit>,
+    /// Folder and sub-folder flag of the running scan (recorded in the project when it is saved meanwhile).
+    pub scan_folder: Option<(PathBuf, bool)>,
     /// Collection info for the graph (filled by the background worker).
     pub collection: CollectionResult,
     /// Bumped whenever the set of images or their metadata changes.
@@ -243,6 +245,7 @@ impl Session {
             scan_map: HashMap::new(),
             scan_count: None,
             scan_edits: HashMap::new(),
+            scan_folder: None,
             collection: CollectionResult::default(),
             images_gen: 1,
             capture_cache: None,
@@ -269,6 +272,7 @@ impl Session {
         self.project_path = None;
         self.dirty = false;
         self.scanning = false;
+        self.scan_folder = None;
         self.scan_map.clear();
         self.scan_edits.clear();
         self.selected_node = None;
@@ -603,6 +607,37 @@ impl Session {
         self.scan_count = None;
         self.scan_map.clear();
         self.scan_edits.clear();
+        self.scan_folder = None;
+    }
+
+    /// Takes the images the running scan has found so far into the project, so
+    /// that what is saved is what the user sees. Only the project of this session
+    /// changes; the scan keeps working on its own copy and its later results
+    /// replace these entries when it finishes.
+    pub fn flush_scan(&mut self) {
+        if !self.scanning || self.demo {
+            return;
+        }
+        if let Some((folder, recursive)) = &self.scan_folder {
+            self.project.note_scanned_folder(folder, *recursive);
+        }
+        let found: Vec<ImageEntry> = self.scan_map.values().cloned().collect();
+        self.project.merge_found(&found);
+    }
+
+    /// A copy of the project as it would be saved right now: while a scan runs it
+    /// includes the images found so far. For recovery copies, which must not
+    /// change the session.
+    pub fn saveable_project(&self) -> Project {
+        let mut project = self.project.clone();
+        if self.scanning && !self.demo {
+            if let Some((folder, recursive)) = &self.scan_folder {
+                project.note_scanned_folder(folder, *recursive);
+            }
+            let found: Vec<ImageEntry> = self.scan_map.values().cloned().collect();
+            project.merge_found(&found);
+        }
+        project
     }
 
     pub fn count_for(&self, node: &rawgraph_core::Node) -> Option<usize> {
@@ -667,6 +702,9 @@ impl Session {
     /// The scan worker is done: swap in the finished project, keeping what the
     /// user changed meanwhile (graph, ratings, flags, labels).
     pub fn finish_scan(&mut self, mut finished: Project, changed: bool) {
+        // The scan worked on a copy: carry over the commit state (revision, history) of the
+        // project the user may have saved meanwhile, or the next save would conflict with it.
+        finished.inherit_versioning(&self.project);
         finished.graph = self.project.graph.clone();
         for (id, (r, f, l)) in std::mem::take(&mut self.scan_edits) {
             if let Some(e) = finished.image_mut(id) {
@@ -678,6 +716,7 @@ impl Session {
         self.project = finished;
         self.scan_map.clear();
         self.scanning = false;
+        self.scan_folder = None;
         self.scan_count = None;
         if changed {
             self.touch();
@@ -688,6 +727,7 @@ impl Session {
 
     pub fn cancel_scan_state(&mut self) {
         self.scan_count = None;
+        self.scan_folder = None;
         self.scanning = false;
         self.scan_map.clear();
         self.scan_edits.clear();
@@ -729,6 +769,7 @@ impl Session {
         self.dirty = false;
         self.demo = false;
         self.scanning = false;
+        self.scan_folder = None;
         self.scan_map.clear();
         self.scan_edits.clear();
         self.selected_node = None;
@@ -744,6 +785,8 @@ impl Session {
     /// commit or load). `overwrite` skips the conflict and project checks. On success the
     /// project has this path and is no longer changed; on failure nothing changes.
     pub fn commit_project(&mut self, path: &Path, overwrite: bool) -> Result<u64, ProjectError> {
+        // A scan that is still running: save what it has found so far; it continues afterwards.
+        self.flush_scan();
         let summary = self.baseline.summarize(&self.project);
         let revision = if overwrite { self.project.commit_overwrite(path, &summary)? } else { self.project.commit(path, &summary)? };
         self.project_path = Some(path.to_path_buf());
@@ -1397,5 +1440,99 @@ pub mod tests {
         assert_eq!((ids.len(), caps.len(), s.scan_found()), (2, 2, 2));
         s.scan_entry(entries[2].clone());
         assert_eq!(s.id_captures().0.len(), 3, "not cached while scanning");
+    }
+
+    #[test]
+    fn saving_during_a_scan_writes_what_was_found_and_keeps_the_revision_straight() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let scanned = png_project(dir.path(), 3);
+        let entries: Vec<ImageEntry> = scanned.images().to_vec();
+        // What the scan thread works on: a clone of the session's project.
+        let base = Project::new();
+        let mut finished = base.clone();
+        finished.merge_found(&entries);
+        let mut s = Session::new(base, provider());
+        s.begin_scan();
+        s.scan_folder = Some((dir.path().to_owned(), true));
+        s.scan_entry(entries[0].clone());
+        s.scan_entry(entries[1].clone());
+        s.set_rating(entries[1].id, 4);
+        let file = out.path().join("p.rawgraph");
+        assert!(s.dirty);
+        assert_eq!(s.commit_project(&file, false).unwrap(), 1, "saving is allowed while the scan runs");
+        assert!(!s.dirty && s.scanning);
+        let saved = Project::load(&file).unwrap();
+        assert_eq!(saved.images().len(), 2, "the images found so far are in the file");
+        assert_eq!(saved.image(entries[1].id).unwrap().rating, 4);
+        assert_eq!(saved.folders().len(), 1, "and the folder that is being scanned");
+        // A second save while it still runs.
+        s.scan_entry(entries[2].clone());
+        assert_eq!(s.commit_project(&file, false).unwrap(), 2);
+        assert_eq!(Project::load(&file).unwrap().images().len(), 3);
+        // The scan returns its copy, which knows nothing about the two saves.
+        assert_eq!(finished.revision(), 0);
+        s.finish_scan(finished, true);
+        assert_eq!((s.project.revision(), s.project.history().len()), (2, 2), "revision and history carry over");
+        assert!(s.dirty, "what the scan did after the last save is unsaved");
+        // The next save is no false conflict and extends the history.
+        assert_eq!(s.commit_project(&file, false).unwrap(), 3);
+        let loaded = Project::load(&file).unwrap();
+        assert_eq!((loaded.images().len(), loaded.history().len(), loaded.revision()), (3, 3, 3));
+    }
+
+    #[test]
+    fn a_real_scan_can_be_saved_in_the_middle_and_merges_in_afterwards() {
+        use crate::scan::{ScanJob, ScanMsg};
+        let dir = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        for i in 0..6 {
+            image::RgbaImage::from_pixel(16, 16, image::Rgba([i * 20, 50, 90, 255])).save(dir.path().join(format!("p{i}.png"))).unwrap();
+        }
+        let mut s = Session::new(Project::new(), provider());
+        s.begin_scan();
+        s.scan_folder = Some((dir.path().to_owned(), true));
+        let job = ScanJob::start(eframe::egui::Context::default(), s.project.clone(), dir.path().to_owned(), true);
+        let file = out.path().join("p.rawgraph");
+        let mut saved_at_catalog = false;
+        let finished = loop {
+            match job.rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap() {
+                ScanMsg::Catalog(entries) => {
+                    s.scan_catalog(entries);
+                    // Save with the catalog only (hashes and metadata still pending).
+                    assert_eq!(s.commit_project(&file, false).unwrap(), 1);
+                    assert_eq!(Project::load(&file).unwrap().images().len(), 6);
+                    saved_at_catalog = true;
+                }
+                ScanMsg::Hashed(entries) => s.scan_entries(entries),
+                ScanMsg::Metadata { entries, .. } => s.scan_metadata(entries),
+                ScanMsg::Done { project, .. } => break *project,
+                ScanMsg::Listing(_) => {}
+            }
+        };
+        assert!(saved_at_catalog);
+        s.finish_scan(finished, true);
+        assert_eq!(s.project.revision(), 1);
+        assert!(s.project.images().iter().all(|e| !e.content_hash.is_empty() && !e.capture.scan_pending));
+        assert_eq!(s.commit_project(&file, false).unwrap(), 2, "no false conflict");
+        let loaded = Project::load(&file).unwrap();
+        assert!(loaded.images().iter().all(|e| !e.content_hash.is_empty()));
+        assert_eq!(loaded.history().len(), 2);
+    }
+
+    #[test]
+    fn a_recovery_copy_made_during_a_scan_contains_the_images_found_so_far() {
+        let dir = tempfile::tempdir().unwrap();
+        let finished = png_project(dir.path(), 3);
+        let mut s = Session::new(Project::new(), provider());
+        s.begin_scan();
+        s.scan_entry(finished.images()[0].clone());
+        s.scan_entry(finished.images()[1].clone());
+        let copy = s.saveable_project();
+        assert_eq!(copy.images().len(), 2);
+        assert_eq!(s.project.images().len(), 0, "making the copy does not change the session");
+        let rec = tempfile::tempdir().unwrap();
+        let file = copy.save_recovery(rec.path(), None, "session").unwrap();
+        assert_eq!(rawgraph_project::load_recovery(&file).unwrap().0.images().len(), 2);
     }
 }

@@ -402,7 +402,10 @@ and auto from DNG correction data) and Export (format incl. AVIF, size, output c
 metadata selection, folder, collision rule). Also: exposed image controls and paintable Draw images, viewer with
 crop and brush tools, node graph with multi-selection, copy/paste and recipes, filmstrip with
 culling, XMP rating import and relinking, colourised scopes, project files in format 2 with
-revisions, history, graph restore, conflict check and crash recovery, and a packaging script.
+revisions, history, graph restore, conflict check and crash recovery, and a packaging script. Project files are
+updated in place in one rollback-journal transaction (only changed rows, appended history, conflict check inside
+the transaction; see `docs/project-format.md`), saving works while a folder scan runs, XMP import reads
+with its own 8-thread pool, and undo steps share unchanged nodes instead of copying the graph.
 The interactive preview runs the trailing pointwise operations and the display transform on the GPU
 with automatic CPU fallback; everything else, including export, uses the CPU reference path.
 Not yet built: Layer mode "All combinations", HEIC, a lens database, GPU versions of the
@@ -414,6 +417,7 @@ Update this section as implementation files are added.
 
 ## Change log
 
+- 2026-11-28 — Project defects: save during a folder scan, in-place incremental project saves (rollback journal, atomic conflict check), XMP import on a dedicated 8-thread pool, undo history shares unchanged nodes (`Graph` nodes are `Arc`, copy on write).
 - 2026-11-15 — Wave 8: nodes of `node_structure.md` (Source folders, Merge rule, Layer, Develop tone, Curves set, Lens Correction auto, Export node), colourised scopes, output colour spaces, AVIF, project format 2 with history and conflict check; new requirements (platforms, project storage and collaboration).
 - 2026-11-15 — Wave 7: Lift/Gamma/Gain, Clarity/Texture, more GPU operations, brush behind crop, curve histogram, packaging script.
 - 2026-11-15 — Wave 6: GPU preview path in the application with CPU fallback.

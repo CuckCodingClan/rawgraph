@@ -1273,6 +1273,7 @@ impl App {
         self.session.begin_scan();
         let absolute = std::path::absolute(&folder).unwrap_or_else(|_| folder.clone());
         self.session.scan_count = Some((crate::session::folder_key(&absolute.to_string_lossy()), recursive, 0));
+        self.session.scan_folder = Some((absolute.clone(), recursive));
         self.scan = Some(ScanJob::start(ctx.clone(), self.session.project.clone(), folder.clone(), recursive));
         self.status.info(format!("Scanning {}", folder.display()));
     }
@@ -1331,6 +1332,9 @@ impl App {
             }
         }
         if let Some((project, report)) = finished {
+            // The scan worked on a copy: continue from the commit state of the project (it may have been saved meanwhile).
+            let mut project = project;
+            project.inherit_versioning(&self.session.project);
             let changed = project != self.session.project;
             self.session.finish_scan(project, changed);
             let text = summarize(&report);
