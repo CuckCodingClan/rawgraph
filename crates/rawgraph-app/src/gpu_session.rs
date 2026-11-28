@@ -219,10 +219,7 @@ pub struct GpuSession<B: Backend> {
 
 impl<B: Backend> GpuSession<B> {
     /// `unavailable`: why the GPU cannot be used at all (for example no wgpu render state).
-    pub fn new(mut backend: B, mode: RendererMode, unavailable: Option<String>) -> Self {
-        if unavailable.is_none() {
-            backend.warm_up();
-        }
+    pub fn new(backend: B, mode: RendererMode, unavailable: Option<String>) -> Self {
         Self {
             backend,
             bases: Lru::new(MAX_BASES),
@@ -318,7 +315,9 @@ impl<B: Backend> GpuSession<B> {
         }
     }
 
-    fn retire(&mut self, class: B::Class, generation: u64) {
+    fn retire(&mut self, mut class: B::Class, generation: u64) {
+        // Its picture stays until the replacement is shown; the scratch textures can go now.
+        self.backend.trim_class(&mut class);
         self.graveyard.push((class, generation));
     }
 
@@ -408,6 +407,13 @@ impl<B: Backend> GpuSession<B> {
             self.stats.classes_created += 1;
             drop(self.classes.insert((w, h), class));
         }
+        // Idle display classes (another picture size) give their scratch textures back before this
+        // frame allocates its own (without touching their LRU order).
+        for (size, c) in self.classes.values_mut() {
+            if *size != (w, h) {
+                self.backend.trim_class(c);
+            }
+        }
         let nodes = gpu_nodes(ops, grids, (w, h))?;
         let (Some(held), Some(class)) = (self.bases.get_mut(key), self.classes.get_mut(&(w, h))) else {
             return Err(GpuError::Readback("GPU images vanished".into()));
@@ -417,16 +423,16 @@ impl<B: Backend> GpuSession<B> {
         // The UI shows the picture as soon as it is told: make sure the work is done.
         self.backend.wait_idle();
         let texture = self.backend.texture_id(class);
-        // Idle display classes (another picture size) give their scratch textures back.
-        for other in self.classes.keys_oldest_first() {
-            if other != (w, h) {
-                if let Some(c) = self.classes.get_mut(&other) {
-                    self.backend.trim_class(c);
-                }
-            }
-        }
         self.last = Some(Last { key: *key, class: (w, h), ops_empty: nodes.is_empty(), display });
         Ok(GpuPicture { texture, width: w, height: h })
+    }
+
+    /// Compiles the pipelines the first drag would otherwise compile. Called once by the render
+    /// worker when it starts (never on the UI thread: it takes a moment on some drivers).
+    pub fn warm_up(&mut self) {
+        if self.fallback.permanent_reason().is_none() {
+            self.backend.warm_up();
+        }
     }
 
     fn on_error(&mut self, key: &BaseKey, error: GpuError, generation: u64) -> Shown {

@@ -406,22 +406,38 @@ static BENCH_STARTED: AtomicBool = AtomicBool::new(false);
 /// What the Wait phase last saw: bit 0 CLI options applied, 1 scan finished, 2 no render pending, 3 images listed, 4 a render was requested.
 static BENCH_WAIT_BITS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// `--bench` gives up with a clear message and exit code 2 when the first picture does not appear.
+/// Bumped whenever the benchmark makes progress (a phase or image step, or the folder scan is
+/// still running); the watchdog fires when it stands still for [`BENCH_WAIT_LIMIT`].
+static BENCH_PROGRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The current phase (`BenchPhase as u8`), for the watchdog's message.
+static BENCH_PHASE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `--bench` gives up with a clear message and exit code 2 when it makes no progress for
+/// [`BENCH_WAIT_LIMIT`] (no first picture, or a phase that never gets its frame).
 fn bench_watchdog() {
     let _ = std::thread::Builder::new().name("bench-watchdog".into()).spawn(|| {
-        std::thread::sleep(BENCH_WAIT_LIMIT);
-        if !BENCH_STARTED.load(Ordering::Relaxed) {
+        let mut seen = u64::MAX;
+        loop {
+            std::thread::sleep(BENCH_WAIT_LIMIT);
+            let now = BENCH_PROGRESS.load(Ordering::Relaxed);
+            if now != seen {
+                seen = now;
+                continue;
+            }
+            let waiting = if BENCH_STARTED.load(Ordering::Relaxed) {
+                "the next frame of this phase".to_owned()
+            } else {
+                let bits = BENCH_WAIT_BITS.load(Ordering::Relaxed);
+                let names = ["CLI options applied", "folder scan finished", "render queue idle", "images in the list", "first render request"];
+                let missing: Vec<&str> = names.iter().enumerate().filter(|(i, _)| bits & (1 << i) == 0).map(|(_, n)| *n).collect();
+                if missing.is_empty() { "nothing".to_owned() } else { missing.join(", ") }
+            };
             eprintln!(
-                "BENCH gave up: no picture was shown {} s after the start ({} frames drawn; waiting for: {}). Use a folder with images, \
+                "BENCH gave up: no progress for {} s in phase {} ({} frames drawn; waiting for: {waiting}). Use a folder with images, \
 --select-image 0 and a window that is visible and not minimized (a hidden window gets no frames).",
                 BENCH_WAIT_LIMIT.as_secs(),
+                BENCH_PHASE.load(Ordering::Relaxed),
                 BENCH_FRAMES.load(Ordering::Relaxed),
-                {
-                    let bits = BENCH_WAIT_BITS.load(Ordering::Relaxed);
-                    let names = ["CLI options applied", "folder scan finished", "render queue idle", "images in the list", "first render request"];
-                    let missing: Vec<&str> = names.iter().enumerate().filter(|(i, _)| bits & (1 << i) == 0).map(|(_, n)| *n).collect();
-                    if missing.is_empty() { "nothing".to_owned() } else { missing.join(", ") }
-                }
             );
             std::process::exit(2);
         }
@@ -1982,7 +1998,12 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         }
         let phase_before = b.phase;
+        let idx_before = b.idx;
         let n = self.session.visible().len();
+        if self.scan.is_some() {
+            // A long folder scan is progress too.
+            BENCH_PROGRESS.fetch_add(1, Ordering::Relaxed);
+        }
         let event = b.event.take();
         let matches = |ev: Option<(ImageId, f32, f32)>, id: ImageId| ev.filter(|e| e.0 == id);
         match b.phase {
@@ -2009,19 +2030,8 @@ impl App {
                     self.last_key = None;
                     b.event = None;
                 } else {
+                    // The watchdog gives up when nothing moves for BENCH_WAIT_LIMIT.
                     b.event = event;
-                    if b.started.elapsed() > BENCH_WAIT_LIMIT {
-                        eprintln!(
-                            "BENCH gave up: no picture was shown {} s after the start ({} images in the list, scan {}, CLI options {}, a render request {}). \
-Use a folder with images, --select-image 0 and a visible window (a minimized window gets no frames).",
-                            BENCH_WAIT_LIMIT.as_secs(),
-                            n,
-                            if self.scan.is_none() { "finished" } else { "still running" },
-                            if self.cli_applied { "applied" } else { "not applied" },
-                            if self.last_key.is_some() { "was made" } else { "was never made" },
-                        );
-                        std::process::exit(2);
-                    }
                 }
             }
             BenchPhase::Uncached | BenchPhase::Cached => {
@@ -2216,6 +2226,10 @@ Use a folder with images, --select-image 0 and a visible window (a minimized win
                 return; // the run is over; do not print twice
             }
         }
+        if b.phase != phase_before || b.idx != idx_before {
+            BENCH_PROGRESS.fetch_add(1, Ordering::Relaxed);
+            BENCH_PHASE.store(b.phase as u8, Ordering::Relaxed);
+        }
         if b.phase != phase_before {
             eprintln!("BENCH phase {:?} -> {:?} after {:.1} s", phase_before, b.phase, b.started.elapsed().as_secs_f32());
         }
@@ -2376,6 +2390,11 @@ Use a folder with images, --select-image 0 and a visible window (a minimized win
             if phase == BenchPhase::Steps {
                 if let Some(graph) = b.graph_snapshot.take() {
                     self.session.project.graph = graph;
+                    // The node added for Lights/Filter/Sharpen is gone: view one that exists.
+                    let g = &self.session.project.graph;
+                    if !self.session.selected_node.is_some_and(|id| g.node(id).is_some()) {
+                        self.session.selected_node = g.nodes().find(|n| n.kind == NodeKind::Output).or_else(|| g.nodes().last()).map(|n| n.id);
+                    }
                 }
             }
             let kind = match phase {

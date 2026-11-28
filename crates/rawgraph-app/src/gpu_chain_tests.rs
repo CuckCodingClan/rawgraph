@@ -388,7 +388,9 @@ fn slider_to_frame_cpu_against_gpu() {
 #[test]
 fn an_idle_display_class_gives_its_scratch_textures_back_and_the_backend_is_warmed_up() {
     let mut s = session();
-    assert!(s.backend().warmed_up, "pipelines are compiled at the start of the session");
+    assert!(!s.backend().warmed_up, "a new session compiles nothing (it may be made on the UI thread)");
+    s.warm_up();
+    assert!(s.backend().warmed_up, "the render worker compiles the pipelines when it starts");
     let (a, b) = (key(1), BaseKey { image: ImageId(2), fingerprint: 2, preview: 64, revision: 0 });
     let wide = ImageBuf::new(80, 4);
     assert_eq!(s.begin(&a, 1, 0), Begin::NeedBase);
