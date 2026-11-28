@@ -26,7 +26,7 @@ mod readback;
 mod shaders;
 
 pub use chain::{
-    apply_chain_to_cpu, render_chain_into, run_chain, ChainScratch, FilterOp, GpuNode, LocalToneOp, Loc, SharpenOp,
+    apply_chain_to_cpu, render_chain_into, run_chain, warm_up_neighbourhood, ChainScratch, FilterOp, GpuNode, LocalToneOp, Loc, SharpenOp,
 };
 pub use context::GpuContext;
 pub use display::{

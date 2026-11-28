@@ -112,6 +112,14 @@ fn neigh_pass(ctx: &GpuContext, kind: NeighKind) -> Arc<Pass> {
     pass
 }
 
+/// Compiles the six neighbourhood pipelines now (the session start), so the first drag of Lights,
+/// Filter or Sharpen and the first blur radius of 16 px or more do not compile a shader on the way.
+pub fn warm_up_neighbourhood(ctx: &GpuContext) {
+    for kind in [NeighKind::Conv, NeighKind::Down, NeighKind::Resolve, NeighKind::LocalTone, NeighKind::SharpenLog, NeighKind::SharpenApply] {
+        let _ = neigh_pass(ctx, kind);
+    }
+}
+
 /// The uploaded texture of a local tone grid (rewritten only when the id is new).
 fn grid_image(ctx: &GpuContext, op: &LocalToneOp) -> Result<Arc<GpuImage>, GpuError> {
     let mut cache = ctx.grid_cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -161,6 +169,12 @@ impl ChainScratch {
     /// Full-size scratch textures currently allocated.
     pub fn image_count(&self) -> usize {
         self.images.len()
+    }
+
+    /// Frees every texture of the pool (an idle display class, an error, memory pressure).
+    pub fn release(&mut self) {
+        self.images = Vec::new();
+        self.small = None;
     }
 
     /// Whether the low-resolution pair exists.
@@ -439,13 +453,31 @@ impl Exec<'_> {
 pub fn run_chain(ctx: &GpuContext, base: &GpuImage, scratch: &mut ChainScratch, nodes: &[GpuNode]) -> Result<Loc, GpuError> {
     let (w, h) = base.size();
     check_size(ctx, w, h)?;
-    let (cur, used, small_used) = {
-        let mut ex = Exec { ctx, base, sc: scratch, size: (w, h), used: 0, small_used: false };
+    let run = {
+        let mut ex = Exec { ctx, base, sc: &mut *scratch, size: (w, h), used: 0, small_used: false };
         let mut cur = Loc::Base;
+        let mut failed = None;
         for node in nodes {
-            cur = ex.node(cur, node)?;
+            match ex.node(cur, node) {
+                Ok(next) => cur = next,
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
         }
-        (cur, ex.used, ex.small_used)
+        match failed {
+            Some(e) => Err(e),
+            None => Ok((cur, ex.used, ex.small_used)),
+        }
+    };
+    // A failed frame (most often out of memory) keeps nothing: the next try starts from an empty pool.
+    let (cur, used, small_used) = match run {
+        Ok(r) => r,
+        Err(e) => {
+            scratch.release();
+            return Err(e);
+        }
     };
     scratch.images.truncate(used);
     if !small_used {

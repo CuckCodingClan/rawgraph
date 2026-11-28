@@ -145,13 +145,13 @@ fn strict_gpu_mode_reports_a_failed_chain_instead_of_falling_back() {
 // ------------------------------------------------------------------ real GPU against the CPU
 
 struct Synth {
-    image: Arc<ImageBuf>,
+    image: std::sync::Mutex<Arc<ImageBuf>>,
     revision: AtomicU64,
 }
 
 impl ImageProvider for Synth {
     fn image(&self, _id: ImageId) -> Result<Arc<ImageBuf>, String> {
-        Ok(self.image.clone())
+        Ok(self.image.lock().unwrap().clone())
     }
     fn revision(&self, _id: ImageId) -> u64 {
         self.revision.load(Ordering::Relaxed)
@@ -211,7 +211,7 @@ impl Rig {
 
     fn sized(ctx: Arc<GpuContext>, w: u32, h: u32) -> Self {
         Self {
-            provider: Synth { image: Arc::new(synthetic(w, h)), revision: AtomicU64::new(0) },
+            provider: Synth { image: std::sync::Mutex::new(Arc::new(synthetic(w, h))), revision: AtomicU64::new(0) },
             ev: Evaluator::new(),
             session: GpuSession::new(RealBackend::headless(ctx), RendererMode::Auto, None),
             generation: 0,
@@ -224,7 +224,7 @@ impl Rig {
         self.generation += 1;
         let cancel = CancelToken::new();
         let plan = self.ev.plan_tail_gpu(g, out, IMG, &self.provider).expect("plan");
-        let k = BaseKey { image: IMG, fingerprint: plan.base_fingerprint, preview: 200, revision: self.provider.revision.load(Ordering::Relaxed) };
+        let k = BaseKey { image: IMG, fingerprint: plan.base_fingerprint, preview: self.provider.image.lock().unwrap().width(), revision: self.provider.revision.load(Ordering::Relaxed) };
         let base = match self.session.begin(&k, self.generation, 0) {
             Begin::Cpu { reason, .. } => panic!("unexpected CPU frame: {reason}"),
             Begin::HaveBase => None,
@@ -367,7 +367,7 @@ fn slider_to_frame_cpu_against_gpu() {
             let t = std::time::Instant::now();
             rig.generation += 1;
             let plan = rig.ev.plan_tail_gpu(&g, out, IMG, &rig.provider).unwrap();
-            let k = BaseKey { image: IMG, fingerprint: plan.base_fingerprint, preview: 200, revision: 0 };
+            let k = BaseKey { image: IMG, fingerprint: plan.base_fingerprint, preview: edge, revision: 0 };
             let mut grids = Vec::new();
             for (i, op) in plan.ops.iter().enumerate() {
                 grids.push(matches!(op, TailOp::LocalTone { .. }).then(|| rig.ev.tail_grid(&g, &plan, i, IMG, &rig.provider, &cancel).unwrap()));
@@ -382,6 +382,49 @@ fn slider_to_frame_cpu_against_gpu() {
     }
 }
 
+
+// ------------------------------------------------------------------ memory rules
+
+#[test]
+fn an_idle_display_class_gives_its_scratch_textures_back_and_the_backend_is_warmed_up() {
+    let mut s = session();
+    assert!(s.backend().warmed_up, "pipelines are compiled at the start of the session");
+    let (a, b) = (key(1), BaseKey { image: ImageId(2), fingerprint: 2, preview: 64, revision: 0 });
+    let wide = ImageBuf::new(80, 4);
+    assert_eq!(s.begin(&a, 1, 0), Begin::NeedBase);
+    assert!(matches!(s.show_with(&a, Some(&base()), &[filter(5.0)], &[None], display(), 1, 0), Shown::Gpu(_)));
+    assert!(s.backend().trims.is_empty(), "the only class is the one that renders");
+    assert_eq!(s.begin(&b, 2, 1), Begin::NeedBase);
+    assert!(matches!(s.show_with(&b, Some(&wide), &[filter(5.0)], &[None], display(), 2, 1), Shown::Gpu(_)));
+    assert_eq!(s.backend().trims, vec![(64, 4)], "the 64 px class was idle while the 80 px one rendered");
+    // Rendering the 64 px picture again trims the 80 px class in turn.
+    assert!(matches!(s.show_with(&a, None, &[filter(5.0)], &[None], display(), 3, 2), Shown::Gpu(_)));
+    assert_eq!(s.backend().trims.last(), Some(&(80, 4)));
+}
+
+#[test]
+fn stepping_a_b_a_and_changing_the_preview_size_keep_the_local_tone_right() {
+    let Some((mut rig, _lock)) = rig() else { return };
+    let (g, _, out) = graph(&[(NodeKind::Develop, &[("highlights", -0.6), ("shadows", 0.5), ("exposure", 0.3)])]);
+    let (a, b) = (Arc::new(synthetic(200, 120)), Arc::new(synthetic(160, 96)));
+    let set = |rig: &Rig, img: &Arc<ImageBuf>, rev: u64| {
+        *rig.provider.image.lock().unwrap() = img.clone();
+        rig.provider.revision.store(rev, Ordering::Relaxed);
+    };
+    for (img, rev) in [(&a, 0), (&b, 1), (&a, 2), (&b, 3)] {
+        set(&rig, img, rev);
+        let (worst, plan) = rig.frame(&g, out);
+        assert!(plan.ops.iter().any(|o| matches!(o, TailOp::LocalTone { .. })));
+        assert!(worst <= 1, "preview {} px: largest difference {worst}", img.width());
+    }
+    // The evaluator kept the grid of the first picture across the steps: asking again costs no evaluation.
+    set(&rig, &a, 0);
+    let plan = rig.ev.plan_tail_gpu(&g, out, IMG, &rig.provider).unwrap();
+    let misses = rig.ev.misses();
+    let i = plan.ops.iter().position(|o| matches!(o, TailOp::LocalTone { .. })).unwrap();
+    rig.ev.tail_grid(&g, &plan, i, IMG, &rig.provider, &CancelToken::new()).unwrap();
+    assert_eq!(rig.ev.misses(), misses, "the grid of A came from the cache");
+}
 #[test]
 fn a_filter_with_a_connected_radius_map_is_a_cpu_base() {
     // No GPU needed: this is the planner.
@@ -389,7 +432,7 @@ fn a_filter_with_a_connected_radius_map_is_a_cpu_base() {
     let map = g.add_node(NodeKind::Generator, [0.0, 0.0]);
     let port = g.expose_parameter(ids[1], "radius", rawgraph_core::PortType::Images).unwrap();
     g.connect(map, ids[1], port).unwrap();
-    let provider = Synth { image: Arc::new(synthetic(32, 32)), revision: AtomicU64::new(0) };
+    let provider = Synth { image: std::sync::Mutex::new(Arc::new(synthetic(32, 32))), revision: AtomicU64::new(0) };
     let plan = Evaluator::new().plan_tail_gpu(&g, out, IMG, &provider).unwrap();
     assert_eq!((plan.base, plan.ops.len()), (ids[1], 0));
     // And asking for the grid of an operation that is not a local tone is an error.

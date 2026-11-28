@@ -109,7 +109,18 @@ impl Backend for RealBackend {
 
     fn render(&mut self, base: &GpuImage, class: &mut RealClass, nodes: &[GpuNode], exposure_ev: f32, tone: GpuToneMap) -> Result<(), GpuError> {
         class.result = Loc::Base;
-        class.result = render_chain_into(&self.ctx, base, &mut class.scratch, &class.target, nodes, exposure_ev, tone)?;
+        let first = render_chain_into(&self.ctx, base, &mut class.scratch, &class.target, nodes, exposure_ev, tone);
+        class.result = match first {
+            Ok(loc) => loc,
+            // Out of memory: free everything this class and the grid cache hold and try once more
+            // before the image is given up for the GPU (a three-texture chain may just not fit next to the others).
+            Err(GpuError::OutOfMemory(_)) => {
+                class.scratch.release();
+                self.ctx.clear_grid_cache();
+                render_chain_into(&self.ctx, base, &mut class.scratch, &class.target, nodes, exposure_ev, tone)?
+            }
+            Err(e) => return Err(e),
+        };
         Ok(())
     }
 
@@ -120,6 +131,15 @@ impl Backend for RealBackend {
 
     fn free_caches(&mut self) {
         self.ctx.clear_grid_cache();
+    }
+
+    fn trim_class(&mut self, class: &mut RealClass) {
+        class.scratch.release();
+        class.result = Loc::Base;
+    }
+
+    fn warm_up(&mut self) {
+        rawgraph_gpu::warm_up_neighbourhood(&self.ctx);
     }
 
     fn read_rgba8(&mut self, class: &RealClass) -> Result<Vec<u8>, GpuError> {
