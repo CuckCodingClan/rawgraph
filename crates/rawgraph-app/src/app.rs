@@ -302,6 +302,8 @@ struct RequestKey {
     /// The compare view needs the CPU picture of the selected image.
     compare: bool,
     timing: bool,
+    /// Moves when a LUT file was reloaded or changed on disk (`rawgraph_core::lut::generation`).
+    lut_generation: u64,
 }
 
 impl RequestKey {
@@ -325,7 +327,7 @@ impl RequestKey {
                 n.pos = [0.0, 0.0];
             }
         }
-        Self { graph, node, port, image, view: session.view, preview: session.provider.preview_size(), scopes, overlay, revision: session.provider.revision(image), overlay_frame: None, histogram: None, mode: RendererMode::Auto, compare: false, timing: false }
+        Self { graph, node, port, image, view: session.view, preview: session.provider.preview_size(), scopes, overlay, revision: session.provider.revision(image), overlay_frame: None, histogram: None, mode: RendererMode::Auto, compare: false, timing: false, lut_generation: rawgraph_core::lut::generation() }
     }
 }
 
@@ -1054,7 +1056,7 @@ impl App {
                 0 => d.add_filter("RawGraph project (*.rawgraph)", &["rawgraph"]).pick_file(),
                 1 | 5 | 7 | 8 => d.pick_folder(),
                 6 => d.pick_file(),
-                9 => d.add_filter("Cube LUT (*.cube)", &["cube"]).pick_file(),
+                9 => d.add_filter("Cube LUT (*.cube)", &["cube", "CUBE", "Cube"]).pick_file(),
                 2 => d.set_file_name(name).add_filter("RawGraph project (*.rawgraph)", &["rawgraph"]).save_file(),
                 3 => d.add_filter("RawGraph graph (*.rawgraph.json)", &["json"]).pick_file(),
                 _ => d.set_file_name(format!("graph{GRAPH_EXT}")).add_filter("RawGraph graph (*.rawgraph.json)", &["json"]).save_file(),
@@ -1087,8 +1089,8 @@ impl App {
             }
             DialogKind::LutFile(node) => {
                 let image = self.session.current_image();
-                if !node_ui::set_lut_file(&mut self.session.project.graph, node, image, Some(path.to_string_lossy().into_owned())) {
-                    self.status.error("The LUT node no longer exists");
+                if let Err(e) = node_ui::set_lut_file(&mut self.session.project.graph, node, image, Some(path.to_string_lossy().into_owned())) {
+                    self.status.error(e);
                 }
             }
             DialogKind::NodeExportFolder(node) => {
@@ -3128,6 +3130,11 @@ impl eframe::App for App {
         if self.status.active() || self.session.scanning {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
+        // A LUT file edited elsewhere is noticed by the status poll (every couple of seconds); keep
+        // frames coming while the graph uses one, so the picture follows without an input event.
+        if self.session.project.graph.nodes().any(|n| n.kind == NodeKind::Lut && rawgraph_core::lut_file(n, self.session.current_image()).is_some()) {
+            ctx.request_repaint_after(rawgraph_core::lut::refresh_interval().max(Duration::from_millis(500)));
+        }
         if !self.renderer.is_alive() {
             self.last_error = Some("The render thread stopped unexpectedly".to_owned());
         }
@@ -3789,6 +3796,16 @@ mod tests {
         assert_eq!(s.filter.iso_min, "100");
         assert_eq!(s.filter.iso_max, "200");
         assert!(s.visible().is_empty(), "PNGs carry no ISO, so an ISO filter hides them");
+    }
+
+    #[test]
+    fn a_lut_reload_or_file_change_gives_a_new_request_key() {
+        let s = demo_session();
+        let out = s.output_node().unwrap();
+        let a = RequestKey::new(&s, out, None, None);
+        assert!(a == RequestKey::new(&s, out, None, None));
+        rawgraph_core::lut::forget(std::path::Path::new("D:/luts/never-loaded.cube"));
+        assert!(a != RequestKey::new(&s, out, None, None), "Reload (or a changed file) renders again");
     }
 
     #[test]

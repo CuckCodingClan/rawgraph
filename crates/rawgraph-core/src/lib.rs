@@ -42,5 +42,5 @@ pub use layer::{
     layer_settings, BlendMode, FitMode, LayerSettings, ResampleFilter, LAYER_BLEND_MODES, LAYER_FILTERS, LAYER_FITS,
     MAX_LAYERS,
 };
-pub use lut::{Lut, LutError, LutSpace};
+pub use lut::{Lut, LutError, LutSpace, LutState};
 pub use lens::{LensProfile, VignetteRadial, WarpRectilinear, LENS_MODES};

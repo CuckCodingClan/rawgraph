@@ -89,7 +89,7 @@ fn lut_op_matches_the_cpu_in_float_and_after_the_display_transform() {
     let mut worst_code = 0u8;
     for (name, lut) in &luts {
         for space in [LutSpace::Linear, LutSpace::Srgb709, LutSpace::AcesCct] {
-            for strength in [1.0, 0.6] {
+            for strength in [1.0, 0.6, 0.5, 0.01] {
                 let op = PointOp::Lut { lut: Arc::clone(lut), space, strength };
                 let gpu = apply_point_ops(ctx, &src, std::slice::from_ref(&op)).unwrap();
                 let out = gpu.download(ctx).unwrap();
@@ -138,4 +138,90 @@ fn lut_op_chains_with_other_ops_and_rewrites_the_table_only_on_change() {
     rawgraph_core::ops::saturation(&mut cpu_img, 0.8);
     let err = first.data().iter().zip(cpu_img.data()).map(|(x, y)| (x - y).abs() / y.abs().max(1.0)).fold(0.0, f32::max);
     assert!(err <= 5e-4, "chain error {err}");
+}
+
+fn max_rel(a: &ImageBuf, b: &ImageBuf) -> f32 {
+    a.data().iter().zip(b.data()).map(|(x, y)| (x - y).abs() / y.abs().max(1.0)).fold(0.0, f32::max)
+}
+
+#[test]
+fn the_largest_tables_match_the_cpu() {
+    let Some(ctx) = shared() else {
+        println!("skipped: no GPU adapter");
+        return;
+    };
+    let _gpu = exclusive();
+    let img = image(33, 17);
+    let src = GpuImage::upload(ctx, &img).unwrap();
+    // 65^3 cube (the biggest size) and a 1D table with 65536 rows, alone and as shaper + cube.
+    let big3 = Arc::new(parse_cube(&cube(65, None)).unwrap());
+    let mut text = String::from("LUT_1D_SIZE 65536\n");
+    for i in 0..65_536 {
+        let t = i as f32 / 65_535.0;
+        text.push_str(&format!("{} {} {}\n", t.powf(0.8), t, t * t));
+    }
+    let big1 = Arc::new(parse_cube(&text).unwrap());
+    let mut both_text = text.replace("LUT_1D_SIZE 65536\n", "LUT_1D_SIZE 65536\nLUT_3D_SIZE 17\n");
+    both_text.push_str(cube(17, None).split_once('\n').unwrap().1);
+    let big_both = Arc::new(parse_cube(&both_text).unwrap());
+    for (name, lut) in [("3D 65", big3), ("1D 65536", big1), ("1D 65536 + 3D 17", big_both)] {
+        for space in [LutSpace::Linear, LutSpace::Srgb709, LutSpace::AcesCct] {
+            let op = PointOp::Lut { lut: Arc::clone(&lut), space, strength: 0.8 };
+            let out = apply_point_ops(ctx, &src, std::slice::from_ref(&op)).unwrap().download(ctx).unwrap();
+            let err = max_rel(&out, &cpu(&img, &lut, space, 0.8));
+            println!("{name} {space:?}: {err:.3e}");
+            assert!(err <= 2e-4, "{name} {space:?}: {err}");
+        }
+    }
+}
+
+#[test]
+fn non_finite_pixels_come_out_finite_and_like_the_cpu() {
+    let Some(ctx) = shared() else {
+        println!("skipped: no GPU adapter");
+        return;
+    };
+    let _gpu = exclusive();
+    let mut img = ImageBuf::new(4, 2);
+    img.set_pixel(0, 0, [f32::INFINITY, 0.5, 0.2, 1.0]);
+    img.set_pixel(1, 0, [f32::NAN, f32::NEG_INFINITY, 0.3, 1.0]);
+    img.set_pixel(2, 0, [0.4, f32::INFINITY, f32::NAN, 0.5]);
+    img.set_pixel(3, 0, [0.1, 0.2, 0.3, 1.0]);
+    let src = GpuImage::upload(ctx, &img).unwrap();
+    let lut = Arc::new(parse_cube(&cube(9, None)).unwrap());
+    for space in [LutSpace::Linear, LutSpace::Srgb709, LutSpace::AcesCct] {
+        for strength in [1.0, 0.5] {
+            let op = PointOp::Lut { lut: Arc::clone(&lut), space, strength };
+            let out = apply_point_ops(ctx, &src, std::slice::from_ref(&op)).unwrap().download(ctx).unwrap();
+            let want = cpu(&img, &lut, space, strength);
+            assert!(want.data().iter().all(|v| v.is_finite()), "{space:?} {strength}: CPU {:?}", want.data());
+            assert!(out.data().iter().all(|v| v.is_finite()), "{space:?} {strength}: GPU {:?}", out.data());
+            let err = max_rel(&out, &want);
+            assert!(err <= 1e-3, "{space:?} {strength}: {err}");
+        }
+    }
+}
+
+#[test]
+fn lut_pipelines_are_bounded_and_the_oldest_are_rebuilt_on_demand() {
+    let Some(ctx) = shared() else {
+        println!("skipped: no GPU adapter");
+        return;
+    };
+    let _gpu = exclusive();
+    let img = image(8, 8);
+    let src = GpuImage::upload(ctx, &img).unwrap();
+    let run = |n: usize| {
+        let lut = Arc::new(parse_cube(&cube(n, None)).unwrap());
+        let op = PointOp::Lut { lut, space: LutSpace::Linear, strength: 1.0 };
+        apply_point_ops(ctx, &src, std::slice::from_ref(&op)).unwrap();
+    };
+    for n in 2..=41 {
+        run(n);
+    }
+    let before = ctx.pipelines_created();
+    run(41);
+    assert_eq!(ctx.pipelines_created(), before, "a recent size is still cached");
+    run(2);
+    assert_eq!(ctx.pipelines_created(), before + 1, "the least recently used size was evicted and is rebuilt");
 }

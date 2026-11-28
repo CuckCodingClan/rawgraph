@@ -1245,19 +1245,22 @@ impl std::error::Error for GraphError {}
 pub struct Issue {
     pub node: NodeId,
     pub message: String,
+    /// Only some images are affected (a LUT file that cannot be read). The viewer passes those
+    /// through and an export fails just the affected items, so it must not stop a whole run.
+    pub per_item: bool,
 }
 
 /// Longest walk along a chain of nodes (graphs are acyclic, this only guards
 /// against hand-built nonsense).
 const MAX_WALK: usize = 512;
 
-/// Loads the LUT file named by a LUT node's data (cached by path, size and modification time).
-/// An empty path is not an error here: it means no file was chosen yet and gives `Ok(None)`.
-pub fn lut_file_status(path: &str) -> Result<Option<std::sync::Arc<crate::lut::Lut>>, crate::lut::LutError> {
+/// The last known state of the LUT file named by a LUT node's data, without touching the disk
+/// (see [`crate::lut::peek`]); `None` when no file is chosen.
+pub fn lut_file_status(path: &str) -> Option<crate::lut::LutState> {
     if path.trim().is_empty() {
-        return Ok(None);
+        return None;
     }
-    crate::lut::load_cached(std::path::Path::new(path)).map(Some)
+    Some(crate::lut::peek(std::path::Path::new(path)))
 }
 
 /// The LUT file path a LUT node uses for `image` (`None` when no file is chosen).
@@ -1603,43 +1606,50 @@ impl Graph {
     pub fn validate(&self) -> Vec<Issue> {
         let mut issues = Vec::new();
         for node in self.nodes.values() {
-            let mut add = |message: String| issues.push(Issue { node: node.id, message });
+            let mut add_with = |message: String, per_item: bool| issues.push(Issue { node: node.id, message, per_item });
             let label = node.kind.label();
+            macro_rules! add {
+                ($m:expr $(,)?) => {
+                    add_with($m, false)
+                };
+            }
             if matches!(node.kind, NodeKind::Merge | NodeKind::Layer)
                 && (0..node.kind.inputs().len()).all(|p| self.input_of(node.id, p).is_none())
             {
-                add(format!("{label}: no input is connected"));
+                add!(format!("{label}: no input is connected"));
             }
             for (port, spec) in node.kind.inputs().iter().enumerate() {
                 if spec.required && self.input_of(node.id, port).is_none() {
-                    add(format!("{label}: input \"{}\" is not connected", spec.label));
+                    add!(format!("{label}: input \"{}\" is not connected", spec.label));
                 }
             }
             match node.kind {
                 NodeKind::Layer if node.all_choice("mode") == 1 => {
-                    add("All combinations is not available yet; Match is used".to_owned());
+                    add!("All combinations is not available yet; Match is used".to_owned());
                 }
                 NodeKind::Export => {
                     let dir_set = matches!(node.all_data(), Some(NodeData::Export(t)) if !t.out_dir.trim().is_empty());
                     if !dir_set {
-                        add("Export: no output folder set".to_owned());
+                        add!("Export: no output folder set".to_owned());
                     }
                 }
                 NodeKind::Lut => {
-                    // Every stored file (All and each image of Individual mode); a problem is
-                    // reported, the node passes its input through meanwhile.
+                    // Only the data in effect: in All mode the All file; in Individual mode the own
+                    // file of each image that has one, plus the All file the other images inherit.
+                    // A problem is reported, the node passes its input through meanwhile. The UI
+                    // calls this every frame, so it only reads the last known state of the files.
                     let all = node.data.iter().map(|d| (None, d));
-                    let own = node.individual_data.iter().map(|(i, d)| (Some(*i), d));
+                    let own = node.individual_data.iter().filter(|_| node.mode == Mode::Individual).map(|(i, d)| (Some(*i), d));
                     for (image, data) in all.chain(own) {
                         let NodeData::LutFile(path) = data else { continue };
-                        if let Err(e) = lut_file_status(path) {
+                        if let Some(crate::lut::LutState::Failed(e)) = lut_file_status(path) {
                             let whose = image.map_or(String::new(), |i| format!(" (image {})", i.0));
-                            add(format!("LUT{whose}: {path}: {e}; the image passes through unchanged"));
+                            add_with(format!("LUT{whose}: {path}: {e}; the image passes through unchanged"), true);
                         }
                     }
                 }
                 NodeKind::LensManual if node.all_choice("mode") == 1 && !self.lens_auto_usable(node.id) => {
-                    add(
+                    add!(
                         "Lens Correction: Auto needs the uncropped frame of a source (no Crop / Rotate, Layer or \
                          other Lens Correction in between)"
                             .to_owned(),
@@ -1649,6 +1659,33 @@ impl Graph {
             }
         }
         issues
+    }
+
+    /// The first LUT file problem that would hit `image` when it is evaluated at `node`: a LUT node
+    /// upstream (strength above 0) whose file for this image cannot be read. Reads the files, so it
+    /// is for export threads, not the UI. `None` when every LUT is fine or no file is chosen.
+    pub fn lut_problem(&self, node: NodeId, image: ImageId) -> Option<String> {
+        let mut upstream = BTreeSet::from([node]);
+        let mut stack = vec![node];
+        while let Some(n) = stack.pop() {
+            for e in self.edges.iter().filter(|e| e.to == n) {
+                if upstream.insert(e.from) {
+                    stack.push(e.from);
+                }
+            }
+        }
+        for id in upstream {
+            let Some(n) = self.node(id).filter(|n| n.kind == NodeKind::Lut) else { continue };
+            let strength = n.param("strength", image);
+            if strength.is_nan() || strength <= 0.0 {
+                continue;
+            }
+            let Some(path) = lut_file(n, image) else { continue };
+            if let Err(e) = crate::lut::load_cached(std::path::Path::new(path)) {
+                return Some(format!("LUT {path}: {e}"));
+            }
+        }
+        None
     }
 
     /// True if the Lens Correction `node` can use the lens profile of its

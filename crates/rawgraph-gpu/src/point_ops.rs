@@ -587,7 +587,8 @@ fn lut_helpers() -> String {
     format!(
         "
 fn lut_nz(x: f32) -> f32 {{
-    return select(x, 0.0, isnanm(x));
+    // NaN -> 0, infinities -> the largest finite value (as the CPU: `finite` of rawgraph_fx::lut).
+    return clamp(select(x, 0.0, isnanm(x)), -3.4028235e38, 3.4028235e38);
 }}
 
 fn lut_mat(r0: vec3<f32>, r1: vec3<f32>, r2: vec3<f32>, c: vec3<f32>) -> vec3<f32> {{
@@ -683,7 +684,8 @@ fn lut_snippet(b: usize, off: usize, n1: u32, n3: u32) -> String {
         "    if (P[{b}].x > 0.0) {{
         FM = bitcast<u32>(P[{b5}].x);
         let sp = u32(P[{b}].y);
-        var v = vec3<f32>(lut_nz(c.x), lut_nz(c.y), lut_nz(c.z));
+        let w = vec3<f32>(lut_nz(c.x), lut_nz(c.y), lut_nz(c.z));
+        var v = w;
         if (sp == 1u) {{
             let lin = lut_to709(v);
             v = vec3<f32>(srgb_oetf1(clamp(lin.x, 0.0, 1.0)), srgb_oetf1(clamp(lin.y, 0.0, 1.0)), srgb_oetf1(clamp(lin.z, 0.0, 1.0)));
@@ -711,13 +713,18 @@ fn lut_snippet(b: usize, off: usize, n1: u32, n3: u32) -> String {
     }
     let _ = write!(
         s,
-        "        var m = v + (s - v) * P[{b}].x;
+        "        var m = s;
         if (sp == 1u) {{
-            m = lut_from709(vec3<f32>(srgb_eotf1(m.x), srgb_eotf1(m.y), srgb_eotf1(m.z)));
+            m = lut_from709(vec3<f32>(srgb_eotf1(s.x), srgb_eotf1(s.y), srgb_eotf1(s.z)));
         }} else if (sp == 2u) {{
-            m = vec3<f32>(cct_dec(m.x), cct_dec(m.y), cct_dec(m.z));
+            m = vec3<f32>(cct_dec(s.x), cct_dec(s.y), cct_dec(s.z));
         }}
-        c = m;
+        // The strength mixes in the working space; at 1 the LUT result is returned as it is.
+        if (P[{b}].x >= 1.0) {{
+            c = m;
+        }} else {{
+            c = w + (m - w) * P[{b}].x;
+        }}
     }}
 "
     );
@@ -954,9 +961,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     s
 }
 
+/// Pipelines with a LUT op that stay cached.
+const MAX_LUT_PIPELINES: usize = 32;
+
 fn pipeline_for(ctx: &GpuContext, kinds: &[OpKind]) -> Result<Arc<PointPipeline>, GpuError> {
     let mut cache = ctx.point_cache.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(p) = cache.get(kinds) {
+    static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some((p, used)) = cache.get_mut(kinds) {
+        *used = tick;
         return Ok(Arc::clone(p));
     }
     let mut table_offsets = Vec::with_capacity(kinds.len());
@@ -992,7 +1005,21 @@ fn pipeline_for(ctx: &GpuContext, kinds: &[OpKind]) -> Result<Arc<PointPipeline>
         table_buf,
         table_keys: Mutex::new(vec![Vec::new(); kinds.len()]),
     });
-    cache.insert(kinds.to_vec(), Arc::clone(&p));
+    // A LUT pipeline pins its table buffer (up to ~4 MB), and every table size is its own
+    // pipeline: keep the most recently used ones and free the rest.
+    let is_lut = |k: &[OpKind]| k.iter().any(|o| matches!(o, OpKind::Lut { .. }));
+    if is_lut(kinds) {
+        while cache.keys().filter(|k| is_lut(k)).count() >= MAX_LUT_PIPELINES {
+            let oldest = cache.iter().filter(|(k, _)| is_lut(k)).min_by_key(|(_, (_, used))| *used).map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => {
+                    cache.remove(&k);
+                }
+                None => break,
+            }
+        }
+    }
+    cache.insert(kinds.to_vec(), (Arc::clone(&p), tick));
     Ok(p)
 }
 

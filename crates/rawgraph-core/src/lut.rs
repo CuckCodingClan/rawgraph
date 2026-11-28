@@ -16,8 +16,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Largest `LUT_3D_SIZE`.
 pub const MAX_3D_SIZE: usize = 65;
@@ -25,8 +26,6 @@ pub const MAX_3D_SIZE: usize = 65;
 pub const MAX_1D_SIZE: usize = 65_536;
 /// Largest file that is read (a 65^3 cube is about 8 MB of text).
 pub const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
-/// Loaded files that stay in the cache.
-const CACHE_ENTRIES: usize = 16;
 
 /// What goes wrong when a LUT file is read or parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +186,11 @@ impl Lut {
         Self { title, lut1d, lut3d, hash: h.finish() }
     }
 
+    /// Bytes of table data.
+    pub fn bytes(&self) -> usize {
+        self.lut1d.iter().chain(self.lut3d.iter()).map(|t| t.data.len()).sum::<usize>() * 4
+    }
+
     /// Hash of the table content (sizes, domains, every value).
     pub fn content_hash(&self) -> u64 {
         self.hash
@@ -270,6 +274,8 @@ fn is_data_line(first: &str) -> bool {
 /// Parses the text of a `.cube` file.
 pub fn parse_cube(text: &str) -> Result<Lut, LutError> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    // CRLF, LF and old Mac CR-only line ends all count as one line end.
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut title: Option<String> = None;
     let (mut dmin_set, mut dmax_set) = (None::<[f32; 3]>, None::<[f32; 3]>);
     let (mut size1, mut size3): (Option<usize>, Option<usize>) = (None, None);
@@ -279,6 +285,8 @@ pub fn parse_cube(text: &str) -> Result<Lut, LutError> {
     let mut expected = 0usize;
     let mut sized = false;
     let mut last_line = 0usize;
+    // Lines of the keywords that set a domain, for the error of an impossible one.
+    let (mut domain_line, mut range1_line, mut range3_line) = (0usize, 0usize, 0usize);
 
     for (index, raw) in text.lines().enumerate() {
         let line_no = index + 1;
@@ -305,7 +313,7 @@ pub fn parse_cube(text: &str) -> Result<Lut, LutError> {
         if rows > 0 {
             return Err(LutError::at(line_no, format!("keyword \"{first}\" after the data rows started")));
         }
-        if first == "TITLE" {
+        if first.eq_ignore_ascii_case("TITLE") {
             let rest = line[first.len()..].trim();
             let rest = rest.strip_prefix('"').map_or(rest, |r| r.rsplit_once('"').map_or(r, |(t, _)| t));
             title = Some(rest.to_owned());
@@ -315,22 +323,26 @@ pub fn parse_cube(text: &str) -> Result<Lut, LutError> {
         let mut parts = body.split_whitespace();
         let keyword = parts.next().unwrap_or("");
         let tokens: Vec<&str> = parts.collect();
-        match keyword {
+        match keyword.to_ascii_uppercase().as_str() {
             "DOMAIN_MIN" => {
                 let v = parse_floats(line_no, "DOMAIN_MIN", &tokens, 3)?;
                 dmin_set = Some([v[0], v[1], v[2]]);
+                domain_line = line_no;
             }
             "DOMAIN_MAX" => {
                 let v = parse_floats(line_no, "DOMAIN_MAX", &tokens, 3)?;
                 dmax_set = Some([v[0], v[1], v[2]]);
+                domain_line = line_no;
             }
             "LUT_1D_INPUT_RANGE" => {
                 let v = parse_floats(line_no, "LUT_1D_INPUT_RANGE", &tokens, 2)?;
                 range1 = Some([v[0], v[1]]);
+                range1_line = line_no;
             }
             "LUT_3D_INPUT_RANGE" => {
                 let v = parse_floats(line_no, "LUT_3D_INPUT_RANGE", &tokens, 2)?;
                 range3 = Some([v[0], v[1]]);
+                range3_line = line_no;
             }
             "LUT_1D_SIZE" => {
                 if size1.is_some() {
@@ -345,7 +357,7 @@ pub fn parse_cube(text: &str) -> Result<Lut, LutError> {
                 size3 = Some(parse_size(line_no, "LUT_3D_SIZE", &tokens, MAX_3D_SIZE)?);
             }
             "LUT_IN_VIDEO_RANGE" | "LUT_OUT_VIDEO_RANGE" => {}
-            other => return Err(LutError::at(line_no, format!("unknown keyword \"{other}\""))),
+            _ => return Err(LutError::at(line_no, format!("unknown keyword \"{keyword}\""))),
         }
         if size1.is_some() || size3.is_some() {
             sized = true;
@@ -363,13 +375,15 @@ pub fn parse_cube(text: &str) -> Result<Lut, LutError> {
         return Err(LutError::at(last_line.max(1), format!("expected {expected} data rows, found {rows}")));
     }
 
-    let domain_for = |range: Option<[f32; 2]>| -> Result<([f32; 3], [f32; 3]), LutError> {
-        let (lo, hi) = match range {
-            Some([lo, hi]) => ([lo; 3], [hi; 3]),
-            None => (dmin_set.unwrap_or([0.0; 3]), dmax_set.unwrap_or([1.0; 3])),
+    let domain_for = |range: Option<[f32; 2]>, range_line: usize| -> Result<([f32; 3], [f32; 3]), LutError> {
+        let (lo, hi, line) = match range {
+            Some([lo, hi]) => ([lo; 3], [hi; 3], range_line),
+            None => (dmin_set.unwrap_or([0.0; 3]), dmax_set.unwrap_or([1.0; 3]), domain_line),
         };
-        if (0..3).any(|c| lo[c] >= hi[c]) {
-            return Err(LutError::general("the domain minimum must be below the maximum on every channel"));
+        // `max - min` must be a positive finite number, or the scale 1 / (max - min) is not usable.
+        if (0..3).any(|c| !(hi[c] - lo[c]).is_finite() || hi[c] <= lo[c]) {
+            let message = "the domain minimum must be below the maximum on every channel, and their distance finite";
+            return Err(if line > 0 { LutError::at(line, message) } else { LutError::general(message) });
         }
         Ok((lo, hi))
     };
@@ -378,14 +392,14 @@ pub fn parse_cube(text: &str) -> Result<Lut, LutError> {
     let split = n1 * 3;
     let lut1d = match size1 {
         Some(n) => {
-            let (lo, hi) = domain_for(range1)?;
+            let (lo, hi) = domain_for(range1, range1_line)?;
             Some(LutTable::new(n, lo, hi, data[..split].to_vec()))
         }
         None => None,
     };
     let lut3d = match size3 {
         Some(n) => {
-            let (lo, hi) = domain_for(range3)?;
+            let (lo, hi) = domain_for(range3, range3_line)?;
             Some(LutTable::new(n, lo, hi, data[split..].to_vec()))
         }
         None => None,
@@ -406,7 +420,13 @@ pub fn load_file(path: &Path) -> Result<Lut, LutError> {
     parse_cube(&String::from_utf8_lossy(&bytes))
 }
 
-// ---- cache ---------------------------------------------------------------------------------
+// ---- registry -------------------------------------------------------------------------------
+//
+// One process-wide registry of every LUT file the graphs refer to. It keeps the last known STATUS of
+// a path (the table or the error, so a broken file is parsed once, not per frame), looks at the file's
+// size and modification time at most every [`refresh_interval`], and evicts least-recently-used
+// entries beyond [`MAX_ENTRIES`] files or [`MAX_BYTES`] of tables. The UI never touches the disk:
+// [`peek`] only reads the registry and asks a background thread to look at the file again.
 
 /// Identity of a file's content as far as the file system tells: size and modification time.
 pub type FileStamp = (u64, Option<SystemTime>);
@@ -417,42 +437,199 @@ pub fn file_stamp(path: &Path) -> Option<FileStamp> {
     Some((meta.len(), meta.modified().ok()))
 }
 
-type CacheEntry = (PathBuf, FileStamp, Arc<Lut>);
+/// Files kept in the registry.
+pub const MAX_ENTRIES: usize = 64;
+/// Bytes of table data kept in the registry.
+pub const MAX_BYTES: usize = 512 * 1024 * 1024;
 
-fn cache() -> &'static Mutex<Vec<CacheEntry>> {
-    static CACHE: Mutex<Vec<CacheEntry>> = Mutex::new(Vec::new());
-    &CACHE
+static REFRESH_MS: AtomicU64 = AtomicU64::new(2000);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// How long a checked file counts as unchanged without looking at the disk again (default 2 s).
+pub fn refresh_interval() -> Duration {
+    Duration::from_millis(REFRESH_MS.load(Ordering::Relaxed))
 }
 
-/// Loads `path` through a process-wide cache keyed by path, file size and modification time:
-/// an unchanged file is parsed once, a changed one is read again. Errors are not cached.
-pub fn load_cached(path: &Path) -> Result<Arc<Lut>, LutError> {
-    let Some(stamp) = file_stamp(path) else {
-        // The metadata call gives the reason (missing file, no permission, ...).
-        return Err(match std::fs::metadata(path) {
-            Err(e) => LutError::general(format!("cannot read the file: {e}")),
-            Ok(_) => LutError::general("cannot read the file"),
-        });
-    };
+/// Sets [`refresh_interval`] (tests use 0 to see a change at once).
+pub fn set_refresh_interval(interval: Duration) {
+    REFRESH_MS.store(interval.as_millis() as u64, Ordering::Relaxed);
+}
+
+/// Changes whenever the status of any LUT file changed (new content, new error, file appeared or
+/// vanished) or "Reload" was pressed. A render request that includes it is repeated when it moves.
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
+
+struct Entry {
+    path: PathBuf,
+    stamp: Option<FileStamp>,
+    checked: Instant,
+    result: Result<Arc<Lut>, LutError>,
+    bytes: usize,
+    used: u64,
+}
+
+struct Registry {
+    entries: Vec<Entry>,
+    tick: u64,
+    /// Paths a background refresh was asked for and has not finished.
+    pending: Vec<PathBuf>,
+}
+
+fn lock() -> std::sync::MutexGuard<'static, Registry> {
+    static REGISTRY: Mutex<Registry> = Mutex::new(Registry { entries: Vec::new(), tick: 0, pending: Vec::new() });
+    REGISTRY.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+#[cfg(test)]
+static PARSES: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+/// How often `path` was parsed (tests).
+#[cfg(test)]
+fn parses_of(path: &Path) -> usize {
+    PARSES.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(p, _)| p == path).map_or(0, |(_, n)| *n)
+}
+
+fn same_status(a: &Result<Arc<Lut>, LutError>, b: &Result<Arc<Lut>, LutError>) -> bool {
+    match (a, b) {
+        (Ok(x), Ok(y)) => x == y,
+        (Err(x), Err(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Looks at `path` (a stat) and parses it when it changed, then stores the status. Blocking: never
+/// call it from the UI thread.
+fn refresh(path: &Path) -> Result<Arc<Lut>, LutError> {
+    let stamp = file_stamp(path);
     {
-        let cache = cache().lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((_, _, lut)) = cache.iter().find(|(p, s, _)| p == path && *s == stamp) {
-            return Ok(Arc::clone(lut));
+        let mut reg = lock();
+        reg.tick += 1;
+        let tick = reg.tick;
+        if let Some(e) = reg.entries.iter_mut().find(|e| e.path == path) {
+            if e.stamp == stamp {
+                e.checked = Instant::now();
+                e.used = tick;
+                return e.result.clone();
+            }
         }
     }
-    let lut = Arc::new(load_file(path)?);
-    let mut cache = cache().lock().unwrap_or_else(|p| p.into_inner());
-    cache.retain(|(p, _, _)| p != path);
-    if cache.len() >= CACHE_ENTRIES {
-        cache.remove(0);
+    #[cfg(test)]
+    {
+        let mut counts = PARSES.lock().unwrap_or_else(|p| p.into_inner());
+        match counts.iter_mut().find(|(p, _)| p == path) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((path.to_path_buf(), 1)),
+        }
     }
-    cache.push((path.to_path_buf(), stamp, Arc::clone(&lut)));
-    Ok(lut)
+    let result = load_file(path).map(Arc::new);
+    let bytes = result.as_ref().map_or(0, |l| l.bytes());
+    let mut reg = lock();
+    reg.tick += 1;
+    let tick = reg.tick;
+    let entry = Entry { path: path.to_path_buf(), stamp, checked: Instant::now(), result: result.clone(), bytes, used: tick };
+    match reg.entries.iter().position(|e| e.path == path) {
+        Some(i) => {
+            if !same_status(&reg.entries[i].result, &result) {
+                GENERATION.fetch_add(1, Ordering::Relaxed);
+            }
+            reg.entries[i] = entry;
+        }
+        None => reg.entries.push(entry),
+    }
+    // Least recently used go first, never the entry just stored.
+    while reg.entries.len() > 1 && (reg.entries.len() > MAX_ENTRIES || reg.entries.iter().map(|e| e.bytes).sum::<usize>() > MAX_BYTES) {
+        let Some(oldest) = reg.entries.iter().enumerate().filter(|(_, e)| e.used != tick).min_by_key(|(_, e)| e.used).map(|(i, _)| i) else { break };
+        reg.entries.remove(oldest);
+    }
+    result
 }
 
-/// Drops `path` from the cache so the next load reads the file again ("Reload").
+/// The status of `path` for an evaluation thread: the stored one while it was checked within
+/// [`refresh_interval`], otherwise the file is looked at again (blocking). Errors are stored too, so
+/// a broken file is parsed once.
+pub fn load_cached(path: &Path) -> Result<Arc<Lut>, LutError> {
+    {
+        let mut reg = lock();
+        reg.tick += 1;
+        let tick = reg.tick;
+        if let Some(e) = reg.entries.iter_mut().find(|e| e.path == path) {
+            if e.checked.elapsed() < refresh_interval() {
+                e.used = tick;
+                return e.result.clone();
+            }
+        }
+    }
+    refresh(path)
+}
+
+/// What the UI knows about a LUT file.
+#[derive(Clone, Debug)]
+pub enum LutState {
+    /// Not looked at yet (a background read was started).
+    Unknown,
+    Ready(Arc<Lut>),
+    Failed(LutError),
+}
+
+/// The last known status of `path` without any file access, safe for the UI thread. A status
+/// that is older than [`refresh_interval`] (or missing) makes a background thread look at the
+/// file; its answer shows in a later call and moves [`generation`] when it changed anything.
+pub fn peek(path: &Path) -> LutState {
+    let (state, stale) = {
+        let mut reg = lock();
+        reg.tick += 1;
+        let tick = reg.tick;
+        match reg.entries.iter_mut().find(|e| e.path == path) {
+            Some(e) => {
+                e.used = tick;
+                let state = match &e.result {
+                    Ok(l) => LutState::Ready(Arc::clone(l)),
+                    Err(err) => LutState::Failed(err.clone()),
+                };
+                (state, e.checked.elapsed() >= refresh_interval())
+            }
+            None => (LutState::Unknown, true),
+        }
+    };
+    if stale {
+        schedule(path);
+    }
+    state
+}
+
+fn schedule(path: &Path) {
+    use std::sync::mpsc::{channel, Sender};
+    static WORKER: OnceLock<Mutex<Sender<PathBuf>>> = OnceLock::new();
+    {
+        let mut reg = lock();
+        if reg.pending.iter().any(|p| p == path) {
+            return;
+        }
+        reg.pending.push(path.to_path_buf());
+    }
+    let sender = WORKER.get_or_init(|| {
+        let (tx, rx) = channel::<PathBuf>();
+        let _ = std::thread::Builder::new().name("rawgraph-lut-refresh".into()).spawn(move || {
+            while let Ok(path) = rx.recv() {
+                let _ = refresh(&path);
+                lock().pending.retain(|p| p != &path);
+            }
+        });
+        Mutex::new(tx)
+    });
+    let sent = sender.lock().unwrap_or_else(|p| p.into_inner()).send(path.to_path_buf()).is_ok();
+    if !sent {
+        lock().pending.retain(|p| p != path);
+    }
+}
+
+/// Drops `path` from the registry so the next load reads the file again ("Reload"), and moves
+/// [`generation`] so the picture is rendered again.
 pub fn forget(path: &Path) {
-    cache().lock().unwrap_or_else(|p| p.into_inner()).retain(|(p, _, _)| p != path);
+    lock().entries.retain(|e| e.path != path);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -634,11 +811,32 @@ mod tests {
         assert!((acescct_encode(0.18) - 0.4135884).abs() < 1e-4);
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    /// A temp folder that is removed when the test ends, also when it fails.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn temp_dir(name: &str) -> TempDir {
+        // A changed file is looked at again at once in these tests.
+        set_refresh_interval(Duration::ZERO);
         let dir = std::env::temp_dir().join(format!("rawgraph-lut-core-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TempDir(dir)
     }
 
     #[test]
@@ -677,6 +875,8 @@ mod tests {
         assert!(issues(&g).is_empty(), "no file chosen yet is not a problem");
         let set = |g: &mut Graph, img: u64, p: &Path| {
             assert!(g.node_mut(lut).unwrap().set_data(ImageId(img), Some(NodeData::LutFile(p.to_string_lossy().into_owned()))));
+            // validate() only reads what is known; the evaluation (or the background thread) reads the file.
+            let _ = load_cached(p);
         };
         set(&mut g, 0, &good);
         assert!(issues(&g).is_empty());
@@ -712,5 +912,135 @@ mod tests {
         assert_eq!(e.line, Some(3));
         assert!(load_cached(&dir).is_err(), "a folder is not a LUT");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn more_files_than_the_old_cache_held_all_stay_cached() {
+        let dir = temp_dir("many");
+        let paths: Vec<PathBuf> = (0..20)
+            .map(|i| {
+                let p = dir.join(format!("f{i}.cube"));
+                std::fs::write(&p, identity_3d(2 + i % 3)).unwrap();
+                p
+            })
+            .collect();
+        let first: Vec<_> = paths.iter().map(|p| load_cached(p).unwrap()).collect();
+        for _round in 0..2 {
+            for (p, f) in paths.iter().zip(&first) {
+                assert!(Arc::ptr_eq(f, &load_cached(p).unwrap()), "{}", p.display());
+            }
+        }
+        assert!(paths.iter().all(|p| parses_of(p) == 1), "every file was parsed exactly once");
+    }
+
+    #[test]
+    fn a_broken_file_is_parsed_once_and_its_error_is_cached() {
+        let dir = temp_dir("errorcache");
+        let p = dir.join("bad.cube");
+        std::fs::write(&p, "LUT_3D_SIZE 2\n0 0 0\nnope\n").unwrap();
+        let first = load_cached(&p).unwrap_err();
+        for _ in 0..50 {
+            assert_eq!(load_cached(&p).unwrap_err(), first);
+            // The UI path: no disk access, the stored error.
+            assert!(matches!(peek(&p), LutState::Failed(e) if e == first));
+        }
+        assert_eq!(parses_of(&p), 1);
+        // Fixing the file clears the error.
+        std::fs::write(&p, identity_3d(3)).unwrap();
+        assert!(load_cached(&p).is_ok());
+        assert_eq!(parses_of(&p), 2);
+    }
+
+    #[test]
+    fn peek_never_blocks_and_a_background_read_fills_in() {
+        let dir = temp_dir("peek");
+        let p = dir.join("p.cube");
+        std::fs::write(&p, identity_3d(4)).unwrap();
+        assert!(matches!(peek(&p), LutState::Unknown | LutState::Ready(_)));
+        let mut state = peek(&p);
+        for _ in 0..500 {
+            if matches!(state, LutState::Ready(_)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            state = peek(&p);
+        }
+        assert!(matches!(state, LutState::Ready(l) if l.describe() == "3D 4"));
+    }
+
+    #[test]
+    fn a_missing_file_that_appears_moves_the_generation() {
+        let dir = temp_dir("appear");
+        let p = dir.join("late.cube");
+        assert!(load_cached(&p).is_err());
+        let g = generation();
+        std::fs::write(&p, identity_3d(2)).unwrap();
+        assert!(load_cached(&p).is_ok());
+        assert!(generation() > g);
+        let g = generation();
+        forget(&p);
+        assert!(generation() > g, "Reload moves it too");
+        assert!(load_cached(&p).is_ok());
+    }
+
+    #[test]
+    fn validate_looks_only_at_the_data_in_effect() {
+        use crate::graph::{Graph, ImageId, Mode, NodeData, NodeKind};
+        let dir = temp_dir("effect");
+        let good = dir.join("good.cube");
+        std::fs::write(&good, identity_3d(2)).unwrap();
+        let missing = dir.join("missing.cube");
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
+        let lut = g.add_node(NodeKind::Lut, [1.0, 0.0]);
+        g.connect(src, lut, 0).unwrap();
+        let n = g.node_mut(lut).unwrap();
+        n.mode = Mode::Individual;
+        assert!(n.set_data(ImageId(3), Some(NodeData::LutFile(missing.to_string_lossy().into_owned()))));
+        assert!(n.set_data(ImageId(4), Some(NodeData::LutFile(good.to_string_lossy().into_owned()))));
+        n.mode = Mode::All;
+        assert!(n.set_data(ImageId(0), Some(NodeData::LutFile(good.to_string_lossy().into_owned()))));
+        let state = |g: &Graph| {
+            let _ = load_cached(&missing);
+            g.validate().into_iter().filter(|i| i.node == lut).collect::<Vec<_>>()
+        };
+        assert!(state(&g).is_empty(), "the own file of image 3 is not in effect in All mode");
+        g.node_mut(lut).unwrap().mode = Mode::Individual;
+        let issues = state(&g);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].per_item && issues[0].message.contains("image 3"));
+        // The export side: only the image that uses the missing file has a problem.
+        assert!(g.lut_problem(lut, ImageId(3)).is_some_and(|m| m.contains("missing.cube")));
+        assert_eq!(g.lut_problem(lut, ImageId(4)), None);
+        assert_eq!(g.lut_problem(lut, ImageId(5)), None, "inherits the good All file");
+        // Strength 0 never reads the file.
+        assert!(g.node_mut(lut).unwrap().set_param("strength", ImageId(3), 0.0));
+        assert_eq!(g.lut_problem(lut, ImageId(3)), None);
+    }
+
+    #[test]
+    fn parser_accepts_lowercase_keywords_and_cr_only_lines() {
+        let text = "title \"mac\"\rlut_3d_size 2\rdomain_min 0 0 0\rdomain_max 1 1 1\r".to_owned()
+            + "0 0 0\r1 0 0\r0 1 0\r1 1 0\r0 0 1\r1 0 1\r0 1 1\r1 1 1\r";
+        let lut = parse_cube(&text).unwrap();
+        assert_eq!(lut.title.as_deref(), Some("mac"));
+        assert_eq!(lut.describe(), "3D 2");
+        // The line number counts CR-only lines too.
+        let e = parse_cube("LUT_1D_SIZE 2\r0 0 0\r1 1 x\r").unwrap_err();
+        assert_eq!(e.line, Some(3));
+    }
+
+    #[test]
+    fn parser_rejects_a_domain_that_cannot_be_scaled() {
+        for (text, line) in [
+            ("LUT_1D_SIZE 2\nDOMAIN_MAX 0 1 1\n0 0 0\n1 1 1\n", 2),
+            ("LUT_1D_SIZE 2\nDOMAIN_MIN -3e38 0 0\nDOMAIN_MAX 3e38 1 1\n0 0 0\n1 1 1\n", 3),
+            ("LUT_1D_SIZE 2\nLUT_1D_INPUT_RANGE 1 1\n0 0 0\n1 1 1\n", 2),
+            ("LUT_3D_SIZE 2\nLUT_3D_INPUT_RANGE 2 1\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n", 2),
+        ] {
+            let e = parse_cube(text).unwrap_err();
+            assert_eq!(e.line, Some(line), "{text:?}: {e}");
+            assert!(e.message.contains("domain minimum"), "{e}");
+        }
     }
 }

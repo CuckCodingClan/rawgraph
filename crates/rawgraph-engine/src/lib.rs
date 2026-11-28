@@ -1091,9 +1091,13 @@ fn node_fingerprint_inner(
         (env.view_tone as u8).hash(&mut hasher);
     }
     if node.kind == NodeKind::Lut {
-        // The file's identity (an edit in place changes it) and, in Display mode, the view transform.
+        // What the file holds (its content hash, or the error: a file that appears or is edited
+        // changes it, even when size and time stamp do not) and, in Display mode, the view transform.
         if let Some(path) = rawgraph_core::lut_file(node, image) {
-            rawgraph_core::lut::file_stamp(std::path::Path::new(path)).hash(&mut hasher);
+            match rawgraph_core::lut::load_cached(std::path::Path::new(path)) {
+                Ok(lut) => lut.content_hash().hash(&mut hasher),
+                Err(e) => e.to_string().hash(&mut hasher),
+            }
         }
         if node.choice("input_space", image) == 0 {
             (env.view_tone as u8).hash(&mut hasher);
@@ -5529,11 +5533,32 @@ mod lut_tests {
         s
     }
 
-    fn dir(name: &str) -> PathBuf {
+    /// A temp folder that is removed again when the test ends, also when it fails.
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn dir(name: &str) -> TempDir {
+        // A changed file is seen at once in these tests.
+        rawgraph_core::lut::set_refresh_interval(std::time::Duration::ZERO);
         let d = std::env::temp_dir().join(format!("rawgraph-lut-engine-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d
+        TempDir(d)
     }
 
     fn graph(file: Option<&Path>, space: f32, strength: f32) -> (Graph, NodeId) {
@@ -5694,5 +5719,66 @@ mod lut_tests {
         let b = eval(&mut ev, &g, lut, A);
         assert!(max_diff(&a, &b) > 1e-3, "a new view tone is a new result");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_file_that_appears_later_is_picked_up() {
+        let d = dir("appears");
+        let f = d.join("late.cube");
+        let (g, lut) = graph(Some(&f), 3.0, 1.0);
+        let mut ev = Evaluator::new();
+        let src = Flat.image(A).unwrap();
+        assert_eq!(*eval(&mut ev, &g, lut, A), *src, "missing: passes through");
+        let before = rawgraph_core::lut::generation();
+        std::fs::write(&f, cube(2, |v| [v[2], v[1], v[0]])).unwrap();
+        let out = eval(&mut ev, &g, lut, A);
+        assert!(max_diff(&out, &src) > 0.01, "the file that appeared is used");
+        assert!(rawgraph_core::lut::generation() > before, "the status change moves the generation");
+    }
+
+    #[test]
+    fn reload_picks_up_an_edit_that_keeps_size_and_time_stamp() {
+        let d = dir("reload");
+        let f = d.join("r.cube");
+        std::fs::write(&f, cube(2, |v| [v[0] * 0.5, v[1], v[2]])).unwrap();
+        let stamp = std::fs::metadata(&f).unwrap().modified().unwrap();
+        let (g, lut) = graph(Some(&f), 3.0, 1.0);
+        let mut ev = Evaluator::new();
+        let first = eval(&mut ev, &g, lut, A);
+        // Same size (same number of characters), same modification time, other numbers.
+        std::fs::write(&f, cube(2, |v| [v[0] * 0.7, v[1], v[2]])).unwrap();
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(stamp).unwrap();
+        let before = rawgraph_core::lut::generation();
+        let stale = eval(&mut ev, &g, lut, A);
+        assert!(Arc::ptr_eq(&first, &stale), "nothing in the file system says it changed");
+        rawgraph_core::lut::forget(&f);
+        assert!(rawgraph_core::lut::generation() > before, "Reload moves the generation");
+        let fresh = eval(&mut ev, &g, lut, A);
+        assert!(max_diff(&first, &fresh) > 0.01, "Reload reads the edited file");
+    }
+
+    #[test]
+    fn strength_is_continuous_in_display_and_srgb_mode() {
+        let d = dir("continuous");
+        let f = d.join("id.cube");
+        std::fs::write(&f, cube(9, |v| v)).unwrap();
+        // A highlight the view transform clips: 1 % strength must not clip it.
+        let mut src = (*Flat.image(A).unwrap()).clone();
+        src.set_pixel(0, 0, [6.0, 4.0, 3.0, 1.0]);
+        for space in [0.0, 1.0] {
+            let (g, lut) = graph(Some(&f), space, 0.01);
+            let mut ev = Evaluator::new();
+            struct One(ImageBuf);
+            impl ImageProvider for One {
+                fn image(&self, _: ImageId) -> Result<Arc<ImageBuf>, String> {
+                    Ok(Arc::new(self.0.clone()))
+                }
+            }
+            let out = ev.eval_image(&g, lut, A, &One(src.clone()), &CancelToken::new()).unwrap();
+            let (s, o) = (src.pixel(0, 0), out.pixel(0, 0));
+            for c in 0..3 {
+                assert!((o[c] - s[c]).abs() < 0.02 * s[c] + 0.05, "space {space}: {} vs {}", o[c], s[c]);
+            }
+        }
     }
 }
