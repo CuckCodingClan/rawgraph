@@ -449,6 +449,63 @@ pub fn source_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
     });
 }
 
+// --------------------------------------------------------------------------------- LUT UI
+
+/// Sets (or, with `None`, removes) the LUT file of a LUT node for `image`: in All mode for every
+/// image, in Individual mode for this image only.
+pub fn set_lut_file(graph: &mut Graph, id: NodeId, image: ImageId, file: Option<String>) -> bool {
+    let Some(n) = graph.node_mut(id).filter(|n| n.kind == NodeKind::Lut) else { return false };
+    n.set_data(image, file.map(NodeData::LutFile))
+}
+
+/// The inspector part of a LUT node: file, Choose / Reload / Clear and what loading it said.
+pub fn lut_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, image: ImageId) {
+    let Some(node) = session.project.graph.node(id) else { return };
+    let file = rawgraph_core::lut_file(node, image).map(str::to_owned);
+    let display_mode = node.choice("input_space", image) == 0;
+    ui.add_space(4.0);
+    ui.group(|ui| {
+        ui.set_min_width(ui.available_width());
+        ui.label(RichText::new("LUT file").strong());
+        match &file {
+            Some(f) => {
+                ui.label(crate::export::elide_middle(f, 44)).on_hover_text(f.as_str());
+            }
+            None => {
+                ui.label("No file chosen (the image passes through)");
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Choose\u{2026}").on_hover_text("Pick an Adobe / Resolve .cube file (1D or 3D)").clicked() {
+                session.ui_requests.push(UiRequest::PickLutFile(id));
+            }
+            if ui.add_enabled(file.is_some(), egui::Button::new("Reload")).on_hover_text("Read the file again").clicked() {
+                if let Some(f) = &file {
+                    rawgraph_core::lut::forget(std::path::Path::new(f));
+                }
+            }
+            if ui.add_enabled(file.is_some(), egui::Button::new("Clear")).on_hover_text("Remove the file; the image passes through").clicked() {
+                set_lut_file(&mut session.project.graph, id, image, None);
+            }
+        });
+        if let Some(f) = &file {
+            match rawgraph_core::lut_file_status(f) {
+                Ok(Some(lut)) => {
+                    let title = lut.title.as_deref().filter(|t| !t.is_empty()).map(|t| format!(" \u{2013} {t}")).unwrap_or_default();
+                    ui.label(RichText::new(format!("{}{title}", lut.describe())).color(Color32::from_rgb(130, 190, 175)));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    ui.label(RichText::new(format!("{e}. The image passes through unchanged.")).color(WARN));
+                }
+            }
+        }
+        if display_mode {
+            ui.label(RichText::new("Display mode applies the view transform on the CPU, the LUT, then its inverse.").weak());
+        }
+    });
+}
+
 // -------------------------------------------------------------------------------- Merge UI
 
 pub fn merge_rule_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {

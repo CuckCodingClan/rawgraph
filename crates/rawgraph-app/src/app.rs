@@ -202,6 +202,8 @@ enum DialogKind {
     SourceFolder(NodeId),
     /// Pick the output folder of an Export node.
     NodeExportFolder(NodeId),
+    /// Pick the `.cube` file of a LUT node.
+    LutFile(NodeId),
 }
 
 struct Dialog {
@@ -1026,6 +1028,7 @@ impl App {
                 DialogKind::RelinkNewFolder => "New place of the folder",
                 DialogKind::SourceFolder(_) => "Choose the folder of the Source",
                 DialogKind::NodeExportFolder(_) => "Choose the output folder of the Export node",
+                DialogKind::LutFile(_) => "Choose a LUT file",
             },
             self.session.project_path.as_ref().and_then(|p| p.parent()).map(std::path::Path::to_path_buf),
         );
@@ -1039,6 +1042,7 @@ impl App {
             DialogKind::LocateFile(_) => 6,
             DialogKind::RelinkNewFolder => 7,
             DialogKind::SourceFolder(_) | DialogKind::NodeExportFolder(_) => 8,
+            DialogKind::LutFile(_) => 9,
         };
         let name = self.save_as_name.take().unwrap_or_else(|| format!("{}{PROJECT_EXT}", self.session.project_name().replace("Untitled project", "untitled")));
         let _ = std::thread::Builder::new().name("rawgraph-dialog".into()).spawn(move || {
@@ -1050,6 +1054,7 @@ impl App {
                 0 => d.add_filter("RawGraph project (*.rawgraph)", &["rawgraph"]).pick_file(),
                 1 | 5 | 7 | 8 => d.pick_folder(),
                 6 => d.pick_file(),
+                9 => d.add_filter("Cube LUT (*.cube)", &["cube"]).pick_file(),
                 2 => d.set_file_name(name).add_filter("RawGraph project (*.rawgraph)", &["rawgraph"]).save_file(),
                 3 => d.add_filter("RawGraph graph (*.rawgraph.json)", &["json"]).pick_file(),
                 _ => d.set_file_name(format!("graph{GRAPH_EXT}")).add_filter("RawGraph graph (*.rawgraph.json)", &["json"]).save_file(),
@@ -1078,6 +1083,12 @@ impl App {
                 let folder = path.to_string_lossy().into_owned();
                 if !node_ui::set_source_folder(&mut self.session.project.graph, node, Some(folder)) {
                     self.status.error("The Source node no longer exists");
+                }
+            }
+            DialogKind::LutFile(node) => {
+                let image = self.session.current_image();
+                if !node_ui::set_lut_file(&mut self.session.project.graph, node, image, Some(path.to_string_lossy().into_owned())) {
+                    self.status.error("The LUT node no longer exists");
                 }
             }
             DialogKind::NodeExportFolder(node) => {

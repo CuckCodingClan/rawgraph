@@ -1731,7 +1731,7 @@ fn new_kinds_are_in_every_list_and_round_trip() {
     for kind in [NodeKind::Layer, NodeKind::Export] {
         assert!(NodeKind::ALL.contains(&kind));
     }
-    assert_eq!(NodeKind::ALL.len(), 31);
+    assert_eq!(NodeKind::ALL.len(), 32);
     let mut seen = std::collections::HashSet::new();
     for kind in NodeKind::ALL {
         assert!(seen.insert(kind), "{kind:?} listed twice");

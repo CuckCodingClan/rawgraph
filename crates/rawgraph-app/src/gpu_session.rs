@@ -55,6 +55,7 @@ pub fn point_ops(ops: &[TailOp]) -> Vec<PointOp> {
             TailOp::Vignette { amount, midpoint, feather } => PointOp::Vignette { amount: *amount, midpoint: *midpoint, feather: *feather },
             TailOp::WhitesBlacks { whites, blacks } => PointOp::WhitesBlacks { whites: *whites, blacks: *blacks },
             TailOp::Vibrance(a) => PointOp::Vibrance(*a),
+            TailOp::Lut { lut, space, strength } => PointOp::Lut { lut: std::sync::Arc::clone(lut), space: *space, strength: *strength },
         })
         .collect()
 }

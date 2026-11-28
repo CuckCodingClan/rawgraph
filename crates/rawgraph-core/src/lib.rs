@@ -16,6 +16,7 @@ pub mod image;
 pub mod layer;
 pub mod lens;
 mod migrate;
+pub mod lut;
 pub mod ops;
 
 #[cfg(test)]
@@ -31,7 +32,7 @@ pub use export::{
     EXPORT_FORMATS, EXPORT_SIZES,
 };
 pub use graph::{
-    cdl_params, curve_set, default_curve, iso_noise_scale, neutral_curve, BrushStroke, Catalog, CaptureFn, CdlParams,
+    cdl_params, curve_set, default_curve, iso_noise_scale, lut_file, lut_file_status, neutral_curve, BrushStroke, Catalog, CaptureFn, CdlParams,
     CurveEntry, DataKind, Edge, Graph, GraphError, ImageId, Issue, Mode, NamedRange, Node, NodeData, NodeId, NodeKind,
     OutputSpec, ParamKind, ParamSpec, PortType, Subgraph, CURVE_CHANNELS, GRAPH_FORMAT_VERSION,
 };
@@ -41,4 +42,5 @@ pub use layer::{
     layer_settings, BlendMode, FitMode, LayerSettings, ResampleFilter, LAYER_BLEND_MODES, LAYER_FILTERS, LAYER_FITS,
     MAX_LAYERS,
 };
+pub use lut::{Lut, LutError, LutSpace};
 pub use lens::{LensProfile, VignetteRadial, WarpRectilinear, LENS_MODES};

@@ -106,6 +106,8 @@ pub enum NodeKind {
     DepthMap,
     /// Generate pixels at the incoming image dimensions.
     Generator,
+    /// Colour lookup table from a `.cube` file (path stored as node data).
+    Lut,
 }
 
 /// How a parameter is edited and which values it accepts.
@@ -235,6 +237,12 @@ const NORMALS_PARAMS: &[ParamSpec] = &[
 const PIXEL_SORT_PARAMS: &[ParamSpec] = &[
     choice("metric", "Sort by", &["Brightness", "Saturation", "Hue"], 0),
     toggle("reverse", "Reverse", false),
+];
+/// Input spaces of the LUT node (the choice index is stored; keep the order).
+pub const LUT_SPACES: &[&str] = &["Display (view transform)", "sRGB / Rec.709 display (clamped)", "ACEScct (log)", "Linear ACEScg"];
+const LUT_PARAMS: &[ParamSpec] = &[
+    p("strength", "Strength", "", 0.0, 1.0, 1.0),
+    choice("input_space", "Input space", LUT_SPACES, 0),
 ];
 const GENERATOR_PARAMS: &[ParamSpec] = &[
     p("width", "Width", "px", 1.0, 8192.0, 1024.0),
@@ -604,7 +612,7 @@ pub fn curve_set(node: &Node, image: ImageId) -> Vec<CurveEntry> {
 }
 
 impl NodeKind {
-    pub const ALL: [NodeKind; 31] = [
+    pub const ALL: [NodeKind; 32] = [
         NodeKind::Source,
         NodeKind::CaptureEv,
         NodeKind::Exposure,
@@ -638,6 +646,7 @@ impl NodeKind {
         NodeKind::NormalMap,
         NodeKind::DepthMap,
         NodeKind::Generator,
+        NodeKind::Lut,
     ];
 
     /// Menu group of this kind.
@@ -651,7 +660,7 @@ impl NodeKind {
             | NodeKind::ToneCurve
             | NodeKind::PointCurve => "Tone",
             NodeKind::WhiteBalance | NodeKind::Saturation | NodeKind::HueSaturation | NodeKind::BlackWhite => "Colour",
-            NodeKind::ColorWheels => "Colour",
+            NodeKind::ColorWheels | NodeKind::Lut => "Colour",
             NodeKind::NoiseReduction | NodeKind::Sharpen | NodeKind::Blur | NodeKind::Clarity => "Detail",
             NodeKind::Transform | NodeKind::LensManual => "Geometry",
             NodeKind::Vignette | NodeKind::PixelSort => "Effects",
@@ -695,6 +704,7 @@ impl NodeKind {
             NodeKind::NormalMap => "Normal Map",
             NodeKind::DepthMap => "Depth Map",
             NodeKind::Generator => "Generator",
+            NodeKind::Lut => "LUT",
         }
     }
 
@@ -733,6 +743,7 @@ impl NodeKind {
             NodeKind::NormalMap => NORMALS_PARAMS,
             NodeKind::DepthMap => &[],
             NodeKind::Generator => GENERATOR_PARAMS,
+            NodeKind::Lut => LUT_PARAMS,
         }
     }
 
@@ -776,6 +787,7 @@ impl NodeKind {
             NodeKind::MetadataSplit => &[DataKind::Ranges],
             NodeKind::Source => &[DataKind::Folder],
             NodeKind::Export => &[DataKind::Export],
+            NodeKind::Lut => &[DataKind::LutFile],
             _ => &[],
         }
     }
@@ -820,6 +832,8 @@ pub enum NodeData {
     CurveSet(Vec<CurveEntry>),
     /// Export: folder, file name template and text metadata.
     Export(ExportText),
+    /// LUT: absolute path of the `.cube` file; "" = none chosen.
+    LutFile(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -831,6 +845,7 @@ pub enum DataKind {
     Folder,
     CurveSet,
     Export,
+    LutFile,
 }
 
 impl NodeData {
@@ -843,6 +858,7 @@ impl NodeData {
             NodeData::Folder(_) => DataKind::Folder,
             NodeData::CurveSet(_) => DataKind::CurveSet,
             NodeData::Export(_) => DataKind::Export,
+            NodeData::LutFile(_) => DataKind::LutFile,
         }
     }
 }
@@ -885,6 +901,7 @@ fn validate_data(kind: NodeKind, data: &NodeData) -> Result<(), String> {
             }
         }
         NodeData::Folder(path) => validate_text("folder", path)?,
+        NodeData::LutFile(path) => validate_text("LUT file", path)?,
         NodeData::Export(t) => {
             validate_text("output folder", &t.out_dir)?;
             validate_text("name template", &t.name_template)?;
@@ -1233,6 +1250,23 @@ pub struct Issue {
 /// Longest walk along a chain of nodes (graphs are acyclic, this only guards
 /// against hand-built nonsense).
 const MAX_WALK: usize = 512;
+
+/// Loads the LUT file named by a LUT node's data (cached by path, size and modification time).
+/// An empty path is not an error here: it means no file was chosen yet and gives `Ok(None)`.
+pub fn lut_file_status(path: &str) -> Result<Option<std::sync::Arc<crate::lut::Lut>>, crate::lut::LutError> {
+    if path.trim().is_empty() {
+        return Ok(None);
+    }
+    crate::lut::load_cached(std::path::Path::new(path)).map(Some)
+}
+
+/// The LUT file path a LUT node uses for `image` (`None` when no file is chosen).
+pub fn lut_file(node: &Node, image: ImageId) -> Option<&str> {
+    match node.data(image) {
+        Some(NodeData::LutFile(p)) if !p.trim().is_empty() => Some(p.as_str()),
+        _ => None,
+    }
+}
 
 /// The folder a Source restricts its images to and whether subfolders count.
 fn source_folder(n: &Node) -> Option<(&str, bool)> {
@@ -1589,6 +1623,19 @@ impl Graph {
                     let dir_set = matches!(node.all_data(), Some(NodeData::Export(t)) if !t.out_dir.trim().is_empty());
                     if !dir_set {
                         add("Export: no output folder set".to_owned());
+                    }
+                }
+                NodeKind::Lut => {
+                    // Every stored file (All and each image of Individual mode); a problem is
+                    // reported, the node passes its input through meanwhile.
+                    let all = node.data.iter().map(|d| (None, d));
+                    let own = node.individual_data.iter().map(|(i, d)| (Some(*i), d));
+                    for (image, data) in all.chain(own) {
+                        let NodeData::LutFile(path) = data else { continue };
+                        if let Err(e) = lut_file_status(path) {
+                            let whose = image.map_or(String::new(), |i| format!(" (image {})", i.0));
+                            add(format!("LUT{whose}: {path}: {e}; the image passes through unchanged"));
+                        }
                     }
                 }
                 NodeKind::LensManual if node.all_choice("mode") == 1 && !self.lens_auto_usable(node.id) => {
@@ -2859,6 +2906,7 @@ mod tests {
             (NodeKind::PixelSort, "Pixel Sort", "Effects"),
             (NodeKind::NormalMap, "Normal Map", "Generators"),
             (NodeKind::Generator, "Generator", "Generators"),
+            (NodeKind::Lut, "LUT", "Colour"),
             (NodeKind::DepthMap, "Depth Map", "Generators"),
             (NodeKind::MetadataFilter, "Metadata Filter", "Collection"),
             (NodeKind::Merge, "Merge", "Collection"),
@@ -3292,6 +3340,7 @@ mod tests {
                 NodeKind::MetadataSplit => Some(DataKind::Ranges),
                 NodeKind::Source => Some(DataKind::Folder),
                 NodeKind::Export => Some(DataKind::Export),
+                NodeKind::Lut => Some(DataKind::LutFile),
                 _ => None,
             };
             assert_eq!(kind.data_kind(), expected, "{kind:?}");
@@ -3328,7 +3377,7 @@ mod tests {
         assert_eq!(s.param_spec("missing").unwrap().kind, ParamKind::Choice(&["Unmatched", "Exclude"]));
         assert_eq!(s.params().len(), 2);
         assert!(NodeKind::ALL.contains(&c) && NodeKind::ALL.contains(&b) && NodeKind::ALL.contains(&s));
-        assert_eq!(NodeKind::ALL.len(), 31);
+        assert_eq!(NodeKind::ALL.len(), 32);
     }
 
     #[test]

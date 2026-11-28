@@ -394,6 +394,16 @@ Pixel Sort stably sorts all complete RGBA pixels across the image, filling each 
 
 Preview sorts the available proxy image, so its pattern can differ from the full-resolution export: downsampling and sorting do not commute. This global sort uses memory proportional to the number of pixels.
 
+### LUT
+
+The LUT node (category Colour) applies an Adobe / Resolve `.cube` file. The inspector shows the file path with Choose... (native dialog, `.cube` filter), Reload and Clear, plus what loading said (for example "3D 33 - title", or the error with its line number). The path is node data, so Individual mode gives every image its own LUT.
+
+- **Formats:** `LUT_1D_SIZE` (2 to 65536), `LUT_3D_SIZE` (2 to 65), `DOMAIN_MIN` / `DOMAIN_MAX`, `TITLE`, `#` comments, LF or CRLF, scientific notation, the Resolve `LUT_1D_INPUT_RANGE` / `LUT_3D_INPUT_RANGE`. A file with both sizes holds the 1D rows first; the 1D table then acts as a shaper before the cube. Hald CLUT images are not supported. A malformed file is an error with the line number, never a panic.
+- **Interpolation:** tetrahedral for 3D, linear for 1D, in 32-bit float. Input outside the table domain is clamped to it.
+- **Input space:** Display (default) applies the viewer's tone map (without exposure), the LUT, then the inverse view transform, like a Display-mode Generator; colours the view transform cannot reach are clipped by the inverse. sRGB / Rec.709 converts to Rec.709 primaries and the sRGB curve, clamped to 0..1, so highlights above 1 are clipped. ACEScct (log) uses the ACEScct curve on the AP1 primaries. Linear ACEScg feeds the working values to the table. Strength mixes the input and the LUT output in the chosen space; at 0 the image passes through bit-identical.
+- **Caching:** loaded files are cached by path, file size and modification time, so no frame reads the file again; editing the file in place changes the node's fingerprint and the result is recomputed. A missing or unreadable file is a `Graph::validate()` issue and the node passes its input through.
+- **GPU:** the sRGB, ACEScct and Linear modes run as a tail operation on the GPU (storage buffer, the same tetrahedral code as the CPU; within 1 code value). Display mode needs the inverse view transform, which exists on the CPU only, so that node is the CPU base of the plan: the frame stays on the GPU for the operations after it and the display transform. Export always uses the CPU path.
+
 ### Sample photos
 
 Some tests and the examples under `crates/*/examples` work on private sample photos, which are

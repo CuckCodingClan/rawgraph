@@ -18,6 +18,7 @@ impl App {
             match r {
                 UiRequest::PickSourceFolder(node) => self.open_dialog(DialogKind::SourceFolder(node)),
                 UiRequest::PickExportFolder(node) => self.open_dialog(DialogKind::NodeExportFolder(node)),
+                UiRequest::PickLutFile(node) => self.open_dialog(DialogKind::LutFile(node)),
                 UiRequest::OpenNodeExport(node) => {
                     if self.session.demo {
                         self.status.error("The demo images cannot be exported. Open a folder first.");

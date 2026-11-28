@@ -180,6 +180,19 @@ Up to six editable named ranges (name, min, max); range names label their output
 | Gain green | `gain_g` | 0 | -2 to 2 EV |
 | Gain blue | `gain_b` | 0 | -2 to 2 EV |
 
+### LUT (`Lut`)
+
+Applies an Adobe / Resolve `.cube` lookup table (1D, 3D, or a 1D shaper followed by a 3D cube). Without a readable file the image passes through and `validate()` reports the reason.
+
+- **Inputs:** Images: Images (required)
+- **Outputs:** Images: Images
+- **Structured settings:** `LutFile` (absolute path of the `.cube` file; per image in Individual mode)
+
+| Setting | Key | Default | Range or choices |
+| --- | --- | --- | --- |
+| Strength | `strength` | 1 | 0 to 1 |
+| Input space | `input_space` | Display (view transform) | Display (view transform) / sRGB / Rec.709 display (clamped) / ACEScct (log) / Linear ACEScg |
+
 ## Detail
 
 ### Filter (`Blur`)

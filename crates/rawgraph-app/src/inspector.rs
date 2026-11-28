@@ -229,6 +229,7 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
             crate::tool_panels::wb_picker_button(ui, session, id);
         }
         NodeKind::MetadataSplit => crate::tool_panels::split_section(ui, session, id),
+        NodeKind::Lut => node_ui::lut_section(ui, session, id, image),
         _ => {}
     }
     if kind == NodeKind::MetadataFilter {
