@@ -324,7 +324,7 @@ Outputs opaque grayscale relative depth (black near, white far). Requires the op
 
 ### Generator (`Generator`)
 
-Image input is optional: it supplies dimensions and collection membership when connected; otherwise Generator produces a standalone image. Gradient has separate draggable colour and opacity ramps, each with 2–256 stops. Select a stop to edit its position, value or midpoint to the next stop, or to delete it. The structured setting is `GradientRamp`; old scalar ramp values are fallback data. Noise remains a separate mode. Display values are inverse-view transformed with the current session tone map (excluding preview exposure); Data preserves numeric values. Control-input evaluation uses data values. Export evaluation uses the session view tone. Saturated ACES-fit colours outside the invertible gamut are projected and can change hue.
+Image input is optional: it supplies dimensions and collection membership when connected; otherwise Generator produces a standalone image. Gradient has separate draggable colour and opacity ramps, each with 2–256 stops. Select a stop to edit its position, value or midpoint to the next stop, or to delete it. The structured setting is `GradientRamp`; old scalar ramp values are fallback data. Noise remains a separate mode. Display values are inverse-view transformed with the current session tone map (excluding preview exposure); Data preserves numeric values. Control-input evaluation uses data values. Export evaluation uses the session view tone. Saturated ACES-fit colours outside the invertible gamut are projected and can change hue. Gradient center X / Y place the gradient origin in percent of the frame (50 / 50 is the centre, the old fixed origin, so existing graphs render identically); the viewer handles edit center, angle and scale on the picture.
 
 - **Inputs:** Images: Images (optional)
 - **Outputs:** Images: Images
@@ -339,6 +339,8 @@ Image input is optional: it supplies dimensions and collection membership when c
 | Gradient style | `gradient_style` | Linear | Linear / Radial / Angle / Reflected / Diamond |
 | Gradient angle | `gradient_angle` | 0 | -180 to 180 deg |
 | Gradient scale | `gradient_scale` | 100 | 1 to 400 % |
+| Gradient center X | `gradient_center_x` | 50 | -100 to 200 % |
+| Gradient center Y | `gradient_center_y` | 50 | -100 to 200 % |
 | Reverse gradient | `gradient_reverse` | Off | Off / On |
 | Start red | `start_r` | 0 | -4 to 4 |
 | Start green | `start_g` | 0 | -4 to 4 |

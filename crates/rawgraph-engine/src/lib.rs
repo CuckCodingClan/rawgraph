@@ -1653,6 +1653,7 @@ fn render_generator(node: &rawgraph_core::Node, image: ImageId, width: u32, heig
             style: node.choice("gradient_style", image) as u32,
             angle: param("gradient_angle"),
             scale: param("gradient_scale") / 100.0,
+            center: [param("gradient_center_x") / 100.0, param("gradient_center_y") / 100.0],
             reverse: node.toggle("gradient_reverse", image),
             start: [param("start_r"), param("start_g"), param("start_b")],
             end: [param("end_r"), param("end_g"), param("end_b")],
