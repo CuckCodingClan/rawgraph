@@ -26,8 +26,8 @@
 //! negative neutral values come out black.
 
 use rawgraph_core::color::{
-    acescg_to_output, acescg_to_rec709, mul, rec709_to_output, srgb_oetf, to_f32, OutputSpace,
-    Transfer,
+    acescg_to_output, acescg_to_rec709, invert, mul, mul_vec, rec709_to_output, srgb_eotf,
+    srgb_oetf, to_f32, OutputSpace, Transfer,
 };
 use rawgraph_core::ImageBuf;
 use rayon::prelude::*;
@@ -49,6 +49,54 @@ pub enum ToneMap {
     /// displays, NOT a certified ACES Output Transform. ACES 2.0 and HDR output
     /// transforms are later work.
     AcesFit,
+}
+
+/// Inverse of the zero-exposure sRGB viewer. Construct once per image.
+///
+/// Encoded components are clamped to 0..1 (NaN becomes zero). For ACES fit,
+/// saturated colours outside the fit's invertible gamut are projected by
+/// clamping the intermediate curve values; their round trip can change hue.
+pub struct InverseDisplayTransform {
+    tone_map: ToneMap,
+    input_inverse: [[f64; 3]; 3],
+    output_inverse: [[f64; 3]; 3],
+}
+
+impl InverseDisplayTransform {
+    pub fn new(tone_map: ToneMap) -> Self {
+        let input = if tone_map == ToneMap::AcesFit {
+            mul(&ACES_FIT_IN, &acescg_to_rec709())
+        } else {
+            acescg_to_rec709()
+        };
+        let output = ACES_FIT_OUT.map(|row| row.map(f64::from));
+        Self { tone_map, input_inverse: invert(&input), output_inverse: invert(&output) }
+    }
+
+    pub fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let linear = rgb.map(|v| f64::from(srgb_eotf(if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) })));
+        let values = if self.tone_map == ToneMap::AcesFit {
+            mul_vec(&self.output_inverse, linear)
+        } else { linear };
+        let scene = values.map(|y| match self.tone_map {
+            ToneMap::Clip => y,
+            ToneMap::SoftHighlights => {
+                // y = x(1+x/64)/(1+x): x² + (64-64y)x - 64y = 0.
+                let b = 64.0 * (1.0 - y);
+                128.0 * y / ((b * b + 256.0 * y).sqrt() + b)
+            }
+            ToneMap::AcesFit => {
+                // y = (x²+a*x-b)/(c*x²+d*x+e).
+                // Positive root of (1-c*y)x² + (a-d*y)x - (b+e*y)=0.
+                let y = y.clamp(0.0, 1.0);
+                let a = 1.0 - 0.983729 * y;
+                let b = 0.0245786 - 0.4329510 * y;
+                let c = 0.000090537 + 0.238081 * y;
+                (2.0 * c) / ((b * b + 4.0 * a * c).sqrt() + b)
+            }
+        });
+        mul_vec(&self.input_inverse, scene).map(|v| v as f32)
+    }
 }
 
 /// Exposure + tone map applied before the sRGB encoding.
@@ -454,4 +502,30 @@ impl DisplayImage {
 #[cfg(test)]
 pub(crate) fn lut_for_tests() -> &'static [f32] {
     lut()
+}
+
+#[cfg(test)]
+mod inverse_tests {
+    use super::*;
+
+    #[test]
+    fn neutral_codes_round_trip_through_actual_view() {
+        for tone_map in [ToneMap::Clip, ToneMap::SoftHighlights, ToneMap::AcesFit] {
+            let inverse = InverseDisplayTransform::new(tone_map);
+            let mut image = ImageBuf::new(1024, 1);
+            for (i, pixel) in image.data_mut().as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let t = i as f32 / 1023.0;
+                let rgb = inverse.apply([t; 3]);
+                pixel[..3].copy_from_slice(&rgb);
+                pixel[3] = 1.0;
+            }
+            let output = DisplayTransform { exposure_ev: 0.0, tone_map }.apply(&image);
+            for (i, pixel) in output.rgb.as_chunks::<3>().0.iter().enumerate() {
+                let t = i as f32 / 1023.0;
+                for value in pixel {
+                    assert!((value - t).abs() <= 0.5 / 1023.0, "{tone_map:?} {i}: {value}");
+                }
+            }
+        }
+    }
 }

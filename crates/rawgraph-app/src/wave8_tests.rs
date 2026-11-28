@@ -91,6 +91,7 @@ fn chain(setup: impl FnOnce(&mut Node, &mut Node)) -> (Graph, NodeId) {
 /// (largest difference in code values, share of differing values) between the GPU frame and the CPU
 /// frame of `graph`; `None` without a GPU adapter. Also asserts the GPU really got a tail.
 fn gpu_vs_cpu(graph: &Graph, out: NodeId, expect_tone_base: bool) -> Option<(u8, f64)> {
+    let _gpu = crate::gpu_real::gpu_test_lock();
     let ctx = match GpuContext::new() {
         Ok(c) => Arc::new(c),
         Err(e) => {
@@ -342,11 +343,9 @@ fn develop_groups_reset_only_their_own_parameters() {
     assert_eq!((n.param("exposure", img), n.param("contrast", img), n.param("whites", img)), (0.0, 0.0, 0.0));
     assert_eq!((n.param("saturation", img), n.param("vibrance", img), n.param("brightness", img)), (0.3, 0.2, 2.0), "other groups keep their values");
     let colour = groups.iter().find(|g| g.title == "Colour").unwrap();
-    let raw = groups.iter().find(|g| g.title == "RAW").unwrap();
     crate::inspector::reset_group(&mut s, dev, img, colour);
-    crate::inspector::reset_group(&mut s, dev, img, raw);
     let n = s.project.graph.node(dev).unwrap();
-    assert_eq!((n.param("saturation", img), n.param("vibrance", img), n.param("brightness", img)), (0.0, 0.0, 1.6));
+    assert_eq!((n.param("saturation", img), n.param("vibrance", img), n.param("brightness", img)), (0.0, 0.0, 2.0));
     assert!(n.toggle("baseline", img));
 }
 

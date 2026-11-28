@@ -574,15 +574,12 @@ fn all_formats_read_back() {
 #[test]
 fn invalid_node_is_rejected() {
     let t = TempDir::new();
-    let (mut g, _, out) = make_graph(0.0);
-    let mask = g.add_node(NodeKind::GradientMask, [0.0; 2]);
+    let (g, _, out) = make_graph(0.0);
     let s = settings(&t.path("out"), ExportFormat::Png);
-    for n in [NodeId(999), mask] {
-        assert!(matches!(
-            export(&g, n, &[], &s, &CancelToken::new(), &mut |_| {}),
-            Err(ExportError::InvalidSettings(_))
-        ));
-    }
+    assert!(matches!(
+        export(&g, NodeId(999), &[], &s, &CancelToken::new(), &mut |_| {}),
+        Err(ExportError::InvalidSettings(_))
+    ));
     assert!(export(&g, out, &[], &s, &CancelToken::new(), &mut |_| {}).unwrap().items.is_empty());
 }
 
@@ -803,8 +800,8 @@ fn develop_uses_capture_metadata_for_every_item() {
     assert_eq!(*asked.lock().unwrap(), vec![a.clone(), b.clone(), c.clone()], "consulted once per item, in order");
 
     let base = load(&a);
-    // a: tag 0.5 + brightness 1.6; b: baseline_default 0.35 + brightness 1.6; c: not RAW, no gain.
-    for (i, gain) in [(0usize, 2.1f32), (1, 1.95), (2, 0.0)] {
+    // These are PNG inputs: even misleading RAW metadata must not add decode or Develop gain.
+    for (i, gain) in [(0usize, 0.0f32), (1, 0.0), (2, 0.0)] {
         let (_, _, data) = read_exr(&written_path(&r.items[i].1));
         let mut expected = base.clone();
         ops::apply_gain(&mut expected, 2f32.powf(gain));

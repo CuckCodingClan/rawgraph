@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "26.11.1"
 edition = "2021"
 publish = false
 
@@ -41,3 +41,13 @@ opt-level = 3
 
 [profile.release]
 lto = "thin"
+
+# Fast-to-rebuild testing build used by `RawGraph Dev.cmd`: release optimisation
+# without link-time optimisation and with incremental compilation, so changing
+# app code only recompiles the changed crates instead of re-linking everything
+# through LTO. Shipped preview builds still use `release`.
+[profile.iter]
+inherits = "release"
+lto = false
+incremental = true
+codegen-units = 16

@@ -366,42 +366,6 @@ fn ref_hue_saturation(img: &mut ImageBuf, bands: &[[f32; 3]; 6]) {
 
 /// Exact reference of `hue_mask` (angle by `atan2` for every pixel). `old_gate` selects the
 /// previous gate `(max - min) / max`, kept only for the timing comparison.
-fn ref_hue_mask(img: &ImageBuf, hue_deg: f32, width_deg: f32, feather: f32, min_sat: f32, old_gate: bool) -> MaskBuf {
-    let sm = |e0: f32, e1: f32, x: f32| {
-        if e1 <= e0 {
-            return (x >= e0) as u8 as f32;
-        }
-        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
-    };
-    let mut m = MaskBuf::new(img.width(), img.height(), 0.0);
-    let (centre, half) = (hue_deg.rem_euclid(360.0), width_deg * 0.5);
-    use rayon::prelude::*;
-    m.data.par_iter_mut().zip(img.data().par_chunks_exact(4)).for_each(|(o, px)| {
-        let (r, g, b) = (px[0], px[1], px[2]);
-        let (hue, c) = hue_chroma(r, g, b);
-        if c <= 0.0 {
-            return;
-        }
-        let gate = if old_gate {
-            let (mx, mn) = (r.max(g).max(b), r.min(g).min(b));
-            if mx <= 0.0 || mx <= mn {
-                return;
-            }
-            sm(min_sat, min_sat + 0.1, (mx - mn) / mx)
-        } else {
-            crate::masks::hue_gate(c, lum([r, g, b, 1.0]), min_sat)
-        };
-        let mut d = (hue - centre).abs();
-        if d > 180.0 {
-            d = 360.0 - d;
-        }
-        let v = if feather <= 0.0 { (d <= half) as u8 as f32 } else { 1.0 - sm(half, half + feather, d) };
-        *o = v * gate;
-    });
-    m
-}
-
 #[test]
 fn hue_saturation_matches_exact_reference() {
     let cases = [
@@ -431,29 +395,6 @@ fn hue_saturation_matches_exact_reference() {
     for (p, q) in a.data().iter().zip(b.data()) {
         assert!((p - q).abs() <= 1e-4 * q.abs().max(1e-3) + 1e-6, "{p} vs {q}");
     }
-}
-
-#[test]
-fn hue_mask_matches_exact_reference_and_ignores_dark_noise() {
-    let img = noise_img(113, 71);
-    for (h, w, f, s) in [(30.0f32, 60.0f32, 20.0f32, 0.1f32), (350.0, 40.0, 0.0, 0.0), (200.0, 120.0, 90.0, 0.2), (10.0, 400.0, 10.0, 0.0), (0.0, 0.0, 30.0, 0.05)] {
-        let a = hue_mask(&img, h, w, f, s);
-        let b = ref_hue_mask(&img, h, w, f, s, false);
-        for (p, q) in a.data.iter().zip(&b.data) {
-            assert!((p - q).abs() <= 1e-4, "{p} vs {q} for {h} {w} {f} {s}");
-        }
-    }
-    // Dark, nearly neutral noise (random hue, tiny chroma) is never selected.
-    let mut dark = flat(64, 64, [0.02; 3]);
-    let mut seed = 7u32;
-    for px in dark.data_mut().chunks_exact_mut(4) {
-        for c in px.iter_mut().take(3) {
-            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            *c += ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.008;
-        }
-    }
-    let m = hue_mask(&dark, 180.0, 360.0, 0.0, 0.15);
-    assert!(m.data.iter().all(|v| *v == 0.0), "dark noise selected");
 }
 
 // ---------------------------------------------------------------- vignette
@@ -495,96 +436,6 @@ fn vignette_hdr_and_alpha() {
     vignette(&mut empty, 1.0, 0.5, 0.5);
 }
 
-// ---------------------------------------------------------------- masked ops
-
-#[test]
-fn masked_ops_all_zero_is_identity_all_one_matches_core() {
-    let src = noise_img(12, 9);
-    let zero = MaskBuf::new(12, 9, 0.0);
-    let one = MaskBuf::new(12, 9, 1.0);
-
-    let mut img = src.clone();
-    gain_masked(&mut img, 1.3, &zero);
-    contrast_masked(&mut img, 0.8, 0.18, &zero);
-    saturation_masked(&mut img, 1.9, &zero);
-    assert_eq!(img, src);
-
-    let mut a = src.clone();
-    gain_masked(&mut a, 1.3, &one);
-    let mut b = src.clone();
-    ops::apply_gain(&mut b, 1.3f32.exp2());
-    assert_eq!(a, b);
-
-    let mut a = src.clone();
-    contrast_masked(&mut a, 0.8, 0.18, &one);
-    let mut b = src.clone();
-    ops::contrast(&mut b, 0.8, 0.18);
-    for (p, q) in a.data().iter().zip(b.data()) {
-        assert!(close(*p, *q, 1e-5));
-    }
-
-    let mut a = src.clone();
-    saturation_masked(&mut a, 1.9, &one);
-    let mut b = src.clone();
-    ops::saturation(&mut b, 1.9);
-    for (p, q) in a.data().iter().zip(b.data()) {
-        assert!(close(*p, *q, 1e-5));
-    }
-}
-
-#[test]
-fn masked_ops_modulate_the_parameter() {
-    let half = MaskBuf::new(1, 1, 0.5);
-    // gain: 2^(2 * 0.5) = 2, not the average of 1 and 4.
-    let mut img = flat(1, 1, [0.5; 3]);
-    gain_masked(&mut img, 2.0, &half);
-    assert!(close(img.pixel(0, 0)[0], 1.0, 1e-6));
-    // saturation: 1 + (3 - 1) * 0.5 = 2.
-    let mut img = ImageBuf::new(1, 1);
-    img.set_pixel(0, 0, [0.4, 0.2, 0.1, 1.0]);
-    let mut reference = img.clone();
-    saturation_masked(&mut img, 3.0, &half);
-    ops::saturation(&mut reference, 2.0);
-    assert!(close(img.pixel(0, 0)[0], reference.pixel(0, 0)[0], 1e-6));
-    // contrast: amount 2 * 0.5 = 1.
-    let mut img = flat(1, 1, [0.36; 3]);
-    let mut reference = img.clone();
-    contrast_masked(&mut img, 2.0, 0.18, &half);
-    ops::contrast(&mut reference, 1.0, 0.18);
-    assert!(close(img.pixel(0, 0)[0], reference.pixel(0, 0)[0], 1e-5));
-}
-
-#[test]
-fn masked_ops_hdr_alpha_and_mismatched_masks() {
-    let masks = [
-        MaskBuf::new(1, 1, 1.0),
-        MaskBuf::new(3, 5, 0.7),
-        mask_from(2, 2, |x, y| (x + y) as f32 * 0.5),
-        MaskBuf::new(0, 0, 1.0),
-        MaskBuf { width: 4, height: 4, data: vec![1.0; 3] },
-        MaskBuf::new(9, 9, f32::NAN),
-        MaskBuf::new(4, 2, 7.0),
-        MaskBuf::new(4, 2, -3.0),
-    ];
-    for m in &masks {
-        let src = hdr_img();
-        let mut img = src.clone();
-        gain_masked(&mut img, 1.5, m);
-        contrast_masked(&mut img, 0.7, 0.18, m);
-        saturation_masked(&mut img, 1.6, m);
-        assert!(all_finite(&img), "mask {}x{}", m.width, m.height);
-        assert!(alpha_same(&img, &src));
-    }
-    let mut img = flat(2, 2, [16.0; 3]);
-    gain_masked(&mut img, 1.0, &MaskBuf::new(2, 2, 1.0));
-    assert!(close(img.pixel(1, 1)[0], 32.0, 1e-6));
-    // A smaller mask is sampled bilinearly: left-to-right ramp on a wider image.
-    let ramp = mask_from(2, 1, |x, _| x as f32);
-    let mut img = flat(8, 1, [1.0; 3]);
-    gain_masked(&mut img, 1.0, &ramp);
-    let v: Vec<f32> = (0..8).map(|x| img.pixel(x, 0)[0]).collect();
-    assert!(v.windows(2).all(|w| w[1] >= w[0]) && v[0] < 1.3 && v[7] > 1.7, "{v:?}");
-}
 
 // ---------------------------------------------------------------- sharpen
 
@@ -991,155 +842,6 @@ fn lens_hdr_and_alpha() {
 // ---------------------------------------------------------------- masks
 
 #[test]
-fn radial_mask_values() {
-    let m = radial_mask(100, 100, 0.5, 0.5, 0.25, 0.25, 0.0, 0.0, false);
-    assert_eq!((m.width, m.height), (100, 100));
-    assert_eq!(m.get(50, 50), 1.0);
-    assert_eq!(m.get(70, 50), 1.0);
-    assert_eq!(m.get(80, 50), 0.0);
-    assert_eq!(m.get(0, 0), 0.0);
-    let inv = radial_mask(100, 100, 0.5, 0.5, 0.25, 0.25, 0.0, 0.0, true);
-    assert_eq!(inv.get(50, 50), 0.0);
-    assert_eq!(inv.get(0, 0), 1.0);
-
-    // Feather 1: falloff starts at the centre; half way out the value is 0.5.
-    let f = radial_mask(100, 100, 0.5, 0.5, 0.25, 0.25, 1.0, 0.0, false);
-    assert!(f.get(50, 50) > 0.99);
-    assert!((f.get(62, 50) - 0.5).abs() < 1e-3, "{}", f.get(62, 50));
-    // Feather 0.5: full inside half the radius, zero at the edge.
-    let f = radial_mask(100, 100, 0.5, 0.5, 0.25, 0.25, 0.5, 0.0, false);
-    assert_eq!(f.get(55, 50), 1.0);
-    assert!(f.get(73, 50) < 0.1 && f.get(65, 50) > 0.8 && f.get(65, 50) < 1.0);
-    assert!(f.data.iter().all(|v| (0.0..=1.0).contains(v)));
-
-    // Rotation by 90 degrees turns a wide ellipse into a tall one.
-    let wide = radial_mask(100, 100, 0.5, 0.5, 0.4, 0.1, 0.0, 0.0, false);
-    let tall = radial_mask(100, 100, 0.5, 0.5, 0.4, 0.1, 0.0, 90.0, false);
-    assert_eq!((wide.get(75, 50), wide.get(50, 75)), (1.0, 0.0));
-    assert_eq!((tall.get(75, 50), tall.get(50, 75)), (0.0, 1.0));
-    // Radii are fractions of each axis.
-    let ell = radial_mask(200, 100, 0.5, 0.5, 0.25, 0.25, 0.0, 0.0, false);
-    assert_eq!((ell.get(140, 50), ell.get(100, 70)), (1.0, 1.0));
-    assert_eq!((ell.get(160, 50), ell.get(100, 80)), (0.0, 0.0));
-    // Degenerate cases.
-    assert!(radial_mask(10, 10, 0.5, 0.5, 0.0, 0.3, 0.2, 0.0, false).data.iter().all(|v| *v == 0.0));
-    assert!(radial_mask(0, 5, 0.5, 0.5, 0.3, 0.3, 0.2, 0.0, false).data.is_empty());
-    assert!(radial_mask(10, 10, f32::NAN, 0.5, 0.3, 0.3, f32::NAN, f32::NAN, false).data.iter().all(|v| v.is_finite()));
-}
-
-#[test]
-fn luminance_mask_values() {
-    let ys = [0.0f32, 0.02, 0.18, 5.0, -1.0, 1.0e6];
-    let mut img = ImageBuf::new(ys.len() as u32, 1);
-    for (i, y) in ys.iter().enumerate() {
-        img.set_pixel(i as u32, 0, [*y, *y, *y, 0.5]);
-    }
-    // t: 0, 0.1, 0.5, 0.965, 0, ~1.
-    let hard = luminance_mask(&img, 0.3, 0.7, 0.0, false);
-    assert_eq!(hard.data, vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
-    let inv = luminance_mask(&img, 0.3, 0.7, 0.0, true);
-    assert_eq!(inv.data, vec![1.0, 1.0, 0.0, 1.0, 1.0, 1.0]);
-    let all = luminance_mask(&img, 0.0, 1.0, 0.0, false);
-    assert_eq!(all.data[0], 1.0);
-    assert_eq!(all.data[5], 1.0);
-    // Soft edge: the edge value at t == low is 0.5.
-    let mut e = ImageBuf::new(1, 1);
-    let y = 0.18 * 0.3 / 0.7;
-    e.set_pixel(0, 0, [y, y, y, 1.0]);
-    let soft = luminance_mask(&e, 0.3, 0.8, 0.2, false);
-    assert!((soft.data[0] - 0.5).abs() < 1e-3, "{}", soft.data[0]);
-    // Fully inside the soft zone's flat part.
-    let soft = luminance_mask(&img, 0.3, 0.7, 0.2, false);
-    assert_eq!(soft.data[2], 1.0);
-    assert!(luminance_mask(&hdr_img(), 0.2, 0.9, 0.3, false).data.iter().all(|v| (0.0..=1.0).contains(v)));
-}
-
-#[test]
-fn hue_mask_values() {
-    let mut img = ImageBuf::new(5, 1);
-    let red = srgb_primary(0);
-    let blue = srgb_primary(4);
-    img.set_pixel(0, 0, [red[0], red[1], red[2], 1.0]);
-    img.set_pixel(1, 0, [blue[0], blue[1], blue[2], 1.0]);
-    img.set_pixel(2, 0, [0.5, 0.5, 0.5, 1.0]);
-    img.set_pixel(3, 0, [0.5, 0.48, 0.47, 1.0]); // barely red, saturation 0.06
-    img.set_pixel(4, 0, [-0.2, -0.2, -0.2, 1.0]);
-    let (h_red, _) = hue_chroma(red[0], red[1], red[2]);
-    let m = hue_mask(&img, 0.0, 40.0, 0.0, 0.0);
-    assert!(h_red < 20.0);
-    assert_eq!(m.data[0], 1.0);
-    assert_eq!(m.data[1], 0.0);
-    assert_eq!(m.data[2], 0.0); // neutral never selected
-    assert_eq!(m.data[4], 0.0);
-    // Wrap-around: 355 degrees +- 10 contains the red primary (hue ~ 4 degrees).
-    let m = hue_mask(&img, 355.0, 20.0 + 2.0 * (h_red - 5.0).max(0.0), 0.0, 0.0);
-    assert_eq!(m.data[0], 1.0);
-    // Saturation gate.
-    let m = hue_mask(&img, 0.0, 60.0, 0.0, 0.0);
-    assert!(m.data[3] > 0.0 && m.data[3] < 1.0);
-    let m = hue_mask(&img, 0.0, 60.0, 0.0, 0.2);
-    assert_eq!(m.data[3], 0.0);
-    assert!(m.data[0] > 0.99);
-    // Feather: outside the hard width the value falls smoothly from 1 to 0.
-    let (hh, _) = hue_chroma(red[0], red[1], red[2]);
-    let m = hue_mask(&img, hh - 25.0, 20.0, 30.0, 0.0);
-    // distance 25, inner 10, feather 30 -> 1 - smoothstep(10, 40, 25) = 0.5
-    assert!((m.data[0] - 0.5).abs() < 1e-3, "{}", m.data[0]);
-    assert!(hue_mask(&hdr_img(), 30.0, 90.0, 20.0, 0.1).data.iter().all(|v| (0.0..=1.0).contains(v)));
-}
-
-#[test]
-fn mask_adjust_table() {
-    let m = mask_from(5, 1, |x, _| x as f32 * 0.25); // 0, .25, .5, .75, 1
-    assert_eq!(mask_adjust(&m, 0.0, 1.0, 1.0, false), m);
-    assert_eq!(mask_adjust(&m, 0.0, 1.0, 1.0, true).data, vec![1.0, 0.75, 0.5, 0.25, 0.0]);
-    let a = mask_adjust(&m, 0.25, 0.75, 1.0, false);
-    assert_eq!(a.data, vec![0.0, 0.0, 0.5, 1.0, 1.0]);
-    let g = mask_adjust(&m, 0.0, 1.0, 2.0, false);
-    assert!(g.data.iter().zip([0.0, 0.0625, 0.25, 0.5625, 1.0]).all(|(a, b)| (a - b).abs() < 1e-6));
-    let g = mask_adjust(&m, 0.0, 1.0, 0.5, false);
-    assert!((g.data[2] - 0.5f32.sqrt()).abs() < 1e-6);
-    // low >= high: hard threshold at low.
-    assert_eq!(mask_adjust(&m, 0.5, 0.5, 1.0, false).data, vec![0.0, 0.0, 1.0, 1.0, 1.0]);
-    assert_eq!(mask_adjust(&m, 0.6, 0.2, 1.0, false).data, vec![0.0, 0.0, 0.0, 1.0, 1.0]);
-    assert_eq!(mask_adjust(&m, 0.5, 0.5, 1.0, true).data, vec![1.0, 1.0, 0.0, 0.0, 0.0]);
-    // Out-of-range input values are clamped first; NaN counts as 0.
-    let wild = MaskBuf { width: 4, height: 1, data: vec![-2.0, 3.0, f32::NAN, 0.5] };
-    assert_eq!(mask_adjust(&wild, 0.0, 1.0, 1.0, false).data, vec![0.0, 1.0, 0.0, 0.5]);
-    assert!(mask_adjust(&wild, 0.2, 0.9, 0.0, false).data.iter().all(|v| v.is_finite()));
-}
-
-#[test]
-fn mask_combine_table() {
-    let a = mask_from(4, 1, |x, _| [0.0, 0.25, 0.5, 1.0][x as usize]);
-    let b = mask_from(4, 1, |x, _| [1.0, 0.5, 0.5, 0.25][x as usize]);
-    assert_eq!(mask_combine(&a, &b, CombineMode::Multiply).data, vec![0.0, 0.125, 0.25, 0.25]);
-    assert_eq!(mask_combine(&a, &b, CombineMode::Add).data, vec![1.0, 0.75, 1.0, 1.0]);
-    assert_eq!(mask_combine(&a, &b, CombineMode::Subtract).data, vec![0.0, 0.0, 0.0, 0.75]);
-    assert_eq!(mask_combine(&a, &b, CombineMode::Maximum).data, vec![1.0, 0.5, 0.5, 1.0]);
-    assert_eq!(mask_combine(&a, &b, CombineMode::Minimum).data, vec![0.0, 0.25, 0.5, 0.25]);
-    let order = [CombineMode::Multiply, CombineMode::Add, CombineMode::Subtract, CombineMode::Maximum, CombineMode::Minimum];
-    for (i, m) in order.iter().enumerate() {
-        assert_eq!(CombineMode::from_index(i), Some(*m));
-    }
-    assert_eq!(CombineMode::from_index(5), None);
-    // b with another size is resampled; result has a's size.
-    let small = MaskBuf::new(1, 1, 0.5);
-    let r = mask_combine(&a, &small, CombineMode::Multiply);
-    assert_eq!((r.width, r.height), (4, 1));
-    assert_eq!(r.data, vec![0.0, 0.125, 0.25, 0.5]);
-    let r = mask_combine(&small, &a, CombineMode::Maximum);
-    assert_eq!((r.width, r.height), (1, 1));
-    assert!(r.data[0] >= 0.5);
-    // Malformed / empty b does not panic.
-    let _ = mask_combine(&a, &MaskBuf::new(0, 0, 1.0), CombineMode::Add);
-    let _ = mask_combine(&a, &MaskBuf { width: 3, height: 3, data: vec![1.0] }, CombineMode::Add);
-    // Out-of-range values are clamped.
-    let wild = MaskBuf { width: 2, height: 1, data: vec![5.0, -5.0] };
-    assert_eq!(mask_combine(&wild, &wild, CombineMode::Add).data, vec![1.0, 0.0]);
-}
-
-#[test]
 fn resize_mask_bilinear() {
     let m = mask_from(2, 2, |x, y| (x + 2 * y) as f32 / 3.0);
     assert_eq!(resize_mask(&m, 2, 2), m);
@@ -1173,8 +875,6 @@ fn pointwise_effects_survive_hdr_without_clamping() {
     let mut img = src.clone();
     black_white(&mut img, [1.0, 1.0, 1.0]);
     assert!(all_finite(&img));
-    let m = luminance_mask(&src, 0.1, 0.9, 0.1, false);
-    assert!(m.data.iter().all(|v| v.is_finite()));
 }
 
 // ---------------------------------------------------------------- timing
@@ -1197,7 +897,7 @@ fn timed(name: &str, mut f: impl FnMut()) {
 fn timing_2560x1707() {
     let (w, h) = (2560, 1707);
     let base = noise_img(w, h);
-    let mask = radial_mask(w, h, 0.5, 0.5, 0.3, 0.3, 0.5, 0.0, false);
+    let mask = mask_from(w, h, |x, _| x as f32 / w as f32);
     println!("rayon threads: {}", rayon::current_num_threads());
     timed("tone_curve", || {
         let mut i = base.clone();
@@ -1218,9 +918,6 @@ fn timing_2560x1707() {
         let mut i = base.clone();
         ref_hue_saturation(&mut i, &[[0.3, 0.5, 0.2], [0.0, -0.4, 0.1], [0.2, 0.3, 0.0], [0.0; 3], [-0.3, 0.6, -0.2], [0.1, 0.1, 0.1]]);
     });
-    timed("hue_mask (old: atan2 each)", || {
-        let _ = ref_hue_mask(&base, 30.0, 60.0, 20.0, 0.1, true);
-    });
     {
         let bands = [[0.3, 0.5, 0.0], [0.0, -0.4, 0.0], [0.2, 0.3, 0.0], [0.0; 3], [-0.3, 0.6, 0.0], [0.1, 0.1, 0.0]];
         let mut buf = base.clone();
@@ -1231,18 +928,6 @@ fn timing_2560x1707() {
     timed("vignette", || {
         let mut i = base.clone();
         vignette(&mut i, -0.6, 0.5, 0.5);
-    });
-    timed("gain_masked", || {
-        let mut i = base.clone();
-        gain_masked(&mut i, 1.0, &mask);
-    });
-    timed("contrast_masked", || {
-        let mut i = base.clone();
-        contrast_masked(&mut i, 0.5, 0.18, &mask);
-    });
-    timed("saturation_masked", || {
-        let mut i = base.clone();
-        saturation_masked(&mut i, 1.5, &mask);
     });
     timed("(core ops::blur sigma 2)", || {
         let _ = ops::blur(&base, 2.0);
@@ -1294,21 +979,6 @@ fn timing_2560x1707() {
     });
     timed("lens vignetting only", || {
         let _ = lens_manual(&base, 0.0, 0.5, 0.0, 0.0);
-    });
-    timed("radial_mask", || {
-        let _ = radial_mask(w, h, 0.5, 0.5, 0.3, 0.3, 0.5, 20.0, false);
-    });
-    timed("luminance_mask", || {
-        let _ = luminance_mask(&base, 0.3, 0.7, 0.2, false);
-    });
-    timed("hue_mask", || {
-        let _ = hue_mask(&base, 30.0, 60.0, 20.0, 0.1);
-    });
-    timed("mask_adjust", || {
-        let _ = mask_adjust(&mask, 0.1, 0.9, 1.5, false);
-    });
-    timed("mask_combine", || {
-        let _ = mask_combine(&mask, &mask, CombineMode::Multiply);
     });
     {
         let strokes = crate::tests_brush_curve::wavy_strokes(30, 200);

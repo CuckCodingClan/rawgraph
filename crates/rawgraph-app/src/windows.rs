@@ -53,6 +53,7 @@ pub fn choose_monitor(monitors: &[MonitorInfo], remembered: Option<&str>, avoid:
 }
 
 /// The monitor after `current`, wrapping around.
+#[cfg(test)]
 pub fn next_monitor(monitors: &[MonitorInfo], current: Option<usize>) -> Option<usize> {
     if monitors.is_empty() {
         return None;
@@ -106,10 +107,14 @@ impl AuxWindow {
     pub fn open(&mut self, monitors: &[MonitorInfo], avoid: &[usize], size_fraction: f32, cascade: u32) {
         self.state.open = true;
         self.created = false;
-        let idx = choose_monitor(monitors, self.state.monitor.as_deref(), avoid);
+        let idx = if self.state.fullscreen {
+            resolve_monitor(monitors, self.state.monitor.as_deref())
+        } else {
+            choose_monitor(monitors, self.state.monitor.as_deref(), avoid)
+        };
         let shared = idx.is_some_and(|i| avoid.contains(&i));
         self.place_on(idx, monitors, size_fraction);
-        if shared {
+        if shared && !self.state.fullscreen {
             if let Some((pos, size)) = &mut self.initial {
                 let step = 56.0 * cascade.max(1) as f32;
                 *pos += Vec2::splat(step);
@@ -140,12 +145,11 @@ impl AuxWindow {
         });
     }
 
-    /// Moves a running window to the next monitor (keeps fullscreen).
-    pub fn move_to_next(&mut self, ctx: &egui::Context, id: ViewportId, monitors: &[MonitorInfo], size_fraction: f32) {
-        let current = self.state.monitor.as_deref().and_then(|cur| monitors.iter().position(|m| m.id == cur));
-        let next = next_monitor(monitors, current);
-        self.place_on(next, monitors, size_fraction);
-        self.apply_placement(ctx, id);
+    /// Choose a display even while closed; a running fullscreen feed moves immediately.
+    pub fn select_monitor(&mut self, ctx: &egui::Context, id: ViewportId, monitors: &[MonitorInfo], index: usize) {
+        if index >= monitors.len() { return; }
+        self.place_on(Some(index), monitors, 1.0);
+        if self.state.open && self.created { self.apply_placement(ctx, id, monitors); }
     }
 
     /// Re-places the window on the primary monitor if its monitor was unplugged.
@@ -157,21 +161,20 @@ impl AuxWindow {
         if !exists && self.created {
             let idx = resolve_monitor(monitors, None);
             self.place_on(idx, monitors, size_fraction);
-            self.apply_placement(ctx, id);
+            self.apply_placement(ctx, id, monitors);
         }
     }
 
-    fn apply_placement(&mut self, ctx: &egui::Context, id: ViewportId) {
-        if let Some((pos, size)) = self.initial {
-            if self.state.fullscreen {
-                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Fullscreen(false));
+    fn apply_placement(&mut self, ctx: &egui::Context, id: ViewportId, monitors: &[MonitorInfo]) {
+        if self.state.fullscreen {
+            // SetMonitor selects the monitor explicitly for borderless fullscreen;
+            // moving a fullscreen window then using Fullscreen(true) is racy.
+            if let Some(index) = self.monitor_index(monitors) {
+                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::SetMonitor(index));
             }
+        } else if let Some((pos, size)) = self.initial {
             ctx.send_viewport_cmd_to(id, egui::ViewportCommand::OuterPosition(pos));
-            if !self.state.fullscreen {
-                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::InnerSize(size));
-            } else {
-                ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Fullscreen(true));
-            }
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::InnerSize(size));
         }
     }
 
@@ -180,36 +183,50 @@ impl AuxWindow {
         ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Fullscreen(self.state.fullscreen));
     }
 
-    fn builder(&self, title: &str, decorations: bool) -> ViewportBuilder {
+    fn builder(&self, title: &str, decorations: bool, monitors: &[MonitorInfo]) -> ViewportBuilder {
         let mut b = ViewportBuilder::default()
             .with_title(title)
             .with_decorations(decorations && !self.state.fullscreen)
-            .with_inner_size([960.0, 600.0])
             .with_min_inner_size([320.0, 200.0]);
-        if let Some((pos, size)) = self.initial {
-            b = b.with_position(pos).with_inner_size(size);
-        }
         if self.state.fullscreen {
+            // Geometry changes become viewport commands on monitor switches and
+            // can resize/reposition an already-fullscreen window. Let winit use
+            // the selected monitor's physical bounds instead.
             b = b.with_fullscreen(true);
+            // egui-winit resolves this at creation to Borderless(Some(monitor));
+            // Windows winit applies it after CreateWindowEx, not during WM_CREATE.
+            if let Some(index) = self.monitor_index(monitors) { b = b.with_monitor(index); }
+        } else {
+            b = b.with_inner_size([960.0, 600.0]);
+            if let Some((pos, size)) = self.initial {
+                b = b.with_position(pos).with_inner_size(size);
+            }
         }
         b
     }
 
     /// Shows the window (immediate viewport) if it is open. `content` paints
     /// into the window's root `Ui`.
+    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         ctx: &egui::Context,
         id: ViewportId,
         title: &str,
         decorations: bool,
+        monitors: &[MonitorInfo],
+        output_visible: Option<bool>,
         mut content: impl FnMut(&mut egui::Ui),
     ) -> AuxOutput {
         let mut out = AuxOutput { close: false };
         if !self.state.open {
             return out;
         }
-        let builder = self.builder(title, decorations);
+        if output_visible.is_some() { self.state.fullscreen = true; }
+        let mut builder = self.builder(title, decorations, monitors);
+        if let Some(visible) = output_visible {
+            builder = builder.with_taskbar(false).with_active(false).with_visible(visible);
+        }
         let mut fullscreen_toggle = false;
         let mut last_rect = self.last_rect;
         ctx.show_viewport_immediate(id, builder, |ui, _class| {
@@ -222,7 +239,12 @@ impl AuxWindow {
                 out.close = true;
             }
             if f11 {
-                fullscreen_toggle = true;
+                // A chrome-free clean feed must not turn into a windowed output.
+                if decorations && output_visible.is_none() {
+                    fullscreen_toggle = true;
+                } else {
+                    out.close = true;
+                }
             }
         });
         self.created = true;
@@ -306,6 +328,36 @@ mod tests {
         assert_eq!(next_monitor(&ms, Some(0)), Some(1));
         assert_eq!(next_monitor(&ms, Some(1)), Some(0));
         assert_eq!(next_monitor(&ms, None), Some(0));
+    }
+
+    #[test]
+    fn fullscreen_uses_explicit_selected_display_even_if_occupied() {
+        let ms = [mon("a", 0, true), mon("b", 2560, false)];
+        let mut w = AuxWindow::from_state(AuxState { open: false, fullscreen: true, monitor: Some("b".into()) });
+        w.open(&ms, &[1], 0.6, 1);
+        assert_eq!(w.monitor_index(&ms), Some(1));
+        let builder = w.builder("feed", false, &ms);
+        assert_eq!(builder.fullscreen, Some(true));
+        assert_eq!(builder.monitor, Some(1));
+        assert_eq!(builder.decorations, Some(false));
+        assert_eq!(builder.position, None);
+        assert_eq!(builder.inner_size, None);
+    }
+
+    #[test]
+    fn fullscreen_monitor_change_does_not_issue_window_geometry_commands() {
+        let mut second = mon("b", -1920, false);
+        second.size = [1920, 1080];
+        second.scale = 1.0;
+        let ms = [mon("a", 0, true), second];
+        let mut w = AuxWindow::from_state(AuxState { open: false, fullscreen: true, monitor: Some("a".into()) });
+        w.open(&ms, &[], 1.0, 0);
+        let mut builder = w.builder("feed", false, &ms);
+        w.place_on(Some(1), &ms, 1.0);
+        let (commands, recreate) = builder.patch(w.builder("feed", false, &ms));
+        assert!(!recreate);
+        assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::SetMonitor(1))));
+        assert!(!commands.iter().any(|c| matches!(c, egui::ViewportCommand::OuterPosition(_) | egui::ViewportCommand::InnerSize(_))));
     }
 
     #[test]

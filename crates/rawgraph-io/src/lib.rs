@@ -22,7 +22,7 @@ mod orient;
 pub mod raw;
 pub mod rendered;
 
-pub use export::{save_avif8, save_exr, save_srgb16_with, save_srgb8, save_srgb8_with, SaveOptions};
+pub use export::{encode_rgb, save_avif8, save_webp8, save_exr, save_srgb16_with, save_srgb8, save_srgb8_with, SaveOptions};
 pub use icc::{icc_profile, srgb_icc_profile};
 pub use lens::read_lens_profile;
 pub use meta::{read_export_metadata, read_xmp_packet, ExportMetadata, GpsInfo};
@@ -165,6 +165,12 @@ pub fn read_capture_info(path: &Path) -> Result<CaptureInfo, IoError> {
         SourceKind::Raw => raw::read_capture_info(path),
         SourceKind::Rendered => rendered::read_capture_info(path),
     }
+}
+
+/// EXIF typically omits a timezone; sort using the camera's recorded local clock.
+fn exif_date(s: &str) -> Option<i64> {
+    chrono::NaiveDateTime::parse_from_str(s.trim_matches('\0').trim(), "%Y:%m:%d %H:%M:%S")
+        .ok().map(|date| date.and_utc().timestamp_millis())
 }
 
 /// Small sRGB preview for filmstrips: the embedded preview if the file has one, otherwise a

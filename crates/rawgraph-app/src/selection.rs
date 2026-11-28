@@ -2,7 +2,7 @@
 //! and the rules for deleting a selection. Pure logic, no UI.
 
 use eframe::egui::Rect;
-use rawgraph_core::{Graph, NodeId, NodeKind};
+use rawgraph_core::{Graph, NodeId};
 
 /// The selected nodes in the order they were selected; the last one is the
 /// "primary" node the inspector shows.
@@ -86,38 +86,22 @@ pub fn band_hits(nodes: impl IntoIterator<Item = (NodeId, Rect)>, band: Rect) ->
     nodes.into_iter().filter(|(_, r)| r.intersects(band)).map(|(id, _)| id).collect()
 }
 
-/// What deleting a selection does.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DeletePlan {
-    pub delete: Vec<NodeId>,
-    /// A Source that was spared because it is the last one.
-    pub kept_source: Option<NodeId>,
-}
-
-/// The last Source node of a graph is never deleted. When the selection holds
-/// all Sources, the first of them (in graph order) stays.
-pub fn plan_delete(graph: &Graph, ids: &[NodeId]) -> DeletePlan {
-    let mut delete: Vec<NodeId> = Vec::new();
+/// Existing nodes to delete, in selection order, with repeats ignored.
+pub fn plan_delete(graph: &Graph, ids: &[NodeId]) -> Vec<NodeId> {
+    let mut delete = Vec::new();
     for id in ids {
         if graph.node(*id).is_some() && !delete.contains(id) {
             delete.push(*id);
         }
     }
-    let sources: Vec<NodeId> = graph.nodes().filter(|n| n.kind == NodeKind::Source).map(|n| n.id).collect();
-    let doomed_sources: Vec<NodeId> = sources.iter().copied().filter(|s| delete.contains(s)).collect();
-    let mut kept_source = None;
-    if !sources.is_empty() && doomed_sources.len() == sources.len() {
-        let keep = doomed_sources[0];
-        delete.retain(|id| *id != keep);
-        kept_source = Some(keep);
-    }
-    DeletePlan { delete, kept_source }
+    delete
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use eframe::egui::{pos2, vec2};
+    use rawgraph_core::NodeKind;
 
     fn graph3() -> (Graph, NodeId, NodeId, NodeId) {
         let mut g = Graph::new();
@@ -172,22 +156,10 @@ mod tests {
     }
 
     #[test]
-    fn the_last_source_survives_a_multi_delete() {
+    fn deletion_plan_includes_every_source_and_ignores_unknown_ids_and_duplicates() {
         let (mut g, a, b, c) = graph3();
-        let p = plan_delete(&g, &[a, b, c]);
-        assert_eq!(p.delete, vec![b, c]);
-        assert_eq!(p.kept_source, Some(a));
-        // A lone last Source: nothing is deleted at all.
-        let p = plan_delete(&g, &[a]);
-        assert!(p.delete.is_empty() && p.kept_source == Some(a));
-        // Two Sources: deleting both keeps the first; deleting one is fine.
-        let a2 = g.add_node(NodeKind::Source, [0.0, 200.0]);
-        let p = plan_delete(&g, &[a2, a]);
-        assert_eq!((p.delete, p.kept_source), (vec![a2], Some(a)));
-        let p = plan_delete(&g, &[a2]);
-        assert_eq!((p.delete, p.kept_source), (vec![a2], None));
-        // Unknown ids and repeats are ignored.
-        let p = plan_delete(&g, &[b, b, NodeId(999)]);
-        assert_eq!(p.delete, vec![b]);
+        assert_eq!(plan_delete(&g, &[a]), vec![a]);
+        let second_source = g.add_node(NodeKind::Source, [0.0, 200.0]);
+        assert_eq!(plan_delete(&g, &[second_source, a, b, b, c, NodeId(999)]), vec![second_source, a, b, c]);
     }
 }

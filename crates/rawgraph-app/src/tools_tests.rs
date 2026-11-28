@@ -31,7 +31,7 @@ impl View {
         let mut s = crate::session::tests::demo_session();
         let src = s.node_by_index(0).unwrap();
         let node = s.project.graph.add_node(kind, [0.0, 0.0]);
-        if kind == NodeKind::Transform {
+        if matches!(kind, NodeKind::Transform | NodeKind::Draw) {
             s.project.graph.connect(src, node, 0).unwrap();
         }
         s.selected_node = Some(node);
@@ -52,6 +52,8 @@ impl View {
             display: Arc::new(rawgraph_scopes::DisplayTransform::default().apply(&img)),
             prepared: None,
             scopes_ms: 0.0,
+            node_timings: None,
+            gpu_tail: false,
             eval_ms: 0.0,
             display_ms: 0.0,
             hits: 0,
@@ -128,6 +130,19 @@ impl View {
     }
 }
 
+#[test]
+fn painting_without_a_photo_edits_the_standalone_draw_image() {
+    let mut v = View::new(NodeKind::Draw);
+    v.s.selected = None;
+    v.s.project.graph.disconnect(v.node, 0);
+    let image = v.s.image_for_target(v.node, None).unwrap();
+    assert_eq!(image, ImageId(u64::MAX - v.node.0));
+    v.drag_path(&[[0.3, 0.4], [0.6, 0.4]]);
+    let strokes = strokes_of(v.s.project.graph.node(v.node).unwrap(), image);
+    assert_eq!(strokes.len(), 1);
+    assert!(strokes[0].points.len() >= 2);
+}
+
 /// A horizontal pointer path of `n` equal steps across the middle of the picture.
 fn line(n: usize) -> Vec<[f32; 2]> {
     (0..=n).map(|i| [0.2 + 0.6 * i as f32 / n as f32, 0.5]).collect()
@@ -135,7 +150,7 @@ fn line(n: usize) -> Vec<[f32; 2]> {
 
 #[test]
 fn a_drag_paints_one_stroke_with_normalised_points_and_one_undo_step() {
-    let mut v = View::new(NodeKind::BrushMask);
+    let mut v = View::new(NodeKind::Draw);
     assert!(v.strokes().is_empty());
     v.drag_path(&line(40));
     let strokes = v.strokes();
@@ -156,7 +171,7 @@ fn a_drag_paints_one_stroke_with_normalised_points_and_one_undo_step() {
 
 #[test]
 fn the_stroke_is_visible_while_the_button_is_still_down() {
-    let mut v = View::new(NodeKind::BrushMask);
+    let mut v = View::new(NodeKind::Draw);
     let (a, b) = (v.at([0.2, 0.5]), v.at([0.5, 0.5]));
     v.move_to(a);
     v.button(PointerButton::Primary, true);
@@ -171,7 +186,7 @@ fn the_stroke_is_visible_while_the_button_is_still_down() {
 
 #[test]
 fn alt_drag_erases_and_the_toggle_flips_it() {
-    let mut v = View::new(NodeKind::BrushMask);
+    let mut v = View::new(NodeKind::Draw);
     v.alt = true;
     v.drag_path(&line(10));
     v.alt = false;
@@ -186,7 +201,7 @@ fn alt_drag_erases_and_the_toggle_flips_it() {
 
 #[test]
 fn coordinates_stay_right_after_zooming_and_panning() {
-    let mut v = View::new(NodeKind::BrushMask);
+    let mut v = View::new(NodeKind::Draw);
     v.viewer.mode = crate::viewer::ZoomMode::Custom(2.0);
     v.frame(vec![]);
     let before = v.at([0.5, 0.5]);
@@ -208,7 +223,7 @@ fn coordinates_stay_right_after_zooming_and_panning() {
 
 #[test]
 fn space_drag_pans_instead_of_painting() {
-    let mut v = View::new(NodeKind::BrushMask);
+    let mut v = View::new(NodeKind::Draw);
     v.viewer.mode = crate::viewer::ZoomMode::Custom(2.0);
     v.frame(vec![]);
     let a = v.at([0.5, 0.5]);
@@ -222,7 +237,7 @@ fn space_drag_pans_instead_of_painting() {
 
 #[test]
 fn bracket_keys_change_the_size_and_shift_brackets_the_hardness() {
-    let mut v = View::new(NodeKind::BrushMask);
+    let mut v = View::new(NodeKind::Draw);
     let centre = v.at([0.5, 0.5]);
     v.move_to(centre);
     let start = v.s.brush.size_pct;
@@ -242,8 +257,8 @@ fn bracket_keys_change_the_size_and_shift_brackets_the_hardness() {
 
 #[test]
 fn strokes_belong_to_the_selected_image_in_individual_mode() {
-    let mut v = View::new(NodeKind::BrushMask);
-    assert_eq!(v.s.project.graph.node(v.node).unwrap().mode, rawgraph_core::Mode::Individual, "a brush mask starts per image");
+    let mut v = View::new(NodeKind::Draw);
+    assert_eq!(v.s.project.graph.node(v.node).unwrap().mode, rawgraph_core::Mode::Individual, "a drawing starts per image");
     let first = v.s.current_image();
     v.drag_path(&line(10));
     let n = v.s.project.graph.node(v.node).unwrap();
@@ -258,7 +273,7 @@ fn strokes_belong_to_the_selected_image_in_individual_mode() {
 
 #[test]
 fn clearing_and_undoing_strokes_through_the_node_data() {
-    let mut v = View::new(NodeKind::BrushMask);
+    let mut v = View::new(NodeKind::Draw);
     v.drag_path(&line(10));
     v.drag_path(&[[0.3, 0.2], [0.6, 0.2]]);
     assert_eq!(v.strokes().len(), 2);
@@ -389,14 +404,15 @@ fn the_viewer_turns_the_picture_with_the_straighten_angle() {
     assert!(v.viewer.orient.is_none() && !v.viewer.tool_active);
 }
 
-/// The demo graph with the brush mask feeding its Exposure node and a Crop / Rotate (and more)
+/// The demo graph with the drawing feeding its Exposure node and a Crop / Rotate (and more)
 /// inserted between the Exposure and the Saturation node that follows it.
 fn brush_behind(v: &mut View, after: &[NodeKind]) -> (NodeId, Vec<NodeId>) {
     let g = &mut v.s.project.graph;
     let find = |g: &rawgraph_core::Graph, k: NodeKind| g.nodes().find(|n| n.kind == k).map(|n| n.id).unwrap();
     let exp = find(g, NodeKind::Exposure);
     let sat = find(g, NodeKind::Saturation);
-    g.connect(v.node, exp, 1).unwrap();
+    let port = g.expose_parameter(exp, "ev", rawgraph_core::PortType::Images).unwrap();
+    g.connect(v.node, exp, port).unwrap();
     let mut prev = exp;
     let mut added = Vec::new();
     for k in after {
@@ -413,8 +429,9 @@ fn brush_behind(v: &mut View, after: &[NodeKind]) -> (NodeId, Vec<NodeId>) {
 
 #[test]
 fn a_stroke_painted_behind_a_crop_is_stored_in_the_frame_of_the_node_that_uses_the_mask() {
-    let mut v = View::new(NodeKind::BrushMask);
+    let mut v = View::new(NodeKind::Draw);
     let (exp, crops) = brush_behind(&mut v, &[NodeKind::Transform]);
+    v.s.viewed_node = Some(crops[0]);
     let img = v.s.current_image();
     {
         let n = v.s.project.graph.node_mut(crops[0]).unwrap();
@@ -441,8 +458,9 @@ fn a_stroke_painted_behind_a_crop_is_stored_in_the_frame_of_the_node_that_uses_t
 
 #[test]
 fn a_stroke_behind_a_quarter_turn_and_a_fine_rotation_lands_where_the_oracle_says() {
-    let mut v = View::new(NodeKind::BrushMask);
+    let mut v = View::new(NodeKind::Draw);
     let (_, crops) = brush_behind(&mut v, &[NodeKind::Transform, NodeKind::Transform]);
+    v.s.viewed_node = Some(crops[1]);
     let img = v.s.current_image();
     v.s.project.graph.node_mut(crops[0]).unwrap().set_param("rotate", img, 1.0);
     v.s.project.graph.node_mut(crops[1]).unwrap().set_param("angle", img, 6.0);
@@ -460,8 +478,9 @@ fn a_stroke_behind_a_quarter_turn_and_a_fine_rotation_lands_where_the_oracle_say
 
 #[test]
 fn a_lens_behind_the_mask_shows_the_consumer_picture_with_a_label_while_painting() {
-    let mut v = View::new(NodeKind::BrushMask);
-    let (exp, _) = brush_behind(&mut v, &[NodeKind::Transform, NodeKind::LensManual]);
+    let mut v = View::new(NodeKind::Draw);
+    let (exp, nodes) = brush_behind(&mut v, &[NodeKind::Transform, NodeKind::LensManual]);
+    v.s.viewed_node = nodes.last().copied();
     assert!(matches!(v.s.brush_plan(v.node), crate::frames::BrushPlan::ShowConsumer { consumer } if consumer == exp));
     assert_eq!(v.s.render_target(), Some((exp, None)), "the picture as it leaves the node that uses the mask");
     v.frame(vec![]);

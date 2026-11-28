@@ -4,7 +4,7 @@
 //! the CPU reference of `rawgraph_fx`. Without a GPU adapter every test prints "skipped: no GPU adapter"
 //! and passes. Run with `-- --nocapture` to see the measured maxima.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use rawgraph_core::color::AP1_LUMA;
 use rawgraph_core::ImageBuf;
@@ -16,10 +16,17 @@ fn shared() -> Option<&'static GpuContext> {
     CTX.get_or_init(|| GpuContext::new().ok()).as_ref()
 }
 
+/// One test at a time on the shared device: concurrent submissions from several test
+/// threads crash Mesa's llvmpipe software adapter (SIGSEGV), which CI uses.
+fn exclusive() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 macro_rules! gpu {
     () => {
         match shared() {
-            Some(c) => c,
+            Some(c) => (c, exclusive()),
             None => {
                 println!("skipped: no GPU adapter");
                 return;
@@ -232,7 +239,7 @@ fn is_colour_curve(op: &PointOp) -> bool {
 
 #[test]
 fn each_wave8_op_matches_the_cpu_in_float() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = image_with_specials(257, 131);
     let src = GpuImage::upload(ctx, &img).unwrap();
     let mut worst: [(&str, f32); 3] = [("whites/blacks", 0.0), ("vibrance", 0.0), ("colour curves", 0.0)];
@@ -262,7 +269,7 @@ fn each_wave8_op_matches_the_cpu_in_float() {
 
 #[test]
 fn each_wave8_op_matches_the_cpu_after_the_display_transform() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = image(257, 131);
     let src = GpuImage::upload(ctx, &img).unwrap();
     let pairs = [(GpuToneMap::Clip, ToneMap::Clip), (GpuToneMap::SoftHighlights, ToneMap::SoftHighlights), (GpuToneMap::AcesFit, ToneMap::AcesFit)];
@@ -293,7 +300,7 @@ fn each_wave8_op_matches_the_cpu_after_the_display_transform() {
 
 #[test]
 fn neutral_wave8_parameters_are_the_bit_exact_identity() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = image_with_specials(129, 65);
     let src = GpuImage::upload(ctx, &img).unwrap();
     let neutral = [
@@ -337,6 +344,7 @@ fn chain(tone: f32) -> Vec<PointOp> {
 
 #[test]
 fn chains_with_the_new_ops_cache_pipelines_and_tables() {
+    let _gpu = exclusive();
     let Ok(ctx) = GpuContext::new() else {
         println!("skipped: no GPU adapter");
         return;
@@ -393,7 +401,7 @@ fn chains_with_the_new_ops_cache_pipelines_and_tables() {
 
 #[test]
 fn render_into_with_the_new_ops_matches_the_cpu_display() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = image(257, 131);
     let base = GpuImage::upload(ctx, &img).unwrap();
     let scratch = GpuImage::new_empty(ctx, 257, 131).unwrap();

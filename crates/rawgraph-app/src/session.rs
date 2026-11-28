@@ -149,7 +149,7 @@ pub fn folder_key(p: &str) -> String {
 }
 
 /// What the viewer does with the pointer: shows the picture, paints a brush
-/// mask, or edits the crop of a Crop / Rotate node.
+/// image, or edits the crop of a Crop / Rotate node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolMode {
     None,
@@ -167,7 +167,7 @@ pub struct Session {
     pub node_sel: NodeSelection,
     /// Bumped by every change of the document (autosave looks at it).
     pub edit_gen: u64,
-    /// Node shown in the viewer; `None` means the Output node.
+    /// Pinned viewer target; None follows the primary selection (session-only).
     pub viewed_node: Option<NodeId>,
     pub view: ViewSettings,
     pub project_path: Option<PathBuf>,
@@ -176,7 +176,7 @@ pub struct Session {
     /// The three built-in test images instead of the project's images.
     pub demo: bool,
     pub filter: FilterUi,
-    /// Brush settings of the brush-mask tool.
+    /// Brush settings of the Draw tool.
     pub brush: BrushSettings,
     pub crop: CropUi,
     /// Luminance histogram behind the curve editor, made by the render worker.
@@ -192,6 +192,7 @@ pub struct Session {
     // Folder scan in progress: entries that finished so far (shown immediately).
     pub scanning: bool,
     scan_map: HashMap<ImageId, ImageEntry>,
+    pub scan_count: Option<(String, bool, usize)>,
     scan_edits: HashMap<ImageId, Edit>,
     /// Collection info for the graph (filled by the background worker).
     pub collection: CollectionResult,
@@ -200,6 +201,14 @@ pub struct Session {
     capture_cache: Option<(u64, Arc<Vec<ImageId>>, Captures)>,
     /// The document as of the last commit or load (the summary of the next revision is derived from it).
     baseline: Baseline,
+}
+
+/// The node collection and image shown together by a viewer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewerTarget {
+    pub node: Option<NodeId>,
+    pub image: Option<ImageId>,
+    pub image_pinned: bool,
 }
 
 impl Session {
@@ -229,6 +238,7 @@ impl Session {
             visible: Vec::new(),
             scanning: false,
             scan_map: HashMap::new(),
+            scan_count: None,
             scan_edits: HashMap::new(),
             collection: CollectionResult::default(),
             images_gen: 1,
@@ -259,6 +269,7 @@ impl Session {
         self.scan_map.clear();
         self.scan_edits.clear();
         self.selected_node = None;
+        self.node_sel.clear();
         self.viewed_node = None;
         self.provider.reset_paths();
         self.sync_paths();
@@ -291,12 +302,14 @@ impl Session {
 
     /// Whether `image` is part of the collection at the viewed node; `None`
     /// while that is not known yet.
+    #[cfg(test)]
     pub fn in_view(&self, image: ImageId) -> Option<bool> {
         let ready = self.collection.view_node.is_some() && self.collection.view_node == self.target_node();
         ready.then(|| self.collection.view_members.contains(&image))
     }
 
     /// Number of listed images that are part of the viewed collection.
+    #[cfg(test)]
     pub fn in_view_count(&self) -> Option<usize> {
         self.in_view(ImageId(0))?;
         Some(self.visible.iter().filter(|id| self.collection.view_members.contains(id)).count())
@@ -317,18 +330,11 @@ impl Session {
         self.visible = if self.demo {
             self.demo_entries.iter().map(|e| e.id).collect()
         } else {
-            let mut ids = self.project.filter(&self.filter.to_filter());
-            if self.filter.missing_only {
-                ids.retain(|id| self.project.image(*id).is_some_and(|e| e.missing));
-            }
-            let mut v = self.project.sorted(&ids, self.filter.sort, self.filter.descending);
-            if self.scanning {
-                let have: HashSet<ImageId> = v.iter().copied().collect();
-                let mut extra: Vec<ImageId> = self.scan_map.keys().copied().filter(|id| !have.contains(id)).collect();
-                extra.sort();
-                v.extend(extra);
-            }
-            v
+            let filter = self.filter.to_filter();
+            let entries = self.project.images().iter().filter_map(|e| self.entry(e.id))
+                .chain(self.scan_map.values().filter(|e| self.project.image(e.id).is_none()));
+            Project::sort_entries(entries.filter(|e| filter.matches(e) && (!self.filter.missing_only || e.missing)), self.filter.sort, self.filter.descending)
+
         };
         if self.selected.is_none_or(|id| !self.visible.contains(&id)) {
             self.selected = self.visible.first().copied();
@@ -341,6 +347,7 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub fn select_id(&mut self, id: ImageId) {
         if self.visible.contains(&id) {
             self.selected = Some(id);
@@ -360,6 +367,36 @@ impl Session {
         let cur = self.selected_index().unwrap_or(0) as i32;
         let next = (cur + delta).clamp(0, self.visible.len() as i32 - 1) as usize;
         self.selected = Some(self.visible[next]);
+    }
+
+    /// Catalog members in filmstrip order, followed by generated images.
+    pub fn gallery_images(&self, members: &HashSet<ImageId>) -> Vec<ImageId> {
+        let mut images: Vec<_> = self.visible.iter().copied().filter(|id| members.contains(id)).collect();
+        let mut generated: Vec<_> = members.iter().copied().filter(|id| self.entry(*id).is_none()).collect();
+        generated.sort();
+        images.extend(generated);
+        images
+    }
+
+    /// Navigate only the viewer's current collection, never stale membership.
+    pub fn step_viewer_image(&mut self, delta: i32) {
+        self.step_viewer_target(self.viewer_target(None, self.viewed_node), delta);
+    }
+
+    pub fn step_viewer_target(&mut self, target: ViewerTarget, delta: i32) {
+        if target.image_pinned || delta == 0 { return; }
+        let Some(node) = target.node else { return };
+        let (ids, captures) = self.id_captures();
+        let members = crate::collection::view_members(&self.project.graph, &ids, &captures, node);
+        let images = self.gallery_images(&members);
+        self.step_gallery(target, &images, delta);
+    }
+
+    pub fn step_gallery(&mut self, target: ViewerTarget, images: &[ImageId], delta: i32) {
+        if target.image_pinned || images.is_empty() || delta == 0 { return; }
+        let index = target.image.and_then(|id| images.iter().position(|x| *x == id));
+        let next = match index { Some(i) => (i as i64 + i64::from(delta)).clamp(0, images.len() as i64 - 1) as usize, None if delta > 0 => 0, None => images.len() - 1 };
+        self.selected = Some(images[next]);
     }
 
     /// Neighbours of the selection in the filtered order, for prefetching.
@@ -433,7 +470,7 @@ impl Session {
         if self.demo {
             return Vec::new();
         }
-        self.project.images().iter().filter(|e| e.capture.raw.is_none()).map(|e| (e.id, e.path.clone())).collect()
+        self.project.images().iter().filter(|e| !e.capture.scan_pending && e.capture.raw.is_none()).map(|e| (e.id, e.path.clone())).collect()
     }
 
     /// Applies re-read capture metadata. Marks the project unsaved when
@@ -560,31 +597,67 @@ impl Session {
 
     pub fn begin_scan(&mut self) {
         self.scanning = true;
+        self.scan_count = None;
         self.scan_map.clear();
         self.scan_edits.clear();
     }
 
-    /// A file finished during the scan: show it right away.
-    pub fn scan_entry(&mut self, entry: ImageEntry) {
-        if self.demo {
-            return;
-        }
-        let id = entry.id;
-        let is_new = !self.scan_map.contains_key(&id) && self.project.image(id).is_none();
-        self.provider.set_paths([(id, entry.path.clone())]);
-        // Keep culling edits the user made on this image while scanning.
-        let mut entry = entry;
-        if let Some((r, f, l)) = self.scan_edits.get(&id) {
-            entry.rating = *r;
-            entry.flag = *f;
-            entry.color_label = *l;
-        }
-        self.scan_map.insert(id, entry);
-        if is_new && !self.filter.is_active() && !self.visible.contains(&id) {
-            self.visible.push(id);
-            if self.selected.is_none() {
-                self.selected = Some(id);
+    pub fn count_for(&self, node: &rawgraph_core::Node) -> Option<usize> {
+        if node.kind == NodeKind::Source {
+            if let Some((folder, recursive, count)) = &self.scan_count {
+                if crate::node_ui::source_subfolders(node) == *recursive
+                    && crate::node_ui::source_folder(node).is_some_and(|p| {
+                        let path = std::path::absolute(&p).unwrap_or_else(|_| p.into());
+                        folder_key(&path.to_string_lossy()) == *folder
+                    })
+                { return Some(*count); }
             }
+        }
+        self.collection.counts.get(&node.id).copied()
+    }
+
+    pub fn scan_catalog(&mut self, entries: Vec<ImageEntry>) {
+        self.provider.set_paths(entries.iter().map(|e| (e.id, e.path.clone())));
+        self.provider.set_captures(entries.iter().map(|e| (e.id, e.capture.clone())));
+        self.scan_map.extend(entries.into_iter().map(|e| (e.id, e)));
+        self.images_gen += 1;
+        self.refresh_visible();
+    }
+
+    pub fn scan_metadata(&mut self, entries: Vec<ImageEntry>) {
+        self.provider.set_captures(entries.iter().map(|e| (e.id, e.capture.clone())));
+        for entry in entries {
+            if let Some(e) = self.scan_map.get_mut(&entry.id) { e.capture = entry.capture; }
+        }
+        self.images_gen += 1;
+        self.refresh_visible();
+    }
+
+    #[cfg(test)]
+    pub fn scan_entry(&mut self, entry: ImageEntry) {
+        self.scan_entries(vec![entry]);
+    }
+
+    pub fn scan_entries(&mut self, entries: Vec<ImageEntry>) {
+        let mut paths = Vec::new();
+        let mut captures = Vec::new();
+        for mut entry in entries {
+            let id = entry.id;
+            let old = self.entry(id);
+            if old.is_none_or(|e| e.path != entry.path) { paths.push((id, entry.path.clone())); }
+            if old.is_none_or(|e| e.capture != entry.capture) { captures.push((id, entry.capture.clone())); }
+            if let Some((r, f, l)) = self.scan_edits.get(&id) {
+                entry.rating = *r;
+                entry.flag = *f;
+                entry.color_label = *l;
+            }
+            self.scan_map.insert(id, entry);
+        }
+        if !paths.is_empty() || !captures.is_empty() {
+            self.provider.set_paths(paths);
+            self.provider.set_captures(captures);
+            self.images_gen += 1;
+            self.refresh_visible();
         }
     }
 
@@ -602,6 +675,7 @@ impl Session {
         self.project = finished;
         self.scan_map.clear();
         self.scanning = false;
+        self.scan_count = None;
         if changed {
             self.touch();
         }
@@ -610,6 +684,7 @@ impl Session {
     }
 
     pub fn cancel_scan_state(&mut self) {
+        self.scan_count = None;
         self.scanning = false;
         self.scan_map.clear();
         self.scan_edits.clear();
@@ -635,7 +710,7 @@ impl Session {
     }
 
     pub fn window_title(&self) -> String {
-        format!("{}{} - RawGraph", self.project_name(), if self.dirty { " *" } else { "" })
+        format!("{}{} - RawGraph {}", self.project_name(), if self.dirty { " *" } else { "" }, crate::display_version())
     }
 
     /// Replaces the document with an empty project and the default graph.
@@ -692,21 +767,28 @@ impl Session {
 
     // ------------------------------------------------------------ nodes
 
+    #[cfg(test)]
     pub fn output_node(&self) -> Option<NodeId> {
         self.project.graph.nodes().find(|n| n.kind == NodeKind::Output).map(|n| n.id)
     }
 
-    /// Node the viewer renders: the viewed node if it still exists, else Output.
+    /// Node the viewer renders: pinned target, otherwise the primary selection.
     pub fn target_node(&self) -> Option<NodeId> {
-        self.viewed_node.filter(|id| self.project.graph.node(*id).is_some()).or_else(|| self.output_node())
+        self.viewer_target(None, self.viewed_node).node
+    }
+
+    pub fn viewer_target(&self, image_pin: Option<ImageId>, node_pin: Option<NodeId>) -> ViewerTarget {
+        let (image, node) = crate::compare::Pane { image: image_pin, node: node_pin.filter(|id| self.project.graph.node(*id).is_some()) }
+            .target(self.selected, self.selected_node.filter(|id| self.project.graph.node(*id).is_some()));
+        ViewerTarget { node, image: node.and(image), image_pinned: image_pin.is_some() }
     }
 
     /// The interactive tool the viewer offers for the selected node.
     pub fn tool_mode(&self) -> ToolMode {
         let Some(node) = self.selected_node.and_then(|id| self.project.graph.node(id)) else { return ToolMode::None };
         match node.kind {
-            NodeKind::BrushMask => ToolMode::Brush(node.id),
-            NodeKind::Transform if self.project.graph.input_edge(node.id, 0).is_some() => ToolMode::Crop(node.id),
+            NodeKind::Draw => ToolMode::Brush(node.id),
+            NodeKind::Transform if self.viewed_node.is_none() && self.project.graph.input_edge(node.id, 0).is_some() => ToolMode::Crop(node.id),
             _ => ToolMode::None,
         }
     }
@@ -715,19 +797,53 @@ impl Session {
     /// wanted, that port. While the crop tool is active this is the picture
     /// that enters the Crop / Rotate node.
     pub fn render_target(&self) -> Option<(NodeId, Option<usize>)> {
+        self.render_viewer_target(self.viewer_target(None, self.viewed_node))
+    }
+
+    pub fn render_viewer_target(&self, target: ViewerTarget) -> Option<(NodeId, Option<usize>)> {
         if let ToolMode::Crop(id) = self.tool_mode() {
-            if let Some((up, port)) = self.project.graph.input_edge(id, 0) {
-                return Some((up, Some(port)));
+            let graph = &self.project.graph;
+            let mut inputs = graph.input_edges(id, 0);
+            if let Some(first) = inputs.next() {
+                let image = target.image?;
+                let evaluator = rawgraph_engine::Evaluator::new();
+                let edge = std::iter::once(first).chain(inputs)
+                    .find(|e| evaluator.contains_output(graph, e.from, e.from_port, image, self.provider.as_ref()))
+                    .unwrap_or(first);
+                return Some((edge.from, Some(edge.from_port)));
             }
         }
-        // Painting a brush mask whose picture cannot be shown right behind later geometry:
-        // show the picture as it leaves the node that uses the mask.
+        // Painting a drawing whose picture cannot be shown right behind later geometry:
+        // show the picture as it leaves the node that uses the drawing.
         if let ToolMode::Brush(id) = self.tool_mode() {
-            if let crate::frames::BrushPlan::ShowConsumer { consumer } = crate::frames::brush_plan(&self.project.graph, id, self.target_node()) {
+            if let crate::frames::BrushPlan::ShowConsumer { consumer } = crate::frames::brush_plan(&self.project.graph, id, target.node) {
                 return Some((consumer, None));
             }
         }
-        self.target_node().map(|n| (n, None))
+        target.node.map(|n| (n, None))
+    }
+
+    /// Draw uses its generated identity when it has no image input.
+    pub fn draw_image(&self, draw: NodeId, viewed_image: ImageId) -> ImageId {
+        if self.project.graph.input_edge(draw, 0).is_none() { ImageId(u64::MAX - draw.0) } else { viewed_image }
+    }
+
+    /// The selected photo, or a generated member when this view does not carry it.
+    pub fn image_for_target(&self, node: NodeId, port: Option<usize>) -> Option<ImageId> {
+        let eval = rawgraph_engine::Evaluator::new();
+        let graph = &self.project.graph;
+        let output = port.unwrap_or(0);
+        let provider = self.provider.as_ref();
+        // Normal photo views preserve the selection, including excluded photos.
+        // Metadata Split preview is the unfiltered input, not its first output.
+        if let Some(image) = self.selected {
+            if graph.node(node).is_some_and(|n| n.kind == NodeKind::MetadataSplit) && port.is_none()
+                || eval.contains_output(graph, node, output, image, provider) {
+                return Some(image);
+            }
+        }
+        let standalone = rawgraph_core::graph::Catalog { images: &[], capture: &|_| None };
+        graph.members(node, output, &standalone).first().copied().or(self.selected)
     }
 
     /// How the brush tool of `brush` paints on the picture that is shown.
@@ -780,8 +896,7 @@ impl Session {
         self.node_sel = sel;
     }
 
-    /// Deletes the selected nodes (one change of the graph). The last Source
-    /// stays. `Ok(n)` is the number removed; the error says why nothing was.
+    /// Deletes the selected nodes together (one graph history change).
     pub fn delete_selected(&mut self) -> Result<usize, String> {
         self.reconcile_selection();
         let ids: Vec<NodeId> = self.node_sel.ids().to_vec();
@@ -789,39 +904,16 @@ impl Session {
     }
 
     pub fn delete_nodes(&mut self, ids: &[NodeId]) -> Result<usize, String> {
-        let plan = plan_delete(&self.project.graph, ids);
-        if plan.delete.is_empty() {
-            return match plan.kept_source {
-                Some(_) => Err("The last Source node cannot be deleted".to_owned()),
-                None => Ok(0),
-            };
-        }
-        for id in &plan.delete {
+        let delete = plan_delete(&self.project.graph, ids);
+        for id in &delete {
             self.project.graph.remove_node(*id);
         }
         self.sanitize();
-        if plan.kept_source.is_some() {
-            return Err(format!("Deleted {} node(s); the last Source node cannot be deleted", plan.delete.len()));
-        }
-        Ok(plan.delete.len())
-    }
-
-    /// Why a node cannot be deleted, if it cannot.
-    pub fn delete_blocker(&self, id: NodeId) -> Option<String> {
-        let node = self.project.graph.node(id)?;
-        if node.kind == NodeKind::Source && self.project.graph.nodes().filter(|n| n.kind == NodeKind::Source).count() <= 1 {
-            return Some("The last Source node cannot be deleted".to_owned());
-        }
-        None
+        Ok(delete.len())
     }
 
     pub fn delete_node(&mut self, id: NodeId) -> Result<(), String> {
-        if let Some(why) = self.delete_blocker(id) {
-            return Err(why);
-        }
-        self.project.graph.remove_node(id);
-        self.sanitize();
-        Ok(())
+        self.delete_nodes(&[id]).map(|_| ())
     }
 
     /// Switches a node's mode (used by the CLI and tests).
@@ -833,12 +925,13 @@ impl Session {
 }
 
 /// Graph of a new project: Source -> Develop -> Exposure -> Contrast ->
-/// Highlights / Shadows -> Saturation -> Output, everything neutral except the
+/// Highlights / Shadows -> Saturation, everything neutral except the
 /// Develop defaults (as-shot white balance, baseline exposure on).
 pub fn default_graph() -> Graph {
     let mut g = Graph::new();
-    let kinds = [NodeKind::Source, NodeKind::Develop, NodeKind::Exposure, NodeKind::Contrast, NodeKind::HighlightsShadows, NodeKind::Saturation, NodeKind::Output];
+    let kinds = [NodeKind::Source, NodeKind::Develop, NodeKind::Exposure, NodeKind::Contrast, NodeKind::HighlightsShadows, NodeKind::Saturation];
     let ids: Vec<NodeId> = kinds.iter().enumerate().map(|(i, k)| g.add_node(*k, [i as f32 * 240.0, 40.0])).collect();
+    crate::node_ui::set_source_folder(&mut g, ids[0], None);
     for pair in ids.windows(2) {
         g.connect(pair[0], pair[1], 0).expect("default chain is valid");
     }
@@ -853,7 +946,7 @@ pub fn fresh_project() -> Project {
 }
 
 /// Source -> Develop -> Capture EV -> White Balance -> Exposure -> Saturation
-/// -> Blur -> Output, with a Gradient Mask driving the Blur radius.
+/// -> Blur -> Output, with a Generator gradient driving the Blur radius.
 pub fn demo_graph() -> Graph {
     let mut g = Graph::new();
     let (dx, y) = (240.0, 40.0);
@@ -865,12 +958,15 @@ pub fn demo_graph() -> Graph {
     let sat = g.add_node(NodeKind::Saturation, [5.0 * dx, y]);
     let blur = g.add_node(NodeKind::Blur, [6.0 * dx, y]);
     let out = g.add_node(NodeKind::Output, [7.0 * dx, y]);
-    let mask = g.add_node(NodeKind::GradientMask, [5.0 * dx, y + 170.0]);
+    let mask = g.add_node(NodeKind::Generator, [5.0 * dx, y + 170.0]);
     let chain = [src, dev, cap, wb, exp, sat, blur, out];
     for pair in chain.windows(2) {
         g.connect(pair[0], pair[1], 0).expect("demo chain is valid");
     }
-    g.connect(mask, blur, 1).expect("demo mask is valid");
+    let port = g.expose_parameter(blur, "radius", rawgraph_core::PortType::Images).expect("Filter supports Radius");
+    g.connect(mask, blur, port).expect("demo control is valid");
+    // The map scales the Filter radius slider: a short gradient from no blur to the slider radius.
+    g.node_mut(mask).unwrap().set_param("height", ImageId(0), 2.0);
     g
 }
 
@@ -925,12 +1021,12 @@ pub mod tests {
                 NodeKind::Saturation,
                 NodeKind::Blur,
                 NodeKind::Output,
-                NodeKind::GradientMask
+                NodeKind::Generator
             ]
         );
         assert_eq!(g.edges().len(), 8);
         let blur = g.nodes().find(|n| n.kind == NodeKind::Blur).unwrap().id;
-        let mask = g.nodes().find(|n| n.kind == NodeKind::GradientMask).unwrap().id;
+        let mask = g.nodes().find(|n| n.kind == NodeKind::Generator).unwrap().id;
         assert_eq!(g.input_of(blur, 1), Some(mask));
     }
 
@@ -948,25 +1044,38 @@ pub mod tests {
     }
 
     #[test]
-    fn last_source_cannot_be_deleted() {
+    fn last_source_can_be_deleted_and_clears_the_viewer_pin() {
         let mut s = demo_session();
-        let src = s.node_by_index(0).unwrap();
-        assert!(s.delete_node(src).is_err());
-        let extra = s.project.graph.add_node(NodeKind::Source, [0.0, 400.0]);
-        assert!(s.delete_node(src).is_ok());
-        assert!(s.delete_node(extra).is_err());
+        let source = s.node_by_index(0).unwrap();
+        s.selected_node = Some(source);
+        s.viewed_node = Some(source);
+        assert!(s.delete_node(source).is_ok());
+        assert!(s.project.graph.node(source).is_none());
+        assert_eq!(s.viewed_node, None);
+        assert_eq!(s.target_node(), None);
     }
 
     #[test]
-    fn target_node_falls_back_to_output() {
+    fn target_follows_selection_and_pin_is_session_only() {
         let mut s = demo_session();
-        let out = s.output_node().unwrap();
-        assert_eq!(s.target_node(), Some(out));
         let exp = s.node_by_index(4).unwrap();
+        let src = s.node_by_index(0).unwrap();
+        assert_eq!(s.target_node(), None);
+        s.selected_node = Some(exp);
+        assert_eq!(s.target_node(), Some(exp));
         s.viewed_node = Some(exp);
+        s.selected_node = Some(src);
         assert_eq!(s.target_node(), Some(exp));
         s.project.graph.remove_node(exp);
-        assert_eq!(s.target_node(), Some(out));
+        s.sanitize();
+        assert_eq!(s.viewed_node, None);
+        assert_eq!(s.target_node(), Some(src));
+        s.selected_node = None;
+        assert_eq!(s.target_node(), None);
+        s.viewed_node = Some(src);
+        s.new_project();
+        assert_eq!(s.target_node(), None);
+        assert_eq!(s.viewed_node, None);
     }
 
     #[test]
@@ -1004,6 +1113,55 @@ pub mod tests {
     }
 
     #[test]
+    fn viewer_wheel_stays_in_the_pinned_nodes_filtered_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let mut project = png_project(&a, 3);
+        std::fs::copy(a.join("img_000.png"), b.join("other.png")).unwrap();
+        project.scan_folder(&b, false, &rawgraph_io::is_supported, &|_| None);
+        let mut s = Session::new(project, provider());
+        let source = s.project.graph.add_node(NodeKind::Source, [0.0; 2]);
+        crate::node_ui::set_source_folder(&mut s.project.graph, source, Some(a.to_str().unwrap().to_owned()));
+        let generator = s.project.graph.add_node(NodeKind::Generator, [0.0; 2]);
+        s.selected_node = Some(generator);
+        s.viewed_node = Some(source);
+        let (ids, captures) = s.id_captures();
+        let members = crate::collection::view_members(&s.project.graph, &ids, &captures, source);
+        let order = s.gallery_images(&members);
+        assert_eq!(order.len(), 3);
+        s.selected = s.visible().iter().copied().find(|id| !members.contains(id));
+        assert!(s.selected.is_some());
+        s.step_viewer_image(1);
+        assert_eq!(s.selected, Some(order[0]));
+        s.step_viewer_image(1);
+        assert_eq!(s.selected, Some(order[1]));
+        s.step_viewer_image(10);
+        assert_eq!(s.selected, Some(order[2]));
+        s.step_viewer_image(1);
+        assert_eq!(s.selected, Some(order[2]));
+    }
+
+    #[test]
+    fn viewer_wheel_recomputes_membership_and_respects_empty_node() {
+        let mut s = demo_session();
+        let original = s.selected;
+        s.selected_node = None;
+        s.step_viewer_image(1);
+        assert_eq!(s.selected, original);
+        s.project.graph = default_graph();
+        let source = s.node_by_index(0).unwrap();
+        s.selected_node = Some(source);
+        // An explicitly empty Source must not use stale cached membership.
+        s.collection.view_node = Some(source);
+        s.collection.view_members = s.visible().iter().copied().collect();
+        s.step_viewer_image(1);
+        assert_eq!(s.selected, original);
+    }
+
+    #[test]
     fn culling_edits_the_right_entry_and_marks_unsaved() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = Session::new(png_project(dir.path(), 3), provider());
@@ -1028,7 +1186,8 @@ pub mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = Session::new(png_project(dir.path(), 4), provider());
         let ids = s.visible().to_vec();
-        let out = s.output_node().unwrap();
+        let out = s.node_by_index(0).unwrap();
+        s.selected_node = Some(out);
         assert_eq!(s.in_view(ids[0]), None, "unknown until the collection is computed");
         assert_eq!(s.in_view_count(), None);
         s.collection.view_node = Some(out);
@@ -1037,7 +1196,7 @@ pub mod tests {
         assert_eq!(s.in_view(ids[1]), Some(false));
         assert_eq!(s.in_view_count(), Some(2));
         // The result belongs to another node: not applicable to the viewed one.
-        let src = s.node_by_index(0).unwrap();
+        let src = s.node_by_index(1).unwrap();
         s.viewed_node = Some(src);
         assert_eq!(s.in_view(ids[1]), None);
     }
@@ -1049,10 +1208,12 @@ pub mod tests {
         let kinds: Vec<NodeKind> = g.nodes().map(|n| n.kind).collect();
         assert_eq!(
             kinds,
-            [NodeKind::Source, NodeKind::Develop, NodeKind::Exposure, NodeKind::Contrast, NodeKind::HighlightsShadows, NodeKind::Saturation, NodeKind::Output]
+            [NodeKind::Source, NodeKind::Develop, NodeKind::Exposure, NodeKind::Contrast, NodeKind::HighlightsShadows, NodeKind::Saturation]
         );
         // A plain chain: every node is fed by the one before it.
         let ids: Vec<NodeId> = g.nodes().map(|n| n.id).collect();
+        assert!(matches!(g.node(ids[0]).unwrap().data(ImageId(0)), Some(rawgraph_core::NodeData::Folder(f)) if f.is_empty()));
+        assert!(!g.contains_in(ids[0], ImageId(42), &rawgraph_core::Catalog { images: &[ImageId(42)], capture: &|_| None }));
         assert_eq!(g.edges().len(), ids.len() - 1);
         for pair in ids.windows(2) {
             assert_eq!(g.input_of(pair[1], 0), Some(pair[0]));
@@ -1206,18 +1367,17 @@ pub mod tests {
     }
 
     #[test]
-    fn deleting_a_selection_removes_it_in_one_go_and_spares_the_last_source() {
+    fn deleting_a_selection_can_remove_the_entire_graph() {
         let mut s = demo_session();
         let ids: Vec<NodeId> = (1..=3).map(|i| s.node_by_index(i).unwrap()).collect();
         let before = s.project.graph.nodes().count();
         assert_eq!(s.delete_nodes(&ids), Ok(3));
         assert_eq!(s.project.graph.nodes().count(), before - 3);
         let all: Vec<NodeId> = s.project.graph.nodes().map(|n| n.id).collect();
-        let err = s.delete_nodes(&all).unwrap_err();
-        assert!(err.contains("last Source"), "{err}");
-        assert_eq!(s.project.graph.nodes().filter(|n| n.kind == NodeKind::Source).count(), 1);
-        let only_source = s.project.graph.nodes().find(|n| n.kind == NodeKind::Source).unwrap().id;
-        assert_eq!(s.delete_nodes(&[only_source]).unwrap_err(), "The last Source node cannot be deleted");
+        assert_eq!(s.delete_nodes(&all), Ok(all.len()));
+        assert_eq!(s.project.graph.nodes().count(), 0);
+        assert!(s.project.graph.validate().is_empty());
+        assert_eq!(s.render_target(), None);
         assert_eq!(s.delete_nodes(&[]), Ok(0));
     }
 

@@ -41,26 +41,33 @@ pub fn saturation(img: &mut ImageBuf, amount: f32) {
     });
 }
 
-/// Linear gradient mask. `angle_deg` 0 runs left to right, 90 top to bottom.
-/// `center` is where the mask reaches 0.5 along that direction and `width`
-/// the length of the transition, both as a fraction of the image.
-pub fn linear_gradient_mask(width: u32, height: u32, angle_deg: f32, center: f32, transition: f32) -> MaskBuf {
-    let (sin, cos) = angle_deg.to_radians().sin_cos();
-    let mut mask = MaskBuf::new(width, height, 0.0);
-    let (w, h) = (width as f32, height as f32);
-    mask.data.par_chunks_mut(width.max(1) as usize).enumerate().for_each(|(y, row)| {
-        let v = (y as f32 + 0.5) / h - 0.5;
-        for (x, out) in row.iter_mut().enumerate() {
-            let u = (x as f32 + 0.5) / w - 0.5;
-            let along = u * cos + v * sin + 0.5;
-            *out = if transition <= f32::EPSILON {
-                if along >= center { 1.0 } else { 0.0 }
-            } else {
-                ((along - center) / transition + 0.5).clamp(0.0, 1.0)
-            };
+/// Apply a different exposure value at each pixel.
+pub fn exposure_mapped(img: &mut ImageBuf, ev: &[f32]) {
+    img.data_mut().par_chunks_exact_mut(4).zip(ev).for_each(|(px, ev)| {
+        let gain = ev.exp2();
+        for c in &mut px[..3] { *c *= gain; }
+    });
+}
+
+/// Apply a different saturation amount at each pixel.
+pub fn saturation_mapped(img: &mut ImageBuf, amounts: &[f32]) {
+    img.data_mut().par_chunks_exact_mut(4).zip(amounts).for_each(|(px, &amount)| {
+        if amount == 1.0 { return; }
+        let y = AP1_LUMA[0] * px[0] + AP1_LUMA[1] * px[1] + AP1_LUMA[2] * px[2];
+        for c in &mut px[..3] { *c = y + (*c - y) * amount; }
+    });
+}
+
+/// Apply a different contrast amount at each pixel around the same pivot.
+pub fn contrast_mapped(img: &mut ImageBuf, amounts: &[f32], pivot: f32) {
+    img.data_mut().par_chunks_exact_mut(4).zip(amounts).for_each(|(px, &amount)| {
+        if amount == 0.0 { return; }
+        let y = AP1_LUMA[0] * px[0] + AP1_LUMA[1] * px[1] + AP1_LUMA[2] * px[2];
+        if y > 0.0 {
+            let gain = pivot * (y / pivot).powf(amount.exp2()) / y;
+            for c in &mut px[..3] { *c *= gain; }
         }
     });
-    mask
 }
 
 /// Width (in pixels) of the column strips used by the vertical pass. A strip of
@@ -177,8 +184,8 @@ fn merge_range((mut lo, mut hi): Range4, (l2, h2): Range4) -> Range4 {
 }
 
 /// Three box passes in both directions at full resolution.
-fn blur_exact(img: &ImageBuf, radius: usize) -> Vec<f32> {
-    box_filter(img.data(), img.width() as usize, img.height() as usize, radius, 3)
+fn blur_exact(img: &ImageBuf, radius: usize, passes: usize) -> Vec<f32> {
+    box_filter(img.data(), img.width() as usize, img.height() as usize, radius, passes)
 }
 
 /// `passes` (1 or 3) box passes in both directions over RGBA data.
@@ -366,13 +373,13 @@ fn box_downscale(img: &ImageBuf, scale: usize) -> ImageBuf {
 }
 
 /// Blurs with the given box radius; `None` means the radius is zero (identity).
-fn blurred(img: &ImageBuf, radius: usize, downscaled: &mut Vec<(usize, ImageBuf)>) -> Option<Blurred> {
+fn blurred(img: &ImageBuf, radius: usize, passes: usize, downscaled: &mut Vec<(usize, ImageBuf)>) -> Option<Blurred> {
     let (w, h) = (img.width() as usize, img.height() as usize);
     if radius == 0 || w == 0 || h == 0 {
         return None;
     }
     if radius < LOW_RES_MIN_RADIUS {
-        return Some(Blurred::Full(blur_exact(img, radius)));
+        return Some(Blurred::Full(blur_exact(img, radius, passes)));
     }
     // Largest power of two that keeps at least 8 low-res pixels of radius.
     let scale = 1usize << (radius / 8).ilog2();
@@ -382,15 +389,21 @@ fn blurred(img: &ImageBuf, radius: usize, downscaled: &mut Vec<(usize, ImageBuf)
     let low = &downscaled.iter().find(|(s, _)| *s == scale).expect("just inserted").1;
     let low_radius = (radius as f32 / scale as f32).round().max(1.0) as usize;
     let (lw, lh) = (low.width() as usize, low.height() as usize);
-    let data = blur_exact(low, low_radius);
+    let data = blur_exact(low, low_radius, passes);
     Some(Blurred::Low(LowRes { data, lw, xt: taps(w, lw, scale), yt: taps(h, lh, scale) }))
 }
 
 /// Gaussian-like blur (three box passes). `sigma_px` is in pixels of `img`.
 pub fn blur(img: &ImageBuf, sigma_px: f32) -> ImageBuf {
+    filter_low(img, sigma_px, false)
+}
+
+/// Low-pass using a single box pass, or the legacy Gaussian approximation.
+pub fn filter_low(img: &ImageBuf, sigma_px: f32, box_kernel: bool) -> ImageBuf {
+    let passes = if box_kernel { 1 } else { 3 };
     let radius = sigma_px.round().max(0.0) as usize;
     let (w, h) = (img.width(), img.height());
-    match blurred(img, radius, &mut Vec::new()) {
+    match blurred(img, radius, passes, &mut Vec::new()) {
         None => img.clone(),
         Some(level) => {
             let w = w as usize;
@@ -412,6 +425,12 @@ const BLUR_LEVELS: usize = 4;
 /// sharp, 1 blurs with `max_sigma_px`, linear in between. This modulates the
 /// parameter itself and is not a blend between sharp and fully blurred.
 pub fn blur_modulated(img: &ImageBuf, max_sigma_px: f32, mask: &MaskBuf) -> ImageBuf {
+    filter_low_modulated(img, max_sigma_px, mask, false)
+}
+
+/// Radius-modulated low-pass using the selected kernel.
+pub fn filter_low_modulated(img: &ImageBuf, max_sigma_px: f32, mask: &MaskBuf, box_kernel: bool) -> ImageBuf {
+    let passes = if box_kernel { 1 } else { 3 };
     let (w, h) = (img.width() as usize, img.height() as usize);
     let mut out = ImageBuf::new(img.width(), img.height());
     if w == 0 || h == 0 {
@@ -455,7 +474,7 @@ pub fn blur_modulated(img: &ImageBuf, max_sigma_px: f32, mask: &MaskBuf) -> Imag
     let levels: Vec<Option<Blurred>> = (0..=BLUR_LEVELS)
         .map(|k| {
             let sigma = max_sigma_px * k as f32 / BLUR_LEVELS as f32;
-            if needed[k] { blurred(img, sigma.round().max(0.0) as usize, &mut downscaled) } else { None }
+            if needed[k] { blurred(img, sigma.round().max(0.0) as usize, passes, &mut downscaled) } else { None }
         })
         .collect();
     let fetch = |k: usize, x: usize, y: usize| -> [f32; 4] {
@@ -484,6 +503,151 @@ pub fn blur_modulated(img: &ImageBuf, max_sigma_px: f32, mask: &MaskBuf) -> Imag
         }
     });
     out
+}
+
+/// Bounded 25-tap spatial filters. Radius is in image pixels, and the mask
+/// scales the sampling radius per output pixel. Sampling is bilinear and edges
+/// clamp. Lens is a uniform disk; shape is a uniform diamond. Radial filters
+/// are centered on the image. Bilateral uses a fixed 0.1 scene-linear RGB range.
+/// The fixed tap budget bounds work independently of image size and radius;
+/// large radii are therefore approximate, not exact dense convolutions.
+pub fn filter_sampled(img: &ImageBuf, radius: f32, kernel: usize, angle: f32, mask: Option<&MaskBuf>) -> ImageBuf {
+    filter_sampled_direction(img, radius, kernel, angle, mask, None)
+}
+
+/// Motion directions use linear normal-map R/G decoded as XY in [-1, 1].
+/// Neutral (0.5, 0.5), non-finite, and near-zero vectors leave that pixel unchanged.
+/// The map is nearest-neighbour scaled to the image; its blue and alpha are ignored.
+pub fn filter_sampled_direction(img: &ImageBuf, radius: f32, kernel: usize, angle: f32, mask: Option<&MaskBuf>, direction: Option<&ImageBuf>) -> ImageBuf {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w == 0 || h == 0 || !radius.is_finite() || radius <= 0.0 { return img.clone(); }
+    let radius = radius.min(w.max(h) as f32);
+    let angle = if angle.is_finite() { angle.to_radians() } else { 0.0 };
+    let src = img.data();
+    let sample = |x: f32, y: f32| -> [f32; 4] {
+        let x = x.clamp(0.0, (w - 1) as f32);
+        let y = y.clamp(0.0, (h - 1) as f32);
+        let (x0, y0) = (x as usize, y as usize);
+        let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        let mut out = [0.0; 4];
+        for c in 0..4 {
+            let a = src[(y0 * w + x0) * 4 + c] * (1.0 - fx) + src[(y0 * w + x1) * 4 + c] * fx;
+            let b = src[(y1 * w + x0) * 4 + c] * (1.0 - fx) + src[(y1 * w + x1) * 4 + c] * fx;
+            out[c] = a * (1.0 - fy) + b * fy;
+        }
+        out
+    };
+    let mut out = img.clone();
+    out.data_mut().par_chunks_exact_mut(w * 4).enumerate().for_each(|(y, row)| {
+        for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+            let m = mask.filter(|m| m.width > 0 && m.height > 0).map_or(1.0, |m| {
+                let mx = x * m.width as usize / w;
+                let my = y * m.height as usize / h;
+                m.data[my * m.width as usize + mx].clamp(0.0, 1.0)
+            });
+            if !m.is_finite() || m <= 0.0 { continue; }
+            let r = radius * m;
+            let (cos, sin) = if kernel == 3 {
+                if let Some(map) = direction.filter(|map| map.width() > 0 && map.height() > 0) {
+                    let p = map.pixel((x * map.width() as usize / w) as u32, (y * map.height() as usize / h) as u32);
+                    let (vx, vy) = (p[0] * 2.0 - 1.0, p[1] * 2.0 - 1.0);
+                    let len = vx.hypot(vy);
+                    if !len.is_finite() || len <= 1e-6 { continue; }
+                    (vx / len, vy / len)
+                } else { (angle.cos(), angle.sin()) }
+            } else { (angle.cos(), angle.sin()) };
+            let center = [src[(y * w + x) * 4], src[(y * w + x) * 4 + 1], src[(y * w + x) * 4 + 2], src[(y * w + x) * 4 + 3]];
+            let (cx, cy) = ((w - 1) as f32 * 0.5, (h - 1) as f32 * 0.5);
+            let (dx, dy) = (x as f32 - cx, y as f32 - cy);
+            let mut sums = [0.0; 4];
+            let mut values = [[0.0f32; 25]; 4];
+            let mut n = 0usize;
+            let mut total = 0.0;
+            // At five samples per axis the discrete disk and diamond are identical.
+            let grid = if kernel == 2 { 7 } else { 5 };
+            for j in 0..grid {
+                for i in 0..grid {
+                    let step = 2.0 / (grid - 1) as f32;
+                    let (u, v) = (i as f32 * step - 1.0, j as f32 * step - 1.0);
+                    if (kernel == 2 && u * u + v * v > 1.0) || (kernel == 6 && u.abs() + v.abs() > 1.0) { continue; }
+                    let line = (j * 5 + i) as f32 / 12.0 - 1.0;
+                    let (sx, sy) = match kernel {
+                        3 => (x as f32 + line * r * cos, y as f32 + line * r * sin),
+                        4 => { let t = line * r / w.max(h) as f32; (x as f32 + dx * t, y as f32 + dy * t) },
+                        5 => { let t = line * r / w.max(h) as f32; (cx + dx * t.cos() - dy * t.sin(), cy + dx * t.sin() + dy * t.cos()) },
+                        _ => (x as f32 + u * r, y as f32 + v * r),
+                    };
+                    let p = sample(sx, sy);
+                    let weight = if kernel == 8 {
+                        let d = (0..3).map(|c| (p[c] - center[c]).powi(2)).sum::<f32>();
+                        (-d / (2.0 * 0.1f32.powi(2))).exp() * (-(u*u + v*v) * 2.0).exp()
+                    } else { 1.0 };
+                    for c in 0..4 {
+                        sums[c] += p[c] * weight;
+                        if kernel == 7 { values[c][n] = p[c]; }
+                    }
+                    total += weight;
+                    n += 1;
+                }
+            }
+            for c in 0..if kernel == 3 { 3 } else { 4 } {
+                pixel[c] = if kernel == 7 {
+                    values[c][..n].sort_by(f32::total_cmp);
+                    values[c][n / 2]
+                } else { sums[c] / total };
+            }
+        }
+    });
+    out
+}
+
+#[cfg(test)]
+mod sampled_filter_tests {
+    use super::*;
+
+    #[test]
+    fn kernels_are_bounded_and_preserve_constants_and_zero_radius() {
+        let constant = ImageBuf::from_rgba(9, 9, [0.25, 0.5, 1.5, 0.8].repeat(81)).unwrap();
+        for kernel in 2..=8 {
+            assert_eq!(filter_sampled(&constant, 0.0, kernel, 0.0, None), constant);
+            let result = filter_sampled(&constant, 10000.0, kernel, 30.0, None);
+            for (a, b) in result.data().iter().zip(constant.data()) { assert!((a - b).abs() < 1e-5); }
+        }
+    }
+
+    #[test]
+    fn normal_direction_vectors_and_neutral_preserve_alpha() {
+        let mut img = ImageBuf::from_rgba(17, 17, [0.0, 0.0, 0.0, 0.25].repeat(17 * 17)).unwrap();
+        img.set_pixel(8, 8, [1.0, 1.0, 1.0, 0.75]);
+        let map = |r, g| ImageBuf::from_rgba(1, 1, vec![r, g, 1.0, 0.0]).unwrap();
+        let run = |r, g| filter_sampled_direction(&img, 4.0, 3, 90.0, None, Some(&map(r, g)));
+        let horizontal = run(1.0, 0.5);
+        let vertical = run(0.5, 1.0);
+        let diagonal = run(1.0, 1.0);
+        assert!(horizontal.pixel(10, 8)[0] > 0.0);
+        assert_eq!(horizontal.pixel(8, 10)[0], 0.0);
+        assert!(vertical.pixel(8, 10)[0] > 0.0);
+        assert_eq!(vertical.pixel(10, 8)[0], 0.0);
+        assert!(diagonal.pixel(10, 10)[0] > 0.0);
+        assert_eq!(run(0.5, 0.5), img);
+        assert_eq!(run(f32::NAN, 0.5), img);
+        for (a, b) in horizontal.data().chunks_exact(4).zip(img.data().chunks_exact(4)) { assert_eq!(a[3], b[3]); }
+        assert_eq!(filter_sampled_direction(&img, 4.0, 3, 90.0, None, None), vertical);
+    }
+
+    #[test]
+    fn motion_direction_and_kernel_shapes_differ() {
+        let mut data = vec![0.0; 17 * 17 * 4];
+        let i = (8 * 17 + 8) * 4;
+        data[i..i + 4].copy_from_slice(&[1.0; 4]);
+        let img = ImageBuf::from_rgba(17, 17, data).unwrap();
+        let horizontal = filter_sampled(&img, 4.0, 3, 0.0, None);
+        let vertical = filter_sampled(&img, 4.0, 3, 90.0, None);
+        assert!(horizontal.data()[(8 * 17 + 10) * 4] > vertical.data()[(8 * 17 + 10) * 4]);
+        assert_ne!(filter_sampled(&img, 4.0, 2, 0.0, None), filter_sampled(&img, 4.0, 6, 0.0, None));
+        assert_ne!(filter_sampled(&img, 4.0, 7, 0.0, None), filter_sampled(&img, 4.0, 8, 0.0, None));
+    }
 }
 
 /// Contrast around a pivot, as a power curve on luminance: pixels keep their
@@ -532,6 +696,87 @@ pub fn highlights_shadows(img: &mut ImageBuf, highlights: f32, shadows: f32) {
         px[0] *= gain;
         px[1] *= gain;
         px[2] *= gain;
+    });
+}
+
+/// Per-pixel Develop controls in parameter units. Missing maps use scalar values.
+/// Each supplied map must contain exactly one value per pixel.
+#[derive(Default)]
+pub struct DevelopControlMaps<'a> {
+    pub exposure: Option<&'a [f32]>, pub contrast: Option<&'a [f32]>,
+    pub highlights: Option<&'a [f32]>, pub shadows: Option<&'a [f32]>,
+    pub whites: Option<&'a [f32]>, pub blacks: Option<&'a [f32]>,
+}
+impl DevelopControlMaps<'_> {
+    fn at(map: Option<&[f32]>, i: usize, scalar: f32) -> f32 { map.map_or(scalar, |m| m[i]) }
+    pub fn validate(&self, n: usize) { for m in [self.exposure, self.contrast, self.highlights, self.shadows, self.whites, self.blacks].into_iter().flatten() { assert_eq!(m.len(), n); } }
+}
+
+/// Apply mapped exposure, Legacy endpoint/recovery and contrast in Develop order.
+pub fn develop_legacy_mapped(img: &mut ImageBuf, values: crate::DevelopTone, maps: &DevelopControlMaps<'_>) {
+    maps.validate(img.width() as usize * img.height() as usize);
+    img.data_mut().par_chunks_exact_mut(4).enumerate().for_each(|(i, px)| {
+        let get = |m, v| DevelopControlMaps::at(m, i, v);
+        let ev = get(maps.exposure, values.exposure);
+        if ev != 0.0 { let g = ev.exp2(); for v in &mut px[..3] { *v *= g; } }
+        let whites = get(maps.whites, values.whites); let blacks = get(maps.blacks, values.blacks);
+        if whites != 0.0 || blacks != 0.0 {
+            let y = AP1_LUMA[0]*px[0].max(0.0) + AP1_LUMA[1]*px[1].max(0.0) + AP1_LUMA[2]*px[2].max(0.0);
+            if y.is_finite() { let t = y/(y+0.18); let gain = (whites*smoothstep(0.35,0.95,t)).exp2(); let add = blacks*0.03*(1.0-smoothstep(0.0,0.45,t));
+                for v in &mut px[..3] { let mut o = *v*gain+add; if blacks < 0.0 { o=o.max(v.min(0.0)); } *v=o; }
+            }
+        }
+        let hi=get(maps.highlights,values.highlights); let sh=get(maps.shadows,values.shadows);
+        if hi != 0.0 || sh != 0.0 { let y=(AP1_LUMA[0]*px[0]+AP1_LUMA[1]*px[1]+AP1_LUMA[2]*px[2]).max(0.0); let t=y/(y+0.18); let g=(2.0*hi*smoothstep(0.5,1.0,t)+2.0*sh*(1.0-smoothstep(0.0,0.5,t))).exp2(); for v in &mut px[..3] { *v *= g; } }
+        let c=get(maps.contrast,values.contrast);
+        if c != 0.0 { let y=AP1_LUMA[0]*px[0]+AP1_LUMA[1]*px[1]+AP1_LUMA[2]*px[2]; if y>0.0 { let g=0.18*(y/0.18).powf(c.exp2())/y; for v in &mut px[..3] { *v *= g; } } }
+    });
+}
+
+/// Experimental local Develop tone v1. A self-guided log-luminance base controls
+/// the gains; the original RGB detail is retained. Signed/non-finite luminance is
+/// left untouched. No display clamp is applied. Radius scales with image size.
+pub fn develop_local_tone(img: &mut ImageBuf, highlights: f32, shadows: f32, whites: f32, blacks: f32) {
+    develop_local_tone_mapped(img, highlights, shadows, whites, blacks, &DevelopControlMaps::default());
+}
+
+/// Local v1 with optional spatial control values; the guidance is computed once.
+pub fn develop_local_tone_mapped(img: &mut ImageBuf, highlights: f32, shadows: f32, whites: f32, blacks: f32, maps: &DevelopControlMaps<'_>) {
+    maps.validate(img.width() as usize * img.height() as usize);
+    if highlights == 0.0 && shadows == 0.0 && whites == 0.0 && blacks == 0.0 && maps.highlights.is_none() && maps.shadows.is_none() && maps.whites.is_none() && maps.blacks.is_none() { return; }
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w == 0 || h == 0 { return; }
+    let n = w * h;
+    let mut moments = vec![0.0f32; n * 4];
+    moments.par_chunks_exact_mut(4).zip(img.data().par_chunks_exact(4)).for_each(|(m, px)| {
+        let y = AP1_LUMA[0]*px[0] + AP1_LUMA[1]*px[1] + AP1_LUMA[2]*px[2];
+        let g = if y.is_finite() && y > 0.0 { (1.0 + y / 0.18).ln() } else { 0.0 };
+        m[0] = g; m[1] = g*g;
+    });
+    let radius = ((w.max(h) as f32 * 0.015).round() as usize).max(1);
+    let mean = box_filter(&moments, w, h, radius, 1);
+    let mut coeff = vec![0.0f32; n * 4];
+    coeff.par_chunks_exact_mut(4).zip(mean.par_chunks_exact(4)).for_each(|(c, m)| {
+        let variance = (m[1] - m[0]*m[0]).max(0.0);
+        let a = variance / (variance + 0.25);
+        c[0] = a; c[1] = m[0]*(1.0-a);
+    });
+    let coeff = box_filter(&coeff, w, h, radius, 1);
+    img.data_mut().par_chunks_exact_mut(4).zip(moments.par_chunks_exact(4)).zip(coeff.par_chunks_exact(4)).enumerate().for_each(|(i, ((px, m), c))| {
+        let highlights = DevelopControlMaps::at(maps.highlights, i, highlights); let shadows = DevelopControlMaps::at(maps.shadows, i, shadows);
+        let whites = DevelopControlMaps::at(maps.whites, i, whites); let blacks = DevelopControlMaps::at(maps.blacks, i, blacks);
+        let y = AP1_LUMA[0]*px[0] + AP1_LUMA[1]*px[1] + AP1_LUMA[2]*px[2];
+        if !y.is_finite() || y <= 0.0 { return; }
+        let base = (c[0]*m[0] + c[1]).max(0.0);
+        let t = 1.0 - (-base).exp();
+        let hi = smoothstep(0.5, 1.0, t);
+        let sh = 1.0 - smoothstep(0.0, 0.5, t);
+        // Endpoint controls are independent of the local recovery weights.
+        let u = y / (y + 0.18);
+        let white = smoothstep(0.8, 1.0, u);
+        let black = 1.0 - smoothstep(0.0, 0.2, u);
+        let gain = (2.0*(highlights*hi + shadows*sh) + whites*white + blacks*black).exp2();
+        for v in &mut px[..3] { *v *= gain; }
     });
 }
 
@@ -687,17 +932,6 @@ mod tests {
     }
 
     #[test]
-    fn gradient_mask_runs_in_the_requested_direction() {
-        let m = linear_gradient_mask(100, 10, 0.0, 0.5, 1.0);
-        assert!(m.get(0, 5) < 0.02 && m.get(99, 5) > 0.98);
-        assert!((m.get(50, 0) - m.get(50, 9)).abs() < 1e-6);
-        let m = linear_gradient_mask(10, 100, 90.0, 0.5, 1.0);
-        assert!(m.get(5, 0) < 0.02 && m.get(5, 99) > 0.98);
-        let step = linear_gradient_mask(100, 1, 0.0, 0.5, 0.0);
-        assert_eq!((step.get(10, 0), step.get(90, 0)), (0.0, 1.0));
-    }
-
-    #[test]
     fn blur_preserves_flat_areas_and_total_energy() {
         let img = flat(32, 16, [0.25, 2.0, 0.0]);
         let out = blur(&img, 3.0);
@@ -811,7 +1045,7 @@ mod tests {
         let img = test_scene(643, 431); // sizes that are not multiples of the scale
         for sigma in [16.0f32, 24.0, 40.0, 60.0] {
             let fast = blur(&img, sigma);
-            let exact = ImageBuf::from_rgba(643, 431, blur_exact(&img, sigma as usize)).unwrap();
+            let exact = ImageBuf::from_rgba(643, 431, blur_exact(&img, sigma as usize, 3)).unwrap();
             let max_ref = exact.data().iter().cloned().fold(0.0f32, f32::max);
             let max_err = fast.data().iter().zip(exact.data()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
             eprintln!("sigma {sigma}: max abs diff {max_err:.5} (peak {max_ref:.2}, {:.3}%)", 100.0 * max_err / max_ref);
@@ -1126,7 +1360,7 @@ mod tests {
         for (i, v) in img.data_mut().iter_mut().enumerate() {
             *v = ((i * 2654435761) % 1000) as f32 / 500.0;
         }
-        let mask = linear_gradient_mask(w, h, 0.0, 0.5, 1.0);
+        let mask = MaskBuf { width: w, height: h, data: (0..w*h).map(|i| (i % w) as f32 / (w - 1) as f32).collect() };
         time_runs("blur sigma 8", || drop(blur(&img, 8.0)));
         time_runs("blur sigma 60", || drop(blur(&img, 60.0)));
         time_runs("blur_modulated max 60", || drop(blur_modulated(&img, 60.0, &mask)));
@@ -1134,5 +1368,25 @@ mod tests {
         time_runs("noise_reduction luma 1.0 chroma 1.0 radius 5 px (heavy)", || drop(noise_reduction(&img, 1.0, 1.0, 5.0)));
         time_runs("noise_reduction luma only", || drop(noise_reduction(&img, 0.6, 0.0, 5.0)));
         time_runs("noise_reduction chroma only", || drop(noise_reduction(&img, 0.0, 0.6, 5.0)));
+    }
+}
+
+#[cfg(test)]
+mod local_develop_tests {
+    use super::*;
+    #[test]
+    fn local_context_identity_hdr_and_endpoints() {
+        let mut a = ImageBuf::new(9, 1);
+        let mut b = ImageBuf::new(9, 1);
+        for x in 0..9 { a.set_pixel(x, 0, [0.12, 0.12, 0.12, 0.7]); b.set_pixel(x, 0, [0.3, 0.3, 0.3, 0.7]); }
+        a.set_pixel(4, 0, [0.2, 0.2, 0.2, 0.7]); b.set_pixel(4, 0, [0.2, 0.2, 0.2, 0.7]);
+        let orig = a.clone(); develop_local_tone(&mut a, 0.0, 0.0, 0.0, 0.0); assert_eq!(a, orig);
+        develop_local_tone(&mut a, -1.0, 0.0, 0.0, 0.0); develop_local_tone(&mut b, -1.0, 0.0, 0.0, 0.0);
+        assert_ne!(a.pixel(4, 0)[0], b.pixel(4, 0)[0]);
+        assert_eq!(a.pixel(4, 0)[3], 0.7);
+        let mut hdr = ImageBuf::from_rgba(1, 1, vec![8.0, 8.0, 8.0, 1.0]).unwrap();
+        develop_local_tone(&mut hdr, 0.0, 0.0, 0.5, 0.0); assert!(hdr.pixel(0, 0)[0] > 8.0);
+        let mut black = ImageBuf::from_rgba(1, 1, vec![0.001, 0.001, 0.001, 1.0]).unwrap();
+        develop_local_tone(&mut black, 0.0, 0.0, 0.0, 0.5); assert!(black.pixel(0, 0)[0] > 0.001);
     }
 }

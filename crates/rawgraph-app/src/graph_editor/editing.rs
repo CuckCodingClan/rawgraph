@@ -254,22 +254,21 @@ impl GraphEditor {
     }
 
     /// Runs queued commands and the keyboard / clipboard events of this frame.
-    pub(super) fn run_edit_input(&mut self, ctx: &egui::Context, session: &mut Session, status: &mut Status, rect: Rect, xf: &Xform, pointer: Option<Pos2>) {
-        let typing = ctx.egui_wants_keyboard_input();
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_edit_input(&mut self, ctx: &egui::Context, session: &mut Session, status: &mut Status, rect: Rect, xf: &Xform, pointer: Option<Pos2>, graph_focus: bool) {
         let at_pointer = pointer.filter(|p| rect.contains(*p)).map(|p| {
             let g = xf.to_graph(p);
             [g.x, g.y]
         });
         let mut ops = std::mem::take(&mut self.edit.ops);
-        if !typing && self.search.is_none() {
+        if graph_focus && !ctx.text_edit_focused() && self.search.is_none() {
             let events = ctx.input(|i| i.events.clone());
             for ev in events {
                 match ev {
                     egui::Event::Copy => ops.push(EditOp::Copy),
                     egui::Event::Cut => ops.push(EditOp::Cut),
                     egui::Event::Paste(text) => {
-                        let text = self.clipboard_read(Some(&text));
-                        self.paste_text(text.as_deref(), at_pointer, session, status);
+                        self.paste_text(Some(&text), at_pointer, session, status);
                     }
                     _ => {}
                 }

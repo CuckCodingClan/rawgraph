@@ -9,7 +9,7 @@ use std::sync::Arc;
 use eframe::egui::{self, Color32, RichText};
 use rawgraph_core::{
     export_spec, ExportFileFormat, ExportSpec, ExportText, Graph, ImageId, LensProfile, Mode, Node, NodeData, NodeId, NodeKind, OutputSpace, ParamKind,
-    EXPORT_FORMATS, LAYER_BLEND_MODES, LAYER_FILTERS, LAYER_FITS, MAX_LAYERS, OUTPUT_SPACES,
+    LAYER_BLEND_MODES, LAYER_FILTERS, LAYER_FITS, MAX_LAYERS, OUTPUT_SPACES,
 };
 
 use crate::collection::{with_thousands as th, LayerStats, MergeStats};
@@ -38,7 +38,7 @@ pub fn set_all_param(graph: &mut Graph, id: NodeId, name: &str, value: f32) -> b
     ok
 }
 
-/// The folder a Source restricts its images to, `None` for "all project images".
+/// The folder a Source restricts its images to, or `None` when unset.
 pub fn source_folder(node: &Node) -> Option<String> {
     match all_view(node).data(ImageId(0)) {
         Some(NodeData::Folder(f)) if !f.is_empty() => Some(f.clone()),
@@ -56,7 +56,7 @@ pub fn set_source_folder(graph: &mut Graph, id: NodeId, folder: Option<String>) 
     let Some(n) = graph.node_mut(id).filter(|n| n.kind == NodeKind::Source) else { return false };
     let mode = n.mode;
     n.mode = Mode::All;
-    let ok = n.set_data(ImageId(0), folder.filter(|f| !f.is_empty()).map(NodeData::Folder));
+    let ok = n.set_data(ImageId(0), Some(NodeData::Folder(folder.unwrap_or_default())));
     n.mode = mode;
     ok
 }
@@ -69,7 +69,7 @@ pub fn folder_name(folder: &str) -> String {
 
 /// What a Source shows in its box and in the inspector heading: the folder name or "All images".
 pub fn source_label(node: &Node) -> String {
-    source_folder(node).map_or_else(|| "All images".to_owned(), |f| folder_name(&f))
+    source_folder(node).map_or_else(|| if matches!(all_view(node).data(ImageId(0)), Some(NodeData::Folder(_))) { "No folder".to_owned() } else { "All images".to_owned() }, |f| folder_name(&f))
 }
 
 /// The folder of every Source node with its sub-folder switch, for noticing changes.
@@ -237,12 +237,12 @@ pub fn export_conflict(format: ExportFileFormat, space: OutputSpace) -> Option<&
 
 /// Whether the quality setting applies to `format`.
 pub fn quality_applies(format: ExportFileFormat) -> bool {
-    matches!(format, ExportFileFormat::Jpeg | ExportFileFormat::Avif)
+    matches!(format, ExportFileFormat::Jpeg | ExportFileFormat::Avif | ExportFileFormat::Webp)
 }
 
 /// Whether the colour space (and the embedded profile) apply to `format`.
 pub fn colour_space_applies(format: ExportFileFormat) -> bool {
-    format != ExportFileFormat::Exr
+    !matches!(format, ExportFileFormat::Exr | ExportFileFormat::Png16Data)
 }
 
 pub const EXR_SPACE_NOTE: &str = "EXR files are linear ACEScg: the colour space and the profile do not apply.";
@@ -408,8 +408,9 @@ fn slider(ui: &mut egui::Ui, value: &mut f32, min: f32, max: f32, enabled: bool)
 pub fn source_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
     let Some(node) = session.project.graph.node(id) else { return };
     let folder = source_folder(node);
+    let legacy_catalog = !matches!(all_view(node).data(ImageId(0)), Some(NodeData::Folder(_)));
     let subfolders = source_subfolders(node);
-    let count = session.collection.counts.get(&id).copied();
+    let count = session.count_for(node);
     ui.add_space(4.0);
     ui.group(|ui| {
         ui.set_min_width(ui.available_width());
@@ -419,14 +420,14 @@ pub fn source_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId) {
                 ui.label(crate::export::elide_middle(f, 44)).on_hover_text(f.as_str());
             }
             None => {
-                ui.label("All project images");
+                ui.label(if legacy_catalog { "All project images (legacy)" } else { "No folder selected" });
             }
         }
         ui.horizontal(|ui| {
             if ui.button("Choose folder\u{2026}").on_hover_text("Show only the images of one folder. A folder that is not part of the project yet is scanned into it.").clicked() {
                 session.ui_requests.push(UiRequest::PickSourceFolder(id));
             }
-            if ui.add_enabled(folder.is_some(), egui::Button::new("Clear")).on_hover_text("Back to all project images").clicked() {
+            if ui.add_enabled(folder.is_some(), egui::Button::new("Clear")).on_hover_text("Clear the folder and show no images").clicked() {
                 set_source_folder(&mut session.project.graph, id, None);
             }
         });
@@ -561,7 +562,7 @@ fn layer_row(ui: &mut egui::Ui, session: &mut Session, id: NodeId, image: ImageI
         if bottom {
             ui.label(RichText::new(BOTTOM_LAYER_HINT).weak().small());
         }
-        if changed && ui.button("Reset layer").clicked() {
+        if changed && crate::icons::button(ui, crate::icons::Icon::Reset, "Reset layer", true).clicked() {
             if let Some(nd) = session.project.graph.node_mut(id) {
                 for name in ["on", "blend", "opacity", "fit", "filter"] {
                     let key = format!("l{n}_{name}");
@@ -647,6 +648,34 @@ pub(crate) fn text_field(ui: &mut egui::Ui, key: egui::Id, current: &str, width:
     out
 }
 
+// The stored format indices remain unchanged for existing projects. PNG/TIFF depth
+// is presented independently, but mapped back to the corresponding legacy index.
+const PHOTO_FORMATS: &[&str] = &["JPEG", "PNG", "TIFF", "EXR", "AVIF", "Adobe XMP sidecar", "PNG 16-bit data map", "WebP"];
+const FORMAT_INDICES: [usize; 8] = [0, 1, 3, 5, 6, 7, 8, 9];
+
+fn export_format_control(format: ExportFileFormat) -> (usize, usize) {
+    match format {
+        ExportFileFormat::Jpeg => (0, 0),
+        ExportFileFormat::Png => (1, 0),
+        ExportFileFormat::Png16 => (1, 1),
+        ExportFileFormat::Tiff => (2, 0),
+        ExportFileFormat::Tiff16 => (2, 1),
+        ExportFileFormat::Exr => (3, 0),
+        ExportFileFormat::Avif => (4, 0),
+        ExportFileFormat::Xmp => (5, 0),
+        ExportFileFormat::Png16Data => (6, 0),
+        ExportFileFormat::Webp => (7, 0),
+    }
+}
+
+fn export_format_index(format: usize, depth: usize) -> usize {
+    match (format, depth) {
+        (1, 1) => 2,
+        (2, 1) => 4,
+        _ => FORMAT_INDICES.get(format).copied().unwrap_or(0),
+    }
+}
+
 pub fn export_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, image: ImageId) {
     let Some(node) = session.project.graph.node(id).cloned() else { return };
     let spec = export_spec(&node, image);
@@ -660,21 +689,32 @@ pub fn export_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, imag
     ui.group(|ui| {
         ui.set_min_width(ui.available_width());
         egui::Grid::new(("export-grid", id.0)).num_columns(2).spacing([10.0, 5.0]).min_col_width(label_w).show(ui, |ui| {
-            let fmt_i = ExportFileFormat::ALL.iter().position(|f| *f == spec.format).unwrap_or(0);
+            let (fmt_i, depth_i) = export_format_control(spec.format);
             let avif_blocked = spec.space == OutputSpace::AdobeRgb;
             let why_not_avif: &dyn Fn(usize) -> Option<&'static str> =
-                &|i| (ExportFileFormat::from_index(i) == ExportFileFormat::Avif && avif_blocked).then_some("AVIF cannot carry Adobe RGB (1998); pick another colour space first");
+                &|i| (i == 4 && avif_blocked).then_some("AVIF cannot carry Adobe RGB (1998); pick another colour space first");
             ui.label("Format");
             ui.vertical(|ui| {
                 ui.set_width(ctrl_w);
-                if let Some(i) = combo(ui, (id.0, "format"), fmt_i, &EXPORT_FORMATS, why_not_avif, true) {
-                    new_values.push(("format", i as f32));
+                if let Some(i) = combo(ui, (id.0, "format"), fmt_i, PHOTO_FORMATS, why_not_avif, true) {
+                    new_values.push(("format", export_format_index(i, depth_i) as f32));
                 }
             });
             ui.end_row();
 
-            let q_ok = quality_applies(spec.format);
-            ui.label("Quality").on_hover_text("Applies to JPEG and AVIF only");
+            if matches!(fmt_i, 1 | 2) {
+                ui.label("Bit depth").on_hover_text("Bits per channel");
+                ui.vertical(|ui| {
+                    ui.set_width(ctrl_w);
+                    if let Some(depth) = combo(ui, (id.0, "bit_depth"), depth_i, &["8-bit", "16-bit"], &|_| None, true) {
+                        new_values.push(("format", export_format_index(fmt_i, depth) as f32));
+                    }
+                });
+                ui.end_row();
+            }
+
+            let q_ok = quality_applies(spec.format) && !(spec.format == ExportFileFormat::Webp && spec.webp_lossless);
+            ui.label("Quality").on_hover_text("Applies to JPEG, AVIF and lossy WebP");
             ui.vertical(|ui| {
                 ui.set_width(ctrl_w);
                 let mut q = f32::from(spec.quality);
@@ -683,6 +723,15 @@ pub fn export_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, imag
                 }
             });
             ui.end_row();
+
+            if spec.format == ExportFileFormat::Webp {
+                ui.label("Compression");
+                let mut lossless = spec.webp_lossless;
+                if ui.checkbox(&mut lossless, "Lossless").changed() {
+                    new_values.push(("webp_lossless", if lossless { 1.0 } else { 0.0 }));
+                }
+                ui.end_row();
+            }
 
             let size_i = node.choice("size", image);
             ui.label("Size");
@@ -732,10 +781,14 @@ pub fn export_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, imag
             ui.label("");
             ui.vertical(|ui| {
                 let mut embed = spec.embed_profile;
-                if ui.add_enabled(space_ok, egui::Checkbox::new(&mut embed, "Embed colour profile")).changed() {
+                if ui.add_enabled(space_ok && spec.format != ExportFileFormat::Webp, egui::Checkbox::new(&mut embed, "Embed colour profile")).changed() {
                     new_values.push(("profile", if embed { 1.0 } else { 0.0 }));
                 }
-                if !space_ok {
+                if spec.format == ExportFileFormat::Webp {
+                    ui.label(RichText::new("WebP ICC profile embedding is not supported.").weak().small());
+                } else if spec.format == ExportFileFormat::Png16Data {
+                    ui.label(RichText::new("Raw RGB data: no colour transform, profile or metadata; use original size for normal maps.").weak().small());
+                } else if !space_ok {
                     ui.label(RichText::new(EXR_SPACE_NOTE).weak().small());
                 }
                 if let Some(why) = export_conflict(spec.format, spec.space) {
@@ -812,6 +865,9 @@ pub fn export_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, imag
         });
     });
 
+    if spec.format == ExportFileFormat::Xmp {
+        ui.label(RichText::new("XMP: proprietary RAW only; rating and colour label only. No edits or pixels are exported. Existing sidecars are always skipped. Place sidecars beside matching RAWs for Adobe.").color(ERROR));
+    }
     ui.add_space(6.0);
     let dir_set = !spec.text.out_dir.trim().is_empty();
     let can_run = dir_set && !busy && export_conflict(spec.format, spec.space).is_none() && !session.demo;
@@ -869,6 +925,7 @@ mod tests {
         assert_eq!(source_folder(g.node(s).unwrap()).as_deref(), Some(r"D:\Photos\Wedding"));
         assert!(set_source_folder(&mut g, s, None), "Clear");
         assert_eq!(source_folder(g.node(s).unwrap()), None);
+        assert_eq!(source_label(g.node(s).unwrap()), "No folder");
         assert!(!set_source_folder(&mut g, NodeId(99), Some("x".into())));
     }
 
@@ -1062,6 +1119,7 @@ mod tests {
         let none: Option<LensProfile> = None;
         assert!(lens_status(g.lens_auto_usable(lens), Some(&none)).starts_with("Auto needs the uncropped frame"));
         assert!(g.validate().iter().any(|i| i.node == lens && i.message.contains("Auto needs the uncropped frame")), "the issue shows where issues show");
+        g.disconnect(lens, 0); // Connecting another image wire now adds a branch.
         g.connect(src, lens, 0).unwrap();
         assert!(lens_status(g.lens_auto_usable(lens), Some(&none)).starts_with("No lens data"));
     }
@@ -1072,10 +1130,23 @@ mod tests {
         assert_eq!(export_conflict(ExportFileFormat::Avif, OutputSpace::DisplayP3), None);
         assert_eq!(export_conflict(ExportFileFormat::Jpeg, OutputSpace::AdobeRgb), None);
         for f in ExportFileFormat::ALL {
-            assert_eq!(quality_applies(f), matches!(f, ExportFileFormat::Jpeg | ExportFileFormat::Avif), "{f:?}");
-            assert_eq!(colour_space_applies(f), f != ExportFileFormat::Exr, "{f:?}");
+            assert_eq!(quality_applies(f), matches!(f, ExportFileFormat::Jpeg | ExportFileFormat::Avif | ExportFileFormat::Webp), "{f:?}");
+            assert_eq!(colour_space_applies(f), !matches!(f, ExportFileFormat::Exr | ExportFileFormat::Png16Data), "{f:?}");
         }
         assert!(EXR_SPACE_NOTE.contains("EXR"));
+    }
+
+    #[test]
+    fn export_format_depth_controls_preserve_legacy_indices() {
+        for (index, format) in ExportFileFormat::ALL.iter().copied().enumerate() {
+            let (kind, depth) = export_format_control(format);
+            assert_eq!(export_format_index(kind, depth), index);
+        }
+        assert_eq!(export_format_index(1, 0), 1);
+        assert_eq!(export_format_index(1, 1), 2);
+        assert_eq!(export_format_index(2, 0), 3);
+        assert_eq!(export_format_index(2, 1), 4);
+        assert_eq!(export_format_index(PHOTO_FORMATS.len(), 0), 0);
     }
 
     #[test]

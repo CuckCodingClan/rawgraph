@@ -17,7 +17,7 @@
 //! exists.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Seek};
 use std::path::Path;
 
 use image::{DynamicImage, ImageDecoder, ImageReader};
@@ -168,17 +168,23 @@ fn rational(field: &exif::Field) -> Option<f32> {
 }
 
 pub fn read_capture_info(path: &Path) -> Result<CaptureInfo, IoError> {
-    // Header check first: garbage must be a Decode error, not an empty CaptureInfo.
+    // Keep the same handle for validation and EXIF; an additional open can
+    // be a network round trip on SMB. Borrow the reader only for validation.
+    let reader = open_reader(path)?;
+    let format = reader.format().ok_or_else(|| IoError::Decode("unknown image format".into()))?;
+    let mut file = reader.into_inner();
     guard("image", || {
-        let reader = open_reader(path)?;
+        let mut reader = ImageReader::with_format(&mut file, format);
+        reader.no_limits();
         reader.into_decoder().map(|_| ()).map_err(|e| IoError::Decode(e.to_string()))
     })?;
 
     let mut info = CaptureInfo { raw: Some(false), ..Default::default() };
-    let Ok(file) = File::open(path) else { return Ok(info) };
-    let Ok(ex) = exif::Reader::new().read_from_container(&mut BufReader::new(file)) else { return Ok(info) };
+    if file.rewind().is_err() { return Ok(info); }
+    let Ok(ex) = exif::Reader::new().read_from_container(&mut file) else { return Ok(info) };
     let get = |tag| ex.get_field(tag, exif::In::PRIMARY);
 
+    info.captured_unix_ms = get(exif::Tag::DateTimeOriginal).and_then(ascii).as_deref().and_then(crate::exif_date);
     info.make = get(exif::Tag::Make).and_then(ascii);
     info.model = get(exif::Tag::Model).and_then(ascii);
     info.lens = get(exif::Tag::LensModel).and_then(ascii);

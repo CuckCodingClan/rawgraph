@@ -41,12 +41,17 @@ pub enum ExportFormat {
     /// 16-bit PNG in the chosen output space (display image quantised to u16, round to nearest,
     /// clamped to 0..1).
     Png16,
+    /// Unmanaged RGB data, quantised directly to 16-bit PNG.
+    Png16Data,
     /// 16-bit TIFF (same quantisation as `Png16`).
     Tiff16,
     /// Linear ACEScg float, no display transform, the output colour space is ignored.
     Exr,
     /// 8-bit AVIF in the chosen output space; `quality` is 1..=100.
     Avif { quality: u8 },
+    Webp { quality: u8, lossless: bool },
+    /// Sidecars require project culling metadata and are handled by the app.
+    Xmp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +76,8 @@ pub struct ExportSettings {
     pub on_conflict: OnConflict,
     /// Applied for Jpeg/Png/Tiff/Png16/Tiff16/Avif. Ignored for Exr.
     pub display: DisplayTransform,
+    /// Viewer tone used to evaluate Display-mode generators, independent of export tone mapping.
+    pub generator_view_tone: rawgraph_scopes::ToneMap,
     /// Embed the ICC profile of `space` in Jpeg/Png/Tiff/Png16/Tiff16/Avif files. Exr is unchanged:
     /// linear ACEScg with chromaticities.
     pub embed_profile: bool,
@@ -105,6 +112,7 @@ impl Default for ExportSettings {
             long_edge: None,
             on_conflict: OnConflict::Skip,
             display: DisplayTransform::default(),
+            generator_view_tone: rawgraph_scopes::ToneMap::AcesFit,
             embed_profile: true,
             copy_metadata: true,
             space: OutputSpace::Srgb,
@@ -126,10 +134,13 @@ pub fn settings_from_spec(spec: &ExportSpec, display: DisplayTransform) -> Expor
         ExportFileFormat::Jpeg => ExportFormat::Jpeg { quality: spec.quality },
         ExportFileFormat::Png => ExportFormat::Png,
         ExportFileFormat::Png16 => ExportFormat::Png16,
+        ExportFileFormat::Png16Data => ExportFormat::Png16Data,
         ExportFileFormat::Tiff => ExportFormat::Tiff,
         ExportFileFormat::Tiff16 => ExportFormat::Tiff16,
         ExportFileFormat::Exr => ExportFormat::Exr,
         ExportFileFormat::Avif => ExportFormat::Avif { quality: spec.quality },
+        ExportFileFormat::Webp => ExportFormat::Webp { quality: spec.quality, lossless: spec.webp_lossless },
+        ExportFileFormat::Xmp => ExportFormat::Xmp,
     };
     let (long_edge, percent) = match spec.size {
         ExportSize::Original => (None, None),
@@ -151,6 +162,7 @@ pub fn settings_from_spec(spec: &ExportSpec, display: DisplayTransform) -> Expor
         long_edge,
         on_conflict,
         display,
+        generator_view_tone: display.tone_map,
         embed_profile: spec.embed_profile,
         copy_metadata: m.camera || m.exposure || m.date || m.gps || m.author || m.software || description.is_some(),
         space: spec.space,
@@ -258,15 +270,17 @@ fn invalid<T>(msg: impl Into<String>) -> Result<T, ExportError> {
 fn extension(format: ExportFormat) -> &'static str {
     match format {
         ExportFormat::Jpeg { .. } => "jpg",
-        ExportFormat::Png | ExportFormat::Png16 => "png",
+        ExportFormat::Png | ExportFormat::Png16 | ExportFormat::Png16Data => "png",
         ExportFormat::Tiff | ExportFormat::Tiff16 => "tif",
         ExportFormat::Exr => "exr",
         ExportFormat::Avif { .. } => "avif",
+        ExportFormat::Webp { .. } => "webp",
+        ExportFormat::Xmp => "xmp",
     }
 }
 
 fn plan(item: &ExportItem, index: usize, settings: &ExportSettings, tokens: &[template::Token]) -> Result<PathBuf, ExportError> {
-    let Some(stem) = item.source.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+    let stem = if item.source.as_os_str().is_empty() { format!("generated-{}", item.id.0) } else if let Some(stem) = item.source.file_stem().map(|s| s.to_string_lossy().into_owned()) { stem } else {
         return invalid(format!("source {} has no file name", item.source.display()));
     };
     let name = template::expand(tokens, &stem, index, item.id.0);
@@ -312,6 +326,7 @@ fn abs_key(p: &Path) -> String {
 }
 
 fn check_settings(settings: &ExportSettings) -> Result<Vec<template::Token>, ExportError> {
+    if settings.format == ExportFormat::Xmp { return invalid("XMP requires project culling metadata; use the application Export node"); }
     let tokens = template::parse(&settings.name_template).map_err(ExportError::InvalidSettings)?;
     if settings.long_edge == Some(0) {
         return invalid("the long edge must be at least 1 pixel");
@@ -321,7 +336,7 @@ fn check_settings(settings: &ExportSettings) -> Result<Vec<template::Token>, Exp
             return invalid(format!("the size percentage {p} must be greater than 0"));
         }
     }
-    if let ExportFormat::Jpeg { quality } | ExportFormat::Avif { quality } = settings.format {
+    if let ExportFormat::Jpeg { quality } | ExportFormat::Avif { quality } | ExportFormat::Webp { quality, .. } = settings.format {
         if !(1..=100).contains(&quality) {
             return invalid(format!("quality {quality} is outside 1..=100"));
         }
@@ -365,6 +380,7 @@ impl<'a> CatalogProvider<'a> {
         let mut order = Vec::with_capacity(catalog.len());
         let mut paths = HashMap::with_capacity(catalog.len());
         for it in catalog {
+            if it.source.as_os_str().is_empty() { continue; }
             if let std::collections::hash_map::Entry::Vacant(v) = paths.entry(it.id) {
                 order.push(it.id);
                 v.insert(it.source.clone());
@@ -441,6 +457,7 @@ impl ImageProvider for CatalogProvider<'_> {
 }
 
 enum Output {
+    Rgba8 { width: u32, height: u32, rgba: Vec<u8> },
     Rgb8 { width: u32, height: u32, rgb: Vec<u8> },
     Rgb16 { width: u32, height: u32, rgb: Vec<u16> },
     Float(ImageBuf),
@@ -450,24 +467,29 @@ impl Output {
     fn size(&self) -> (u32, u32) {
         match self {
             Output::Rgb8 { width, height, .. } | Output::Rgb16 { width, height, .. } => (*width, *height),
+            Output::Rgba8 { width, height, .. } => (*width, *height),
             Output::Float(img) => (img.width(), img.height()),
         }
     }
 
     fn write(&self, path: &Path, settings: &ExportSettings, overwrite: bool, metadata: &Option<rawgraph_io::ExportMetadata>) -> Result<(), IoError> {
         let quality = match settings.format {
-            ExportFormat::Jpeg { quality } | ExportFormat::Avif { quality } => quality,
+            ExportFormat::Jpeg { quality } | ExportFormat::Avif { quality } | ExportFormat::Webp { quality, .. } => quality,
             _ => 100,
         };
         let options = rawgraph_io::SaveOptions {
             jpeg_quality: quality,
             overwrite,
-            embed_profile: settings.embed_profile,
+            embed_profile: settings.embed_profile && settings.format != ExportFormat::Png16Data,
             space: settings.space,
-            metadata: metadata.clone(),
+            metadata: if settings.format == ExportFormat::Png16Data { None } else { metadata.clone() },
         };
         match self {
             Output::Float(img) => rawgraph_io::save_exr(path, img, overwrite),
+            Output::Rgba8 { width, height, rgba } => match settings.format {
+                ExportFormat::Webp { lossless, .. } => rawgraph_io::save_webp8(path, *width, *height, rgba, lossless, &options),
+                _ => unreachable!(),
+            },
             Output::Rgb8 { width, height, rgb } => match settings.format {
                 ExportFormat::Avif { .. } => rawgraph_io::save_avif8(path, *width, *height, rgb, &options),
                 _ => rawgraph_io::save_srgb8_with(path, *width, *height, rgb, &options),
@@ -475,6 +497,14 @@ impl Output {
             Output::Rgb16 { width, height, rgb } => rawgraph_io::save_srgb16_with(path, *width, *height, rgb, &options),
         }
     }
+}
+
+fn data_map_output(img: &ImageBuf) -> Output {
+    let rgb = img.data().as_chunks::<4>().0.iter().flat_map(|p| p[..3].iter().map(|v| {
+        let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+        (v * 65535.0).round() as u16
+    })).collect();
+    Output::Rgb16 { width: img.width(), height: img.height(), rgb }
 }
 
 /// 16-bit RGB: clamp 0..1 (NaN -> 0), round(x * 65535).
@@ -620,6 +650,7 @@ fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job
         return ItemStatus::SkippedExisting(planned.to_path_buf());
     }
 
+    ev.set_view_tone(settings.generator_view_tone);
     let evaluated = ev.eval_image(ctx.graph, ctx.node, item.id, provider, ctx.cancel);
     ev.clear();
     provider.release_pixels();
@@ -638,10 +669,23 @@ fn run_item(ctx: &Ctx, ev: &mut Evaluator, provider: &CatalogProvider, job: &Job
         None => None,
     };
     let output = match settings.format {
+        ExportFormat::Png16Data => {
+            data_map_output(resized.as_ref().unwrap_or(&image))
+        }
         ExportFormat::Exr => Output::Float(match resized {
             Some(small) => small,
             None => (*image).clone(),
         }),
+        ExportFormat::Webp { .. } => {
+            let img = resized.as_ref().unwrap_or(&image);
+            let display = settings.display.apply_in_space(img, settings.space);
+            let rgb = to_rgb8(&display);
+            let rgba = rgb.as_chunks::<3>().0.iter().zip(img.data().as_chunks::<4>().0).flat_map(|(rgb, p)| {
+                let alpha = if p[3].is_nan() { 0.0 } else { p[3].clamp(0.0, 1.0) };
+                [rgb[0], rgb[1], rgb[2], (alpha * 255.0).round() as u8]
+            }).collect();
+            Output::Rgba8 { width: display.width, height: display.height, rgba }
+        }
         ExportFormat::Png16 | ExportFormat::Tiff16 => {
             let display = settings.display.apply_in_space(resized.as_ref().unwrap_or(&image), settings.space);
             Output::Rgb16 { width: display.width, height: display.height, rgb: to_rgb16(&display) }
@@ -696,6 +740,18 @@ pub fn export(
     progress: &mut dyn FnMut(&ExportProgress),
 ) -> Result<ExportReport, ExportError> {
     export_with(graph, node, items, settings, cancel, progress, &|p| rawgraph_io::read_capture_info(p).ok(), &rawgraph_io::read_lens_profile)
+}
+
+/// Render selected items against the complete project catalog. Keeping these separate
+/// preserves graph pairing and protects originals outside the selected scope.
+pub fn export_catalog(
+    graph: &Graph, node: NodeId, catalog: &[ExportItem], items: &[ExportItem],
+    settings: &ExportSettings, cancel: &CancelToken, progress: &mut dyn FnMut(&ExportProgress),
+) -> Result<ExportReport, ExportError> {
+    check_node(graph, node)?;
+    check_settings(settings)?;
+    let jobs: Vec<Job> = items.iter().map(|it| Job { item: it.clone(), settings, pre_failure: None }).collect();
+    run_batch(graph, node, catalog, &jobs, cancel, progress, &|p| rawgraph_io::read_capture_info(p).ok(), &rawgraph_io::read_lens_profile)
 }
 
 /// `export` with injectable metadata readers (capture metadata and lens profile, each asked once
@@ -765,6 +821,8 @@ pub(crate) fn export_node_with(
         None => return invalid(format!("node {} does not exist in the graph", export_node.0)),
     };
     let by_id: HashMap<ImageId, &ExportItem> = catalog.iter().rev().map(|it| (it.id, it)).collect();
+    let provider = CatalogProvider::new(catalog, read_capture, read_lens);
+    let members = Evaluator::new().members(graph, export_node, 0, &provider);
     let mut settings = Vec::with_capacity(selection.len());
     for &id in selection {
         let s = settings_from_spec(&export_spec(node, id), display);
@@ -782,7 +840,7 @@ pub(crate) fn export_node_with(
             None => Job {
                 item: ExportItem { id, source: PathBuf::new() },
                 settings: s,
-                pre_failure: Some(format!("image {} is not part of the project", id.0)),
+                pre_failure: (!members.contains(&id)).then(|| format!("image {} is not part of the project", id.0)),
             },
         })
         .collect();

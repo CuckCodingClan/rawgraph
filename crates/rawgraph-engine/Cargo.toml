@@ -6,4 +6,5 @@ publish.workspace = true
 
 [dependencies]
 rawgraph-core.workspace = true
+rawgraph-scopes = { path = "../rawgraph-scopes" }
 rawgraph-fx = { path = "../rawgraph-fx" }

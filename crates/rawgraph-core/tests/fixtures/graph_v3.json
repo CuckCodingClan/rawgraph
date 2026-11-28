@@ -1,5 +1,5 @@
 {
-  "format_version": 1,
+  "format_version": 3,
   "nodes": {
     "1": {
       "id": 1,
@@ -126,7 +126,7 @@
     },
     "8": {
       "id": 8,
-      "kind": "BrushMask",
+      "kind": "Draw",
       "mode": "Individual",
       "all": {},
       "individual": {},
@@ -160,6 +160,7 @@
     "9": {
       "id": 9,
       "kind": "Blur",
+      "exposed_inputs": [{"parameter": "radius", "ty": "Images"}],
       "mode": "All",
       "all": {},
       "individual": {},

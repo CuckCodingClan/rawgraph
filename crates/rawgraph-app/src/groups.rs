@@ -1,8 +1,7 @@
 //! Pure rules for long parameter lists: which parameters form a group in the
-//! inspector, which ones fit into a node box, and the text that describes the
-//! mask input of a node. No UI code, so everything here is unit-testable.
+//! inspector, which ones fit into a node box, and which image control to overlay.
 
-use rawgraph_core::{Graph, ImageId, Node, NodeId, NodeKind, ParamKind, PortType};
+use rawgraph_core::{Graph, ImageId, Node, NodeId, NodeKind, ParamKind, ParamSpec};
 
 /// Most parameters a node box shows; the rest is summarised as "... +n".
 pub const MAX_BOX_ROWS: usize = 4;
@@ -71,7 +70,7 @@ pub fn wheels_rows(node: &Node, image: ImageId) -> Vec<Row> {
             parts.extend(ch);
             let changed = !parts.is_empty();
             let value = if changed { parts.join(" ") } else { "-".to_owned() };
-            Row { label: (*title).to_owned(), value, changed }
+            Row { key: None, label: (*title).to_owned(), value, changed }
         })
         .collect()
 }
@@ -130,9 +129,9 @@ pub fn param_groups(kind: NodeKind) -> (Vec<ParamGroup>, Vec<&'static str>) {
         NodeKind::Develop => {
             let pick = |names: &[&str]| -> Vec<&'static str> { names.iter().filter_map(|n| all.iter().copied().find(|a| a == n)).collect() };
             for (title, names) in [
-                ("Tone", pick(&["exposure", "contrast", "highlights", "shadows", "whites", "blacks"])),
+                ("Tone", pick(&["tone_version", "exposure", "contrast", "highlights", "shadows", "whites", "blacks"])),
                 ("Colour", pick(&["wb", "temperature", "tint", "vibrance", "saturation"])),
-                ("RAW", pick(&["baseline", "baseline_default", "brightness"])),
+
             ] {
                 if !names.is_empty() {
                     groups.push(ParamGroup { title: title.to_owned(), names, swatch: None });
@@ -141,7 +140,7 @@ pub fn param_groups(kind: NodeKind) -> (Vec<ParamGroup>, Vec<&'static str>) {
         }
         _ => {}
     }
-    let rest: Vec<&'static str> = all.iter().copied().filter(|n| !groups.iter().any(|g| g.names.contains(n))).collect();
+    let rest: Vec<&'static str> = all.iter().copied().filter(|n| !(kind == NodeKind::Develop && ["baseline", "baseline_default", "brightness"].contains(n)) && !groups.iter().any(|g| g.names.contains(n))).collect();
     (groups, rest)
 }
 
@@ -153,6 +152,7 @@ pub fn is_changed(node: &Node, image: ImageId, name: &str) -> bool {
 /// One row of a node box.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
+    pub key: Option<&'static str>,
     pub label: String,
     pub value: String,
     pub changed: bool,
@@ -175,20 +175,23 @@ fn format_value(v: f32, unit: &str) -> String {
     }
 }
 
-/// Every parameter of a node as a row (no limit).
+pub fn parameter_row(node: &Node, image: ImageId, spec: &ParamSpec) -> Row {
+    let v = node.param(spec.name, image);
+    let value = match spec.kind {
+        ParamKind::Choice(opts) => opts.get(v.max(0.0).round() as usize).copied().unwrap_or("?").to_owned(),
+        ParamKind::Toggle => if v >= 0.5 { "on" } else { "off" }.to_owned(),
+        ParamKind::Continuous => format_value(v, spec.unit),
+    };
+    Row { key: Some(spec.name), label: spec.label.to_owned(), value, changed: is_changed(node, image, spec.name) }
+}
+
+/// Every visible parameter of a node as a row (no limit).
 pub fn all_rows(node: &Node, image: ImageId) -> Vec<Row> {
     node.kind
         .params()
         .iter()
-        .map(|spec| {
-            let v = node.param(spec.name, image);
-            let value = match spec.kind {
-                ParamKind::Choice(opts) => opts.get(v.max(0.0).round() as usize).copied().unwrap_or("?").to_owned(),
-                ParamKind::Toggle => if v >= 0.5 { "on" } else { "off" }.to_owned(),
-                ParamKind::Continuous => format_value(v, spec.unit),
-            };
-            Row { label: spec.label.to_owned(), value, changed: is_changed(node, image, spec.name) }
-        })
+        .filter(|spec| !(node.kind == NodeKind::Develop && ["baseline", "baseline_default", "brightness"].contains(&spec.name)))
+        .map(|spec| parameter_row(node, image, spec))
         .collect()
 }
 
@@ -218,7 +221,7 @@ pub fn limit_rows(rows: Vec<Row>, max: usize) -> Vec<Row> {
     }
     let hidden = rows.len() - max;
     let mut out: Vec<Row> = rows.into_iter().zip(keep).filter(|(_, k)| *k).map(|(r, _)| r).collect();
-    out.push(Row { label: format!("\u{2026} +{hidden}"), value: String::new(), changed: false });
+    out.push(Row { key: None, label: format!("\u{2026} +{hidden}"), value: String::new(), changed: false });
     out
 }
 
@@ -228,38 +231,23 @@ pub fn box_row_count(kind: NodeKind) -> usize {
     n.min(MAX_BOX_ROWS) + usize::from(n > MAX_BOX_ROWS)
 }
 
-/// "Mask modulates: Exposure - ..." for nodes with an optional mask input;
-/// `None` for nodes whose mask input does not modulate a parameter.
-pub fn mask_text(graph: &Graph, id: NodeId) -> Option<String> {
-    let node = graph.node(id)?;
-    let (port, spec) = node.kind.inputs().iter().enumerate().find(|(_, s)| s.ty == PortType::Mask && s.modulates.is_some())?;
-    let param = node.kind.param_spec(spec.modulates?)?;
-    let connected = graph.input_of(id, port).is_some();
-    Some(if connected {
-        format!("Mask modulates: {} \u{2014} 0 = no change, 1 = full value", param.label)
-    } else {
-        format!("Mask input (optional): connect a mask to apply {} only where the mask is above 0 (0 = no change, 1 = full value).", param.label)
-    })
-}
-
-/// The mask node feeding the first connected mask input of `id`, if any:
-/// the node whose mask the overlay shows.
-pub fn overlay_source(graph: &Graph, id: NodeId) -> Option<NodeId> {
-    let node = graph.node(id)?;
-    node.kind.inputs().iter().enumerate().filter(|(_, s)| s.ty == PortType::Mask).find_map(|(port, _)| graph.input_of(id, port))
-}
-
 /// Which mask the viewer should overlay: only when the toggle is on and the
 /// selected node has a connected mask input.
 pub fn overlay_request(enabled: bool, graph: &Graph, selected: Option<NodeId>) -> Option<NodeId> {
-    // A selected Brush Mask is being painted: its own mask is always shown.
-    if let Some(node) = selected.and_then(|id| graph.node(id)).filter(|n| n.kind == NodeKind::BrushMask) {
+    // A selected Draw is being painted: its own mask is always shown.
+    if let Some(node) = selected.and_then(|id| graph.node(id)).filter(|n| n.kind == NodeKind::Draw) {
         return Some(node.id);
     }
     if !enabled {
         return None;
     }
-    overlay_source(graph, selected?)
+    let id = selected?;
+    let node = graph.node(id)?;
+    node.exposed_inputs().iter().enumerate().find_map(|(i, input)| {
+        let input = input.as_ref()?;
+        if input.parameter == "direction" { return None; }
+        graph.input_of(id, node.kind.inputs().len() + i)
+    })
 }
 
 #[cfg(test)]
@@ -380,13 +368,12 @@ mod tests {
     #[test]
     fn develop_groups_and_plain_kinds() {
         let (groups, rest) = param_groups(NodeKind::Develop);
-        assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Tone", "Colour", "RAW"]);
-        assert_eq!(groups[0].names, vec!["exposure", "contrast", "highlights", "shadows", "whites", "blacks"]);
+        assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Tone", "Colour"]);
+        assert_eq!(groups[0].names, vec!["tone_version", "exposure", "contrast", "highlights", "shadows", "whites", "blacks"]);
         assert_eq!(groups[1].names, vec!["wb", "temperature", "tint", "vibrance", "saturation"]);
-        assert_eq!(groups[2].names, vec!["baseline", "baseline_default", "brightness"]);
         assert!(rest.is_empty(), "every Develop parameter is in a group");
         let total: usize = groups.iter().map(|g| g.names.len()).sum();
-        assert_eq!(total, NodeKind::Develop.params().len());
+        assert_eq!(total + 3, NodeKind::Develop.params().len());
         let (g, r) = param_groups(NodeKind::Exposure);
         assert!(g.is_empty());
         assert_eq!(r, vec!["ev"]);
@@ -414,7 +401,7 @@ mod tests {
 
     #[test]
     fn limit_keeps_the_order_of_the_chosen_rows() {
-        let row = |l: &str, c: bool| Row { label: l.to_owned(), value: String::new(), changed: c };
+        let row = |l: &str, c: bool| Row { key: None, label: l.to_owned(), value: String::new(), changed: c };
         let rows = vec![row("a", false), row("b", false), row("c", true), row("d", false), row("e", true), row("f", false)];
         let out = limit_rows(rows, 4);
         let labels: Vec<&str> = out.iter().map(|r| r.label.as_str()).collect();
@@ -422,33 +409,19 @@ mod tests {
     }
 
     #[test]
-    fn mask_text_names_the_modulated_parameter() {
-        let mut g = Graph::new();
-        let e = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
-        let m = g.add_node(NodeKind::RadialMask, [0.0, 0.0]);
-        let t = mask_text(&g, e).unwrap();
-        assert!(t.contains("Exposure") && t.contains("optional"), "{t}");
-        g.connect(m, e, 1).unwrap();
-        let t = mask_text(&g, e).unwrap();
-        assert!(t.starts_with("Mask modulates: Exposure"), "{t}");
-        assert!(t.contains("0 = no change, 1 = full value"));
-        let s = g.add_node(NodeKind::Source, [0.0, 0.0]);
-        assert_eq!(mask_text(&g, s), None);
-    }
-
-    #[test]
     fn overlay_needs_the_toggle_and_a_connected_mask() {
         let mut g = Graph::new();
         let e = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
-        let m = g.add_node(NodeKind::RadialMask, [0.0, 0.0]);
+        let m = g.add_node(NodeKind::Generator, [0.0, 0.0]);
         assert_eq!(overlay_request(true, &g, Some(e)), None, "no mask connected");
-        g.connect(m, e, 1).unwrap();
+        let port = g.expose_parameter(e, "ev", rawgraph_core::PortType::Images).unwrap();
+        g.connect(m, e, port).unwrap();
         assert_eq!(overlay_request(true, &g, Some(e)), Some(m));
         assert_eq!(overlay_request(false, &g, Some(e)), None, "toggle off");
         assert_eq!(overlay_request(true, &g, None), None, "nothing selected");
         assert_eq!(overlay_request(true, &g, Some(m)), None, "the mask node itself has no mask input");
-        // A brush mask is the exception: while it is selected its mask is shown without the toggle.
-        let b = g.add_node(NodeKind::BrushMask, [0.0, 0.0]);
+        // A drawing is the exception: while it is selected its mask is shown without the toggle.
+        let b = g.add_node(NodeKind::Draw, [0.0, 0.0]);
         assert_eq!(overlay_request(false, &g, Some(b)), Some(b));
         assert_eq!(overlay_request(true, &g, Some(b)), Some(b));
     }

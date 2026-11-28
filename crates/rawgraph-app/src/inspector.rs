@@ -95,7 +95,6 @@ pub fn profile_text(profile: &rawgraph_io::InputProfile) -> (String, bool) {
 }
 
 fn node_section(ui: &mut egui::Ui, session: &mut Session) {
-    let image = session.current_image();
     let image_name = session.current_entry().map(crate::testimages::display_name).unwrap_or_default();
     let Some(id) = session.selected_node.filter(|id| session.project.graph.node(*id).is_some()) else {
         ui.heading("Inspector");
@@ -103,6 +102,7 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
         return;
     };
     let kind = session.project.graph.node(id).map_or(NodeKind::Source, |n| n.kind);
+    let image = if kind == NodeKind::Draw { session.draw_image(id, session.current_image()) } else { session.current_image() };
     ui.heading(kind.label());
     if session.node_sel.len() > 1 {
         ui.label(RichText::new(format!("{} nodes selected", session.node_sel.len())).color(Color32::from_rgb(255, 210, 90)));
@@ -169,6 +169,10 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
             }
         } else {
             for name in rest {
+                if kind == NodeKind::Generator && (name.starts_with("start_") || name.starts_with("end_") || (name.starts_with("ramp_") && !matches!(name, "ramp_interpolation" | "ramp_smoothness" | "ramp_dither"))) { continue; }
+                if kind == NodeKind::Blur && name == "angle" && !session.project.graph.node(id).is_some_and(|n| n.choice("kernel", image) == 3) {
+                    continue;
+                }
                 // The tabs of the curves editor choose the channel.
                 if kind == NodeKind::PointCurve && name == "channel" {
                     continue;
@@ -217,8 +221,9 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
     }
 
     match kind {
+        NodeKind::Generator if session.project.graph.node(id).is_some_and(|n| n.choice("type", image) == 0) => crate::gradient_editor::show(ui, session, id),
         NodeKind::PointCurve => crate::curve_editor::show(ui, session, id),
-        NodeKind::BrushMask => crate::tool_panels::brush_section(ui, session, id),
+        NodeKind::Draw => crate::tool_panels::brush_section(ui, session, id),
         NodeKind::MetadataSplit => crate::tool_panels::split_section(ui, session, id),
         _ => {}
     }
@@ -233,24 +238,8 @@ fn node_section(ui: &mut egui::Ui, session: &mut Session) {
     }
     if kind == NodeKind::Blur {
         ui.add_space(8.0);
-        let connected = session.project.graph.input_of(id, 1).is_some();
-        ui.label(
-            RichText::new(if connected {
-                "The Radius mask input modulates the radius: mask 0 gives no blur, 1 the full radius, linear in between."
-            } else {
-                "Connect a mask to the Radius mask input to vary the radius across the image (0 = no blur, 1 = full radius)."
-            })
-            .weak(),
-        );
-    } else if let Some(text) = groups::mask_text(&session.project.graph, id) {
-        ui.add_space(8.0);
-        let connected = groups::overlay_source(&session.project.graph, id).is_some();
-        ui.group(|ui| {
-            ui.label(if connected { RichText::new(text).color(crate::graph_editor::COLOR_MASK) } else { RichText::new(text).weak() });
-            if connected {
-                ui.label(RichText::new("View > Show mask overlay (M) tints the viewer red where the mask is above 0.").weak());
-            }
-        });
+        ui.label(RichText::new("High pass: 0.5 + input − low pass (unclipped RGB); alpha is unchanged.").weak());
+        ui.label(RichText::new("Add Input can expose Radius as a full-range intensity map or Direction (RGB) for Motion Blur.").weak());
     }
 }
 
@@ -445,27 +434,7 @@ fn develop_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, image: 
                     }
                 }
             }),
-            _ => group_frame(ui, session, id, image, group, |ui, session| {
-                if let Some(spec) = kind.param_spec("baseline") {
-                    param_widget(ui, session, id, spec, image);
-                }
-                let on = session.project.graph.node(id).is_some_and(|n| n.toggle("baseline", image));
-                if let Some(spec) = kind.param_spec("baseline_default") {
-                    ui.add_enabled_ui(on, |ui| param_widget(ui, session, id, spec, image));
-                }
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Applied to this image:");
-                    ui.label(RichText::new(view.baseline.as_str()).strong());
-                });
-                ui.label(RichText::new("The baseline exposure lifts RAW files to the brightness the camera maker intended. It is applied as an exposure gain before the other nodes.").weak());
-                if let Some(spec) = kind.param_spec("brightness") {
-                    param_widget(ui, session, id, spec, image);
-                }
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(view.total.as_str()).strong());
-                });
-                ui.label(RichText::new("Brightness is a rendering offset for RAW files, added to the baseline exposure.").weak());
-            }),
+            _ => {},
         }
     }
 }
@@ -519,8 +488,8 @@ pub fn widget_for(spec: &rawgraph_core::graph::ParamSpec) -> WidgetKind {
     match spec.kind {
         ParamKind::Choice(_) => WidgetKind::Combo,
         ParamKind::Toggle => WidgetKind::Check,
-        // A logarithmic range that stays positive (temperature, pivot) is a log slider even when it is wide.
-        ParamKind::Continuous if spec.logarithmic && spec.min > 0.0 => WidgetKind::LogSlider,
+        // Positive ranges use log scaling; ranges starting at zero use a power curve.
+        ParamKind::Continuous if spec.logarithmic && spec.min >= 0.0 => WidgetKind::LogSlider,
         ParamKind::Continuous if spec.max - spec.min > WIDE_RANGE => WidgetKind::Drag,
         ParamKind::Continuous => WidgetKind::Slider,
     }
@@ -534,7 +503,10 @@ fn param_widget(ui: &mut egui::Ui, session: &mut Session, id: rawgraph_core::Nod
 fn param_widget_opts(ui: &mut egui::Ui, session: &mut Session, id: rawgraph_core::NodeId, spec: &rawgraph_core::graph::ParamSpec, image: rawgraph_core::ImageId, show_label: bool) {
     let current = session.project.graph.node(id).map_or(spec.default, |n| n.param(spec.name, image));
     let mut value = current;
-    let label = if spec.unit.is_empty() { spec.label.to_owned() } else { format!("{} ({})", spec.label, spec.unit) };
+    // The persisted Filter radius stays in per-mille for compatibility.
+    let filter_radius = spec.name == "radius" && session.project.graph.node(id).is_some_and(|n| n.kind == NodeKind::Blur);
+    let label = if filter_radius { "Radius (% of long edge)".to_owned() }
+        else if spec.unit.is_empty() { spec.label.to_owned() } else { format!("{} ({})", spec.label, spec.unit) };
     let kind = widget_for(spec);
     match kind {
         WidgetKind::Check => {
@@ -576,17 +548,15 @@ fn param_widget_opts(ui: &mut egui::Ui, session: &mut Session, id: rawgraph_core
             }
         }
         WidgetKind::Slider | WidgetKind::LogSlider => {
-            let label_resp = ui.label(label);
-            ui.spacing_mut().slider_width = (ui.available_width() - 76.0).max(80.0);
-            let resp = ui
-                .add(egui::Slider::new(&mut value, spec.min..=spec.max).logarithmic(kind == WidgetKind::LogSlider).clamping(egui::SliderClamping::Always).max_decimals(3))
-                .labelled_by(label_resp.id);
-            let resp = resp.on_hover_text("Double-click to reset to the default");
-            if resp.double_clicked() {
-                value = spec.default;
-            }
-            if resp.drag_stopped() {
-                resp.surrender_focus();
+            let label_resp = ui.add(egui::Label::new(label).sense(egui::Sense::click())).on_hover_text("Double-click to reset to the default");
+            let width = (ui.available_width() - 76.0).max(80.0);
+            if filter_radius {
+                let mut percent = value / 10.0;
+                if crate::fine_slider::show(ui, &mut percent, 0.0..=100.0, spec.default / 10.0, true, &label_resp, width, 3).changed() {
+                    value = percent * 10.0;
+                }
+            } else {
+                crate::fine_slider::show(ui, &mut value, spec.min..=spec.max, spec.default, kind == WidgetKind::LogSlider, &label_resp, width, 3);
             }
         }
     }
@@ -709,20 +679,7 @@ fn capture_section(ui: &mut egui::Ui, session: &mut Session, id: rawgraph_core::
 fn view_section(ui: &mut egui::Ui, session: &mut Session) {
     ui.add_space(4.0);
     ui.heading("View");
-    ui.label(RichText::new("View-only display settings. Not part of the graph, not exported.").weak());
-    ui.add_space(4.0);
-    let label = ui.label("Display exposure (EV)");
-    ui.spacing_mut().slider_width = (ui.available_width() - 76.0).max(80.0);
-    let resp = ui
-        .add(egui::Slider::new(&mut session.view.exposure_ev, -6.0..=6.0).clamping(egui::SliderClamping::Always).max_decimals(2))
-        .labelled_by(label.id)
-        .on_hover_text("Double-click to reset");
-    if resp.double_clicked() {
-        session.view.exposure_ev = 0.0;
-    }
-    if resp.drag_stopped() {
-        resp.surrender_focus();
-    }
+    ui.label(RichText::new("Tone map affects preview and scopes; exports can optionally apply the selected tone map (EXR stays linear).").weak());
     ui.horizontal(|ui| {
         ui.label("Tone map");
         egui::ComboBox::from_id_salt("view-tone").selected_text(session.view.tone.label()).show_ui(ui, |ui| {
@@ -756,7 +713,7 @@ mod tests {
     #[test]
     fn develop_params_form_the_two_blocks() {
         let (groups, _) = groups::param_groups(NodeKind::Develop);
-        assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Tone", "Colour", "RAW"]);
+        assert_eq!(groups.iter().map(|g| g.title.as_str()).collect::<Vec<_>>(), vec!["Tone", "Colour"]);
         assert_eq!(widget_for(&NodeKind::Develop.param_spec("brightness").copied().unwrap()), WidgetKind::Slider);
         let spec = |n: &str| *NodeKind::Develop.param_spec(n).unwrap();
         assert_eq!(widget_for(&spec("wb")), WidgetKind::Combo);

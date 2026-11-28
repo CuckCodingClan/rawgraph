@@ -144,6 +144,15 @@ pub fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'sta
     wgpu::DeviceDescriptor { label: Some("rawgraph wgpu device"), required_limits: wanted_limits(&adapter.limits(), gl), ..Default::default() }
 }
 
+/// One real-GPU test at a time in this test binary: several threads creating devices and
+/// submitting work on Mesa's llvmpipe software adapter at once crash it (SIGSEGV), which
+/// CI and the build host use. Same rule as `rawgraph-gpu/tests`.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +199,7 @@ mod tests {
     /// The real GPU frame equals the CPU frame within one code value, for each tone map.
     #[test]
     fn gpu_frame_equals_cpu_frame_for_each_tone_map() {
+        let _gpu = super::gpu_test_lock();
         let Some(ctx) = headless() else { return };
         let base = synthetic(97, 61);
         let ops = [
@@ -221,6 +231,7 @@ mod tests {
     /// Largest difference (code values) between the GPU frame and the CPU frame for `ops`, or
     /// `None` when there is no GPU adapter on this machine.
     fn worst_difference(ops: &[TailOp]) -> Option<u8> {
+        let _gpu = super::gpu_test_lock();
         let ctx = headless()?;
         let base = synthetic(97, 61);
         let mut session = GpuSession::new(RealBackend::headless(ctx), RendererMode::Auto, None);

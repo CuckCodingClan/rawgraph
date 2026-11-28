@@ -1,4 +1,5 @@
 //! RawGraph desktop application (wave 1: interactive loop on built-in test images).
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod app;
 mod autosave;
@@ -16,6 +17,8 @@ mod develop;
 mod dialogs;
 mod export;
 mod filmstrip;
+mod live_thumbs;
+mod fine_slider;
 mod filter;
 mod frames;
 mod gpu_path;
@@ -27,9 +30,12 @@ mod groups;
 mod histogram;
 mod history;
 mod inspector;
+mod gradient_editor;
+mod icons;
 mod missing_check;
 mod node_ui;
 mod prefetch;
+mod quick_preview;
 mod provider;
 mod ranges_logic;
 mod recipes;
@@ -43,6 +49,7 @@ mod selection;
 mod session;
 mod shot;
 mod status;
+mod splash;
 mod testimages;
 mod textfit;
 mod thumbs;
@@ -58,7 +65,23 @@ mod xmp_import;
 
 use std::sync::atomic::Ordering;
 
+fn display_version() -> String {
+    let build: u32 = env!("CARGO_PKG_VERSION_PATCH").parse().expect("numeric Cargo patch version");
+    let year: u32 = env!("CARGO_PKG_VERSION_MAJOR").parse().expect("numeric Cargo major version");
+    let month: u32 = env!("CARGO_PKG_VERSION_MINOR").parse().expect("numeric Cargo minor version");
+    format!("{year:02}{month:02}.{build:03}")
+}
+
 fn main() {
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).is_some() {
+        // Do not create a console for Explorer launches. Attach before first output.
+        unsafe { windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS); }
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--version")) {
+        println!("RawGraph {}", display_version());
+        return;
+    }
     let cli = match cli::parse_args(std::env::args().skip(1)) {
         Ok(c) => c,
         Err(e) => {
@@ -71,6 +94,7 @@ fn main() {
         return;
     }
 
+    let _splash = splash::start(&cli);
     let (w, h) = cli.size.unwrap_or((1600.0, 1000.0));
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("RawGraph")
@@ -105,3 +129,5 @@ fn main() {
     }
 }
 
+
+mod xmp_export;

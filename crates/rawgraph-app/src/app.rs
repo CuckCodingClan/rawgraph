@@ -39,7 +39,7 @@ use crate::gpu_path::{RenderPath, RendererMode};
 use crate::gpu_real::GpuSetup;
 use crate::render::{Frame, GpuConfig, GpuHints, Renderer, Reply};
 use crate::scan::{summarize, ScanJob, ScanMsg};
-use crate::session::{ViewSettings, Session};
+use crate::session::{Session, ViewerTarget, ViewSettings};
 use crate::shot::{report, save_png};
 use crate::status::Status;
 use crate::testimages::display_name;
@@ -103,6 +103,9 @@ struct Settings {
     scopes: AuxState,
     preview_size: u32,
     renderer: RendererMode,
+    click_zoom: f32,
+    wheel_navigates: bool,
+    editable_thumb_gib: u32,
 }
 
 impl Default for Settings {
@@ -115,6 +118,9 @@ impl Default for Settings {
             scopes: AuxState::default(),
             preview_size: DEFAULT_PREVIEW,
             renderer: RendererMode::Auto,
+            click_zoom: 2.0,
+            wheel_navigates: false,
+            editable_thumb_gib: crate::live_thumbs::DEFAULT_GIB,
         }
     }
 }
@@ -144,8 +150,7 @@ enum Command {
     ToggleClean,
     ToggleScopes,
     SetScopesPos(ScopesPos),
-    CleanFullscreen,
-    CleanNextMonitor,
+    CleanMonitor(usize),
     ResetLayout,
     Shortcuts,
     ScanReport,
@@ -219,8 +224,6 @@ fn shortcut_of(cmd: Command) -> Option<KeyboardShortcut> {
         Command::SetWorkspace(Workspace::Dual) => sc(cs, Key::D),
         Command::ToggleClean => sc(cs, Key::C),
         Command::ToggleScopes => sc(cs, Key::K),
-        Command::CleanFullscreen => sc(cs, Key::F),
-        Command::CleanNextMonitor => sc(cs, Key::M),
         Command::ToggleMaskOverlay => sc(Modifiers::NONE, Key::M),
         Command::Copy => sc(c, Key::C),
         Command::Cut => sc(c, Key::X),
@@ -233,14 +236,12 @@ fn shortcut_of(cmd: Command) -> Option<KeyboardShortcut> {
 }
 
 /// Commands bound to a key, most specific modifier combination first.
-const SHORTCUT_ORDER: [Command; 21] = [
+const SHORTCUT_ORDER: [Command; 18] = [
     Command::SaveAs,
     Command::OpenFolder,
     Command::SetWorkspace(Workspace::Dual),
     Command::ToggleClean,
     Command::ToggleScopes,
-    Command::CleanFullscreen,
-    Command::CleanNextMonitor,
     Command::NewProject,
     Command::OpenProject,
     Command::Save,
@@ -250,7 +251,6 @@ const SHORTCUT_ORDER: [Command; 21] = [
     Command::Redo,
     Command::Fit,
     Command::Actual,
-    Command::DeleteNode,
     Command::ViewNode,
     Command::FrameAll,
     Command::ScanReport,
@@ -259,7 +259,7 @@ const SHORTCUT_ORDER: [Command; 21] = [
 
 /// Everything that decides whether a new render is needed. Node positions are
 /// zeroed so that moving a node does not trigger an evaluation.
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct RequestKey {
     graph: Graph,
     node: NodeId,
@@ -282,6 +282,7 @@ struct RequestKey {
     mode: RendererMode,
     /// The compare view needs the CPU picture of the selected image.
     compare: bool,
+    timing: bool,
 }
 
 impl RequestKey {
@@ -290,6 +291,7 @@ impl RequestKey {
         Self::for_target(session, node, None, scopes, overlay)
     }
 
+    #[cfg(test)]
     fn for_target(session: &Session, node: NodeId, port: Option<usize>, scopes: Option<PrepareSettings>, overlay: Option<NodeId>) -> Self {
         Self::for_image(session, session.current_image(), node, port, scopes, overlay)
     }
@@ -304,7 +306,7 @@ impl RequestKey {
                 n.pos = [0.0, 0.0];
             }
         }
-        Self { graph, node, port, image, view: session.view, preview: session.provider.preview_size(), scopes, overlay, revision: session.provider.revision(image), overlay_frame: None, histogram: None, mode: RendererMode::Auto, compare: false }
+        Self { graph, node, port, image, view: session.view, preview: session.provider.preview_size(), scopes, overlay, revision: session.provider.revision(image), overlay_frame: None, histogram: None, mode: RendererMode::Auto, compare: false, timing: false }
     }
 }
 
@@ -391,6 +393,9 @@ pub struct App {
     renderer: Renderer,
     /// View > Renderer (or `--renderer`).
     renderer_mode: RendererMode,
+    timing_debug: bool,
+    node_timings: Option<Vec<rawgraph_engine::NodeTiming>>,
+    timing_gpu_tail: bool,
     /// Pixels of the last CPU frame, kept only for `--dump-frame`.
     last_cpu_pixels: Option<(u32, u32, Vec<u8>)>,
     /// `--bench`: when the exact scopes of the resting GPU picture arrived after the last frame.
@@ -398,6 +403,10 @@ pub struct App {
     last_frame_at: Option<Instant>,
     viewer: Viewer,
     filmstrip: Filmstrip,
+    quick_preview: crate::quick_preview::QuickPreview,
+    quick_generation: u64,
+    /// The selection placeholder is the gallery's edited thumbnail (not an unedited preview).
+    placeholder_edited: bool,
     editor: GraphEditor,
     scope_panel: ScopePanel,
     /// UI-thread time of the last scope upload (`set_prepared`) in ms.
@@ -433,6 +442,9 @@ pub struct App {
     title: String,
     submitted_at: Option<Instant>,
     bench: Option<Bench>,
+    gallery_collection: CollectionWorker,
+    gallery_key: Option<(Graph, Option<NodeId>, u64, usize)>,
+    gallery_result: Option<crate::collection::CollectionResult>,
     collection: CollectionWorker,
     collection_key: Option<(Graph, Option<rawgraph_core::NodeId>, u64)>,
     /// Frame counter value when the last export finished (screenshots wait for the report to fade in).
@@ -445,8 +457,6 @@ pub struct App {
     show_mask_overlay: bool,
     /// Re-reading capture metadata of an old project in the background.
     capture_job: Option<CaptureRefresh>,
-    /// Last collection request during a scan: (found images, time).
-    scan_collection_at: Option<(usize, Instant)>,
     /// The last reply was an error or an excluded image: the scopes show older data.
     scopes_stale: bool,
     /// Number of render requests sent (screenshot diagnostics).
@@ -472,11 +482,7 @@ pub struct App {
     crash_done: bool,
     compare: Compare,
     cmp_view: SharedView,
-    cmp_renderer: Option<Renderer>,
-    cmp_viewer: Viewer,
-    cmp_key: Option<RequestKey>,
-    cmp_image: Option<ImageId>,
-    cmp_error: Option<String>,
+    cmp_panes: [ext::PaneRender; 2],
     compare_started: Option<Instant>,
     compare_reported: bool,
     xmp_dialog: Option<XmpDialog>,
@@ -572,6 +578,7 @@ impl App {
         };
         let mut status = Status::default();
         if let Some(path) = &cli.project {
+            crate::splash::stage(crate::splash::Stage::OpeningProject);
             match session.load_project(path) {
                 Ok(note) => {
                     if let Some(n) = note {
@@ -585,6 +592,7 @@ impl App {
             }
         }
 
+        crate::splash::stage(crate::splash::Stage::PreparingEditor);
         let history = History::new(&session.project.graph);
         let renderer_mode = cli.renderer.unwrap_or(settings.renderer);
         let renderer = Renderer::with_gpu(
@@ -601,7 +609,9 @@ impl App {
         );
         let dirs = DataDirs::from_option(cli.data_dir.as_deref());
         let thumb_cache = rawgraph_project::ThumbCache::new(&dirs.thumbs(), CACHE_BUDGET).map_err(|e| eprintln!("thumbnail cache: {e}")).ok().map(Arc::new);
-        let filmstrip = Filmstrip::with_thumbs(ThumbLoader::with_cache(cc.egui_ctx.clone(), provider.clone(), thumb_cache.clone()));
+        let mut live = crate::live_thumbs::LiveThumbs::new(cc.egui_ctx.clone(), provider.clone(), dirs.thumbs().join("linear"), settings.editable_thumb_gib);
+        live.allow_gpu(cc.wgpu_render_state.is_some());
+        let filmstrip = Filmstrip::with_thumbs(ThumbLoader::with_cache(cc.egui_ctx.clone(), provider.clone(), thumb_cache.clone()), live);
         let session_key = format!("{}-{}", std::process::id(), crate::clock::now_unix_ms());
         let lock = SessionLock::create(&dirs.recovery(), &session_key).map_err(|e| eprintln!("recovery lock: {e}")).ok();
         let startup_scan = Some(Self::spawn_startup_scan(&cc.egui_ctx, dirs.recovery(), lock.as_ref().and_then(SessionLock::file_name).unwrap_or_default()));
@@ -614,10 +624,13 @@ impl App {
         let workspace = cli.workspace.unwrap_or(settings.workspace);
         let mut viewer_state = settings.viewer;
         viewer_state.open = workspace == Workspace::Dual;
+        viewer_state.fullscreen = true;
         let mut scopes_state = settings.scopes;
         let scopes_pos = cli.scopes.unwrap_or(settings.scopes_pos);
         scopes_state.open = scopes_pos == ScopesPos::Window;
         let mut clean_state = settings.clean;
+        // A restored clean feed is always fullscreen.
+        clean_state.fullscreen = true;
         if cli.clean_feed {
             clean_state.open = true;
         }
@@ -659,11 +672,17 @@ impl App {
             status,
             renderer,
             renderer_mode,
+            timing_debug: false,
+            node_timings: None,
+            timing_gpu_tail: false,
             last_cpu_pixels: None,
             bench_refined: Vec::new(),
             last_frame_at: None,
-            viewer: Viewer::default(),
+            viewer: Viewer::with_preferences(settings.click_zoom, settings.wheel_navigates),
             filmstrip,
+            quick_preview: crate::quick_preview::QuickPreview::new(cc.egui_ctx.clone(), thumb_cache.clone()),
+            quick_generation: 0,
+            placeholder_edited: false,
             editor,
             scope_panel: ScopePanel::new(),
             scope_ms: 0.0,
@@ -697,6 +716,9 @@ impl App {
             title: String::new(),
             submitted_at: None,
             bench,
+            gallery_collection: CollectionWorker::new(cc.egui_ctx.clone()),
+            gallery_key: None,
+            gallery_result: None,
             collection: CollectionWorker::new(cc.egui_ctx.clone()),
             collection_key: None,
             export_done_frame: None,
@@ -706,7 +728,6 @@ impl App {
             finished_export: None,
             show_mask_overlay: cli_mask_overlay,
             capture_job: None,
-            scan_collection_at: None,
             scopes_stale: false,
             submits: 0,
             window_area: egui::Rect::NOTHING,
@@ -726,11 +747,7 @@ impl App {
             crash_done: false,
             compare: Compare::default(),
             cmp_view: SharedView::default(),
-            cmp_renderer: None,
-            cmp_viewer: Viewer::default(),
-            cmp_key: None,
-            cmp_image: None,
-            cmp_error: None,
+            cmp_panes: [ext::PaneRender::default(), ext::PaneRender::default()],
             compare_started: None,
             compare_reported: false,
             xmp_dialog: None,
@@ -831,12 +848,13 @@ impl App {
             Command::ClearThumbCache => self.clear_cache_confirm = true,
             Command::ViewNode => {
                 if let Some(id) = self.session.selected_node {
-                    self.session.viewed_node = Some(id);
+                    self.session.viewed_node = None;
+                    self.session.selected_node = Some(id);
                 }
             }
             Command::FrameAll => self.editor.request_frame_all(),
-            Command::Fit => self.viewer.fit(),
-            Command::Actual => self.viewer.actual_size(ctx.pixels_per_point()),
+            Command::Fit => { if self.compare.active() { self.cmp_view = SharedView::default(); } else { self.viewer.fit(); } },
+            Command::Actual => { if self.compare.active() { self.cmp_view.mode = crate::viewer::ZoomMode::Custom(1.0 / ctx.pixels_per_point().max(0.1)); self.cmp_view.pan = egui::Vec2::ZERO; } else { self.viewer.actual_size(ctx.pixels_per_point()); } },
             Command::SetWorkspace(w) => self.set_workspace(w),
             Command::ToggleClean => {
                 if self.clean_win.is_open() {
@@ -851,18 +869,8 @@ impl App {
                 self.set_scopes_pos(next);
             }
             Command::SetScopesPos(p) => self.set_scopes_pos(p),
-            Command::CleanFullscreen => {
-                if !self.clean_win.is_open() {
-                    self.run(Command::ToggleClean, ctx);
-                }
-                self.clean_win.toggle_fullscreen(ctx, ViewportId::from_hash_of(CLEAN_ID));
-            }
-            Command::CleanNextMonitor => {
-                if self.clean_win.is_open() {
-                    self.clean_win.move_to_next(ctx, ViewportId::from_hash_of(CLEAN_ID), &self.monitors, 0.6);
-                } else {
-                    self.status.info("The clean feed window is not open");
-                }
+            Command::CleanMonitor(index) => {
+                self.clean_win.select_monitor(ctx, ViewportId::from_hash_of(CLEAN_ID), &self.monitors, index);
             }
             Command::ResetLayout => {
                 self.layout_epoch += 1;
@@ -946,22 +954,23 @@ impl App {
     fn after_document_change(&mut self) {
         self.history.reset(&self.session.project.graph);
         self.filmstrip.thumbs.clear();
+        self.filmstrip.live.reset();
         self.editor.request_frame_all();
         self.last_key = None;
         self.frame_info = None;
         self.last_error = None;
         self.scope_panel.clear();
-        self.viewer = Viewer::default();
+        self.viewer = Viewer::with_preferences(self.viewer.click_zoom, self.viewer.wheel_navigates);
         self.scan_report = None;
         self.capture_job = None;
-        self.scan_collection_at = None;
         self.scopes_stale = false;
         self.prefetch.forget();
         self.xmp_offer = None;
         self.xmp_probe = None;
         self.compare.forget();
-        self.cmp_key = None;
-        self.cmp_image = None;
+        self.cmp_panes = [ext::PaneRender::default(), ext::PaneRender::default()];
+        self.gallery_key = None;
+        self.gallery_result = None;
         self.relink = RelinkUi::None;
         self.node_export = None;
         self.run_nodes = None;
@@ -1137,7 +1146,7 @@ impl App {
             return;
         }
         let Some(node) = export::export_node(&self.session) else {
-            self.status.error("The graph has no Output node to export");
+            self.status.error("Select or pin an image node to export");
             return;
         };
         let items = self.export_ui.items(&self.session);
@@ -1148,12 +1157,12 @@ impl App {
                 return;
             }
         };
-        self.spawn_export(ctx, node, items, settings);
+        self.spawn_export(ctx, node, items, settings, export::catalog_items(&self.session));
     }
 
-    fn spawn_export(&mut self, ctx: &egui::Context, node: rawgraph_core::NodeId, items: Vec<rawgraph_batch::ExportItem>, settings: rawgraph_batch::ExportSettings) {
+    fn spawn_export(&mut self, ctx: &egui::Context, node: rawgraph_core::NodeId, items: Vec<rawgraph_batch::ExportItem>, settings: rawgraph_batch::ExportSettings, catalog: Vec<rawgraph_batch::ExportItem>) {
         self.status.info(format!("Exporting {} image(s) to {}", items.len(), settings.out_dir.display()));
-        self.export_job = Some(ExportJob::start(ctx.clone(), self.session.project.graph.clone(), node, items, settings));
+        self.export_job = Some(ExportJob::start(ctx.clone(), self.session.project.graph.clone(), node, items, settings, catalog));
         self.finished_export = None;
     }
 
@@ -1194,7 +1203,7 @@ impl App {
                     } else {
                         self.status.info(text);
                     }
-                    self.finished_export = Some(FinishedExport { report, items: job.items, settings: job.settings, node: job.node, node_run: job.node_run });
+                    self.finished_export = Some(FinishedExport { report, items: job.items, settings: job.settings, node: job.node, node_run: job.node_run, quick_catalog: job.quick_catalog });
                 }
                 Err(e) => {
                     eprintln!("export failed: {e}");
@@ -1208,7 +1217,7 @@ impl App {
         if self.show_export {
             let items = self.export_ui.items(&self.session);
             let counts = ExportState::scope_counts(&self.session);
-            let node_text = export::export_node(&self.session).map_or_else(|| "(no Output node)".to_owned(), |n| export::node_label(&self.session.project.graph, n));
+            let node_text = export::export_node(&self.session).map_or_else(|| "(no image node selected)".to_owned(), |n| export::node_label(&self.session.project.graph, n));
             match export::show_dialog(ctx, self.window_area, &mut self.export_ui, &self.session.view, &export::DialogInfo { counts, node_text: &node_text, items: &items, busy: self.export_job.is_some(), demo: self.session.demo }) {
                 DialogAction::PickFolder => self.open_dialog(DialogKind::ExportFolder),
                 DialogAction::Start => {
@@ -1223,7 +1232,7 @@ impl App {
         let mut close = false;
         if let Some(fin) = &self.finished_export {
             match export::show_report(ctx, self.window_area, fin) {
-                ReportAction::Retry => retry = Some((fin.node, fin.report.retry_items(&fin.items), fin.settings.clone(), fin.node_run.clone())),
+                ReportAction::Retry => retry = Some((fin.node, fin.report.retry_items(&fin.items), fin.settings.clone(), fin.node_run.clone(), fin.quick_catalog.clone())),
                 ReportAction::OpenFolder => export::open_folder(&fin.settings.out_dir),
                 ReportAction::Close => close = true,
                 ReportAction::None => {}
@@ -1232,14 +1241,14 @@ impl App {
         if close {
             self.finished_export = None;
         }
-        if let Some((node, items, settings, node_run)) = retry {
+        if let Some((node, items, settings, node_run, catalog)) = retry {
             match node_run {
                 Some(run) => {
                     self.status.info(format!("Exporting {} image(s) again through the Export node", items.len()));
                     self.export_job = Some(ExportJob::start_node(ctx.clone(), self.session.project.graph.clone(), node, items, run));
                     self.finished_export = None;
                 }
-                None => self.spawn_export(ctx, node, items, settings),
+                None => self.spawn_export(ctx, node, items, settings, catalog),
             }
         }
     }
@@ -1247,7 +1256,18 @@ impl App {
     // --------------------------------------------------------------- scanning
 
     fn start_scan(&mut self, ctx: &egui::Context, folder: PathBuf) {
+        if self.scan.is_some() {
+            self.status.error("A scan is already running");
+            return;
+        }
+        if self.session.demo {
+            self.session.new_project();
+            self.after_document_change();
+        }
         let recursive = !self.cli.no_recursive;
+        bind_open_folder(&mut self.session, &folder, recursive);
+        // This explicit scan handles the change; do not enqueue it a second time.
+        self.source_seen = node_ui::source_states(&self.session.project.graph);
         self.start_scan_with(ctx, folder, recursive);
     }
 
@@ -1262,8 +1282,11 @@ impl App {
         }
         self.xmp_offer = None;
         self.xmp_probe = None;
+        self.capture_job = None;
         self.scan_done_at = None;
         self.session.begin_scan();
+        let absolute = std::path::absolute(&folder).unwrap_or_else(|_| folder.clone());
+        self.session.scan_count = Some((crate::session::folder_key(&absolute.to_string_lossy()), recursive, 0));
         self.scan = Some(ScanJob::start(ctx.clone(), self.session.project.clone(), folder.clone(), recursive));
         self.status.info(format!("Scanning {}", folder.display()));
     }
@@ -1275,19 +1298,40 @@ impl App {
         }
     }
 
-    fn poll_scan(&mut self) {
+    fn poll_scan(&mut self, ctx: &egui::Context) {
         let Some(job) = &mut self.scan else { return };
         let mut finished = None;
         let mut disconnected = false;
-        loop {
+        for index in 0..512 {
+            if index == 511 { ctx.request_repaint(); }
             match job.rx.try_recv() {
-                Ok(ScanMsg::Progress { done, total, current, entry }) => {
-                    job.done = done;
-                    job.total = total;
-                    job.current = current.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    if let Some(e) = entry {
-                        self.session.scan_entry(e);
+                Ok(ScanMsg::Listing(event)) => {
+                    use rawgraph_project::staged::Listing;
+                    let count = match event {
+                        Listing::Counting(n) => { job.counting = n; n }
+                        Listing::Count(n) => { job.count = Some(n); n }
+                    };
+                    if let Some((_, _, current)) = &mut self.session.scan_count { *current = count; }
+                }
+                Ok(ScanMsg::Catalog(entries)) => {
+                    job.listed = true;
+                    let stale: Vec<_> = entries.iter().filter(|e| e.content_hash.is_empty() && self.session.project.image(e.id).is_some()).map(|e| e.id).collect();
+                    if !stale.is_empty() {
+                        self.filmstrip.thumbs.invalidate(&stale);
+                        self.session.provider.clear_cache();
                     }
+                    self.session.scan_catalog(entries);
+                    ctx.request_repaint();
+                    break; // Paint the full placeholder list before applying file results.
+                }
+                Ok(ScanMsg::Hashed(entries)) => {
+                    let moved: Vec<_> = entries.iter().filter(|entry| self.session.entry(entry.id).is_some_and(|e| e.path != entry.path)).map(|entry| entry.id).collect();
+                    if !moved.is_empty() { self.filmstrip.thumbs.invalidate(&moved); }
+                    self.session.scan_entries(entries);
+                }
+                Ok(ScanMsg::Metadata { done, total, entries }) => {
+                    job.metadata = Some((done, total));
+                    self.session.scan_metadata(entries);
                 }
                 Ok(ScanMsg::Done { project, report }) => {
                     finished = Some((*project, report));
@@ -1301,7 +1345,7 @@ impl App {
             }
         }
         if let Some((project, report)) = finished {
-            let changed = !report.added.is_empty() || !report.relinked.is_empty() || !report.updated.is_empty();
+            let changed = project != self.session.project;
             self.session.finish_scan(project, changed);
             let text = summarize(&report);
             if report.failed.is_empty() {
@@ -1390,7 +1434,13 @@ impl App {
 
     fn poll_renderer(&mut self, ctx: &egui::Context) {
         let reply = self.renderer.poll();
-        if let Some(r) = self.renderer.take_refined() {
+        if self.last_key.is_none() {
+            self.renderer.take_refined();
+            self.renderer.take_histogram();
+            return;
+        }
+        let matches_selection = !self.viewer.awaiting_final() || self.last_key.as_ref().map(|k| k.image) == self.viewer.preview_image;
+        if let Some(r) = self.renderer.take_refined().filter(|_| matches_selection && !self.compare.active()) {
             // The scopes of the resting GPU picture, now read at the full resolution.
             self.scope_panel.set_prepared(ctx, r.prepared);
             self.scope_worker_ms = r.scopes_ms;
@@ -1405,12 +1455,13 @@ impl App {
             self.session.curve_hist = Some(crate::session::CurveHist { node: h.node, image: h.image, bins: h.bins });
         }
         if let Some(reply) = reply {
+            if !matches_selection { return; }
             if let Some(s) = &mut self.shot {
                 s.reply_at = Some(self.frames);
             }
             match reply {
                 Reply::Frame(f) => {
-                    self.scopes_stale = false;
+                    if !self.compare.active() { self.scopes_stale = false; }
                     self.apply_frame(ctx, &f);
                 }
                 Reply::Refined(_) | Reply::Dumped { .. } | Reply::Histogram(_) => {}
@@ -1423,12 +1474,12 @@ impl App {
                     }
                     self.last_error = Some(message.clone());
                     self.viewer.set_error(message);
-                    self.scopes_stale = true;
+                    if !self.compare.active() { self.scopes_stale = true; }
                 }
                 Reply::Excluded { message, .. } => {
                     self.last_error = None;
                     self.viewer.set_excluded(message);
-                    self.scopes_stale = true;
+                    if !self.compare.active() { self.scopes_stale = true; }
                 }
             }
         }
@@ -1436,6 +1487,8 @@ impl App {
 
     fn apply_frame(&mut self, ctx: &egui::Context, f: &Frame) {
         let latency = self.submitted_at.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0);
+        self.node_timings = f.node_timings.clone();
+        self.timing_gpu_tail = f.gpu_tail;
         self.viewer.set_frame(ctx, f);
         self.last_error = None;
         self.last_frame_at = Some(Instant::now());
@@ -1445,7 +1498,7 @@ impl App {
         // Only a frame dump needs the CPU pixels; they are not kept otherwise.
         self.last_cpu_pixels = (self.cli.dump_frame.is_some() && f.gpu.is_none()).then(|| (f.width, f.height, f.rgba8.clone()));
         self.frame_info = Some(FrameInfo { width: f.width, height: f.height, eval_ms: f.eval_ms, display_ms: f.display_ms, hits: f.hits, misses: f.misses, path: f.path.clone(), scope_step: f.scope_step });
-        if let Some(prepared) = f.prepared.clone() {
+        if let Some(prepared) = f.prepared.clone().filter(|_| !self.compare.active()) {
             let t = Instant::now();
             self.scope_panel.set_prepared(ctx, prepared);
             self.scope_ms = t.elapsed().as_secs_f32() * 1000.0;
@@ -1499,29 +1552,11 @@ impl App {
     }
 
     /// Re-computes the collection info when the graph, the viewed node or the
-    /// image set changed (never while a scan is still adding images).
+    /// image set or a capture metadata batch changed.
     fn refresh_collection(&mut self) {
         if let Some(r) = self.collection.poll() {
             self.session.collection = r;
         }
-        if self.session.scanning {
-            // Counts follow the scan: at most twice a second, whenever new images arrived.
-            let found = self.session.scan_found();
-            let due = match self.scan_collection_at {
-                Some((n, at)) => n != found && at.elapsed() >= Duration::from_millis(500),
-                None => found > 0,
-            };
-            if !due {
-                return;
-            }
-            let (ids, caps) = self.session.id_captures();
-            let g = self.neutral_graph();
-            self.collection.request(g, ids, caps, self.session.target_node());
-            self.scan_collection_at = Some((found, Instant::now()));
-            self.collection_key = None;
-            return;
-        }
-        self.scan_collection_at = None;
         let g = self.neutral_graph();
         let key = (g, self.session.target_node(), self.session.images_gen);
         if self.collection_key.as_ref() != Some(&key) {
@@ -1531,25 +1566,115 @@ impl App {
         }
     }
 
-    fn submit_if_needed(&mut self) {
-        if self.session.selected.is_none() {
-            return;
+    fn refresh_gallery(&mut self) {
+        if let Some(result) = self.gallery_collection.poll() {
+            if !self.gallery_collection.pending() && self.gallery_key.as_ref().is_some_and(|key| key.1 == result.view_node) {
+                self.gallery_result = Some(result);
+            }
         }
-        let Some((node, port)) = self.session.render_target() else {
-            if self.last_error.is_none() {
-                self.last_error = Some("The graph has no Output node to show".to_owned());
-                self.viewer.set_error("The graph has no Output node to show".to_owned());
+        let node = self.primary_target().node;
+        let key = (self.neutral_graph(), node, self.session.images_gen, self.session.scan_found());
+        if self.gallery_key.as_ref() != Some(&key) {
+            if !self.session.scanning || self.gallery_key.as_ref().is_none_or(|old| old.0 != key.0 || old.1 != key.1) {
+                self.gallery_result = None;
+            }
+            if node.is_some() {
+                let (ids, caps) = self.session.id_captures();
+                self.gallery_collection.request(key.0.clone(), ids, caps, node);
+            }
+            self.gallery_key = Some(key);
+        }
+    }
+
+    fn gallery_members(result: Option<&crate::collection::CollectionResult>, target: ViewerTarget) -> Option<&std::collections::HashSet<ImageId>> {
+        result.filter(|r| r.view_node.is_some() && r.view_node == target.node).map(|r| &r.view_members)
+    }
+
+    fn single_viewer_request(&self) -> Option<(ImageId, NodeId, Option<usize>)> {
+        let target = if self.compare.active() { self.session.viewer_target(None, self.session.viewed_node) } else { self.primary_target() };
+        let (node, port) = self.session.render_viewer_target(target)?;
+        // A pinned image stays; otherwise a node whose collection does not contain the selected
+        // photo (e.g. a standalone Generator) shows its own image.
+        let image = if target.image_pinned { target.image? } else { self.session.image_for_target(node, port).or(target.image)? };
+        Some((image, node, port))
+    }
+
+    fn update_selection_preview(&mut self, ctx: &egui::Context) {
+        let target = if self.compare.active() {
+            let target = self.primary_target();
+            target.image.zip(target.node)
+        } else {
+            self.single_viewer_request().map(|(image, node, _)| (image, node))
+        };
+        let viewer = if self.compare.active() { &mut self.cmp_panes[1].viewer } else { &mut self.viewer };
+        let Some((image, node)) = target else {
+            if viewer.preview_image.is_some() { *viewer = Viewer::with_preferences(viewer.click_zoom, viewer.wheel_navigates); }
+            return;
+        };
+        // The gallery already renders the Primary viewer's node for every photo, so its
+        // thumbnail shows the current edits; prefer it over an unedited proxy or camera JPEG.
+        let edited = if self.compare.active() { None } else { self.filmstrip.live.current(image) };
+        if viewer.preview_image != Some(image) {
+            self.quick_generation = self.quick_generation.wrapping_add(1);
+            viewer.select(image, self.quick_generation);
+            self.prefetch.forget();
+            self.scopes_stale = true;
+            self.placeholder_edited = false;
+            let provider = &self.session.provider;
+            if let Some(tex) = edited.clone() {
+                viewer.set_placeholder(self.quick_generation, tex.clone(), edited_geometry(&self.session, node, image, &tex));
+                self.placeholder_edited = true;
+            } else if let Some(proxy) = provider.cached_proxy(image) {
+                let size = (proxy.width(), proxy.height());
+                let tex = crate::quick_preview::proxy_texture(ctx, &proxy, self.session.view.transform());
+                viewer.set_placeholder(self.quick_generation, tex, crate::quick_preview::geometry(&self.session, node, image, size));
+            } else if let Some(tex) = self.filmstrip.thumbs.texture(image) {
+                let [w, h] = tex.size();
+                let size = crate::quick_preview::estimate_proxy_size(provider, image, (w as u32, h as u32));
+                viewer.set_placeholder(self.quick_generation, tex, crate::quick_preview::geometry(&self.session, node, image, size));
+            } else if let Some(path) = provider.path_of(image) {
+                let hash = self.session.entry(image).map_or_else(String::new, |e| e.content_hash.clone());
+                self.quick_preview.request(crate::quick_preview::Job { generation: self.quick_generation, path, hash });
+            }
+            ctx.request_repaint();
+        }
+        if !self.placeholder_edited && viewer.awaiting_final() {
+            // The edited gallery thumbnail arrived after the selection: upgrade the placeholder.
+            if let Some(tex) = edited {
+                viewer.set_placeholder(self.quick_generation, tex.clone(), edited_geometry(&self.session, node, image, &tex));
+                self.placeholder_edited = true;
+            }
+        }
+        for (generation, pixels) in self.quick_preview.poll() {
+            if generation != self.quick_generation || !viewer.awaiting_final() || self.placeholder_edited { continue; }
+            let [w, h] = pixels.size;
+            let size = crate::quick_preview::estimate_proxy_size(&self.session.provider, image, (w as u32, h as u32));
+            let tex = ctx.load_texture("embedded selection preview", pixels, egui::TextureOptions::LINEAR);
+            viewer.set_placeholder(generation, tex, crate::quick_preview::geometry(&self.session, node, image, size));
+        }
+    }
+
+    fn submit_if_needed(&mut self) {
+        let Some((image, node, port)) = self.single_viewer_request() else {
+            if self.last_key.take().is_some() {
+                self.viewer = Viewer::with_preferences(self.viewer.click_zoom, self.viewer.wheel_navigates);
+                self.frame_info = None;
+                self.last_error = None;
+                if !self.compare.active() {
+                    self.scope_panel.clear();
+                    self.scopes_stale = false;
+                }
             }
             return;
         };
         // The panels need a few frames to settle; asking before that would use
         // default scope settings and cost a second render.
-        if self.frames < SETTLE_FRAMES {
+        if self.frames < SETTLE_FRAMES || (!self.compare.active() && Self::gallery_members(self.gallery_result.as_ref(), self.primary_target()).is_none()) {
             return;
         }
-        let scopes = (self.scopes_pos != ScopesPos::Hidden).then(|| self.scope_panel.prepare_settings());
+        let scopes = (!self.compare.active() && self.scopes_pos != ScopesPos::Hidden).then(|| self.scope_panel.prepare_settings());
         let overlay = crate::groups::overlay_request(self.show_mask_overlay, &self.session.project.graph, self.session.selected_node);
-        // A brush mask is drawn in the frame of the node that uses it; one that cannot be shown right
+        // A drawing is drawn in the frame of the node that uses it; one that cannot be shown right
         // on this picture is not drawn at all.
         let (overlay, overlay_frame) = if port.is_some() { (overlay, None) } else { crate::frames::overlay_for_render(&self.session.project.graph, overlay, node) };
         let histogram = self
@@ -1559,11 +1684,12 @@ impl App {
             .filter(|n| n.kind == NodeKind::PointCurve && self.session.project.graph.input_edge(n.id, 0).is_some())
             .map(|n| n.id)
             .filter(|_| port.is_none());
-        let mut key = RequestKey::for_target(&self.session, node, port, scopes, overlay);
+        let mut key = RequestKey::for_image(&self.session, image, node, port, scopes, overlay);
         key.overlay_frame = overlay_frame.clone();
         key.histogram = histogram;
         key.mode = self.renderer_mode;
         key.compare = self.compare.active();
+        key.timing = self.timing_debug;
         if self.last_key.as_ref() != Some(&key) {
             if self.last_key.as_ref().is_some_and(|k| k.preview != key.preview) {
                 self.prefetch.forget();
@@ -1575,8 +1701,13 @@ impl App {
             } else {
                 None
             };
-            let hints = GpuHints { cpu_reason, revision: key.revision, preview: key.preview, neighbours: self.session.neighbours(), histogram, overlay_frame };
-            self.renderer.submit_with(self.session.project.graph.clone(), node, port, self.session.current_image(), self.session.view, key.scopes.clone(), key.overlay, hints);
+            let hints = GpuHints { timing: key.timing, cpu_reason, revision: key.revision, preview: key.preview, neighbours: self.session.neighbours(), histogram, overlay_frame };
+            // A notice belongs to the previous request, not the frame we are
+            // waiting for. Keep the last successful texture visible.
+            self.viewer.excluded = None;
+            self.viewer.error = None;
+            self.viewer.rendering();
+            self.renderer.submit_with(self.session.project.graph.clone(), node, port, key.image, self.session.view, key.scopes.clone(), key.overlay, hints);
             self.submits += 1;
             self.submitted_at = Some(Instant::now());
             self.last_key = Some(key);
@@ -1633,7 +1764,7 @@ impl App {
     }
 
     fn shot_ready(&self, shot: &Shot) -> bool {
-        let replied = !self.session.demo || true;
+        let expects_frame = self.single_viewer_request().is_some();
         self.frames >= MIN_FRAMES_BEFORE_SHOT
             && self.cli_applied
             && self.scan.is_none()
@@ -1652,12 +1783,11 @@ impl App {
             && (!self.compare.active() || self.cmp_ready())
             && self.export_done_frame.is_none_or(|f| self.frames >= f + 25)
             && !self.collection.pending()
-            && replied
-            && (self.session.selected.is_none() || shot.reply_at.is_some_and(|at| self.frames >= at + 4))
+            && (!expects_frame || shot.reply_at.is_some_and(|at| self.frames >= at + 4))
             && !self.renderer.pending()
             && self.filmstrip.all_loaded()
             && (self.late_disconnect_done || self.cli.late_disconnect.is_empty())
-            && self.last_key.is_some() == self.session.selected.is_some()
+            && self.last_key.is_some() == expects_frame
             && self.curve_hist_ready()
     }
 
@@ -1996,8 +2126,9 @@ impl App {
                 let sat = g.nodes().find(|n| n.kind == NodeKind::Saturation).map(|n| n.id);
                 let out = g.nodes().find(|n| n.kind == NodeKind::Output).map(|n| n.id);
                 if let (Some(exp), Some(sat), Some(out)) = (exp, sat, out) {
-                    let brush = g.add_node(NodeKind::BrushMask, [0.0, 300.0]);
-                    let _ = g.connect(brush, exp, 1);
+                    let brush = g.add_node(NodeKind::Draw, [0.0, 300.0]);
+                    if let Some(input) = g.input_of(exp, 0) { let _ = g.connect(input, brush, 0); }
+                    if let Ok(port) = g.expose_parameter(exp, "ev", rawgraph_core::PortType::Images) { let _ = g.connect(brush, exp, port); }
                     if let Some(n) = g.node_mut(exp) {
                         n.set_param("ev", image, 1.5);
                     }
@@ -2085,7 +2216,7 @@ impl App {
                     s.sort_by(f32::total_cmp);
                     format!("n={} min {:.1} median {:.1} max {:.1} ms", s.len(), s[0], s[s.len() / 2], s[s.len() - 1])
                 };
-                eprintln!("BENCH preview {} px, brush mask with 30 existing strokes + {} points in progress", self.session.provider.preview_size(), TOOL_BENCH_STEPS);
+                eprintln!("BENCH preview {} px, drawing with 30 existing strokes + {} points in progress", self.session.provider.preview_size(), TOOL_BENCH_STEPS);
                 eprintln!("BENCH paint: pointer move -> updated frame: {}", stats(&tb.paint));
                 eprintln!("BENCH curve: drag step -> updated frame:    {}", stats(&tb.curve));
                 let (lat, eval): (Vec<f32>, Vec<f32>) = tb.transform.iter().copied().unzip();
@@ -2229,6 +2360,7 @@ impl App {
         let has_report = self.scan_report.is_some();
         let show_overlay = self.show_mask_overlay;
         let mut new_preview = None;
+        let mut thumb_budget = self.filmstrip.live.budget();
         let renderer_mode = self.renderer_mode;
         let mut new_renderer = None;
         let item_tip = |ui: &mut egui::Ui, cmds: &mut Vec<Command>, label: &str, cmd: Command, enabled: bool, tip: &str| {
@@ -2287,6 +2419,12 @@ impl App {
                 item(ui, cmds, "View selected node", Command::ViewNode, has_sel);
                 item(ui, cmds, "Frame all nodes", Command::FrameAll, true);
             });
+            ui.menu_button("Debug", |ui| {
+                if ui.checkbox(&mut self.timing_debug, "Per-node CPU timing").changed() {
+                    self.node_timings = None;
+                    self.timing_gpu_tail = false;
+                }
+            });
             ui.menu_button("View", |ui| {
                 ui.label(RichText::new("Workspace").weak());
                 if ui.radio(workspace == Workspace::Single, "Single").clicked() {
@@ -2299,6 +2437,13 @@ impl App {
                     ui.close();
                 }
                 ui.separator();
+                ui.label(RichText::new("Viewer click zoom (relative to fit)").weak());
+                ui.radio_value(&mut self.viewer.click_zoom, 2.0, "2× fit");
+                ui.radio_value(&mut self.viewer.click_zoom, 3.0, "3× fit");
+                ui.label(RichText::new("Viewer wheel / swipe").weak());
+                ui.radio_value(&mut self.viewer.wheel_navigates, false, "Zoom");
+                ui.radio_value(&mut self.viewer.wheel_navigates, true, "Navigate images");
+                ui.separator();
                 ui.label(RichText::new("Preview size (long edge)").weak());
                 for n in PREVIEW_SIZES {
                     if ui.radio(preview == n, format!("{n} px")).clicked() {
@@ -2307,8 +2452,12 @@ impl App {
                     }
                 }
                 ui.separator();
+                ui.menu_button("Editable thumbnail cache", |ui| {
+                    ui.add(egui::DragValue::new(&mut thumb_budget).range(0..=128).suffix(" GiB"));
+                    ui.label("0 keeps editable bases in memory only.");
+                });
                 ui.label(RichText::new("Renderer").weak());
-                let tip = "Automatic runs the last pointwise nodes and the display transform on the GPU and falls back to the CPU when that is not possible.\nExport, thumbnails, collection counts and the compare view's reference image always use the CPU.";
+                let tip = "Automatic runs the last pointwise nodes and the display transform on the GPU and falls back to the CPU when that is not possible.\nExport, collection counts and the compare view's reference image always use the CPU.";
                 for m in [RendererMode::Auto, RendererMode::Cpu] {
                     if ui.radio(renderer_mode == m, m.label()).on_hover_text(tip).clicked() {
                         new_renderer = Some(m);
@@ -2318,8 +2467,19 @@ impl App {
                 ui.separator();
                 let clean_label = if clean_open { "Close clean feed" } else { "Clean feed" };
                 item(ui, cmds, clean_label, Command::ToggleClean, true);
-                item(ui, cmds, "Clean feed fullscreen", Command::CleanFullscreen, true);
-                item(ui, cmds, "Move clean feed to next monitor", Command::CleanNextMonitor, clean_open);
+                ui.menu_button("Clean feed display", |ui| {
+                    for (index, monitor) in self.monitors.iter().enumerate() {
+                        let name = monitor.id.split('|').next().unwrap_or("Display");
+                        let label = format!("{}: {} ({} × {} at {}, {}){}", index + 1, name,
+                            monitor.size[0], monitor.size[1], monitor.pos[0], monitor.pos[1],
+                            if monitor.primary { " — primary" } else { "" });
+                        if ui.radio(self.clean_win.state.monitor.as_deref() == Some(&monitor.id), label).clicked() {
+                            cmds.push(Command::CleanMonitor(index));
+                            ui.close();
+                        }
+                    }
+                    if self.monitors.is_empty() { ui.label("No displays available"); }
+                });
                 ui.menu_button("Scopes position", |ui| {
                     for p in ScopesPos::ALL {
                         if ui.radio(scopes_pos == p, p.label()).clicked() {
@@ -2365,6 +2525,7 @@ impl App {
                 item(ui, cmds, "Open demo images", Command::OpenDemo, true);
             });
         });
+        if thumb_budget != self.filmstrip.live.budget() { self.filmstrip.live.set_budget(thumb_budget); }
         if let Some(n) = new_preview {
             self.session.provider.set_preview_size(n);
         }
@@ -2435,8 +2596,13 @@ impl App {
             let mut cancel = false;
             if let Some(job) = &self.scan {
                 ui.separator();
-                let text = if job.total == 0 { "Scanning...".to_owned() } else { format!("Scanning {}/{}", job.done, job.total) };
-                ui.add(egui::ProgressBar::new(job.fraction()).desired_width(170.0).text(text));
+                let n = crate::collection::with_thousands(job.count.unwrap_or(job.counting));
+                let detail = match (job.count, job.metadata) {
+                    (None, _) => "counting…".to_owned(),
+                    (_, Some((done, total))) => format!("metadata {done}/{total}"),
+                    (_, None) => "preparing thumbnails…".to_owned(),
+                };
+                ui.label(format!("{n} images")).on_hover_text(detail);
                 cancel = ui.button("Cancel").clicked();
             }
             if cancel {
@@ -2474,7 +2640,7 @@ impl App {
     fn scopes_ui(&mut self, ui: &mut egui::Ui) {
         let stale = self.scopes_stale;
         let area = ui.available_rect_before_wrap();
-        let step = self.frame_info.as_ref().filter(|f| f.path.is_gpu()).map(|f| f.scope_step);
+        let step = self.frame_info.as_ref().filter(|f| !self.compare.active() && f.path.is_gpu()).map(|f| f.scope_step);
         egui::Frame::NONE.inner_margin(6.0).show(ui, |ui| {
             if let Some(step) = step {
                 scope_step_label(ui, step);
@@ -2499,6 +2665,9 @@ impl App {
                 .size_range(180.0..=max.max(240.0))
                 .show(ui, |ui| self.scopes_ui(ui));
         }
+        self.editor.timings = self.timing_debug.then(|| {
+            crate::graph_editor::NodeTimings::new(self.node_timings.as_deref().unwrap_or_default(), self.timing_gpu_tail)
+        });
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.editor.show(ui, &mut self.session, &mut self.status));
     }
 
@@ -2508,7 +2677,7 @@ impl App {
         }
         let mut open = true;
         egui::Window::new("Keyboard shortcuts").open(&mut open).resizable(false).show(ctx, |ui| {
-            let rows: [(&str, &str); 36] = [
+            let rows = [
                 ("Shift/Ctrl+click, drag on empty space", "Add to the node selection, rubber band"),
                 ("Ctrl+A", "Select all nodes"),
                 ("Ctrl+C / X / V", "Copy / cut / paste nodes (as text)"),
@@ -2533,13 +2702,11 @@ impl App {
                 ("Scroll / Ctrl+scroll", "Pan / zoom the graph"),
                 ("Drag from a port", "Connect; drag off an input to disconnect"),
                 ("Double-click slider", "Reset to default"),
-                ("Viewer: wheel, drag", "Zoom around cursor, pan"),
+                ("Viewer: click, wheel, drag", "Toggle fit zoom, zoom/navigate, pan"),
                 ("Viewer: double-click", "Toggle fit / 100 %"),
                 ("Ctrl+0 / Ctrl+1", "Fit / 100 %"),
                 ("Ctrl+Shift+D", "Dual workspace"),
                 ("Ctrl+Shift+C", "Clean feed window"),
-                ("Ctrl+Shift+F / F11", "Clean feed fullscreen"),
-                ("Ctrl+Shift+M", "Clean feed to next monitor"),
                 ("Ctrl+Shift+K", "Scopes window"),
                 ("Right-click image", "Set as reference, locate a missing file"),
                 ("Right-click graph", "Paste here, Recipes"),
@@ -2615,39 +2782,33 @@ impl App {
     }
 
     fn viewer_area(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
-        if self.session.total_images() == 0 && self.scan.is_none() {
-            let rect = ui.available_rect_before_wrap();
-            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(14));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(egui::Rect::from_center_size(rect.center(), egui::vec2(380.0, 120.0))), |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Open a folder to begin").size(22.0).color(egui::Color32::from_gray(190)));
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("RAW, DNG, JPEG, PNG and TIFF files are added to the project; nothing is changed on disk.").weak());
-                    ui.add_space(10.0);
-                    if ui.button("Open folder...").clicked() {
-                        cmds.push(Command::OpenFolder);
-                    }
-                });
-            });
-            ui.advance_cursor_after_rect(rect);
-            return;
-        }
+        ui.horizontal(|ui| {
+            if ui.selectable_label(self.compare.active(), "Split").on_hover_text("Toggle split viewer (C)").clicked() { cmds.push(Command::Compare); }
+            if ui.button("Fit").clicked() { cmds.push(Command::Fit); }
+            if ui.button("100%").clicked() { cmds.push(Command::Actual); }
+            ui.separator();
+            let pinned = self.session.viewed_node.is_some();
+            if crate::icons::button(ui, if pinned { crate::icons::Icon::Unpin } else { crate::icons::Icon::Pin }, if pinned { "Unpin viewer" } else { "Pin viewer" }, pinned || self.session.target_node().is_some()).clicked() {
+                self.session.viewed_node = if pinned { None } else { self.session.target_node() };
+            }
+            ui.label(if pinned { "Pinned" } else { "Following selection" });
+            ui.separator();
+            let label = ui.add(egui::Label::new("Display exposure (EV)").sense(egui::Sense::click())).on_hover_text("Preview and scopes only. Double-click the slider or label to reset.");
+            crate::fine_slider::show(ui, &mut self.session.view.exposure_ev, -6.0..=6.0, 0.0, false, &label, 100.0, 2);
+        });
         if self.compare.active() {
             self.compare_area(ui);
             return;
         }
-        self.viewer.shows_mask = self
-            .session
-            .render_target()
-            .and_then(|(id, _)| self.session.project.graph.node(id))
-            .is_some_and(|n| n.kind.output() == Some(rawgraph_core::PortType::Mask));
-        // Keep the previous frame dimmed while a proxy decodes.
-        self.viewer.busy = None;
-        if self.renderer.pending() && self.session.selected.is_some_and(|id| !self.session.provider.is_cached(id)) {
-            if let Some(e) = self.session.current_entry() {
-                self.viewer.busy = Some(format!("Decoding {}...", display_name(e)));
-            }
+        if self.primary_target().image.is_none() && self.session.total_images() == 0 && self.scan.is_none() {
+            ui.centered_and_justified(|ui| { ui.label("Choose a folder in a Source node to preview its images"); });
+            return;
         }
+        if self.primary_target().node.is_none() {
+            ui.centered_and_justified(|ui| { ui.label("Select a node to view it"); });
+            return;
+        }
+        if self.primary_target().image.is_none() { return; }
         if let Some(message) = show_viewer(&mut self.viewer, &mut self.tools, &mut self.session, ui) {
             self.status.error(message);
         }
@@ -2687,13 +2848,36 @@ impl App {
 
     fn filmstrip_panel(&mut self, ui: &mut egui::Ui, epoch: u32) {
         egui::Panel::left(("filmstrip", epoch)).resizable(true).default_size(232.0).size_range(170.0..=420.0).show(ui, |ui| {
+            let target = self.primary_target();
             egui::Panel::bottom(("filmstrip-info", epoch)).resizable(false).show_separator_line(true).show(ui, |ui| {
                 ui.add_space(4.0);
-                Filmstrip::capture_info(ui, &self.session);
+                Filmstrip::capture_info(ui, &self.session, target.image);
                 ui.add_space(4.0);
             });
-            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.filmstrip.show(ui, &mut self.session));
+            // A Source is just folder membership. Don't hold its newly listed
+            // placeholders behind an asynchronous graph collection query.
+            let immediate = self.scan.as_ref().filter(|job| job.listed)
+                .and(target.node)
+                .and_then(|id| self.session.project.graph.node(id))
+                .filter(|node| node.kind == NodeKind::Source)
+                .and_then(|node| node_ui::source_folder(node).map(|folder| (folder, node_ui::source_subfolders(node))))
+                .map(|(folder, recursive)| self.session.visible().iter().copied().filter(|&id| {
+                    self.session.entry(id).is_some_and(|e| rawgraph_core::path_in_folder(&e.path.to_string_lossy(), &folder, recursive))
+                }).collect::<std::collections::HashSet<_>>());
+            let members = immediate.as_ref().or_else(|| Self::gallery_members(self.gallery_result.as_ref(), target));
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.filmstrip.show(ui, &mut self.session, target, members));
+            if let Some(job) = self.scan.as_ref().filter(|j| j.listed && (members.is_some() || target.node.is_none())) {
+                job.prioritize(self.filmstrip.scan_wanted(), self.filmstrip.scan_thumbs_ready());
+            }
         });
+    }
+
+    fn primary_frame(&self) -> (Option<egui::TextureId>, [u32; 2]) {
+        if self.compare.active() {
+            self.primary_split_frame()
+        } else {
+            (self.single_viewer_request().and_then(|_| self.viewer.texture_id()), self.viewer.frame_size)
+        }
     }
 
     fn secondary_windows(&mut self, ctx: &egui::Context) {
@@ -2705,29 +2889,51 @@ impl App {
         self.clean_win.ensure_monitor_exists(ctx, clean_id, &monitors, 0.6);
         self.scopes_win.ensure_monitor_exists(ctx, scopes_id, &monitors, 0.5);
 
-        let viewer = &mut self.viewer;
-        let (tools, session) = (&mut self.tools, &mut self.session);
-        let mut tool_message = None;
-        let out = self.viewer_win.show(ctx, viewer_id, "RawGraph - Viewer", true, |ui| {
-            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| tool_message = show_viewer(viewer, tools, session, ui));
+        let mut viewer_win = std::mem::take(&mut self.viewer_win);
+        let out = viewer_win.show(ctx, viewer_id, "RawGraph - Viewer", false, &monitors, Some(true), |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                if self.compare.active() {
+                    self.compare_area(ui);
+                } else if let Some(message) = self.single_viewer_request().and_then(|_| show_viewer(&mut self.viewer, &mut self.tools, &mut self.session, ui)) {
+                    self.status.error(message);
+                }
+            });
         });
-        if let Some(m) = tool_message {
-            self.status.error(m);
-        }
+        self.viewer_win = viewer_win;
         if out.close && self.workspace == Workspace::Dual {
             // Closing the detached viewer returns to the single workspace.
             self.workspace = Workspace::Single;
         }
 
-        let (texture, size) = (self.viewer.texture_id(), self.viewer.frame_size);
-        self.clean_win.show(ctx, clean_id, "RawGraph - Clean feed", false, |ui| {
-            viewer::paint_clean(ui, texture, size);
+        let (texture, size) = self.primary_frame();
+        let uv = if self.compare.active() { self.cmp_panes[1].viewer.preview_uv } else { self.viewer.preview_uv };
+        let editor_focused = ctx.input(|i| {
+            i.focused || [viewer_id, clean_id, scopes_id].into_iter().any(|id| {
+                i.raw.viewports.get(&id).and_then(|v| v.focused) == Some(true)
+            })
         });
+        let focus_key = egui::Id::unique("clean_feed_editor_was_focused");
+        let editor_refocused = ctx.data_mut(|data| {
+            let was_focused = data.get_temp::<bool>(focus_key).unwrap_or(false);
+            data.insert_temp(focus_key, editor_focused);
+            editor_focused && !was_focused
+        });
+        let clean_out = self.clean_win.show(ctx, clean_id, "RawGraph - Clean feed", false, &monitors, Some(editor_focused), |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                viewer::paint_clean(ui, texture, size, uv);
+            });
+        });
+        if self.clean_win.state.open && !clean_out.close && editor_refocused {
+            // Raise without taking keyboard focus from the editor. Immediately
+            // restore normal stacking so the feed won't cover other apps later.
+            ctx.send_viewport_cmd_to(clean_id, egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+            ctx.send_viewport_cmd_to(clean_id, egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        }
 
         let panel = &mut self.scope_panel;
         let stale = self.scopes_stale;
-        let step = self.frame_info.as_ref().filter(|f| f.path.is_gpu()).map(|f| f.scope_step);
-        self.scopes_win.show(ctx, scopes_id, "RawGraph - Scopes", true, |ui| {
+        let step = self.frame_info.as_ref().filter(|f| !self.compare.active() && f.path.is_gpu()).map(|f| f.scope_step);
+        self.scopes_win.show(ctx, scopes_id, "RawGraph - Scopes", true, &monitors, None, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 let area = ui.available_rect_before_wrap();
                 if let Some(step) = step {
@@ -2777,6 +2983,7 @@ enum Aux {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        crate::splash::finish();
         let ctx = ui.ctx().clone();
         self.frames += 1;
         if self.frames == 20 && self.shot.is_some() {
@@ -2795,8 +3002,7 @@ impl eframe::App for App {
             self.prompt = Some(Pending::Quit);
         }
         self.poll_renderer(&ctx);
-        self.filmstrip.poll(&ctx);
-        self.poll_scan();
+        self.poll_scan(&ctx);
         self.poll_capture_refresh();
         self.poll_export();
         self.advance_export_queue(&ctx);
@@ -2831,11 +3037,15 @@ impl eframe::App for App {
         let status_top = egui::Panel::bottom("status").show_separator_line(true).show(ui, |ui| self.status_bar(ui)).response.rect.top();
         let content = ctx.content_rect();
         self.window_area = egui::Rect::from_min_max(egui::pos2(content.left(), menu_bottom + 2.0), egui::pos2(content.right(), (status_top - 2.0).max(menu_bottom + 40.0)));
+        self.resolve_compare_pins();
+        self.refresh_gallery();
+        self.update_selection_preview(&ctx);
         match self.workspace {
             Workspace::Single => self.layout_single(ui, &mut cmds),
             Workspace::Dual => self.layout_dual(ui, &mut cmds),
         }
         self.handle_ui_requests(&ctx);
+        self.update_selection_preview(&ctx);
         self.shortcuts_window(&ctx);
         self.report_window(&ctx);
         self.prompt_window(&ctx);
@@ -2863,8 +3073,12 @@ impl eframe::App for App {
         self.autosave_step(&ctx);
         self.refresh_collection();
         self.tool_bench_step(&ctx);
+        self.update_selection_preview(&ctx);
         self.compare_step(&ctx);
         self.submit_if_needed();
+        let target = self.primary_target();
+        self.filmstrip.request_live(&ctx, &mut self.session, target, self.renderer_mode != RendererMode::Cpu && !self.cli.capture());
+        self.filmstrip.poll(&ctx);
         self.crash_step();
         self.report_fill_time();
         self.screenshot_step(&ctx);
@@ -2923,6 +3137,9 @@ impl eframe::App for App {
             scopes: self.scopes_win.state.clone(),
             scopes_pos: self.scopes_pos,
             preview_size: self.session.provider.preview_size(),
+            click_zoom: self.viewer.click_zoom,
+            wheel_navigates: self.viewer.wheel_navigates,
+            editable_thumb_gib: self.filmstrip.live.budget(),
             // GPU-only is a test setting from the command line, never saved.
             renderer: if self.renderer_mode == RendererMode::Gpu { RendererMode::Auto } else { self.renderer_mode },
         };
@@ -2952,6 +3169,23 @@ fn ensure_extension(path: PathBuf, ext: &str, strip: Option<&str>) -> PathBuf {
     path.with_file_name(format!("{stem}{ext}"))
 }
 
+/// Bind an explicit open-folder action to a Source, never to the catalog alone.
+/// A selected Source is intentional; otherwise use an empty Source or add one.
+fn bind_open_folder(session: &mut Session, folder: &std::path::Path, recursive: bool) -> NodeId {
+    let graph = &mut session.project.graph;
+    let selected = session.selected_node.filter(|id| graph.node(*id).is_some_and(|n| n.kind == NodeKind::Source));
+    let empty = graph.nodes().find(|n| n.kind == NodeKind::Source && matches!(n.data(ImageId(0)), Some(rawgraph_core::NodeData::Folder(f)) if f.is_empty())).map(|n| n.id);
+    let id = selected.or(empty).unwrap_or_else(|| graph.add_node(NodeKind::Source, [0.0, 300.0]));
+    node_ui::set_source_folder(graph, id, Some(folder.to_string_lossy().into_owned()));
+    let node = graph.node_mut(id).unwrap();
+    let mode = node.mode;
+    node.mode = rawgraph_core::Mode::All;
+    node.set_param("subfolders", ImageId(0), if recursive { 1.0 } else { 0.0 });
+    node.mode = mode;
+    session.dirty = true;
+    id
+}
+
 /// True when the finished export's report goes to the application's own log; a
 /// `--run-export-node` run prints it once, on standard output, itself.
 pub fn report_on_stderr(cli: &Cli) -> bool {
@@ -2968,7 +3202,8 @@ pub fn apply_cli_state(session: &mut Session, cli: &Cli) {
     for (kind, pos) in &cli.add_node {
         let n = session.project.graph.nodes().count();
         let pos = pos.unwrap_or([(n % 7) as f32 * 240.0, 200.0 + (n / 7) as f32 * 160.0]);
-        session.project.graph.add_node(*kind, pos);
+        let id = session.project.graph.add_node(*kind, pos);
+        if *kind == NodeKind::Source { node_ui::set_source_folder(&mut session.project.graph, id, None); }
     }
     for &(node, x, y) in &cli.move_node {
         if let Some(n) = session.node_by_index(node).and_then(|id| session.project.graph.node_mut(id)) {
@@ -3104,10 +3339,11 @@ pub fn apply_cli_state(session: &mut Session, cli: &Cli) {
         }
     }
     for (node, points, look) in &cli.paint {
-        let Some(id) = session.node_by_index(*node).filter(|id| session.project.graph.node(*id).is_some_and(|n| n.kind == NodeKind::BrushMask)) else {
-            eprintln!("--paint: node {node} is not a Brush Mask");
+        let Some(id) = session.node_by_index(*node).filter(|id| session.project.graph.node(*id).is_some_and(|n| n.kind == NodeKind::Draw)) else {
+            eprintln!("--paint: node {node} is not a Draw");
             continue;
         };
+        let image = session.draw_image(id, image);
         let mut settings = session.brush.clone();
         if let Some([size, hardness, flow]) = look {
             settings.size_pct = *size;
@@ -3170,8 +3406,11 @@ pub fn apply_cli_state(session: &mut Session, cli: &Cli) {
 /// Shows the viewer and lets the tool of the selected node work on top of it.
 pub fn show_viewer(viewer: &mut Viewer, tools: &mut Tools, session: &mut Session, ui: &mut egui::Ui) -> Option<String> {
     crate::tools::prepare_viewer(viewer, session);
-    let geom = viewer.show(ui)?;
-    tools.show(ui, &geom, session, viewer.frame_size)
+    let geom = viewer.show(ui);
+    let result = if viewer.awaiting_final() { None } else { geom.as_ref().and_then(|geom| tools.show(ui, geom, session, viewer.frame_size)) };
+    let step = std::mem::take(&mut viewer.navigation_step);
+    if step != 0 { session.step_viewer_image(step); }
+    result
 }
 
 /// Index visited at step `i` of a stride walk over `n` images (no two
@@ -3240,6 +3479,8 @@ fn setup_style(ctx: &egui::Context) {
         style.text_styles.insert(TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace));
         style.spacing.item_spacing = egui::vec2(8.0, 5.0);
         style.spacing.button_padding = egui::vec2(8.0, 3.0);
+        style.spacing.slider_rail_height = 4.0;
+        style.visuals.slider_trailing_fill = true;
         style.visuals.panel_fill = egui::Color32::from_rgb(33, 35, 40);
         style.visuals.window_fill = egui::Color32::from_rgb(38, 40, 46);
         style.visuals.extreme_bg_color = egui::Color32::from_rgb(22, 24, 28);
@@ -3247,11 +3488,225 @@ fn setup_style(ctx: &egui::Context) {
     });
 }
 
+/// Placement of an edited gallery thumbnail as a selection placeholder: it is already the
+/// node's output (transforms and crop applied), so it maps 1:1 onto the final frame.
+fn edited_geometry(session: &crate::session::Session, node: rawgraph_core::NodeId, image: rawgraph_core::ImageId, tex: &egui::TextureHandle) -> crate::quick_preview::Geometry {
+    let [w, h] = tex.size();
+    let source = crate::quick_preview::estimate_proxy_size(&session.provider, image, (w as u32, h as u32));
+    let out = crate::quick_preview::geometry(session, node, image, source).size;
+    // Final frame's long edge, the thumbnail's own aspect (it is already the node's output).
+    let scale = out[0].max(out[1]).max(1) as f64 / w.max(h).max(1) as f64;
+    crate::quick_preview::Geometry {
+        size: [((w as f64 * scale).round() as u32).max(1), ((h as f64 * scale).round() as u32).max(1)],
+        uv: [egui::pos2(0.0, 0.0), egui::pos2(1.0, 0.0), egui::pos2(1.0, 1.0), egui::pos2(0.0, 1.0)],
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn open_folder_binds_a_source_without_overwriting_other_sources() {
+        use super::*;
+        let mut s = Session::new(crate::session::fresh_project(), provider());
+        let first = bind_open_folder(&mut s, std::path::Path::new("/photos/a"), false);
+        assert_eq!(node_ui::source_folder(s.project.graph.node(first).unwrap()).as_deref(), Some("/photos/a"));
+        assert!(!node_ui::source_subfolders(s.project.graph.node(first).unwrap()));
+        let second = bind_open_folder(&mut s, std::path::Path::new("/photos/b"), true);
+        assert_ne!(first, second);
+        assert_eq!(node_ui::source_folder(s.project.graph.node(first).unwrap()).as_deref(), Some("/photos/a"));
+        s.selected_node = Some(first);
+        assert_eq!(bind_open_folder(&mut s, std::path::Path::new("/photos/c"), true), first);
+        assert_eq!(node_ui::source_folder(s.project.graph.node(second).unwrap()).as_deref(), Some("/photos/b"));
+    }
     use super::*;
     use crate::session::tests::{demo_session, png_project, provider};
     use crate::session::demo_graph;
+
+    fn headless_app(dir: &std::path::Path) -> App {
+        let ctx = egui::Context::default();
+        App::new(&eframe::CreationContext::_new_kittest(ctx), Cli { demo: true, data_dir: Some(dir.to_owned()), ..Default::default() })
+    }
+
+    fn load_gallery(app: &mut App) {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            app.refresh_gallery();
+            if App::gallery_members(app.gallery_result.as_ref(), app.primary_target()).is_some() { return; }
+            assert!(Instant::now() < until, "gallery worker did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn gallery_selection_displays_cached_pixels_before_the_worker_reply() {
+        use rawgraph_engine::ImageProvider;
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        let ctx = egui::Context::default();
+        app.session.selected_node = app.session.node_by_index(0);
+        app.frames = SETTLE_FRAMES;
+        load_gallery(&mut app);
+        let before = app.single_viewer_request().unwrap().0;
+        app.session.select_index(1);
+        let after = app.single_viewer_request().unwrap().0;
+        assert_ne!(before, after);
+        app.session.provider.image(after).unwrap();
+        ctx.run_ui(egui::RawInput::default(), |_| app.update_selection_preview(&ctx)).drop_without_applying_deltas();
+        assert_eq!(app.viewer.preview_image, Some(after));
+        let placeholder = app.viewer.texture_id().expect("available in the selection update");
+        assert_eq!(app.viewer.badge(&ctx, Instant::now()), Some("Preview"));
+        assert!(app.scopes_stale);
+        app.submit_if_needed();
+        let until = Instant::now() + Duration::from_secs(10);
+        while app.viewer.awaiting_final() {
+            ctx.run_ui(egui::RawInput::default(), |_| app.poll_renderer(&ctx)).drop_without_applying_deltas();
+            assert!(Instant::now() < until, "render did not complete");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_ne!(app.viewer.texture_id().unwrap(), placeholder);
+        assert_eq!(app.viewer.badge(&ctx, Instant::now()), None);
+        assert!(!app.scopes_stale);
+        app.shutdown();
+    }
+
+    #[test]
+    fn single_viewer_pins_gallery_and_scope_request_until_unpinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        let develop = app.session.node_by_index(1).unwrap();
+        let generator = app.session.project.graph.add_node(NodeKind::Generator, [0.0; 2]);
+        app.session.selected_node = Some(generator);
+        app.session.viewed_node = Some(develop);
+        app.frames = SETTLE_FRAMES;
+        app.scopes_pos = ScopesPos::RightColumn;
+        load_gallery(&mut app);
+        let members = App::gallery_members(app.gallery_result.as_ref(), app.primary_target()).unwrap();
+        assert_eq!(app.session.gallery_images(members), app.session.visible());
+        app.submit_if_needed();
+        let key = app.last_key.as_ref().unwrap();
+        assert_eq!(key.node, develop);
+        assert!(key.scopes.is_some());
+        assert_eq!(app.session.selected_node, Some(generator), "inspector selection is independent");
+
+        app.session.viewed_node = None;
+        assert!(App::gallery_members(app.gallery_result.as_ref(), app.primary_target()).is_none(), "discard stale membership");
+        load_gallery(&mut app);
+        let members = App::gallery_members(app.gallery_result.as_ref(), app.primary_target()).unwrap().clone();
+        assert_eq!(members.len(), 1);
+        app.session.step_viewer_image(1);
+        app.submit_if_needed();
+        let key = app.last_key.as_ref().unwrap();
+        assert_eq!(key.node, generator);
+        assert!(members.contains(&key.image));
+        assert!(key.scopes.is_some());
+        app.shutdown();
+    }
+
+    #[test]
+    fn split_gallery_scopes_and_clean_feed_follow_right_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        let develop = app.session.node_by_index(1).unwrap();
+        let generator = app.session.project.graph.add_node(NodeKind::Generator, [0.0; 2]);
+        let ctx = egui::Context::default();
+        app.toggle_compare();
+        app.frames = SETTLE_FRAMES;
+        app.scopes_pos = ScopesPos::RightColumn;
+        let image = app.session.visible()[1];
+        app.compare.panes[1].node = Some(develop);
+        app.compare.panes[1].image = Some(image);
+        app.compare.panes[0].node = Some(generator);
+        app.session.selected_node = Some(generator);
+        let (ids, captures) = app.session.id_captures();
+        let generator_image = *crate::collection::view_members(&app.session.project.graph, &ids, &captures, generator).iter().next().unwrap();
+        app.compare.panes[0].image = Some(generator_image);
+        load_gallery(&mut app);
+        let target = app.primary_target();
+        assert_eq!((target.node, target.image), (Some(develop), Some(image)));
+        let members = App::gallery_members(app.gallery_result.as_ref(), target).unwrap();
+        assert!(members.contains(&image) && !members.contains(&generator_image));
+        let selection = app.session.selected;
+        app.session.step_viewer_target(target, 1);
+        assert_eq!(app.session.selected, selection, "stepping cannot move the image pin");
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            ctx.run_ui(egui::RawInput::default(), |_| app.compare_step(&ctx)).drop_without_applying_deltas();
+            // The CPU renderer publishes its picture before the asynchronous scopes.
+            if app.cmp_ready() && !app.scope_panel.needs_refresh() { break; }
+            assert!(Instant::now() < until, "compare frames or primary scopes did not arrive");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.pane_key(1).map(|key| (key.node, key.image)), Some((develop, image)));
+        assert!(app.primary_frame().0.is_some(), "right render supplies the Clean Feed texture");
+        let frame = app.primary_frame();
+        app.compare.panes[0] = Default::default();
+        assert_eq!(app.primary_target(), target);
+        assert_eq!(app.primary_frame(), frame);
+        app.compare.panes[1].node = None;
+        app.resolve_compare_pins();
+        assert_eq!(app.primary_target(), target, "image-only pin retains its last compatible stage");
+        app.compare.panes[1].image = None;
+        app.resolve_compare_pins();
+        assert_eq!(app.primary_target().node, Some(generator));
+        app.shutdown();
+    }
+
+    #[test]
+    fn editable_thumbnail_budget_is_persisted_and_legacy_settings_default_to_eight() {
+        #[derive(Default)]
+        struct Storage(std::collections::HashMap<String, String>);
+        impl eframe::Storage for Storage {
+            fn get_string(&self, key: &str) -> Option<String> { self.0.get(key).cloned() }
+            fn set_string(&mut self, key: &str, value: String) { self.0.insert(key.to_owned(), value); }
+            fn remove_string(&mut self, key: &str) { self.0.remove(key); }
+            fn flush(&mut self) {}
+        }
+        let mut storage = Storage::default();
+        storage.0.insert(SETTINGS_KEY.to_owned(), "()".to_owned());
+        assert_eq!(eframe::get_value::<Settings>(&storage, SETTINGS_KEY).unwrap().editable_thumb_gib, 8);
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        app.filmstrip.live.set_budget(23);
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(eframe::get_value::<Settings>(&storage, SETTINGS_KEY).unwrap().editable_thumb_gib, 23);
+        app.shutdown();
+    }
+
+    #[test]
+    fn deleting_last_source_blanks_viewer_and_gallery_and_undo_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = headless_app(dir.path());
+        let ctx = egui::Context::default();
+        app.session.project.graph = Graph::new();
+        let source = app.session.project.graph.add_node(NodeKind::Source, [0.0; 2]);
+        app.history.reset(&app.session.project.graph);
+        app.session.set_node_selection(crate::selection::NodeSelection::single(source));
+        app.session.viewed_node = Some(source);
+        app.frames = SETTLE_FRAMES;
+        load_gallery(&mut app);
+        app.submit_if_needed();
+        let until = Instant::now() + Duration::from_secs(10);
+        while app.primary_frame().0.is_none() {
+            ctx.run_ui(egui::RawInput::default(), |_| app.poll_renderer(&ctx)).drop_without_applying_deltas();
+            assert!(Instant::now() < until, "source viewer frame did not arrive");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.run(Command::DeleteNode, &ctx);
+        assert!(app.history.commit_if_changed(&app.session.project.graph, false));
+        app.refresh_gallery();
+        app.submit_if_needed();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.filmstrip_panel(ui, 0);
+            app.viewer_area(ui, &mut Vec::new());
+        }).drop_without_applying_deltas();
+        assert!(App::gallery_members(app.gallery_result.as_ref(), app.primary_target()).is_none());
+        assert!(app.primary_frame().0.is_none());
+        assert!(app.last_key.is_none() && app.last_error.is_none());
+        assert!(!app.status.current().is_some_and(|(_, error)| error));
+        app.run(Command::Undo, &ctx);
+        assert_eq!(app.session.project.graph.node(source).unwrap().kind, NodeKind::Source);
+        app.shutdown();
+    }
 
     #[test]
     fn extensions_are_enforced() {
@@ -3318,7 +3773,7 @@ mod tests {
     fn the_mask_overlay_and_new_metadata_trigger_exactly_one_new_request() {
         let s = demo_session();
         let out = s.output_node().unwrap();
-        let mask = s.project.graph.nodes().find(|n| n.kind == NodeKind::GradientMask).unwrap().id;
+        let mask = s.project.graph.nodes().find(|n| n.kind == NodeKind::Generator).unwrap().id;
         let base = RequestKey::new(&s, out, None, None);
         assert!(base != RequestKey::new(&s, out, None, Some(mask)), "switching the overlay on asks once");
         assert!(RequestKey::new(&s, out, None, Some(mask)) == RequestKey::new(&s, out, None, Some(mask)));
@@ -3357,10 +3812,7 @@ mod tests {
     #[test]
     fn m_toggles_the_mask_overlay() {
         assert_eq!(shortcut_of(Command::ToggleMaskOverlay), Some(sc(Modifiers::NONE, Key::M)));
-        assert_eq!(shortcut_of(Command::CleanNextMonitor), Some(sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::M)));
-        let pos = |c: Command| SHORTCUT_ORDER.iter().position(|x| *x == c).unwrap();
-        assert!(pos(Command::CleanNextMonitor) < pos(Command::ToggleMaskOverlay), "the more specific shortcut is checked first");
-        assert_eq!(SHORTCUT_ORDER.len(), 21);
+        assert!(SHORTCUT_ORDER.contains(&Command::ToggleMaskOverlay));
     }
 }
 

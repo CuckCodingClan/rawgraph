@@ -5,33 +5,32 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 
 use rawgraph_core::ImageId;
-use rawgraph_engine::ImageProvider;
 
 use crate::provider::FileProvider;
 
 pub struct Prefetcher {
-    tx: Sender<Vec<ImageId>>,
+    tx: Sender<(u64, Vec<ImageId>)>,
     generation: Arc<AtomicU64>,
     last: Vec<ImageId>,
 }
 
 impl Prefetcher {
     pub fn new(provider: Arc<FileProvider>) -> Self {
-        let (tx, rx) = channel::<Vec<ImageId>>();
+        let (tx, rx) = channel::<(u64, Vec<ImageId>)>();
         let generation = Arc::new(AtomicU64::new(0));
         let g = generation.clone();
         let _ = std::thread::Builder::new().name("rawgraph-prefetch".into()).spawn(move || {
-            while let Ok(mut ids) = rx.recv() {
+            while let Ok(mut job) = rx.recv() {
                 while let Ok(newer) = rx.try_recv() {
-                    ids = newer;
+                    job = newer;
                 }
-                let mine = g.load(Ordering::SeqCst);
+                let (mine, ids) = job;
                 for id in ids {
                     // A newer request replaces this one between decodes.
                     if g.load(Ordering::SeqCst) != mine {
                         break;
                     }
-                    let _ = provider.image(id);
+                    provider.prefetch(id);
                 }
             }
         });
@@ -44,13 +43,13 @@ impl Prefetcher {
             return;
         }
         self.last = ids.clone();
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        let _ = self.tx.send(ids);
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.tx.send((generation, ids));
     }
 
     /// Forces the next `request` to go through (after a preview-size change).
     pub fn forget(&mut self) {
-        self.last.clear();
+        self.request(Vec::new());
     }
 }
 

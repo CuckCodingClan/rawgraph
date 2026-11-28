@@ -184,29 +184,9 @@ fn run(tag: &str, path: &Path) {
     vignette(&mut a, 0.6, 0.45, 0.5);
     pair(&format!("{tag}_04b_vignette_bright"), &base, &a);
 
-    let radial = radial_mask(w, h, 0.5, 0.45, 0.3, 0.38, 0.6, 25.0, false);
-    let lum = luminance_mask(&base, 0.2, 0.7, 0.25, false);
-    let hue = hue_mask(&base, 40.0, 50.0, 40.0, 0.15);
-    save_mask(&format!("{tag}_10_mask_radial"), &radial);
-    save_mask(&format!("{tag}_11_mask_luminance"), &lum);
-    save_mask(&format!("{tag}_12_mask_hue"), &hue);
-    save_mask(&format!("{tag}_13_mask_adjusted"), &mask_adjust(&radial, 0.3, 0.8, 1.8, true));
-    save_mask(&format!("{tag}_14_mask_combined"), &mask_combine(&radial, &lum, CombineMode::Multiply));
-
-    let mut a = base.clone();
-    gain_masked(&mut a, 2.0, &radial);
-    pair(&format!("{tag}_05_gain_masked_radial"), &base, &a);
-    let mut a = base.clone();
-    contrast_masked(&mut a, 1.0, 0.18, &lum);
-    pair(&format!("{tag}_06_contrast_masked_lum"), &base, &a);
-    let mut a = base.clone();
-    saturation_masked(&mut a, 2.5, &hue);
-    pair(&format!("{tag}_07_saturation_masked_hue"), &base, &a);
-
     pair(&format!("{tag}_08_sharpen"), &base, &sharpen(&base, 1.5, 2.0, 0.0, None));
     let soft = ops::blur(&base, 2.0);
     pair(&format!("{tag}_08b_sharpen_on_soft"), &soft, &sharpen(&soft, 2.0, 2.0, 0.02, None));
-    pair(&format!("{tag}_08c_sharpen_masked"), &base, &sharpen(&base, 3.0, 2.0, 0.0, Some(&radial)));
 
     let p = TransformParams { angle_deg: 8.0, left: 0.05, right: 0.95, ..Default::default() };
     pair(&format!("{tag}_09_transform_rot8_crop"), &base, &transform(&base, &p));
@@ -233,7 +213,8 @@ fn run(tag: &str, path: &Path) {
     save_mask(&format!("{tag}_20b_brush_mask_inverted"), &stroke_mask(w, h, &strokes, true));
     save_mask(&format!("{tag}_20c_brush_mask_1600"), &stroke_mask(1600, 1067, &strokes, false));
     let mut a = base.clone();
-    gain_masked(&mut a, 1.5, &brush);
+    let exposure: Vec<_> = brush.data.iter().map(|&v| v * 1.5).collect();
+    ops::exposure_mapped(&mut a, &exposure);
     pair(&format!("{tag}_21_brush_gain_plus1_5ev"), &base, &a);
 
     // Point curves.

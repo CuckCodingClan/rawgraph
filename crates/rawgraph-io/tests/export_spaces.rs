@@ -295,3 +295,34 @@ fn avif_files_have_the_signature_exif_and_follow_the_overwrite_rule() {
     let names: Vec<_> = std::fs::read_dir(&d.0).expect("dir").filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
     assert_eq!(names.len(), 1, "no temporary files left: {names:?}");
 }
+
+#[test]
+fn webp_lossless_and_lossy_decode_alpha_quality_and_exif() {
+    let d = Dir::new("webp");
+    let (w, h) = (32, 24);
+    let rgba: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |x| [((x * 17 + y * 3) % 256) as u8, ((x * 5 + y * 11) % 256) as u8, ((x * 13 + y * 7) % 256) as u8, ((x * 7 + y * 9) % 256) as u8])).collect();
+    let options = SaveOptions { metadata: Some(meta()), ..Default::default() };
+    let p = d.file("lossless.webp");
+    save_webp8(&p, w, h, &rgba, true, &options).unwrap();
+    let bytes = std::fs::read(&p).unwrap();
+    let decoded = webp_rust::decode(&bytes).unwrap();
+    assert_eq!((decoded.width, decoded.height), (w as usize, h as usize));
+    assert_eq!(decoded.rgba, rgba);
+    assert!(bytes.windows(4).any(|b| b == b"EXIF"));
+    let exif = exif_of(&p).expect("read WebP EXIF");
+    assert_eq!(text(&exif, exif::Tag::Make).as_deref(), Some("SONY"));
+    assert!(!bytes.windows(4).any(|b| b == b"ICCP"));
+    assert!(matches!(save_webp8(&p, w, h, &rgba, true, &options), Err(IoError::Exists(_))));
+    assert!(save_webp8(&d.file("bad.webp"), w, h, &rgba[..4], true, &options).is_err());
+    let mut encodings = Vec::new();
+    for quality in [20, 90] {
+        let q = d.file(&format!("lossy{quality}.webp"));
+        save_webp8(&q, w, h, &rgba, false, &SaveOptions { jpeg_quality: quality, metadata: None, ..options.clone() }).unwrap();
+        let bytes = std::fs::read(q).unwrap();
+        let out = webp_rust::decode(&bytes).unwrap();
+        assert_eq!((out.width, out.height), (w as usize, h as usize));
+        assert_eq!(out.rgba.iter().skip(3).step_by(4).copied().collect::<Vec<_>>(), rgba.iter().skip(3).step_by(4).copied().collect::<Vec<_>>());
+        encodings.push(bytes);
+    }
+    assert_ne!(encodings[0], encodings[1]);
+}

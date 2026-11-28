@@ -10,9 +10,9 @@ use eframe::egui::{
     self, epaint::CubicBezierShape, Align2, Color32, CornerRadius, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke,
     StrokeKind, Vec2,
 };
-use rawgraph_core::{Graph, ImageId, Mode, NodeId, NodeKind, PortType};
+use rawgraph_core::{Graph, ImageId, Mode, Node, NodeId, NodeKind, PortType};
 
-use crate::groups::{all_rows, box_row_count, limit_rows, MAX_BOX_ROWS};
+use crate::groups::{all_rows, box_row_count, limit_rows, parameter_row, MAX_BOX_ROWS};
 use crate::selection::{band_hits, NodeSelection};
 use crate::session::Session;
 use crate::status::Status;
@@ -28,16 +28,19 @@ const ROW_H: f32 = 21.0;
 const PARAM_H: f32 = 16.0;
 const PAD: f32 = 8.0;
 const PORT_R: f32 = 5.5;
+const TAB_SIZE: f32 = 16.0;
+const TAB_INSET: f32 = 6.0;
+const TITLE_GAP: f32 = 4.0;
+const TAB_INPUT: Color32 = Color32::from_rgb(58, 120, 190);
+const TAB_OUTPUT: Color32 = Color32::from_rgb(180, 70, 74);
 
 pub const COLOR_IMAGES: Color32 = Color32::from_rgb(92, 165, 240);
-pub const COLOR_MASK: Color32 = Color32::from_rgb(240, 165, 62);
 const COLOR_SELECTED: Color32 = Color32::from_rgb(255, 210, 90);
 const COLOR_WARN: Color32 = Color32::from_rgb(255, 176, 40);
 
 pub fn port_color(ty: PortType) -> Color32 {
     match ty {
         PortType::Images => COLOR_IMAGES,
-        PortType::Mask => COLOR_MASK,
     }
 }
 
@@ -62,13 +65,13 @@ pub fn category_color(category: &str) -> Color32 {
         "Geometry" => Color32::from_rgb(56, 108, 92),
         "Effects" => Color32::from_rgb(100, 84, 56),
         "Collection" => Color32::from_rgb(40, 110, 104),
-        "Mask" => Color32::from_rgb(128, 90, 34),
+        "Generators" => Color32::from_rgb(128, 90, 34),
         _ => Color32::from_rgb(70, 76, 90),
     }
 }
 
 /// Categories in the order of the add-node menu and the Tab search.
-pub const CATEGORY_ORDER: [&str; 9] = ["Input/Output", "Develop", "Tone", "Colour", "Detail", "Geometry", "Effects", "Collection", "Mask"];
+pub const CATEGORY_ORDER: [&str; 9] = ["Input/Output", "Develop", "Tone", "Colour", "Detail", "Geometry", "Effects", "Collection", "Generators"];
 
 /// Groups of the add-node menu and the Tab search: every node kind once, by
 /// `NodeKind::category()`, categories in `CATEGORY_ORDER`, kinds in their
@@ -76,6 +79,7 @@ pub const CATEGORY_ORDER: [&str; 9] = ["Input/Output", "Develop", "Tone", "Colou
 pub fn node_groups() -> Vec<(&'static str, Vec<NodeKind>)> {
     let mut groups: Vec<(&'static str, Vec<NodeKind>)> = CATEGORY_ORDER.iter().map(|c| (*c, Vec::new())).collect();
     for kind in NodeKind::ALL {
+        if kind == NodeKind::Output { continue; }
         let cat = kind.category();
         match groups.iter_mut().find(|(c, _)| *c == cat) {
             Some((_, kinds)) => kinds.push(kind),
@@ -108,11 +112,6 @@ fn summary_row_count(kind: NodeKind) -> usize {
     }
 }
 
-/// Whether the box shows an image count (mask producers do not carry images).
-fn has_count(kind: NodeKind) -> bool {
-    kind.output() != Some(PortType::Mask)
-}
-
 fn compact(v: f32) -> String {
     if (v - v.round()).abs() < 1e-3 {
         format!("{v:.0}")
@@ -138,9 +137,23 @@ pub fn summary_rows(node: &rawgraph_core::Node, image: ImageId) -> Vec<(String, 
         return vec![(name.to_owned(), format!("{lo_t} ... {hi_t}")), (String::new(), note.join(", "))];
     }
     if node.kind == NodeKind::ColorWheels {
-        return crate::groups::wheels_rows(node, image).into_iter().map(|r| (r.label, r.value)).collect();
+        return crate::groups::wheels_rows(node, image).into_iter().filter(|r| r.changed).map(|r| (r.label, r.value)).collect();
     }
-    limit_rows(all_rows(node, image), MAX_BOX_ROWS).into_iter().map(|r| (r.label, r.value)).collect()
+    // Exposed parameters always occupy the first summary rows, in stable port
+    // order, regardless of the current image or which slider values changed.
+    let mut rows: Vec<_> = node.exposed_inputs().iter().flatten()
+        .map(|input| match node.kind.param_spec(&input.parameter) {
+            Some(spec) => parameter_row(node, image, spec),
+            // Vector inputs such as Filter direction have no slider: show the port's own label.
+            None => crate::groups::Row { key: None, label: Graph::parameter_input_label(node.kind, &input.parameter).unwrap_or(&input.parameter).to_owned(), value: "image".to_owned(), changed: true },
+        })
+        .collect();
+    let max = MAX_BOX_ROWS.saturating_sub(rows.len());
+    let other = all_rows(node, image).into_iter()
+        .filter(|row| row.changed && !rows.iter().any(|exposed| exposed.key == row.key))
+        .collect();
+    rows.extend(limit_rows(other, max));
+    rows.into_iter().map(|r| (r.label, r.value)).collect()
 }
 
 /// The rows of a node box: like [`summary_rows`], but a Source shows its folder, a Layer a compact
@@ -160,7 +173,7 @@ pub fn node_size(kind: NodeKind) -> Vec2 {
     let rows = port_rows(kind) as f32;
     let params = summary_row_count(kind) as f32;
     let param_block = if params > 0.0 { params * PARAM_H + 4.0 } else { 0.0 };
-    let count = if has_count(kind) { COUNT_H } else { 0.0 };
+    let count = COUNT_H;
     Vec2::new(NODE_W, TITLE_H + 6.0 + rows * ROW_H + param_block + count + PAD)
 }
 
@@ -169,14 +182,124 @@ pub fn port_rows(kind: NodeKind) -> usize {
     kind.inputs().len().max(kind.outputs().len()).max(1)
 }
 
-/// Centre of input port `port`, in graph units.
-pub fn input_port(pos: [f32; 2], port: usize) -> Pos2 {
+fn node_port_rows(node: &rawgraph_core::Node) -> usize {
+    node.kind.inputs().len().max(node.kind.outputs().len() + node.exposed_outputs().len()).max(1)
+}
+
+#[cfg(test)]
+fn record_port_control(response: &egui::Response, id: NodeId, name: &'static str) {
+    response.ctx.data_mut(|data| data.insert_temp(egui::Id::unique(("port_control", id, name)), response.rect));
+}
+
+fn input_menu(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions: &mut Vec<Action>) {
+    for &parameter in Graph::supported_parameter_inputs(node.kind) {
+        if node.exposed_inputs().iter().flatten().any(|p| p.parameter == parameter) { continue; }
+        let label = Graph::parameter_input_label(node.kind, parameter).unwrap();
+        let hint = if parameter == "direction" { "Use linear RGB as an encoded Motion Blur direction" }
+            else { "Scale this slider per pixel by luminance: black = no effect, white = the slider value" };
+        let response = ui.button(label).on_hover_text(hint);
+        #[cfg(test)] record_port_control(&response, id, "input_item");
+        if response.clicked() { actions.push(Action::ExposeInput(id, parameter)); ui.close(); }
+    }
+}
+
+fn output_menu(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions: &mut Vec<Action>) {
+    if let Some(source) = node.kind.outputs().iter().position(|p| p.ty == PortType::Images) {
+        for label in ["Luma", "R", "G", "B", "A"] {
+            if node.exposed_outputs().iter().flatten().any(|p| p.label == label) { continue; }
+            let response = ui.button(label);
+            #[cfg(test)] if label == "Luma" { record_port_control(&response, id, "output_item"); }
+            if response.clicked() { actions.push(Action::ExposeOutput(id, source, label)); ui.close(); }
+        }
+    }
+}
+
+fn has_input_tab(kind: NodeKind) -> bool {
+    !Graph::supported_parameter_inputs(kind).is_empty()
+}
+
+fn has_output_tab(kind: NodeKind) -> bool {
+    kind.outputs().iter().any(|p| p.ty == PortType::Images)
+}
+
+fn exposed_port_menus(ui: &mut egui::Ui, node: &rawgraph_core::Node, id: NodeId, actions: &mut Vec<Action>) {
+    if has_input_tab(node.kind) {
+        ui.menu_button("Add Input", |ui| input_menu(ui, node, id, actions));
+    }
+    if has_output_tab(node.kind) {
+        ui.menu_button("Add Output", |ui| output_menu(ui, node, id, actions));
+    }
+}
+
+fn actual_node_size(node: &Node) -> Vec2 {
+    let extra_port_rows = node_port_rows(node) - port_rows(node.kind);
+    let extra_param_rows = node.exposed_inputs().iter().flatten().count().saturating_sub(MAX_BOX_ROWS);
+    node_size(node.kind) + Vec2::new(0.0, extra_port_rows as f32 * ROW_H + extra_param_rows as f32 * PARAM_H)
+}
+
+fn parameter_row_y(node: &Node, row: usize) -> f32 {
+    TITLE_H + 6.0 + node_port_rows(node) as f32 * ROW_H + 4.0 + (row as f32 + 0.5) * PARAM_H
+}
+
+fn builtin_input_port(pos: [f32; 2], port: usize) -> Pos2 {
     Pos2::new(pos[0], pos[1] + TITLE_H + 6.0 + port as f32 * ROW_H + ROW_H / 2.0)
+}
+
+/// Centre of an input in graph units, including parameter inputs on summary rows.
+fn input_port(node: &Node, port: usize) -> Pos2 {
+    if let Some(i) = port.checked_sub(node.kind.inputs().len()) {
+        // Removed inputs leave holes in their port indices, not in the layout.
+        let row = node.exposed_inputs()[..i].iter().flatten().count();
+        Pos2::new(node.pos[0], node.pos[1] + parameter_row_y(node, row))
+    } else {
+        builtin_input_port(node.pos, port)
+    }
 }
 
 /// Centre of output port `port`, in graph units.
 pub fn output_port(pos: [f32; 2], port: usize) -> Pos2 {
     Pos2::new(pos[0] + NODE_W, pos[1] + TITLE_H + 6.0 + port as f32 * ROW_H + ROW_H / 2.0)
+}
+
+struct TitleBar {
+    rect: Rect,
+    input: Option<Rect>,
+    output: Option<Rect>,
+    mode: Option<Rect>,
+    count: Option<Rect>,
+    warning: Option<Rect>,
+    text: Rect,
+}
+
+impl TitleBar {
+    fn new(node: &Node, node_rect: Rect, zoom: f32, has_warning: bool) -> Self {
+        let rect = Rect::from_min_size(node_rect.min, Vec2::new(node_rect.width(), TITLE_H * zoom));
+        let cy = rect.center().y;
+        let side = TAB_SIZE * zoom;
+        let gap = TITLE_GAP * zoom;
+        let left = rect.left() + TAB_INSET * zoom;
+        let mut right = rect.right() - TAB_INSET * zoom;
+        let input = has_input_tab(node.kind)
+            .then(|| Rect::from_min_size(Pos2::new(left, cy - side / 2.0), Vec2::splat(side)));
+        let mut reserve = |width: f32| {
+            let badge = Rect::from_min_size(Pos2::new(right - width, cy - side / 2.0), Vec2::new(width, side));
+            right = badge.left() - gap;
+            badge
+        };
+        let output = has_output_tab(node.kind).then(|| reserve(side));
+        let show_mode = zoom >= 0.5 && !node.kind.params().is_empty();
+        let mode = show_mode.then(|| reserve(side));
+        let count = (show_mode && node.mode == Mode::Individual).then(|| {
+            let digits = node.individual_count().to_string().len() as f32;
+            reserve((10.0 + 6.5 * digits) * zoom)
+        });
+        let warning = (zoom >= 0.5 && has_warning).then(|| reserve(side));
+        let text = Rect::from_min_max(
+            Pos2::new(input.map_or(left, |tab| tab.right() + gap), rect.top()),
+            Pos2::new(right, rect.bottom()),
+        );
+        Self { rect, input, output, mode, count, warning, text }
+    }
 }
 
 /// Graph <-> screen mapping: `screen = origin + pan + graph * zoom`.
@@ -204,9 +327,10 @@ impl Xform {
     }
 }
 
+#[derive(Clone, Copy)]
 enum ConnDrag {
     /// Dragging from an output port towards an input.
-    FromOutput(NodeId, usize),
+    FromOutput(NodeId, usize, Option<(NodeId, usize)>),
     /// Dragging from an unconnected input towards an output.
     FromInput { node: NodeId, port: usize },
 }
@@ -216,7 +340,8 @@ struct Search {
     screen_pos: Pos2,
     query: String,
     selected: usize,
-    fresh: bool,
+
+    connection: Option<ConnDrag>,
 }
 
 pub struct GraphEditor {
@@ -242,6 +367,38 @@ pub struct GraphEditor {
     recipes_dir: Option<std::path::PathBuf>,
     manage_open: bool,
     edit: EditState,
+    /// Debug > Per-node CPU timing: the last profiled preview, drawn under each node.
+    pub timings: Option<NodeTimings>,
+}
+
+/// Per-node CPU timing of the last profiled preview, for the on-node debug labels.
+#[derive(Clone, Debug, Default)]
+pub struct NodeTimings {
+    pub rows: HashMap<NodeId, rawgraph_engine::NodeTiming>,
+    pub total: std::time::Duration,
+    /// The pointwise tail ran batched on the GPU, so those nodes have no CPU time.
+    pub gpu_tail: bool,
+}
+
+impl NodeTimings {
+    pub fn new(rows: &[rawgraph_engine::NodeTiming], gpu_tail: bool) -> Self {
+        Self { total: rows.iter().map(|r| r.cpu).sum(), rows: rows.iter().map(|r| (r.node, r.clone())).collect(), gpu_tail }
+    }
+
+    /// Label, colour and hover text for one node, or None if it has no timing.
+    fn label(&self, id: NodeId) -> Option<(String, Color32, String)> {
+        let r = self.rows.get(&id)?;
+        let ms = r.cpu.as_secs_f64() * 1000.0;
+        let share = if self.total.is_zero() { 0.0 } else { r.cpu.as_secs_f64() / self.total.as_secs_f64() };
+        let text = if r.computed == 0 && r.cache_hits > 0 { "cached".to_owned() } else if ms < 10.0 { format!("{ms:.1} ms") } else { format!("{ms:.0} ms") };
+        let color = if r.computed == 0 { Color32::from_gray(120) }
+            else if share >= 0.5 { Color32::from_rgb(235, 110, 95) }
+            else if share >= 0.2 { Color32::from_rgb(230, 180, 90) }
+            else { Color32::from_gray(185) };
+        let mut tip = format!("{ms:.3} ms exclusive CPU time ({:.0} % of this preview), {} computed, {} cache hits", share * 100.0, r.computed, r.cache_hits);
+        if self.gpu_tail { tip.push_str("\nThe pointwise tail ran batched on the GPU; those nodes have no CPU time here."); }
+        Some((text, color, tip))
+    }
 }
 
 /// How a node takes part in the selection.
@@ -272,6 +429,7 @@ impl Default for GraphEditor {
             recipes_dir: None,
             manage_open: false,
             edit: EditState::default(),
+            timings: None,
         }
     }
 }
@@ -280,7 +438,7 @@ impl Default for GraphEditor {
 pub fn bounds(graph: &Graph) -> Option<Rect> {
     let mut rect: Option<Rect> = None;
     for n in graph.nodes() {
-        let r = Rect::from_min_size(Pos2::new(n.pos[0], n.pos[1]), node_size(n.kind));
+        let r = Rect::from_min_size(Pos2::new(n.pos[0], n.pos[1]), actual_node_size(n));
         rect = Some(rect.map_or(r, |acc| acc.union(r)));
     }
     rect
@@ -324,6 +482,47 @@ pub fn fit_view(content: Rect, viewport: Rect, focus: Option<Rect>) -> (Vec2, f3
     (pan, zoom)
 }
 
+// egui-winit's viewport inner rect is in screen points, using the same
+// pixels_per_point (native DPI * egui zoom) as the canvas.
+#[cfg(any(windows, test))]
+fn screen_to_canvas(screen_px: [i32; 2], pixels_per_point: f32, inner: Rect, canvas: Rect) -> Option<Pos2> {
+    if !pixels_per_point.is_finite() || pixels_per_point <= 0.0 {
+        return None;
+    }
+    let screen = Pos2::new(screen_px[0] as f32, screen_px[1] as f32) / pixels_per_point;
+    if !inner.contains(screen) {
+        return None;
+    }
+    let local = (screen - inner.min).to_pos2();
+    canvas.contains(local).then_some(local)
+}
+
+#[cfg(windows)]
+fn native_drop_pos(ctx: &egui::Context, canvas: Rect) -> Option<Pos2> {
+    use windows_sys::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+    let mut point = POINT { x: 0, y: 0 };
+    // SAFETY: point is writable, and GetCursorPos only fills it synchronously.
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        return None;
+    }
+    let inner = ctx.input(|i| i.viewport().inner_rect)?;
+    screen_to_canvas([point.x, point.y], ctx.pixels_per_point(), inner, canvas)
+}
+
+#[cfg(not(windows))]
+fn native_drop_pos(ctx: &egui::Context, canvas: Rect) -> Option<Pos2> {
+    ctx.input(|i| i.pointer.hover_pos()).filter(|p| canvas.contains(*p))
+}
+
+fn add_dropped_folders(session: &mut Session, pos: Pos2, paths: &[std::path::PathBuf]) {
+    for (i, path) in paths.iter().enumerate() {
+        let id = session.project.graph.add_node(NodeKind::Source, [pos.x, pos.y + i as f32 * 160.0]);
+        crate::node_ui::set_source_folder(&mut session.project.graph, id, Some(path.to_string_lossy().into_owned()));
+        session.set_node_selection(NodeSelection::single(id));
+    }
+    session.dirty = true;
+}
+
 impl GraphEditor {
     pub fn request_frame_all(&mut self) {
         self.frame_all_pending = true;
@@ -348,7 +547,7 @@ impl GraphEditor {
                 let focus = session
                     .selected_node
                     .and_then(|id| session.project.graph.node(id))
-                    .map(|n| Rect::from_min_size(Pos2::new(n.pos[0], n.pos[1]), node_size(n.kind)));
+                    .map(|n| Rect::from_min_size(Pos2::new(n.pos[0], n.pos[1]), actual_node_size(n)));
                 let (pan, zoom) = fit_view(b, Rect::from_min_size(Pos2::ZERO, rect.size()), focus);
                 self.pan = pan;
                 self.zoom = zoom;
@@ -361,6 +560,22 @@ impl GraphEditor {
         let ctx = ui.ctx().clone();
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         self.hovered = pointer.is_some_and(|p| rect.contains(p));
+        // Windows OLE drops do not carry a cursor position through winit. Query
+        // the cursor only for an actual drop; never import outside the canvas.
+        let has_drop = ctx.input(|i| !i.raw.dropped_files.is_empty());
+        if let Some(pos) = has_drop.then(|| native_drop_pos(&ctx, rect)).flatten() {
+            let paths = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path()).filter(|p| p.is_dir()).map(|p| p.to_owned()).collect::<Vec<_>>());
+            if !paths.is_empty() {
+                if session.demo {
+                    status.error("Create or open a project before dropping folders into the graph");
+                } else {
+                    let xf = Xform { origin: rect.min, pan: self.pan, zoom: self.zoom };
+                    let graph_pos = xf.to_graph(pos);
+                    add_dropped_folders(session, graph_pos, &paths);
+                    status.info(format!("Added {} Source node(s)", paths.len()));
+                }
+            }
+        }
         let typing = ctx.egui_wants_keyboard_input();
         let space = ctx.input(|i| i.key_down(Key::Space)) && !typing;
 
@@ -392,24 +607,32 @@ impl GraphEditor {
                     self.zoom = x.zoom;
                 }
             }
-            if !typing && self.search.is_none() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Backspace)) && !session.node_sel.is_empty() {
-                if let Err(why) = session.delete_selected() {
-                    status.error(why);
-                }
-            }
             if self.open_search {
                 self.open_search = false;
                 if let Some(c) = pointer {
                     let x = Xform { origin: rect.min, pan: self.pan, zoom: self.zoom };
                     let g = x.to_graph(c);
-                    self.search = Some(Search { graph_pos: [g.x, g.y], screen_pos: c, query: String::new(), selected: 0, fresh: true });
+                    self.search = Some(Search { graph_pos: [g.x, g.y], screen_pos: c, query: String::new(), selected: 0, connection: None });
                 }
             }
         }
         self.open_search = false;
         let xf = Xform { origin: rect.min, pan: self.pan, zoom: self.zoom };
         session.reconcile_selection();
-        self.run_edit_input(&ctx, session, status, rect, &xf, pointer);
+        // Buttons and the canvas may take egui keyboard focus too; that is not
+        // text editing. Only accept clipboard events for this graph or no focus.
+        let focused = ctx.memory(|m| m.focused());
+        let graph_focus = focused.is_none() || focused == Some(bg.id) || session.project.graph.nodes().any(|n| {
+            focused == Some(ui.scope_id().with(("node", n.id.0)))
+                || (0..n.kind.inputs().len() + n.exposed_inputs().len()).any(|i| focused == Some(ui.scope_id().with(("in", n.id.0, i))))
+                || (0..n.kind.outputs().len() + n.exposed_outputs().len()).any(|i| focused == Some(ui.scope_id().with(("out", n.id.0, i))))
+        });
+        if graph_focus && self.search.is_none() && !session.node_sel.is_empty()
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace))
+        {
+            if let Err(reason) = session.delete_selected() { status.error(reason); }
+        }
+        self.run_edit_input(&ctx, session, status, rect, &xf, pointer, graph_focus);
         let mods = ctx.input(|i| i.modifiers);
         let additive = mods.shift || mods.command;
 
@@ -426,11 +649,11 @@ impl GraphEditor {
             let now = pointer.or_else(|| ctx.input(|i| i.pointer.latest_pos()));
             if let Some(now) = now {
                 let r = Rect::from_two_pos(band.start, now);
-                let boxes = session.project.graph.nodes().map(|n| (n.id, Rect::from_min_size(xf.to_screen(Pos2::new(n.pos[0], n.pos[1])), node_size(n.kind) * self.zoom)));
+                let boxes = session.project.graph.nodes().map(|n| (n.id, Rect::from_min_size(xf.to_screen(Pos2::new(n.pos[0], n.pos[1])), actual_node_size(n) * self.zoom)));
                 let hits = band_hits(boxes, r);
                 let mut sel = NodeSelection::default();
                 sel.replace(band.base.iter().copied().chain(hits));
-                if sel != session.node_sel {
+                if !sel.ids().is_empty() && sel != session.node_sel {
                     session.set_node_selection(sel);
                 }
                 band_rect = Some(r);
@@ -461,8 +684,8 @@ impl GraphEditor {
         // Wires sit behind the nodes.
         for e in session.project.graph.edges() {
             let (Some(from), Some(to)) = (session.project.graph.node(e.from), session.project.graph.node(e.to)) else { continue };
-            let color = from.kind.outputs().get(e.from_port).map_or(Color32::GRAY, |o| port_color(o.ty));
-            draw_wire(&painter, xf.to_screen(output_port(from.pos, e.from_port)), xf.to_screen(input_port(to.pos, e.to_port)), color, self.zoom);
+            let color = from.output_type(e.from_port).map_or(Color32::GRAY, port_color);
+            draw_wire(&painter, xf.to_screen(output_port(from.pos, e.from_port)), xf.to_screen(input_port(to, e.to_port)), color, self.zoom);
         }
 
         // Port screen positions for the drop test, filled while drawing.
@@ -471,10 +694,10 @@ impl GraphEditor {
         let mut actions = Vec::new();
 
         for id in order {
-            let Some(node) = session.project.graph.node(id) else { continue };
+            let Some(node) = session.project.graph.node(id).cloned() else { continue };
             let kind = node.kind;
             let pos = node.pos;
-            let size = node_size(kind) * self.zoom;
+            let size = actual_node_size(&node) * self.zoom;
             let node_rect = Rect::from_min_size(xf.to_screen(Pos2::new(pos[0], pos[1])), size);
             if !node_rect.expand(40.0).intersects(rect) {
                 // Still register ports for completeness of drops? Off-screen: skip.
@@ -492,40 +715,69 @@ impl GraphEditor {
             let resp = ui.interact(node_rect.intersect(rect), ui.scope_id().with(("node", id.0)), sense);
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Node {}", kind.label())));
 
-            self.paint_node(&painter, session, id, node_rect, selected, viewed, image);
+            let issue = issues.get(&id).map(String::as_str);
+            let title = TitleBar::new(&node, node_rect, self.zoom, issue.is_some());
+            self.paint_node(&painter, session, id, node_rect, &title, image);
+            self.badges(ui, &painter, &node, &title, issue);
 
-            // Badges and their tooltips.
-            self.badges(ui, &painter, session, id, node_rect, viewed, issues.get(&id).map(String::as_str), image);
+            // Register tabs after the node so even a drag that starts on a tab
+            // belongs to the tab, not to the node underneath it.
+            for (input, tab) in [(true, title.input), (false, title.output)] {
+                let Some(tab) = tab else { continue };
+                let label = if input { "Add input port" } else { "Add output port" };
+                let response = ui.interact(tab.intersect(rect), ui.scope_id().with(("port_tab", id.0, input)),
+                    if space { Sense::hover() } else { Sense::click_and_drag() });
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, !space, label));
+                let response = response.on_hover_text(label);
+                let fill = if input { TAB_INPUT } else { TAB_OUTPUT };
+                let fill = if response.hovered() { fill.gamma_multiply(1.15) } else { fill };
+                painter.rect_filled(tab, (4.0 * self.zoom).round() as u8, fill);
+                painter.text(tab.center(), Align2::CENTER_CENTER, "+", FontId::proportional(13.0 * self.zoom),
+                    Color32::from_white_alpha(217));
+                #[cfg(test)] record_port_control(&response, id, if input { "input" } else { "output" });
+                if !space {
+                    egui::Popup::menu(&response).show(|ui| {
+                        if input { input_menu(ui, &node, id, &mut actions); } else { output_menu(ui, &node, id, &mut actions); }
+                    });
+                }
+            }
+            // Keep the selection outline above the tabs, even at minimum zoom.
+            self.paint_outline(&painter, node_rect, selected, viewed);
+            self.paint_timing(ui, &painter, id, node_rect);
 
             // Ports.
             if self.zoom > 0.0 {
-                for (i, spec) in kind.inputs().iter().enumerate() {
-                    let c = xf.to_screen(input_port(pos, i));
+                for i in 0..kind.inputs().len() + node.exposed_inputs().len() {
+                    let Some(ty) = node.input_type(i) else { continue };
+                    let builtin = kind.inputs().get(i);
+                    let label = builtin.map(|s| s.label).unwrap_or_else(|| Graph::parameter_input_label(kind, &node.exposed_inputs()[i - kind.inputs().len()].as_ref().unwrap().parameter).unwrap_or("Input"));
+                    let c = xf.to_screen(input_port(&node, i));
                     let connected = session.project.graph.input_of(id, i).is_some();
-                    inputs.push((id, i, c, spec.ty));
+                    inputs.push((id, i, c, ty));
                     let hover_rect = Rect::from_center_size(c, Vec2::splat((PORT_R * 2.6 * self.zoom).max(14.0)));
                     let pr = ui.interact(hover_rect, ui.scope_id().with(("in", id.0, i)), if space { Sense::hover() } else { Sense::click_and_drag() });
+                    #[cfg(test)] if builtin.is_none() { record_port_control(&pr, id, "parameter_port"); }
                     pr.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{} input {}", kind.label(), spec.label))
+                        egui::WidgetInfo::labeled(egui::Role::Button, true, format!("{} input {}", kind.label(), label))
                     });
                     let pr = pr.on_hover_text(format!(
                         "{} input ({:?}{})",
-                        spec.label,
-                        spec.ty,
-                        if spec.required { ", required" } else { ", optional" }
+                        label,
+                        ty,
+                        if builtin.is_some_and(|s| s.required) { ", required" } else { ", optional" }
                     ));
+                    if builtin.is_none() { pr.context_menu(|ui| { if ui.button("Remove port").clicked() { actions.push(Action::RemoveInput(id, i)); ui.close(); } }); }
                     if pr.drag_started() {
                         if let Some((src, src_port)) = session.project.graph.input_edge(id, i) {
-                            actions.push(Action::Disconnect(id, i));
-                            self.conn = Some(ConnDrag::FromOutput(src, src_port));
+                            self.conn = Some(ConnDrag::FromOutput(src, src_port, Some((id, i))));
                         } else {
                             self.conn = Some(ConnDrag::FromInput { node: id, port: i });
                         }
                     }
-                    draw_port(&painter, c, spec.ty, connected, pr.hovered() || pr.dragged(), self.zoom);
+                    draw_port(&painter, c, ty, connected, pr.hovered() || pr.dragged(), self.zoom);
                 }
-                for (port, spec) in kind.outputs().iter().enumerate() {
-                    let ty = spec.ty;
+                for port in 0..kind.outputs().len() + node.exposed_outputs().len() {
+                    let Some(ty) = node.output_type(port) else { continue };
                     let c = xf.to_screen(output_port(pos, port));
                     outputs.push((id, port, c, ty));
                     let hover_rect = Rect::from_center_size(c, Vec2::splat((PORT_R * 2.6 * self.zoom).max(14.0)));
@@ -537,8 +789,9 @@ impl GraphEditor {
                         None => format!("Output ({ty:?}): drag to an input to connect"),
                     };
                     let pr = pr.on_hover_text(tip);
+                    if port >= kind.outputs().len() { pr.context_menu(|ui| { if ui.button("Remove port").clicked() { actions.push(Action::RemoveOutput(id, port)); ui.close(); } }); }
                     if pr.drag_started() {
-                        self.conn = Some(ConnDrag::FromOutput(id, port));
+                        self.conn = Some(ConnDrag::FromOutput(id, port, None));
                     }
                     let connected = session.project.graph.edges().iter().any(|e| e.from == id && e.from_port == port);
                     draw_port(&painter, c, ty, connected, pr.hovered() || pr.dragged(), self.zoom);
@@ -567,15 +820,22 @@ impl GraphEditor {
                 } else if resp.secondary_clicked() && !session.node_sel.contains(id) {
                     session.set_node_selection(NodeSelection::single(id));
                 }
-                if resp.double_clicked() {
-                    session.viewed_node = Some(id);
-                }
                 if resp.dragged_by(egui::PointerButton::Primary) {
                     let d = resp.drag_delta() / self.zoom;
                     actions.push(Action::Move(id, d));
                 }
             }
             resp.context_menu(|ui| {
+                exposed_port_menus(ui, &node, id, &mut actions);
+                ui.menu_button("Remove exposed port", |ui| {
+                    for (i, port) in node.exposed_inputs().iter().enumerate() {
+                        if let Some(port) = port { if ui.button(format!("Input {}", port.parameter)).clicked() { actions.push(Action::RemoveInput(id, kind.inputs().len() + i)); ui.close(); } }
+                    }
+                    for (i, port) in node.exposed_outputs().iter().enumerate() {
+                        if let Some(port) = port { if ui.button(format!("Output {}", port.label)).clicked() { actions.push(Action::RemoveOutput(id, kind.outputs().len() + i)); ui.close(); } }
+                    }
+                });
+                ui.separator();
                 if ui.button("Copy  (Ctrl+C)").on_hover_text(PER_IMAGE_NOTE).clicked() {
                     actions.push(Action::Edit(EditOp::Copy));
                     ui.close();
@@ -664,8 +924,12 @@ impl GraphEditor {
             });
         });
         self.edit.list = list_slot;
-        if bg.clicked() && self.search.is_none() && !additive {
-            session.set_node_selection(NodeSelection::default());
+        if bg.double_clicked() && !space && self.conn.is_none() && self.search.is_none() {
+            if let Some(p) = pointer {
+                if let Some(edge) = nearest_wire(&session.project.graph, &xf, p) {
+                    session.project.graph.disconnect_edge(edge);
+                }
+            }
         }
         if let Some(r) = band_rect {
             painter.rect_filled(r, 2.0, Color32::from_rgba_unmultiplied(90, 140, 220, 36));
@@ -676,9 +940,9 @@ impl GraphEditor {
         if let Some(conn) = &self.conn {
             if let Some(p) = pointer.or_else(|| ctx.input(|i| i.pointer.latest_pos())) {
                 match conn {
-                    ConnDrag::FromOutput(src, src_port) => {
+                    ConnDrag::FromOutput(src, src_port, _) => {
                         if let Some(n) = session.project.graph.node(*src) {
-                            let ty = n.kind.outputs().get(*src_port).map_or(PortType::Images, |o| o.ty);
+                            let ty = n.output_type(*src_port).unwrap_or(PortType::Images);
                             draw_wire(&painter, xf.to_screen(output_port(n.pos, *src_port)), p, port_color(ty), self.zoom);
                             let target = nearest_input(&inputs, p, self.zoom, Some(ty));
                             if let Some((_, _, c, _)) = target {
@@ -688,8 +952,8 @@ impl GraphEditor {
                     }
                     ConnDrag::FromInput { node, port } => {
                         if let Some(n) = session.project.graph.node(*node) {
-                            let ty = n.kind.inputs().get(*port).map_or(PortType::Images, |s| s.ty);
-                            draw_wire(&painter, p, xf.to_screen(input_port(n.pos, *port)), port_color(ty), self.zoom);
+                            let ty = n.input_type(*port).unwrap_or(PortType::Images);
+                            draw_wire(&painter, p, xf.to_screen(input_port(n, *port)), port_color(ty), self.zoom);
                             let target = nearest_output(&outputs, p, self.zoom, Some(ty));
                             if let Some((_, _, c, _)) = target {
                                 painter.circle_stroke(c, 9.0 * self.zoom.max(0.8), Stroke::new(2.0, Color32::from_rgb(120, 230, 140)));
@@ -703,18 +967,23 @@ impl GraphEditor {
                 let release = pointer.or_else(|| ctx.input(|i| i.pointer.latest_pos()));
                 let conn = self.conn.take();
                 if let (Some(conn), Some(p)) = (conn, release) {
-                    match conn {
-                        ConnDrag::FromOutput(src, from_port) => {
+                    let over_port = nearest_input(&inputs, p, self.zoom, None).is_some() || nearest_output(&outputs, p, self.zoom, None).is_some();
+                    let over_node = session.project.graph.nodes().any(|n| Rect::from_min_size(xf.to_screen(Pos2::new(n.pos[0], n.pos[1])), actual_node_size(n) * self.zoom).contains(p));
+                    if rect.contains(p) && !over_port && !over_node {
+                        let g = xf.to_graph(p);
+                        self.search = Some(Search { graph_pos: [g.x, g.y], screen_pos: p, query: String::new(), selected: 0, connection: Some(conn) });
+                    } else { match conn {
+                        ConnDrag::FromOutput(src, from_port, old) => {
                             if let Some((to, port, _, _)) = nearest_input(&inputs, p, self.zoom, None) {
-                                actions.push(Action::Connect { from: src, from_port, to, port });
+                                actions.push(Action::Connect { from: src, from_port, to, port, old });
                             }
                         }
                         ConnDrag::FromInput { node, port } => {
                             if let Some((from, from_port, _, _)) = nearest_output(&outputs, p, self.zoom, None) {
-                                actions.push(Action::Connect { from, from_port, to: node, port });
+                                actions.push(Action::Connect { from, from_port, to: node, port, old: None });
                             }
                         }
-                    }
+                    }}
                 }
             }
             ctx.request_repaint();
@@ -755,24 +1024,7 @@ impl GraphEditor {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn paint_node(
-        &self,
-        painter: &egui::Painter,
-        session: &Session,
-        id: NodeId,
-        node_rect: Rect,
-        selected: Sel,
-        viewed: bool,
-        image: ImageId,
-    ) {
-        let Some(node) = session.project.graph.node(id) else { return };
-        let z = self.zoom;
-        let r = (7.0 * z).round().clamp(2.0, 20.0) as u8;
-        painter.rect_filled(node_rect.translate(Vec2::new(2.0, 3.0) * z), r, Color32::from_black_alpha(70));
-        painter.rect_filled(node_rect, r, Color32::from_rgb(44, 47, 54));
-        let title = Rect::from_min_size(node_rect.min, Vec2::new(node_rect.width(), TITLE_H * z));
-        painter.rect_filled(title, CornerRadius { nw: r, ne: r, sw: 0, se: 0 }, title_color(node.kind));
+    fn paint_outline(&self, painter: &egui::Painter, node_rect: Rect, selected: Sel, viewed: bool) {
         let outline = if selected == Sel::Primary {
             Stroke::new(2.5, COLOR_SELECTED)
         } else if selected == Sel::Member {
@@ -782,26 +1034,54 @@ impl GraphEditor {
         } else {
             Stroke::new(1.0, Color32::from_rgb(84, 89, 99))
         };
-        painter.rect_stroke(node_rect, r, outline, StrokeKind::Inside);
+        painter.rect_stroke(node_rect, self.node_radius(), outline, StrokeKind::Inside);
+    }
+
+    fn node_radius(&self) -> u8 {
+        (7.0 * self.zoom).round().clamp(2.0, 20.0) as u8
+    }
+
+    fn paint_node(
+        &self,
+        painter: &egui::Painter,
+        session: &Session,
+        id: NodeId,
+        node_rect: Rect,
+        title: &TitleBar,
+        image: ImageId,
+    ) {
+        let Some(node) = session.project.graph.node(id) else { return };
+        let z = self.zoom;
+        let r = self.node_radius();
+        painter.rect_filled(node_rect.translate(Vec2::new(2.0, 3.0) * z), r, Color32::from_black_alpha(70));
+        painter.rect_filled(node_rect, r, Color32::from_rgb(44, 47, 54));
+        painter.rect_filled(title.rect, CornerRadius { nw: r, ne: r, sw: 0, se: 0 }, title_color(node.kind));
 
         if z < 0.35 {
             return;
         }
-        painter.text(
-            node_rect.min + Vec2::new(8.0, TITLE_H / 2.0) * z,
-            Align2::LEFT_CENTER,
-            node.kind.label(),
-            FontId::proportional(13.0 * z),
-            Color32::from_gray(240),
-        );
+        let color = Color32::from_gray(240);
+        let mut job = egui::text::LayoutJob::simple_singleline(node.kind.label().to_owned(), FontId::proportional(13.0 * z), color);
+        job.wrap.max_width = title.text.width();
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        let galley = painter.layout_job(job);
+        let text_rect = Align2::CENTER_CENTER.anchor_size(title.text.center(), galley.size());
+        painter.with_clip_rect(title.text).galley(text_rect.min, galley, color);
         if z < 0.5 {
             return;
         }
         let label_font = FontId::proportional(11.5 * z);
         let label_color = Color32::from_gray(176);
         for (i, spec) in node.kind.inputs().iter().enumerate() {
-            let p = node_rect.min + (input_port([0.0, 0.0], i).to_vec2()) * z;
+            let p = node_rect.min + (builtin_input_port([0.0, 0.0], i).to_vec2()) * z;
             painter.text(p + Vec2::new(11.0 * z, 0.0), Align2::LEFT_CENTER, spec.label, label_font.clone(), label_color);
+        }
+        for (i, output) in node.exposed_outputs().iter().enumerate() {
+            if let Some(output) = output {
+                let p = node_rect.min + output_port([0.0, 0.0], node.kind.outputs().len() + i).to_vec2() * z;
+                painter.text(p - Vec2::new(11.0 * z, 0.0), Align2::RIGHT_CENTER, &output.label, label_font.clone(), label_color);
+            }
         }
         let is_split = node.kind == NodeKind::MetadataSplit;
         let defined = match node.data(image) {
@@ -811,11 +1091,7 @@ impl GraphEditor {
         for (port, spec) in node.kind.outputs().iter().enumerate() {
             let p = node_rect.min + output_port([0.0, 0.0], port).to_vec2() * z;
             if !is_split {
-                let label = match spec.ty {
-                    PortType::Images => "Images",
-                    PortType::Mask => "Mask",
-                };
-                painter.text(p - Vec2::new(11.0 * z, 0.0), Align2::RIGHT_CENTER, label, label_font.clone(), label_color);
+                painter.text(p - Vec2::new(11.0 * z, 0.0), Align2::RIGHT_CENTER, spec.label, label_font.clone(), label_color);
                 continue;
             }
             // Split by Metadata: range name and how many images leave through the port.
@@ -828,18 +1104,19 @@ impl GraphEditor {
             painter.text(p - Vec2::new(54.0 * z, 0.0), Align2::RIGHT_CENTER, name, label_font.clone(), name_color);
         }
         // Parameter summary for the selected image.
-        let rows = port_rows(node.kind) as f32;
-        let mut y = TITLE_H + 6.0 + rows * ROW_H + 4.0;
         let own = node.mode == Mode::Individual && node.has_individual(image);
         let color = if own { Color32::from_rgb(255, 196, 120) } else { Color32::from_gray(150) };
-        for (label, value) in box_rows(&session.project.graph, node, image) {
-            painter.text(node_rect.min + Vec2::new(10.0, y + PARAM_H / 2.0) * z, Align2::LEFT_CENTER, label, FontId::proportional(11.0 * z), Color32::from_gray(130));
-            painter.text(node_rect.min + Vec2::new(NODE_W - 10.0, y + PARAM_H / 2.0) * z, Align2::RIGHT_CENTER, value, FontId::monospace(11.0 * z), color);
-            y += PARAM_H;
+        for (i, (label, value)) in box_rows(&session.project.graph, node, image).into_iter().enumerate() {
+            let y = parameter_row_y(node, i);
+            #[cfg(test)] if i == 0 && node.exposed_inputs().iter().any(Option::is_some) {
+                painter.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(("parameter_row", id)), node_rect.top() + y * z));
+            }
+            painter.text(node_rect.min + Vec2::new(10.0, y) * z, Align2::LEFT_CENTER, label, FontId::proportional(11.0 * z), Color32::from_gray(130));
+            painter.text(node_rect.min + Vec2::new(NODE_W - 10.0, y) * z, Align2::RIGHT_CENTER, value, FontId::monospace(11.0 * z), color);
         }
-        if has_count(node.kind) {
-            let text = match session.collection.counts.get(&id) {
-                Some(n) => format!("{} img", crate::collection::with_thousands(*n)),
+        {
+            let text = match session.count_for(node) {
+                Some(n) => format!("{} img", crate::collection::with_thousands(n)),
                 None => "... img".to_owned(),
             };
             let cy = node_rect.max.y - (PAD * 0.5 + COUNT_H * 0.5) * z;
@@ -847,36 +1124,26 @@ impl GraphEditor {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn badges(
-        &self,
-        ui: &mut egui::Ui,
-        painter: &egui::Painter,
-        session: &Session,
-        id: NodeId,
-        node_rect: Rect,
-        viewed: bool,
-        issue: Option<&str>,
-        _image: ImageId,
-    ) {
-        let Some(node) = session.project.graph.node(id) else { return };
+    /// Debug timing pill just below the node: time spent in this node for the last preview.
+    fn paint_timing(&self, ui: &mut egui::Ui, painter: &egui::Painter, id: NodeId, node_rect: Rect) {
+        let Some(timings) = &self.timings else { return };
         let z = self.zoom;
-        if z < 0.5 {
-            return;
-        }
-        let h = 16.0 * z;
-        let mut x = node_rect.max.x - 6.0 * z;
-        let cy = node_rect.min.y + TITLE_H * z / 2.0;
+        if z < 0.35 { return; }
+        let Some((text, color, tip)) = timings.label(id) else { return };
+        let font = FontId::monospace(10.5 * z);
+        let galley = painter.layout_no_wrap(text, font, color);
+        let size = galley.size() + Vec2::new(10.0, 4.0) * z;
+        let pill = Rect::from_min_size(Pos2::new(node_rect.right() - size.x, node_rect.bottom() + 4.0 * z), size);
+        painter.rect_filled(pill, (4.0 * z).round() as u8, Color32::from_rgb(28, 30, 35));
+        painter.galley(pill.center() - galley.size() / 2.0, galley, color);
+        ui.interact(pill, ui.scope_id().with(("timing", id.0)), Sense::hover()).on_hover_text(tip);
+        #[cfg(test)] painter.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(("timing_pill", id.0)), pill));
+    }
 
-        // Eye marker for the viewed node.
-        if viewed {
-            let rect = Rect::from_center_size(Pos2::new(x - 9.0 * z, cy), Vec2::new(18.0 * z, h));
-            draw_eye(painter, rect.center(), z);
-            ui.interact(rect, ui.scope_id().with(("eye", id.0)), Sense::hover()).on_hover_text("This node is shown in the viewer");
-            x -= 22.0 * z;
-        }
-        if let Some(msg) = issue {
-            let rect = Rect::from_center_size(Pos2::new(x - 8.0 * z, cy), Vec2::new(16.0 * z, h));
+    fn badges(&self, ui: &mut egui::Ui, painter: &egui::Painter, node: &Node, title: &TitleBar, issue: Option<&str>) {
+        let id = node.id;
+        let z = self.zoom;
+        if let (Some(rect), Some(msg)) = (title.warning, issue) {
             let c = rect.center();
             let tri = vec![
                 Pos2::new(c.x, c.y - 7.5 * z),
@@ -886,35 +1153,36 @@ impl GraphEditor {
             painter.add(egui::Shape::convex_polygon(tri, COLOR_WARN, Stroke::new(1.0, Color32::from_rgb(90, 50, 0))));
             painter.text(Pos2::new(c.x, c.y + 1.5 * z), Align2::CENTER_CENTER, "!", FontId::proportional(11.0 * z), Color32::BLACK);
             ui.interact(rect, ui.scope_id().with(("warn", id.0)), Sense::hover()).on_hover_text(msg);
-            x -= 20.0 * z;
         }
-        if node.kind.params().is_empty() {
-            return;
-        }
-        if node.mode == Mode::Individual {
+        if let Some(rect) = title.count {
             let n = node.individual_count();
-            let text = n.to_string();
-            let w = (10.0 + 6.5 * text.len() as f32) * z;
-            let rect = Rect::from_center_size(Pos2::new(x - w / 2.0, cy), Vec2::new(w, h));
             painter.rect_filled(rect, (4.0 * z).round() as u8, Color32::from_rgb(30, 32, 38));
-            painter.text(rect.center(), Align2::CENTER_CENTER, &text, FontId::monospace(11.0 * z), Color32::from_rgb(255, 205, 140));
+            painter.text(rect.center(), Align2::CENTER_CENTER, n.to_string(), FontId::monospace(11.0 * z), Color32::from_rgb(255, 205, 140));
             ui.interact(rect, ui.scope_id().with(("count", id.0)), Sense::hover())
                 .on_hover_text(format!("{n} image(s) have their own values on this node"));
-            x -= w + 3.0 * z;
         }
-        let rect = Rect::from_center_size(Pos2::new(x - 8.0 * z, cy), Vec2::new(16.0 * z, h));
+        let Some(rect) = title.mode else { return };
         let (letter, fill, tip) = match node.mode {
             Mode::All => ("A", Color32::from_rgb(70, 76, 90), "Mode All: the same values for every image"),
             Mode::Individual => ("I", Color32::from_rgb(214, 128, 40), "Mode Individual: values per image"),
         };
         painter.rect_filled(rect, (4.0 * z).round() as u8, fill);
         painter.text(rect.center(), Align2::CENTER_CENTER, letter, FontId::proportional(11.5 * z), Color32::WHITE);
-        ui.interact(rect, ui.scope_id().with(("mode", id.0)), Sense::hover()).on_hover_text(tip);
+        let _badge = ui.interact(rect, ui.scope_id().with(("mode", id.0)), Sense::hover()).on_hover_text(tip);
+        #[cfg(test)] record_port_control(&_badge, id, "mode");
     }
 
     fn apply(&mut self, actions: Vec<Action>, session: &mut Session, status: &mut Status) {
         for a in actions {
             match a {
+                Action::ExposeInput(id, parameter) => {
+                    if let Err(e) = session.project.graph.expose_parameter(id, parameter, PortType::Images) { status.error(format!("Cannot expose input: {e}")); }
+                }
+                Action::ExposeOutput(id, source, label) => {
+                    if let Err(e) = session.project.graph.expose_output(id, source, label) { status.error(format!("Cannot expose output: {e}")); }
+                }
+                Action::RemoveInput(id, port) => { session.project.graph.remove_exposed_input(id, port); }
+                Action::RemoveOutput(id, port) => { session.project.graph.remove_exposed_output(id, port); }
                 Action::Move(id, d) => {
                     // A selected node drags the whole selection along.
                     let ids: Vec<NodeId> = if session.node_sel.contains(id) && session.node_sel.len() > 1 { session.node_sel.ids().to_vec() } else { vec![id] };
@@ -925,16 +1193,20 @@ impl GraphEditor {
                         }
                     }
                 }
-                Action::Disconnect(node, port) => session.project.graph.disconnect(node, port),
-                Action::Connect { from, from_port, to, port } => match session.project.graph.connect_ports(from, from_port, to, port) {
-                    Ok(()) => {}
-                    Err(e) => status.error(format!("Cannot connect: {e}")),
+                Action::Connect { from, from_port, to, port, old } => {
+                    let mut graph = session.project.graph.clone();
+                    if let Some((node, input)) = old { graph.disconnect_edge(rawgraph_core::graph::Edge { from, from_port, to: node, to_port: input }); }
+                    match graph.connect_ports(from, from_port, to, port) {
+                        Ok(()) => session.project.graph = graph,
+                        Err(e) => status.error(format!("Cannot connect: {e}")),
+                    }
                 },
                 Action::Add(kind, pos) => {
                     let id = session.project.graph.add_node(kind, pos);
+                    if kind == NodeKind::Source { crate::node_ui::set_source_folder(&mut session.project.graph, id, None); }
                     session.set_node_selection(NodeSelection::single(id));
                 }
-                Action::View(id) => session.viewed_node = Some(id),
+                Action::View(id) => { session.viewed_node = None; session.set_node_selection(NodeSelection::single(id)); },
                 Action::Delete(id) => {
                     let result = if session.node_sel.contains(id) && session.node_sel.len() > 1 { session.delete_selected().map(|_| ()) } else { session.delete_node(id) };
                     if let Err(why) = result {
@@ -951,7 +1223,7 @@ impl GraphEditor {
         let mut close = false;
         let mut add: Option<NodeKind> = None;
         let q = search.query.to_lowercase();
-        let matches: Vec<NodeKind> = node_groups().into_iter().flat_map(|(_, kinds)| kinds).filter(|k| k.label().to_lowercase().contains(&q) || group_of(*k).to_lowercase().contains(&q)).collect();
+        let matches: Vec<NodeKind> = node_groups().into_iter().flat_map(|(_, kinds)| kinds).filter(|k| (k.label().to_lowercase().contains(&q) || group_of(*k).to_lowercase().contains(&q)) && search.connection.is_none_or(|c| compatible_port(&session.project.graph, c, *k).is_some())).collect();
         search.selected = search.selected.min(matches.len().saturating_sub(1));
 
         let (down, up, enter, esc) = ctx.input_mut(|i| {
@@ -982,11 +1254,11 @@ impl GraphEditor {
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_width(230.0);
-                    let edit = ui.add(egui::TextEdit::singleline(&mut search.query).hint_text("Add node...").desired_width(f32::INFINITY));
-                    if search.fresh {
-                        edit.request_focus();
-                        search.fresh = false;
-                    }
+                    let input_id = egui::Id::unique("rawgraph_node_search_text");
+                    // Search is the active keyboard target for the lifetime of
+                    // the popup, even when canvas focus is reassigned.
+                    ui.memory_mut(|memory| memory.request_focus(input_id));
+                    ui.add(egui::TextEdit::singleline(&mut search.query).id(input_id).hint_text("Add node...").desired_width(f32::INFINITY));
                     ui.add_space(4.0);
                     if matches.is_empty() {
                         ui.label(egui::RichText::new("No matching node").weak());
@@ -1006,9 +1278,23 @@ impl GraphEditor {
         }
         if let Some(kind) = add {
             let pos = search.graph_pos;
-            let id = session.project.graph.add_node(kind, pos);
-            session.set_node_selection(NodeSelection::single(id));
-            status.info(format!("Added {}", kind.label()));
+            let mut graph = session.project.graph.clone();
+            let port = search.connection.and_then(|c| compatible_port(&graph, c, kind));
+            let id = graph.add_node(kind, pos);
+            if kind == NodeKind::Source { crate::node_ui::set_source_folder(&mut graph, id, None); }
+            let result = match (search.connection, port) {
+                (Some(ConnDrag::FromOutput(src, src_port, old)), Some(port)) => {
+                    if let Some((node, input)) = old { graph.disconnect_edge(rawgraph_core::graph::Edge { from: src, from_port: src_port, to: node, to_port: input }); }
+                    graph.connect_ports(src, src_port, id, port)
+                }
+                (Some(ConnDrag::FromInput { node, port }), Some(from_port)) => graph.connect_ports(id, from_port, node, port),
+                (None, _) => Ok(()),
+                _ => { self.search = None; return; }
+            };
+            match result {
+                Ok(()) => { session.project.graph = graph; session.set_node_selection(NodeSelection::single(id)); status.info(format!("Added {}", kind.label())); }
+                Err(e) => status.error(format!("Cannot connect: {e}")),
+            }
         }
         if close {
             self.search = None;
@@ -1017,14 +1303,31 @@ impl GraphEditor {
 }
 
 enum Action {
+    ExposeInput(NodeId, &'static str),
+
+    ExposeOutput(NodeId, usize, &'static str),
+    RemoveInput(NodeId, usize),
+    RemoveOutput(NodeId, usize),
     Move(NodeId, Vec2),
-    Disconnect(NodeId, usize),
-    Connect { from: NodeId, from_port: usize, to: NodeId, port: usize },
+    Connect { from: NodeId, from_port: usize, to: NodeId, port: usize, old: Option<(NodeId, usize)> },
     Add(NodeKind, [f32; 2]),
     View(NodeId),
     Delete(NodeId),
     /// An editing command that runs at the start of the next frame.
     Edit(EditOp),
+}
+
+fn compatible_port(graph: &Graph, conn: ConnDrag, kind: NodeKind) -> Option<usize> {
+    match conn {
+        ConnDrag::FromOutput(node, port, _) => {
+            let ty = graph.node(node)?.output_type(port)?;
+            kind.inputs().iter().position(|p| p.ty == ty)
+        }
+        ConnDrag::FromInput { node, port } => {
+            let ty = graph.node(node)?.input_type(port)?;
+            kind.outputs().iter().position(|p| p.ty == ty)
+        }
+    }
 }
 
 fn hit_radius(zoom: f32) -> f32 {
@@ -1054,9 +1357,34 @@ fn nearest_output(outputs: &[(NodeId, usize, Pos2, PortType)], p: Pos2, zoom: f3
         .copied()
 }
 
-fn draw_wire(painter: &egui::Painter, from: Pos2, to: Pos2, color: Color32, zoom: f32) {
+fn wire_points(from: Pos2, to: Pos2, zoom: f32) -> [Pos2; 4] {
     let dx = ((to.x - from.x).abs() * 0.5).max(50.0 * zoom);
-    let pts = [from, from + Vec2::new(dx, 0.0), to - Vec2::new(dx, 0.0), to];
+    [from, from + Vec2::new(dx, 0.0), to - Vec2::new(dx, 0.0), to]
+}
+
+fn nearest_wire(graph: &Graph, xf: &Xform, p: Pos2) -> Option<rawgraph_core::graph::Edge> {
+    let mut best = 8.0_f32;
+    let mut hit = None;
+    for edge in graph.edges() {
+        let (Some(from), Some(to)) = (graph.node(edge.from), graph.node(edge.to)) else { continue };
+        let pts = wire_points(xf.to_screen(output_port(from.pos, edge.from_port)), xf.to_screen(input_port(to, edge.to_port)), xf.zoom);
+        let mut prev = pts[0];
+        for i in 1..=64 {
+            let t = i as f32 / 64.0;
+            let u = 1.0 - t;
+            let q = (pts[0].to_vec2() * (u*u*u) + pts[1].to_vec2() * (3.0*u*u*t) + pts[2].to_vec2() * (3.0*u*t*t) + pts[3].to_vec2() * (t*t*t)).to_pos2();
+            let d = q - prev;
+            let fraction = if d.length_sq() > 0.0 { ((p - prev).dot(d) / d.length_sq()).clamp(0.0, 1.0) } else { 0.0 };
+            let distance = p.distance(prev + d * fraction);
+            if distance < best { best = distance; hit = Some(*edge); }
+            prev = q;
+        }
+    }
+    hit
+}
+
+fn draw_wire(painter: &egui::Painter, from: Pos2, to: Pos2, color: Color32, zoom: f32) {
+    let pts = wire_points(from, to, zoom);
     painter.add(CubicBezierShape::from_points_stroke(pts, false, Color32::TRANSPARENT, Stroke::new((2.2 * zoom).max(1.2), color)));
 }
 
@@ -1065,37 +1393,45 @@ fn draw_port(painter: &egui::Painter, c: Pos2, ty: PortType, connected: bool, ho
     let color = port_color(ty);
     let fill = if connected || hot { color } else { Color32::from_rgb(30, 32, 38) };
     let stroke = Stroke::new((1.6 * zoom).max(1.0), if hot { Color32::WHITE } else { color });
-    match ty {
-        PortType::Images => {
-            painter.circle_filled(c, r, fill);
-            painter.circle_stroke(c, r, stroke);
-        }
-        PortType::Mask => {
-            // Hollow diamond while nothing is connected, filled once it is.
-            let d = r * 1.35;
-            let pts = vec![Pos2::new(c.x, c.y - d), Pos2::new(c.x + d, c.y), Pos2::new(c.x, c.y + d), Pos2::new(c.x - d, c.y)];
-            let hollow = Stroke::new((2.0 * zoom).max(1.4), if hot { Color32::WHITE } else { color });
-            let fill = if connected || hot { color } else { Color32::from_rgb(44, 47, 54) };
-            painter.add(egui::Shape::convex_polygon(pts, fill, hollow));
-        }
-    }
+    painter.circle_filled(c, r, fill);
+    painter.circle_stroke(c, r, stroke);
 }
 
-fn draw_eye(painter: &egui::Painter, c: Pos2, z: f32) {
-    let w = 8.5 * z;
-    let h = 5.0 * z;
-    let stroke = Stroke::new((1.5 * z).max(1.0), Color32::WHITE);
-    let upper = [Pos2::new(c.x - w, c.y), Pos2::new(c.x - w * 0.5, c.y - h * 1.5), Pos2::new(c.x + w * 0.5, c.y - h * 1.5), Pos2::new(c.x + w, c.y)];
-    let lower = [Pos2::new(c.x - w, c.y), Pos2::new(c.x - w * 0.5, c.y + h * 1.5), Pos2::new(c.x + w * 0.5, c.y + h * 1.5), Pos2::new(c.x + w, c.y)];
-    painter.add(CubicBezierShape::from_points_stroke(upper, false, Color32::TRANSPARENT, stroke));
-    painter.add(CubicBezierShape::from_points_stroke(lower, false, Color32::TRANSPARENT, stroke));
-    painter.circle_filled(c, 2.8 * z, Color32::WHITE);
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::demo_graph;
+
+    #[test]
+    fn windows_drop_coordinates_use_screen_dpi_and_canvas_bounds() {
+        let inner = Rect::from_min_size(Pos2::new(-800.0, 100.0), Vec2::new(800.0, 600.0));
+        let canvas = Rect::from_min_max(Pos2::new(200.0, 100.0), Pos2::new(700.0, 500.0));
+        assert_eq!(screen_to_canvas([-900, 450], 1.5, inner, canvas), Some(Pos2::new(200.0, 200.0)));
+        assert_eq!(screen_to_canvas([-1050, 450], 1.5, inner, canvas), None); // sidebar
+        assert_eq!(screen_to_canvas([100, 450], 1.5, inner, canvas), None); // other window
+        assert_eq!(screen_to_canvas([-900, 450], 0.0, inner, canvas), None);
+        let xf = Xform { origin: canvas.min, pan: Vec2::new(40.0, -20.0), zoom: 2.0 };
+        assert_eq!(xf.to_graph(Pos2::new(200.0, 200.0)), Pos2::new(-20.0, 60.0));
+    }
+
+    #[test]
+    fn dropped_folders_create_sources_and_schedule_scans() {
+        let mut session = crate::session::tests::demo_session();
+        session.new_project();
+        let before = crate::node_ui::source_states(&session.project.graph);
+        let paths = vec![std::path::PathBuf::from("/test/a"), std::path::PathBuf::from("/test/b")];
+        add_dropped_folders(&mut session, Pos2::new(40.0, 60.0), &paths);
+        let after = crate::node_ui::source_states(&session.project.graph);
+        let scans = crate::node_ui::scans_needed(&before, &after, &|_, _| false);
+        assert_eq!(scans.len(), 2);
+        assert!(paths.iter().all(|p| scans.iter().any(|(folder, _)| folder == p)));
+        let created: Vec<_> = session.project.graph.nodes().filter(|n| crate::node_ui::source_folder(n).is_some_and(|f| f == "/test/a" || f == "/test/b")).collect();
+        assert_eq!(created.len(), 2);
+        assert_eq!(created[0].pos, [40.0, 60.0]);
+        assert_eq!(created[1].pos, [40.0, 220.0]);
+        assert!(session.dirty);
+    }
 
     #[test]
     fn transform_roundtrip_and_zoom_anchor() {
@@ -1110,12 +1446,151 @@ mod tests {
     }
 
     #[test]
+    fn exposed_ports_layout_hit_testing_and_removal() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [0.0, 0.0]);
+        let exp = g.add_node(NodeKind::Exposure, [300.0, 0.0]);
+        let input = g.expose_parameter(exp, "ev", PortType::Images).unwrap();
+        let output = g.expose_output(src, 0, "Luma").unwrap();
+        g.connect_ports(src, output, exp, input).unwrap();
+        let n = g.node(exp).unwrap();
+        assert!(input_port(n, input).y < n.pos[1] + actual_node_size(n).y);
+        let p = input_port(n, input);
+        assert_eq!(nearest_input(&[(exp, input, p, PortType::Images)], p, 1.0, Some(PortType::Images)).unwrap().1, input);
+        assert_eq!(compatible_port(&g, ConnDrag::FromOutput(src, output, None), NodeKind::Exposure), Some(0));
+        assert!(g.remove_exposed_input(exp, input));
+        assert!(g.edges().is_empty());
+        let next = g.expose_parameter(exp, "ev", PortType::Images).unwrap();
+        assert!(next > input);
+        assert!(g.node(exp).unwrap().input_type(input).is_none());
+    }
+
+    fn port_control(h: &Harness, id: NodeId, name: &'static str) -> Rect {
+        h.ctx.data(|d| d.get_temp(egui::Id::unique(("port_control", id, name))).expect(name))
+    }
+
+    #[test]
+    fn per_node_timing_is_drawn_under_each_node_and_hidden_when_off() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [40.0, 40.0]);
+        let exp = g.add_node(NodeKind::Exposure, [300.0, 40.0]);
+        g.connect(src, exp, 0).unwrap();
+        let mut h = Harness::new(g);
+        let pill = |h: &Harness, id: NodeId| h.ctx.data(|d| d.get_temp::<Rect>(egui::Id::unique(("timing_pill", id.0))));
+        assert!(pill(&h, exp).is_none(), "no timing labels while the debug option is off");
+        let row = |node, ms: u64, computed, cache_hits| rawgraph_engine::NodeTiming { node, cpu: std::time::Duration::from_millis(ms), computed, cache_hits };
+        let t = NodeTimings::new(&[row(src, 0, 0, 1), row(exp, 12, 1, 0)], false);
+        assert_eq!(t.label(exp).unwrap().0, "12 ms");
+        assert_eq!(t.label(src).unwrap().0, "cached");
+        assert_eq!(t.label(exp).unwrap().1, Color32::from_rgb(235, 110, 95), "the node with most of the time is highlighted");
+        h.ed.timings = Some(t);
+        h.settle();
+        let node_rect = |h: &Harness, id: NodeId| {
+            let n = h.s.project.graph.node(id).unwrap();
+            let xf = h.xf();
+            Rect::from_min_size(xf.to_screen(Pos2::new(n.pos[0], n.pos[1])), actual_node_size(n) * xf.zoom)
+        };
+        let (rect, p) = (node_rect(&h, exp), pill(&h, exp).expect("timing pill drawn"));
+        assert!(p.top() >= rect.bottom() && (p.right() - rect.right()).abs() < 1e-3, "pill sits right under the node");
+        assert!(pill(&h, src).is_some());
+    }
+
+    #[test]
+    fn inset_port_tabs_open_menus_without_selecting_or_dragging_the_node() {
+        let (graph, src, id, _) = loose_graph();
+        let mut h = Harness::new(graph);
+        h.click(h.node_title_pos(src));
+        let original = h.s.project.graph.node(id).unwrap().pos;
+        let xf = h.xf();
+        let node_rect = Rect::from_min_size(xf.to_screen(Pos2::from(original)), node_size(NodeKind::Exposure) * xf.zoom);
+        let title_rect = Rect::from_min_size(node_rect.min, Vec2::new(node_rect.width(), TITLE_H * xf.zoom));
+        let input = port_control(&h, id, "input");
+        let output = port_control(&h, id, "output");
+        let mode = port_control(&h, id, "mode");
+        for tab in [input, output] {
+            assert!(title_rect.contains_rect(tab));
+            assert!(node_rect.shrink(4.0 * xf.zoom).contains_rect(tab));
+            assert!((tab.width() - TAB_SIZE * xf.zoom).abs() < 1e-4);
+            assert!((tab.center().y - title_rect.center().y).abs() < 1e-4);
+        }
+        assert!((input.left() - node_rect.left() - TAB_INSET * xf.zoom).abs() < 1e-4);
+        assert!((node_rect.right() - output.right() - TAB_INSET * xf.zoom).abs() < 1e-4);
+        assert!(output.left() - mode.right() >= TITLE_GAP * xf.zoom - 1e-4);
+
+        h.drag(input.center(), input.center() + Vec2::new(65.0, 20.0));
+        assert_eq!(h.s.selected_node, Some(src));
+        assert_eq!(h.s.project.graph.node(id).unwrap().pos, original);
+        h.click(input.center());
+        assert_eq!(h.s.selected_node, Some(src));
+        h.click(port_control(&h, id, "input_item").center());
+        let node = h.s.project.graph.node(id).unwrap();
+        let port = node.kind.inputs().len();
+        assert_eq!(node.exposed_inputs()[0].as_ref().unwrap().parameter, "ev");
+        assert_eq!(summary_rows(node, h.s.current_image()), vec![("Exposure".into(), "0.00 EV".into())]);
+        let row_y = h.ctx.data(|d| d.get_temp::<f32>(egui::Id::unique(("parameter_row", id))).unwrap());
+        assert!((port_control(&h, id, "parameter_port").center().y - row_y).abs() < 1e-4);
+        assert!((h.in_port(id, port).y - row_y).abs() < 1e-4);
+
+        h.click(output.center());
+        assert_eq!(h.s.selected_node, Some(src));
+        h.click(port_control(&h, id, "output_item").center());
+        let node = h.s.project.graph.node(id).unwrap();
+        assert_eq!(node.exposed_outputs()[0].as_ref().unwrap().label, "Luma");
+        assert_eq!(node.pos, original);
+        let undo_output = h.hist.undo().unwrap();
+        assert!(undo_output.node(id).unwrap().exposed_outputs().iter().flatten().next().is_none());
+        assert_eq!(undo_output.node(id).unwrap().exposed_inputs()[0].as_ref().unwrap().parameter, "ev");
+        let undo_input = h.hist.undo().unwrap();
+        assert!(undo_input.node(id).unwrap().exposed_inputs().iter().flatten().next().is_none());
+    }
+
+    #[test]
+    fn dragging_a_wire_to_and_from_an_inline_parameter_port() {
+        let (mut graph, src, id, _) = loose_graph();
+        let port = graph.expose_parameter(id, "ev", PortType::Images).unwrap();
+        let mut h = Harness::new(graph);
+        let image = h.s.current_image();
+        h.s.project.graph.node_mut(id).unwrap().set_param("ev", image, 1.51);
+        h.settle();
+        assert_eq!(summary_rows(h.s.project.graph.node(id).unwrap(), image), vec![("Exposure".into(), "1.51 EV".into())]);
+        let source = h.out_port(src);
+        let parameter = port_control(&h, id, "parameter_port").center();
+        h.drag(source, parameter);
+        assert_eq!(h.s.project.graph.input_edge(id, port), Some((src, 0)));
+        h.drag(parameter, h.in_port(id, 0));
+        assert_eq!(h.s.project.graph.input_edge(id, port), None);
+        assert_eq!(h.s.project.graph.input_edge(id, 0), Some((src, 0)));
+    }
+
+    #[test]
+    fn all_exposed_develop_parameters_fit_and_removed_slots_leave_no_gap() {
+        let mut graph = Graph::new();
+        let id = graph.add_node(NodeKind::Develop, [0.0, 0.0]);
+        let keys = Graph::supported_parameter_inputs(NodeKind::Develop);
+        let ports: Vec<_> = keys.iter().map(|key| graph.expose_parameter(id, key, PortType::Images).unwrap()).collect();
+        let image = ImageId(1);
+        let node = graph.node_mut(id).unwrap();
+        node.set_param("saturation", image, 0.25);
+        let rows = summary_rows(node, image);
+        assert_eq!(rows.len(), 7); // Six exposed parameters and the overflow note.
+        assert!(rows[6].0.contains("+1"));
+        for (i, (&port, key)) in ports.iter().zip(keys).enumerate() {
+            assert_eq!(rows[i].0, node.kind.param_spec(key).unwrap().label);
+            assert_eq!(input_port(node, port).y, parameter_row_y(node, i));
+        }
+        assert!(parameter_row_y(node, 6) < actual_node_size(node).y - COUNT_H);
+        assert!(graph.remove_exposed_input(id, ports[0]));
+        let node = graph.node(id).unwrap();
+        assert_eq!(input_port(node, ports[1]).y, parameter_row_y(node, 0));
+    }
+
+    #[test]
     fn ports_lie_on_the_node_edges() {
         for kind in NodeKind::ALL {
             let size = node_size(kind);
             let origin = [0.0, 0.0];
             for i in 0..kind.inputs().len() {
-                let p = input_port(origin, i);
+                let p = builtin_input_port(origin, i);
                 assert_eq!(p.x, 0.0);
                 assert!(p.y > TITLE_H && p.y < size.y, "{kind:?} input {i} inside node");
             }
@@ -1186,6 +1661,7 @@ mod tests {
         pos: Pos2,
         mods: Modifiers,
         last_mods: Modifiers,
+        other_input: Option<String>,
         hist: crate::history::History,
     }
 
@@ -1204,6 +1680,7 @@ mod tests {
                 pos: Pos2::new(5.0, 5.0),
                 mods: Modifiers::NONE,
                 last_mods: Modifiers::NONE,
+                other_input: None,
                 hist: crate::history::History::new(&Graph::new()),
             };
             h.hist.reset(&h.s.project.graph);
@@ -1224,9 +1701,14 @@ mod tests {
                 ..Default::default()
             };
             self.t += 0.04;
-            let (ed, s, st) = (&mut self.ed, &mut self.s, &mut self.st);
+            let (ed, s, st, other_input) = (&mut self.ed, &mut self.s, &mut self.st, &mut self.other_input);
             let out = self.ctx.run_ui(input, |ui| {
-                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| ed.show(ui, s, st));
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    if let Some(text) = other_input {
+                        ui.add(egui::TextEdit::singleline(text).id(egui::Id::unique("test_other_input")));
+                    }
+                    ed.show(ui, s, st);
+                });
             });
             out.drop_without_applying_deltas();
             let gesture = self.ctx.input(|i| i.pointer.any_down());
@@ -1289,8 +1771,18 @@ mod tests {
         }
 
         fn in_port(&self, id: NodeId, port: usize) -> Pos2 {
-            self.xf().to_screen(input_port(self.s.project.graph.node(id).unwrap().pos, port))
+            self.xf().to_screen(input_port(self.s.project.graph.node(id).unwrap(), port))
         }
+    }
+
+    #[test]
+    fn clicking_blank_canvas_keeps_the_viewed_node() {
+        let (g, _, exp, _) = loose_graph();
+        let mut h = Harness::new(g);
+        h.click(h.node_title_pos(exp));
+        h.click(Pos2::new(450.0, 420.0));
+        assert_eq!(h.s.selected_node, Some(exp));
+        assert_eq!(h.s.target_node(), Some(exp));
     }
 
     fn loose_graph() -> (Graph, NodeId, NodeId, NodeId) {
@@ -1311,25 +1803,28 @@ mod tests {
     }
 
     #[test]
-    fn dragging_a_wire_off_an_input_disconnects_it() {
+    fn dropping_an_output_on_blank_canvas_adds_and_wires_a_node() {
+        let (g, src, _, _) = loose_graph();
+        let mut h = Harness::new(g);
+        h.drag(h.out_port(src), Pos2::new(450.0, 420.0));
+        assert!(h.ed.search.is_some());
+        h.frame(vec![Event::Text("Exposure".to_owned())]);
+        h.key(Key::Enter);
+        let added = h.s.selected_node.expect("the added node is selected");
+        assert_eq!(h.s.project.graph.nodes().count(), 4);
+        assert_eq!(h.s.project.graph.node(added).unwrap().kind, NodeKind::Exposure);
+        assert_eq!(h.s.project.graph.input_of(added, 0), Some(src));
+    }
+
+    #[test]
+    fn dragging_a_wire_off_an_input_preserves_it_until_confirmed() {
         let (mut g, src, exp, _) = loose_graph();
         g.connect(src, exp, 0).unwrap();
         let mut h = Harness::new(g);
         let from = h.in_port(exp, 0);
         h.drag(from, Pos2::new(450.0, 420.0));
-        assert_eq!(h.s.project.graph.input_of(exp, 0), None);
-    }
-
-    #[test]
-    fn invalid_connections_are_refused_with_a_message() {
-        let (mut g, _, exp, _) = loose_graph();
-        let mask = g.add_node(NodeKind::GradientMask, [0.0, 150.0]);
-        let mut h = Harness::new(g);
-        let (from, to) = (h.out_port(mask), h.in_port(exp, 0));
-        h.drag(from, to);
-        assert_eq!(h.s.project.graph.input_of(exp, 0), None);
-        let (text, is_error) = h.st.current().expect("a status message");
-        assert!(is_error && text.contains("Cannot connect") && text.contains("Mask"), "{text}");
+        assert_eq!(h.s.project.graph.input_of(exp, 0), Some(src));
+        assert!(h.ed.search.is_some());
     }
 
     #[test]
@@ -1347,7 +1842,7 @@ mod tests {
     }
 
     #[test]
-    fn backspace_deletes_the_selection_but_never_the_last_source() {
+    fn backspace_deletes_the_selection_including_the_last_source() {
         let (g, src, exp, _) = loose_graph();
         let mut h = Harness::new(g);
         h.click(h.node_title_pos(exp));
@@ -1356,21 +1851,19 @@ mod tests {
         assert!(h.s.project.graph.node(exp).is_none());
         h.click(h.node_title_pos(src));
         h.key(Key::Backspace);
-        assert!(h.s.project.graph.node(src).is_some(), "the last Source must stay");
-        assert!(h.st.current().is_some_and(|(t, e)| e && t.contains("last Source")));
+        assert!(h.s.project.graph.node(src).is_none());
+        assert!(!h.st.current().is_some_and(|(_, error)| error));
+        assert!(h.hist.undo().unwrap().node(src).is_some());
     }
 
     #[test]
-    fn double_click_views_a_node() {
+    fn single_click_views_a_node() {
         let (g, _, exp, _) = loose_graph();
         let mut h = Harness::new(g);
         let p = h.node_title_pos(exp);
-        h.move_to(p);
-        for _ in 0..2 {
-            h.button(true);
-            h.button(false);
-        }
-        assert_eq!(h.s.viewed_node, Some(exp));
+        h.click(p);
+        assert_eq!(h.s.target_node(), Some(exp));
+        assert_eq!(h.s.viewed_node, None);
     }
 
     #[test]
@@ -1382,7 +1875,10 @@ mod tests {
         h.ed.open_search = true; // the app sets this from the Tab key
         h.settle();
         assert!(h.ed.search.is_some(), "the search box opens");
-        h.frame(vec![Event::Text("blu".to_owned())]);
+        h.frame(vec![Event::Text("fi".to_owned())]);
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::unique("test_canvas_focus")));
+        h.frame(vec![Event::Text("lte".to_owned())]);
+        assert_eq!(h.ed.search.as_ref().unwrap().query, "filte");
         h.key(Key::Enter);
         h.settle();
         assert_eq!(h.s.project.graph.nodes().count(), before + 1);
@@ -1397,7 +1893,7 @@ mod tests {
         let groups = node_groups();
         for kind in NodeKind::ALL {
             let n = groups.iter().filter(|(_, ks)| ks.contains(&kind)).count();
-            assert_eq!(n, 1, "{kind:?}");
+            assert_eq!(n, usize::from(kind != NodeKind::Output), "{kind:?}");
         }
         assert_eq!(group_of(NodeKind::Merge), "Collection");
     }
@@ -1410,7 +1906,7 @@ mod tests {
         assert_eq!(names, expected, "the order given for the menu");
         assert_eq!(names[0], "Input/Output");
         assert_eq!(names[1], "Develop");
-        assert_eq!(*names.last().unwrap(), "Mask");
+        assert_eq!(*names.last().unwrap(), "Generators");
         for (cat, kinds) in &groups {
             assert!(kinds.iter().all(|k| k.category() == *cat));
         }
@@ -1418,8 +1914,11 @@ mod tests {
         assert_eq!(develop.1, vec![NodeKind::CaptureEv, NodeKind::Develop]);
         let tone: Vec<NodeKind> = groups.iter().find(|(g, _)| *g == "Tone").unwrap().1.clone();
         assert!(tone.contains(&NodeKind::Exposure) && tone.contains(&NodeKind::ToneCurve));
-        let mask = &groups.iter().find(|(g, _)| *g == "Mask").unwrap().1;
-        assert!(mask.contains(&NodeKind::RadialMask) && mask.contains(&NodeKind::GradientMask) && mask.contains(&NodeKind::MaskCombine));
+        let generators = &groups.iter().find(|(g, _)| *g == "Generators").unwrap().1;
+        assert_eq!(generators.len(), 4);
+        for kind in [NodeKind::Generator, NodeKind::Draw, NodeKind::DepthMap, NodeKind::NormalMap] {
+            assert!(generators.contains(&kind));
+        }
     }
 
     #[test]
@@ -1430,6 +1929,10 @@ mod tests {
         assert!(hs.y <= one.y + 5.0 * PARAM_H, "{hs:?} vs {one:?}");
         let mut g = Graph::new();
         let id = g.add_node(NodeKind::HueSaturation, [0.0, 0.0]);
+        assert!(summary_rows(g.node(id).unwrap(), ImageId(1)).is_empty());
+        for spec in NodeKind::HueSaturation.params() {
+            g.node_mut(id).unwrap().set_param(spec.name, ImageId(1), spec.max);
+        }
         let rows = summary_rows(g.node(id).unwrap(), ImageId(1));
         assert_eq!(rows.len(), 5);
         assert!(rows[4].0.starts_with('\u{2026}') && rows[4].0.contains("+14"));
@@ -1451,6 +1954,8 @@ mod tests {
         n.set_param("missing", first, 1.0);
         assert_eq!(summary_rows(g.node(f).unwrap(), first)[1].1, "inverted, missing: include");
         let e = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
+        assert!(summary_rows(g.node(e).unwrap(), first).is_empty());
+        g.node_mut(e).unwrap().set_param("ev", first, 1.0);
         assert_eq!(summary_rows(g.node(e).unwrap(), first)[0].0, "Exposure");
     }
 
@@ -1458,17 +1963,16 @@ mod tests {
     fn merge_has_four_input_ports_in_the_box() {
         let size = node_size(NodeKind::Merge);
         for i in 0..4 {
-            assert!(input_port([0.0, 0.0], i).y < size.y);
+            assert!(builtin_input_port([0.0, 0.0], i).y < size.y);
         }
         assert!(node_size(NodeKind::MetadataFilter).y > node_size(NodeKind::CaptureEv).y);
     }
 
     #[test]
-    fn nearest_port_respects_types() {
+    fn nearest_port_respects_distance() {
         let a = NodeId(1);
-        let inputs = vec![(a, 0, Pos2::new(10.0, 10.0), PortType::Images), (a, 1, Pos2::new(10.0, 40.0), PortType::Mask)];
+        let inputs = vec![(a, 0, Pos2::new(10.0, 10.0), PortType::Images), (a, 1, Pos2::new(10.0, 40.0), PortType::Images)];
         assert_eq!(nearest_input(&inputs, Pos2::new(12.0, 12.0), 1.0, None).map(|x| x.1), Some(0));
-        assert!(nearest_input(&inputs, Pos2::new(12.0, 12.0), 1.0, Some(PortType::Mask)).is_none());
         assert!(nearest_input(&inputs, Pos2::new(300.0, 300.0), 1.0, None).is_none());
     }
 
@@ -1557,18 +2061,6 @@ mod tests {
         assert_eq!(g.output_label(split, 7, img), "", "no such port");
     }
 
-    #[test]
-    fn connections_to_the_wrong_port_type_are_refused_for_every_split_output() {
-        let (mut g, _, split, a, _, _) = split_graph_loose();
-        let mask_user = g.add_node(NodeKind::MaskAdjust, [0.0, 0.0]);
-        let mut h = Harness::new(std::mem::take(&mut g));
-        let (from, to) = (h.out_port_n(split, 5), h.in_port(mask_user, 0));
-        h.drag(from, to);
-        assert_eq!(h.s.project.graph.input_edge(mask_user, 0), None);
-        assert!(h.st.current().is_some_and(|(t, e)| e && t.contains("Cannot connect")));
-        let _ = a;
-    }
-
     // ---- wave 5b: multi-selection, copy / paste, recipes ----
 
     fn row_graph() -> (Graph, NodeId, NodeId, NodeId) {
@@ -1620,12 +2112,12 @@ mod tests {
         // A plain click collapses the selection to the clicked node.
         h.click(h.node_title_pos(a));
         assert_eq!(h.sel(), vec![a]);
-        // Clicking empty space clears it; with Shift held it does not.
+        // Clicking empty space preserves the selection with or without Shift.
         h.click_with(h.node_title_pos(b), Modifiers::SHIFT);
         h.click_with(Pos2::new(300.0, 420.0), Modifiers::SHIFT);
         assert_eq!(h.sel().len(), 2);
         h.click(Pos2::new(300.0, 420.0));
-        assert!(h.sel().is_empty() && h.s.selected_node.is_none());
+        assert_eq!((h.sel(), h.s.selected_node), (vec![a, b], Some(b)));
     }
 
     #[test]
@@ -1687,7 +2179,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_the_selection_in_one_step_and_keeps_the_last_source() {
+    fn delete_removes_the_selection_in_one_step_and_can_empty_the_graph() {
         let (g, a, b, c) = row_graph();
         let mut h = Harness::new(g);
         h.click(h.node_title_pos(b));
@@ -1698,14 +2190,72 @@ mod tests {
         assert!(h.s.project.graph.node(a).is_some());
         assert_eq!(h.undo_steps(), steps + 1, "one undo step for both nodes");
         assert!(h.sel().is_empty());
-        // Everything selected: the Source stays, with a message.
+        // Everything selected: deleting the Source leaves a valid empty graph.
         h.key_with(Key::A, Modifiers::COMMAND);
         h.key(Key::Backspace);
-        assert!(h.s.project.graph.node(a).is_some(), "the last Source stays");
-        assert!(h.st.current().is_some_and(|(t, e)| e && t.contains("last Source")));
-        // The back-history returns the deleted nodes.
+        assert_eq!(h.s.project.graph.nodes().count(), 0);
+        assert!(h.s.project.graph.validate().is_empty());
+        assert!(!h.st.current().is_some_and(|(_, error)| error));
+        assert!(h.hist.undo().unwrap().node(a).is_some());
+        // The earlier back-history returns the other deleted nodes.
         let g = h.hist.undo().unwrap();
         assert!(g.node(b).is_some() && g.node(c).is_some());
+    }
+
+    #[test]
+    fn double_click_wire_disconnects_one_edge_and_undo_restores_it() {
+        let (mut g, a, b, c) = row_graph();
+        g.connect(a, b, 0).unwrap();
+        g.connect(b, c, 0).unwrap();
+        let mut h = Harness::new(g);
+        let from = h.out_port(a);
+        let to = h.xf().to_screen(input_port(h.s.project.graph.node(b).unwrap(), 0));
+        let p = from + (to - from) * 0.5;
+        let steps = h.undo_steps();
+        h.move_to(p);
+        h.button(true); h.button(false);
+        assert_eq!(h.s.project.graph.input_of(b, 0), Some(a));
+        h.button(true); h.button(false);
+        assert_eq!(h.s.project.graph.input_of(b, 0), None);
+        assert_eq!(h.s.project.graph.input_of(c, 0), Some(b));
+        assert_eq!(h.undo_steps(), steps + 1);
+        assert_eq!(h.hist.undo().unwrap().input_of(b, 0), Some(a));
+    }
+
+    #[test]
+    fn clipboard_events_work_with_focused_node_but_not_other_widgets() {
+        let (g, _, b, _) = row_graph();
+        let mut h = Harness::new(g);
+        h.click(h.node_title_pos(b));
+        h.frame(vec![Event::Copy]);
+        let text = h.ed.last_copy().expect("copy with graph focus").to_owned();
+        h.frame(vec![Event::Paste(text.clone())]);
+        assert_eq!(h.s.project.graph.nodes().count(), 4);
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::unique("other widget")));
+        h.frame(vec![Event::Paste(text)]);
+        assert_eq!(h.s.project.graph.nodes().count(), 4);
+    }
+
+    #[test]
+    fn delete_respects_graph_focus_and_can_be_undone() {
+        let (g, _, b, _) = row_graph();
+        let mut h = Harness::new(g);
+        h.click(h.node_title_pos(b));
+        h.other_input = Some("abc".into());
+        h.frame(vec![]);
+        let other = egui::Id::unique("test_other_input");
+        h.ctx.memory_mut(|m| m.request_focus(other));
+        h.key(Key::Delete);
+        assert_eq!(h.ctx.memory(|m| m.focused()), Some(other));
+        assert!(h.s.project.graph.node(b).is_some());
+        h.key(Key::Backspace);
+        assert_eq!(h.ctx.memory(|m| m.focused()), Some(other));
+        assert!(h.s.project.graph.node(b).is_some());
+        h.other_input = None;
+        h.click(h.node_title_pos(b));
+        h.key(Key::Delete);
+        assert!(h.s.project.graph.node(b).is_none());
+        assert!(h.hist.undo().unwrap().node(b).is_some());
     }
 
     #[test]

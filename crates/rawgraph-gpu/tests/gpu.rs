@@ -3,7 +3,7 @@
 //! GPU vs CPU reference tests. Without a GPU adapter every test prints "skipped: no GPU adapter"
 //! and passes. Run with `-- --nocapture` to see the measured maxima.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use rawgraph_core::ops;
 use rawgraph_core::ImageBuf;
@@ -27,10 +27,17 @@ fn shared() -> Option<&'static GpuContext> {
     .as_ref()
 }
 
+/// One test at a time on the shared device: concurrent submissions from several test
+/// threads crash Mesa's llvmpipe software adapter (SIGSEGV), which CI uses.
+fn exclusive() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 macro_rules! gpu {
     () => {
         match shared() {
-            Some(c) => c,
+            Some(c) => (c, exclusive()),
             None => {
                 println!("skipped: no GPU adapter");
                 return;
@@ -130,7 +137,7 @@ fn split_max(errs: &[f32], flags: &[bool]) -> (f32, f32) {
 
 #[test]
 fn adapter_is_reported() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let s = ctx.adapter_summary();
     println!("adapter_summary: {s}");
     assert!(s.contains("max texture"));
@@ -138,7 +145,7 @@ fn adapter_is_reported() {
 
 #[test]
 fn upload_download_is_bit_exact() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     // Odd widths exercise the 256-byte row padding of the readback.
     for (w, h) in [(37u32, 19u32), (16, 16), (257, 131), (1, 1)] {
         let mut img = ImageBuf::new(w, h);
@@ -210,7 +217,7 @@ fn cpu_apply(img: &ImageBuf, ops_list: &[PointOp]) -> ImageBuf {
 
 #[test]
 fn each_point_op_matches_the_cpu() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = test_image(257, 131);
     let src = GpuImage::upload(ctx, &img).unwrap();
     let mut worst = 0.0f32;
@@ -233,7 +240,7 @@ fn each_point_op_matches_the_cpu() {
 
 #[test]
 fn chain_of_all_five_ops_matches_the_cpu() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = test_image(257, 131);
     let src = GpuImage::upload(ctx, &img).unwrap();
     let chain = vec![
@@ -265,7 +272,7 @@ fn tone_pairs() -> [(GpuToneMap, ToneMap); 3] {
 
 #[test]
 fn display_matches_the_cpu_within_one_code_value() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = test_image(257, 131);
     let src = GpuImage::upload(ctx, &img).unwrap();
     for (gt, ct) in tone_pairs() {
@@ -352,7 +359,7 @@ fn extreme_image() -> ImageBuf {
 
 #[test]
 fn extreme_values_display_like_the_cpu() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = extreme_image();
     let src = GpuImage::upload(ctx, &img).unwrap();
     let mut worst = 0u8;
@@ -405,7 +412,7 @@ fn extreme_values_display_like_the_cpu() {
 
 #[test]
 fn display_texture_has_the_same_content_as_display_rgba8() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = test_image(65, 33);
     let src = GpuImage::upload(ctx, &img).unwrap();
     let tex = display_texture(ctx, &src, 0.5, GpuToneMap::AcesFit).unwrap();
@@ -418,7 +425,7 @@ fn display_texture_has_the_same_content_as_display_rgba8() {
 
 #[test]
 fn nan_does_not_poison_neighbours() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let clean = test_image(64, 40);
     let mut nan = clean.clone();
     let mut zeroed = clean.clone();
@@ -448,6 +455,7 @@ fn nan_does_not_poison_neighbours() {
 #[test]
 fn pipelines_are_cached_per_op_kind_sequence() {
     // Fresh context: the counter must not be disturbed by parallel tests.
+    let _gpu = exclusive();
     let Ok(ctx) = GpuContext::new() else {
         println!("skipped: no GPU adapter");
         return;
@@ -483,7 +491,7 @@ fn pipelines_are_cached_per_op_kind_sequence() {
 
 #[test]
 fn error_paths() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     // Zero-sized image.
     let empty = ImageBuf::new(0, 0);
     assert_eq!(GpuImage::upload(ctx, &empty).err(), Some(GpuError::EmptyImage { width: 0, height: 0 }));
@@ -508,7 +516,7 @@ fn error_paths() {
 
 #[test]
 fn into_variants_reuse_targets_and_check_sizes() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = test_image(65, 33);
     let src = GpuImage::upload(ctx, &img).unwrap();
     let dst = GpuImage::upload(ctx, &ImageBuf::new(65, 33)).unwrap();
@@ -555,7 +563,7 @@ fn max_code_diff(a: &[u8], b: &[u8]) -> u8 {
 
 #[test]
 fn render_into_matches_display_path_and_cpu() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = test_image(257, 131);
     let base = GpuImage::upload(ctx, &img).unwrap();
     let scratch = GpuImage::new_empty(ctx, 257, 131).unwrap();
@@ -589,7 +597,7 @@ fn render_into_matches_display_path_and_cpu() {
 
 #[test]
 fn render_into_errors_and_empty_ops_leave_scratch_alone() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = test_image(65, 33);
     let base = GpuImage::upload(ctx, &img).unwrap();
     let scratch = GpuImage::upload(ctx, &ImageBuf::new(65, 33)).unwrap();
@@ -619,6 +627,7 @@ fn render_into_errors_and_empty_ops_leave_scratch_alone() {
 #[test]
 fn render_into_creates_no_pipelines_or_allocations_after_the_first_call() {
     // Fresh context: the counters must not be disturbed by parallel tests.
+    let _gpu = exclusive();
     let Ok(ctx) = GpuContext::new() else {
         println!("skipped: no GPU adapter");
         return;
@@ -808,7 +817,7 @@ fn linear_from_gamma_rgb(srgb: vec3<f32>) -> vec3<f32> {
 
 #[test]
 fn egui_sampling_of_the_display_target_shows_the_cpu_code_values() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let (w, h) = (64u32, 32u32);
     let img = test_image(w, h);
     let base = GpuImage::upload(ctx, &img).unwrap();
@@ -889,7 +898,7 @@ fn samples_vs_cpu(ctx: &GpuContext, img: &ImageBuf, src: &GpuImage, ev: f32, gt:
 
 #[test]
 fn display_samples_match_the_cpu_display_image() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     // 101 x 67: not divisible by 2, 3 or 4.
     let img = test_image(101, 67);
     let src = GpuImage::upload(ctx, &img).unwrap();
@@ -920,6 +929,7 @@ fn display_samples_match_the_cpu_display_image() {
 
 #[test]
 fn display_samples_reuse_their_targets() {
+    let _gpu = exclusive();
     let Ok(ctx) = GpuContext::new() else {
         println!("skipped: no GPU adapter");
         return;
@@ -946,7 +956,7 @@ fn count_differences(a: &[u32], b: &[u32]) -> (usize, u64) {
 
 #[test]
 fn scopes_on_decimated_gpu_samples_agree_with_the_cpu_scopes() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = test_image(101, 67);
     let src = GpuImage::upload(ctx, &img).unwrap();
     for (gt, ct) in [(GpuToneMap::Clip, ToneMap::Clip), (GpuToneMap::AcesFit, ToneMap::AcesFit)] {
@@ -1013,7 +1023,7 @@ fn scopes_on_decimated_gpu_samples_agree_with_the_cpu_scopes() {
 
 #[test]
 fn limit_errors_leave_the_context_usable() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     assert!(!ctx.is_device_lost());
     let max = ctx.max_texture_dimension();
     println!("limits_ok_for(max, max): {}", ctx.limits_ok_for(max, max));
@@ -1125,7 +1135,7 @@ fn max_err(a: &ImageBuf, b: &ImageBuf, tol: f32) -> (f32, usize) {
 
 #[test]
 fn each_new_op_matches_the_cpu() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = wide_image(257, 131);
     let src = GpuImage::upload(ctx, &img).unwrap();
     let mut worst = 0.0f32;
@@ -1146,7 +1156,7 @@ fn each_new_op_matches_the_cpu() {
 
 #[test]
 fn neutral_parameters_leave_the_image_bit_exact() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = wide_image(129, 65);
     let src = GpuImage::upload(ctx, &img).unwrap();
     let neutral = [
@@ -1194,7 +1204,7 @@ fn all_ten_chain() -> Vec<PointOp> {
 
 #[test]
 fn chain_of_all_ten_kinds_matches_the_cpu_and_the_display() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = wide_image(257, 131);
     let src = GpuImage::upload(ctx, &img).unwrap();
     let chain = all_ten_chain();
@@ -1242,7 +1252,7 @@ fn chain_of_all_ten_kinds_matches_the_cpu_and_the_display() {
 
 #[test]
 fn each_new_op_matches_the_cpu_after_the_display_transform() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = wide_image(257, 131);
     let src = GpuImage::upload(ctx, &img).unwrap();
     let mut worst = 0u8;
@@ -1287,7 +1297,7 @@ fn rel_errors_allow_inf(a: &ImageBuf, b: &ImageBuf) -> Vec<f32> {
 
 #[test]
 fn nan_inf_and_negative_inputs_behave_like_the_cpu() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let mut img = wide_image(64, 16);
     let specials: [[f32; 3]; 14] = [
         [f32::NAN, 0.5, 0.5],
@@ -1330,7 +1340,7 @@ fn nan_inf_and_negative_inputs_behave_like_the_cpu() {
 
 #[test]
 fn vignette_on_non_square_and_odd_sizes() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     for (w, h) in [(257u32, 131u32), (101, 37), (300, 64), (64, 300), (65, 65), (63, 8), (2, 2), (1, 1), (1, 9), (9, 1)] {
         let mut img = ImageBuf::new(w, h);
         for y in 0..h {
@@ -1361,6 +1371,7 @@ fn vignette_on_non_square_and_odd_sizes() {
 #[test]
 fn pipeline_cache_and_tables_with_the_new_ops() {
     // Fresh context: the counters must not be disturbed by parallel tests.
+    let _gpu = exclusive();
     let Ok(ctx) = GpuContext::new() else {
         println!("skipped: no GPU adapter");
         return;
@@ -1420,7 +1431,7 @@ fn pipeline_cache_and_tables_with_the_new_ops() {
 
 #[test]
 fn render_into_with_the_new_ops_equals_op_pass_plus_display() {
-    let ctx = gpu!();
+    let (ctx, _gpu) = gpu!();
     let img = wide_image(257, 131);
     let base = GpuImage::upload(ctx, &img).unwrap();
     let scratch = GpuImage::new_empty(ctx, 257, 131).unwrap();
