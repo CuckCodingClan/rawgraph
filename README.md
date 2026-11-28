@@ -687,14 +687,15 @@ The interactive preview runs the trailing operations (pointwise ones, the Develo
 and Sharpen; see "What runs on the GPU") and the display transform on the GPU
 with automatic CPU fallback; everything else, including export, uses the CPU reference path.
 Not yet built: Layer mode "All combinations", HEIC on macOS/Linux, a lens database, GPU versions of Noise
-Reduction, Clarity, Layer and Lens Correction, HDR output and ACES output transforms, merging of concurrent edits, node
-groups and macros, installer and signing, macOS/Linux verification. Interactive use with a real
+Reduction, Clarity, Layer and Lens Correction, HDR output and ACES output transforms, merging of concurrent edits,
+focus stacking, lens distortion correction before stitching, installer and signing, macOS/Linux verification. Interactive use with a real
 mouse and keyboard has not been tested by hand yet. Open questions: `docs/offene-punkte.md`.
 
 Update this section as implementation files are added.
 
 ## Change log
 
+- 2026-11-28 — Release 26.11.3: mask migration (graph formats 1-4 -> 6), GPU Develop local tone / Filter / Sharpen, export preview for more codecs, WebP with ICC, HEIC export (Windows encoder), Depth Map worker process, project-file safety fixes, LUT node, node groups and macros, HDR Merge, Panorama and HDR panorama, keywords, caption-sheet naming and batch rename, multi-monitor workspaces, gallery remembers the last photo per node.
 - 2026-11-28 — Caption sheets and batch rename (Library > Rename files, `{sheet_name}` / `{caption}` / `{no}` export tokens).
 
 - 2026-11-28 — Keywords: project format 3 (`keywords` table, migration from 2), keyword panel and filter, Keyword measure of Metadata Filter / Split by Metadata, XMP keyword import and sidecar export, keywords in exported JPEG / PNG / TIFF / WebP, `{keywords}` file name token.

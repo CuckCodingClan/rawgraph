@@ -3434,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-app"
-version = "26.11.2"
+version = "26.11.3"
 dependencies = [
  "arboard",
  "eframe",
@@ -3460,7 +3460,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-batch"
-version = "26.11.2"
+version = "26.11.3"
 dependencies = [
  "exr",
  "image",
@@ -3475,7 +3475,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-core"
-version = "26.11.2"
+version = "26.11.3"
 dependencies = [
  "rawgraph-io",
  "rawgraph-scopes",
@@ -3486,7 +3486,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-engine"
-version = "26.11.2"
+version = "26.11.3"
 dependencies = [
  "rawgraph-core",
  "rawgraph-fx",
@@ -3498,7 +3498,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-fx"
-version = "26.11.2"
+version = "26.11.3"
 dependencies = [
  "rawgraph-core",
  "rawgraph-io",
@@ -3507,7 +3507,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-gpu"
-version = "26.11.2"
+version = "26.11.3"
 dependencies = [
  "bytemuck",
  "pollster",
@@ -3519,7 +3519,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-io"
-version = "26.11.2"
+version = "26.11.3"
 dependencies = [
  "avif-serialize",
  "chrono",
@@ -3536,7 +3536,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-project"
-version = "26.11.2"
+version = "26.11.3"
 dependencies = [
  "blake3",
  "quick-xml 0.41.0",
@@ -3548,7 +3548,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-rename"
-version = "26.11.2"
+version = "26.11.3"
 dependencies = [
  "calamine",
  "libc",
@@ -3561,7 +3561,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-scope-views"
-version = "26.11.2"
+version = "26.11.3"
 dependencies = [
  "eframe",
  "egui",
@@ -3571,7 +3571,7 @@ dependencies = [
 
 [[package]]
 name = "rawgraph-scopes"
-version = "26.11.2"
+version = "26.11.3"
 dependencies = [
  "rawgraph-core",
  "rayon",
