@@ -91,6 +91,7 @@ fn chain(setup: impl FnOnce(&mut Node, &mut Node)) -> (Graph, NodeId) {
 /// (largest difference in code values, share of differing values) between the GPU frame and the CPU
 /// frame of `graph`; `None` without a GPU adapter. Also asserts the GPU really got a tail.
 fn gpu_vs_cpu(graph: &Graph, out: NodeId, expect_tone_base: bool) -> Option<(u8, f64)> {
+    let _gpu = crate::gpu_real::gpu_test_lock();
     let ctx = match GpuContext::new() {
         Ok(c) => Arc::new(c),
         Err(e) => {

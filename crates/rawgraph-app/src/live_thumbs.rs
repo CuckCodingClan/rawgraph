@@ -235,6 +235,12 @@ impl LiveThumbs {
 
     pub(crate) fn stale(&self, id: ImageId) -> bool { self.stale.contains(&id) }
 
+    /// The edited gallery picture of `id` for the current graph and view, if one is shown.
+    pub(crate) fn current(&mut self, id: ImageId) -> Option<egui::TextureHandle> {
+        if self.stale.contains(&id) || self.state.is_none() { return None; }
+        self.texture(id)
+    }
+
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
         // Bound per-frame uploads, leaving the viewer and input processing first claim on the frame.
         for reply in self.rx.try_iter().take(BATCH) {
@@ -457,6 +463,8 @@ fn run_worker(mail: &(Mutex<Mail>, Condvar), ctx: &egui::Context, live: &Arc<Fil
         let split = pending.iter().take_while(|(id, _, _)| job.wanted.iter().take(job.visible).any(|(visible, _)| visible == id)).count();
         let (visible, nearby) = pending.split_at(split);
         for work in visible.chunks(BATCH).chain(nearby.chunks(BATCH)) {
+            // The viewer's first decode of a new photo has priority over the gallery.
+            live.yield_to_foreground(|| job.cancel.is_cancelled());
             if job.cancel.is_cancelled() { break; }
             // RAW/cache I/O is not graph latency. Warm the visible sources first so a
             // cold decode does not permanently classify Develop as a heavy stage.
@@ -702,6 +710,7 @@ mod tests {
         let after = cpu_pass(&job);
         println!("synthetic warm-base CPU exposure re-render {count} × {EDGE}: {:.2} ms", start.elapsed().as_secs_f64() * 1000.0);
         assert_ne!(before[0], after[0]);
+        let _gpu = crate::gpu_real::gpu_test_lock();
         match GpuBatch::new() {
             Err(error) => println!("GPU unavailable: {error}"),
             Ok(mut gpu) => {
