@@ -2,7 +2,7 @@
 //! import, relinking and clearing the thumbnail cache. They only draw and
 //! report what the user chose; the app carries it out.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Color32, RichText};
 use rawgraph_core::ImageId;
@@ -281,4 +281,39 @@ pub fn clear_cache_window(ctx: &egui::Context, size_text: &str) -> Option<bool> 
         });
     });
     answer
+}
+
+#[derive(Debug, PartialEq)]
+pub enum UnfinishedAction {
+    None,
+    Recover,
+    Cancel,
+}
+
+/// A project file has the journal of an interrupted save beside it and sits on a network drive or in a
+/// sync folder, where another computer may be saving it right now. Plain words, two buttons.
+pub fn unfinished_window(ctx: &egui::Context, file: &Path, error: Option<&str>) -> UnfinishedAction {
+    let mut action = UnfinishedAction::None;
+    egui::Window::new("Unfinished save").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+        ui.set_min_width(520.0);
+        ui.label(RichText::new(file.display().to_string()).strong());
+        ui.add_space(4.0);
+        ui.label("A save of this project was interrupted (the program or the computer stopped while it was writing), or another computer is saving it right now. The project cannot be read until that is cleared up.");
+        ui.label("\"Recover unfinished save\" rolls the file back to its last complete state. Your last save may be lost; nothing else is.");
+        ui.label(warn("Do this only if no other computer is saving this project right now."));
+        if let Some(e) = error {
+            ui.add_space(4.0);
+            ui.label(warn(e));
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("Recover unfinished save").clicked() {
+                action = UnfinishedAction::Recover;
+            }
+            if ui.button("Cancel").clicked() {
+                action = UnfinishedAction::Cancel;
+            }
+        });
+    });
+    action
 }

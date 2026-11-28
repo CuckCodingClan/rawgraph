@@ -25,6 +25,7 @@ mod store;
 pub mod staged;
 mod thumbs;
 mod util;
+mod writemode;
 mod xmp;
 
 #[cfg(test)]
@@ -33,6 +34,8 @@ mod tests;
 mod tests_extra;
 #[cfg(test)]
 mod tests_project;
+#[cfg(test)]
+mod tests_inplace;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -47,6 +50,7 @@ pub use history::HistoryEntry;
 pub use recovery::{discard_recovery, list_recoveries, load_recovery, RecoveryInfo};
 pub use thumbs::ThumbCache;
 pub use util::{content_hash, natural_cmp};
+pub use writemode::{always_rewrite, set_always_rewrite, write_mode, WriteChoice, WriteMode};
 pub use xmp::{parse_xmp_culling, xmp_sidecar_path, XmpCulling};
 
 /// File extension of project files (without the dot).
@@ -211,6 +215,10 @@ pub enum ProjectError {
     Conflict { disk_revision: u64, loaded_revision: u64 },
     /// The file was written by a newer version of the program.
     TooNew { file_version: u32, supported: u32 },
+    /// A save was interrupted (crash, power loss) and left its rollback journal next to the
+    /// project file; the file is not read until the save is rolled back, see
+    /// [`Project::recover_unfinished_save`]. Carries the project file.
+    UnfinishedSave(PathBuf),
 }
 
 impl fmt::Display for ProjectError {
@@ -231,6 +239,13 @@ impl fmt::Display for ProjectError {
                 f,
                 "project file format version {file_version} is newer than this build supports (version {supported})"
             ),
+            ProjectError::UnfinishedSave(file) => {
+                let journal = file.file_name().map(|n| format!("{}-journal", n.to_string_lossy())).unwrap_or_default();
+                write!(
+                    f,
+                    "the project file has an unfinished save next to it ({journal}): open it from the computer that saved it, or recover the unfinished save (only if no other computer is saving this project right now)"
+                )
+            }
         }
     }
 }
@@ -274,6 +289,8 @@ pub struct Project {
     pub(crate) migrated_from: Option<u32>,
     /// Not persisted and not part of equality.
     pub(crate) scan_threads: usize,
+    /// How the last commit really wrote its file; not persisted, not part of equality.
+    pub(crate) last_write: Option<WriteChoice>,
 }
 
 impl PartialEq for Project {
@@ -312,6 +329,7 @@ impl Project {
             folders: Vec::new(),
             migrated_from: None,
             scan_threads: DEFAULT_SCAN_THREADS,
+            last_write: None,
         }
     }
 
@@ -342,6 +360,61 @@ impl Project {
     /// Folders scanned into the project, in the order they were first scanned.
     pub fn folders(&self) -> &[SourceFolder] {
         &self.folders
+    }
+
+    /// Makes this copy of the project continue where `from` is in its commit
+    /// history: revision, history and the "migrated from" note are taken over.
+    ///
+    /// A background scan works on a copy of the project and hands it back when
+    /// it is done. If the original was saved (committed) meanwhile, the copy
+    /// still carries the old revision and history; swapping it in unchanged
+    /// would make the next save conflict with the file the user saved
+    /// themselves. Call this before swapping.
+    pub fn inherit_versioning(&mut self, from: &Project) {
+        self.revision = from.revision;
+        self.history = from.history.clone();
+        self.migrated_from = from.migrated_from;
+    }
+
+    /// Adds the images a running scan has found so far (`found`, any order) and
+    /// replaces the entries it has already changed. Entries for ids that are
+    /// older than the newest entry and unknown here are ignored (the image was
+    /// removed meanwhile). Keeps ids strictly ascending and the id counter ahead
+    /// of every id. Returns how many entries were added or replaced.
+    pub fn merge_found(&mut self, found: &[ImageEntry]) -> usize {
+        let mut sorted: Vec<&ImageEntry> = found.iter().collect();
+        sorted.sort_by_key(|e| e.id);
+        let mut merged = 0;
+        for entry in sorted {
+            if let Some(i) = self.index_of(entry.id) {
+                let old = &self.images[i];
+                // A rescan empties the hash (and marks the capture pending) of files that changed on
+                // disk while it reads them. Such a half-finished entry never replaces a complete one:
+                // the file keeps the old, good values, and because their size and time no longer match
+                // the file, the next scan reads it again.
+                let downgrade = !old.content_hash.is_empty()
+                    && (entry.content_hash.is_empty() || (entry.capture.scan_pending && !old.capture.scan_pending));
+                if !downgrade && *old != *entry {
+                    self.images[i] = entry.clone();
+                    merged += 1;
+                }
+            } else if self.images.last().is_none_or(|last| last.id < entry.id) {
+                self.next_image_id = self.next_image_id.max(entry.id.0 + 1);
+                self.images.push(entry.clone());
+                merged += 1;
+            }
+        }
+        merged
+    }
+
+    /// Records `folder` as scanned (what a scan does first), for a project that
+    /// is saved while the scan is still running.
+    pub fn note_scanned_folder(&mut self, folder: &Path, recursive: bool) {
+        if let Ok(absolute) = std::path::absolute(folder) {
+            if absolute.is_dir() {
+                self.note_folder(&absolute, recursive);
+            }
+        }
     }
 
     fn note_folder(&mut self, folder: &Path, recursive: bool) {
@@ -709,11 +782,37 @@ impl Project {
     /// Writes the current state (images, graph, folders, revision and history,
     /// schema 2) into one SQLite file, replacing its previous content, without
     /// a new revision and without any conflict check (see [`Project::commit`]).
-    /// The new file is written next to the target and swapped in, so a failure
-    /// leaves an existing project file untouched. An existing file of another
-    /// schema version is first copied to `<name>.v<N>.bak`.
+    /// An existing file of this project in the current schema is updated in
+    /// place in one transaction (only what differs is written); any other
+    /// target gets a complete new file that is written next to it and swapped
+    /// in, so a failure leaves an existing project file untouched. An existing
+    /// file of another schema version is first copied to `<name>.v<N>.bak`.
     pub fn save(&self, path: &Path) -> Result<(), ProjectError> {
         store::save(self, path)
+    }
+
+    /// Rolls an interrupted save back (see the module notes in `docs/project-format.md`):
+    /// loading never replays a leftover `<name>-journal`, it fails with a message that
+    /// names it. This opens the file read-write once so SQLite restores the last
+    /// complete state. Call it only when the user asks for it, on the computer that
+    /// saved the file, while no program is saving it. Returns whether a journal was found.
+    pub fn recover_unfinished_save(path: &Path) -> Result<bool, ProjectError> {
+        store::recover_unfinished_save(path)
+    }
+
+    /// Like [`Project::load`], but an interrupted save next to the file is dealt with when
+    /// only this computer writes the file (write mode "in place": a local fixed drive outside
+    /// sync folders): the save is rolled back first and `true` is returned. For network drives
+    /// and sync folders the error `UnfinishedSave` is returned as `load` does, so the caller can
+    /// ask the user (the file may be in use by another computer).
+    pub fn load_recovering(path: &Path) -> Result<(Project, bool), ProjectError> {
+        match store::load(path) {
+            Err(ProjectError::UnfinishedSave(_)) if writemode::write_mode(path).mode == WriteMode::InPlace => {
+                store::recover_unfinished_save(path)?;
+                Ok((store::load(path)?, true))
+            }
+            other => other.map(|p| (p, false)),
+        }
     }
 
     /// Loads a project file. Schema 1 files are migrated in memory (the file
@@ -727,12 +826,13 @@ impl Project {
     /// project with a higher revision than [`Project::revision`] gives
     /// [`ProjectError::Conflict`], a file of another project gives
     /// [`ProjectError::Mismatch`]; nothing is written then. A missing target
-    /// is simply created. Everything is written in one transaction and the
-    /// file is swapped in atomically; if the write fails the project stays
+    /// is simply created. An existing file of this project in the current
+    /// schema is updated in place, in one transaction (rollback journal): the
+    /// conflict check runs inside that transaction under the write lock, so
+    /// check and write are one atomic step. Any other existing target is
+    /// replaced by a complete new file that is swapped in atomically. If the
+    /// write fails the file keeps its old content and the project stays
     /// unchanged. Returns the new revision.
-    ///
-    /// The check and the swap are not one atomic step: two commits at the very
-    /// same moment can both pass the check (there is no locking).
     pub fn commit(&mut self, path: &Path, summary: &str) -> Result<u64, ProjectError> {
         self.commit_impl(path, summary, false)
     }
@@ -743,10 +843,86 @@ impl Project {
         self.commit_impl(path, summary, true)
     }
 
+    /// The history with the entry of `revision` appended (limits applied).
+    fn log_with_commit(&self, revision: u64, summary: &str) -> history::HistoryLog {
+        let mut log = self.history.clone();
+        log.push(
+            HistoryEntry {
+                revision,
+                time_unix_ms: ids::now_ms(),
+                author: ids::author_name(),
+                device: ids::device_name(),
+                summary: summary.to_string(),
+                has_graph: true,
+            },
+            self.graph.to_json(),
+            history::MAX_HISTORY_ENTRIES,
+            history::MAX_SNAPSHOT_BYTES,
+        );
+        log
+    }
+
+    /// How the last [`Project::commit`] really wrote the file (not how it would have liked to):
+    /// in place, or the whole file with the reason (new file, older format, another project's
+    /// file, a change that cannot be made row by row, or the place does not allow in place).
+    pub fn last_write(&self) -> Option<&WriteChoice> {
+        self.last_write.as_ref()
+    }
+
+    /// The check made right before a full write swaps the file in: the file may have been
+    /// committed to since the first look. (Full writes are still not atomic between computers:
+    /// a commit by somebody else between this look and the rename is lost, the last writer wins.)
+    fn recheck_before_swap(&self, path: &Path, overwrite: bool) -> Result<(), ProjectError> {
+        if overwrite || !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+            return Ok(());
+        }
+        let d = store::read_identity(path)?;
+        if d.version > SCHEMA_VERSION {
+            return Err(ProjectError::TooNew { file_version: d.version, supported: SCHEMA_VERSION });
+        }
+        match d.uuid {
+            Some(u) if u == self.uuid && d.revision > self.revision => {
+                Err(ProjectError::Conflict { disk_revision: d.revision, loaded_revision: self.revision })
+            }
+            Some(u) if u != self.uuid => Err(ProjectError::Mismatch(format!(
+                "{} belongs to another project (use commit_overwrite to replace it)",
+                path.display()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     fn commit_impl(&mut self, path: &Path, summary: &str, overwrite: bool) -> Result<u64, ProjectError> {
         let mut base = self.revision;
-        match std::fs::metadata(path) {
-            Ok(meta) if meta.is_file() => {
+        let meta = std::fs::metadata(path);
+        let choice = writemode::write_mode(path);
+        let mut why_whole = if meta.is_err() { "new file".to_owned() } else { choice.reason.clone() };
+        if meta.as_ref().is_ok_and(|m| m.is_file()) && choice.mode == WriteMode::InPlace {
+            // Fast path: the file is a current-schema file of this project. It is
+            // updated in place in one transaction, and the conflict check runs
+            // inside that transaction (atomic with the write).
+            let own = self.revision;
+            let outcome = store::update_in_place(self, path, &mut |disk| {
+                if !overwrite && disk.revision > own {
+                    return Err(ProjectError::Conflict { disk_revision: disk.revision, loaded_revision: own });
+                }
+                let base = if overwrite { own.max(disk.revision) } else { own };
+                let revision = base.checked_add(1).ok_or_else(|| ProjectError::Database("revision overflow".into()))?;
+                Ok((revision, self.log_with_commit(revision, summary)))
+            })?;
+            match outcome {
+                store::InPlace::Written { revision, log } => {
+                    self.revision = revision;
+                    self.history = log;
+                    self.migrated_from = None;
+                    self.last_write = Some(choice);
+                    return Ok(revision);
+                }
+                store::InPlace::NotApplicable(reason) => why_whole = reason.to_owned(),
+            }
+        }
+        match meta {
+            Ok(m) if m.is_file() => {
                 let disk = store::read_identity(path);
                 if overwrite {
                     if let Ok(d) = disk {
@@ -792,24 +968,13 @@ impl Project {
         }
 
         let revision = base.checked_add(1).ok_or_else(|| ProjectError::Database("revision overflow".into()))?;
-        let mut log = self.history.clone();
-        log.push(
-            HistoryEntry {
-                revision,
-                time_unix_ms: ids::now_ms(),
-                author: ids::author_name(),
-                device: ids::device_name(),
-                summary: summary.to_string(),
-                has_graph: true,
-            },
-            self.graph.to_json(),
-            history::MAX_HISTORY_ENTRIES,
-            history::MAX_SNAPSHOT_BYTES,
-        );
-        store::write_file(self, &store::Versioning { revision, log: &log }, path, &[], true)?;
+        let log = self.log_with_commit(revision, summary);
+        let guard = || self.recheck_before_swap(path, overwrite);
+        store::write_file(self, &store::Versioning { revision, log: &log }, path, &[], true, Some(&guard))?;
         self.revision = revision;
         self.history = log;
         self.migrated_from = None;
+        self.last_write = Some(WriteChoice::new(WriteMode::FullRewrite, why_whole));
         Ok(revision)
     }
 }

@@ -154,3 +154,119 @@ mod tests {
         assert!(!h.can_undo() && !h.can_redo());
     }
 }
+
+#[cfg(test)]
+mod memory_tests {
+    use std::collections::HashSet;
+
+    use rawgraph_core::{BrushStroke, ImageId, NodeData, NodeKind};
+
+    use super::*;
+
+    /// Estimate by counting: a fixed 512 bytes per node plus, for stroke data
+    /// of images 1 and 2, 8 bytes per point and 32 bytes per stroke.
+    fn node_bytes(node: &rawgraph_core::Node) -> usize {
+        let strokes = [ImageId(1), ImageId(2)].into_iter().map(|image| match node.data(image) {
+            Some(NodeData::Strokes(s)) => s.iter().map(|k| 32 + k.points.len() * 8).sum(),
+            _ => 0usize,
+        });
+        512 + strokes.sum::<usize>()
+    }
+
+    fn snapshots(h: &History) -> impl Iterator<Item = &Graph> {
+        std::iter::once(&h.baseline).chain(h.undo.iter()).chain(h.redo.iter())
+    }
+
+    /// `(shared, unshared)`: bytes of node data kept by the history when every
+    /// node allocation counts once (what is really held), and when every
+    /// snapshot would hold private copies of all its nodes (the old full copies).
+    fn retained_bytes(h: &History) -> (usize, usize) {
+        let mut seen = HashSet::new();
+        let (mut shared, mut unshared) = (0, 0);
+        for g in snapshots(h) {
+            for n in g.nodes() {
+                let bytes = node_bytes(n);
+                unshared += bytes;
+                if g.node_identity(n.id).is_some_and(|p| seen.insert(p)) {
+                    shared += bytes;
+                }
+            }
+        }
+        (shared, unshared)
+    }
+
+    #[test]
+    fn two_hundred_parameter_edits_share_the_big_draw_node() {
+        let mut g = Graph::new();
+        let draw = g.add_node(NodeKind::Draw, [0.0, 0.0]);
+        let exposure = g.add_node(NodeKind::Exposure, [300.0, 0.0]);
+        // 3,000 strokes of 50 points: the data limit is 2,000 strokes per image, so two images carry 1,500 each.
+        let strokes = |offset: usize| -> Vec<BrushStroke> {
+            (0..1500)
+                .map(|s| BrushStroke {
+                    points: (0..50).map(|p| [((s + offset) % 97) as f32 / 97.0, p as f32 / 50.0]).collect(),
+                    radius: 0.01,
+                    hardness: 0.5,
+                    flow: 1.0,
+                    erase: false,
+                })
+                .collect()
+        };
+        assert!(g.node_mut(draw).unwrap().set_data(ImageId(1), Some(NodeData::Strokes(strokes(0)))));
+        assert!(g.node_mut(draw).unwrap().set_data(ImageId(2), Some(NodeData::Strokes(strokes(1)))));
+        let mut h = History::new(&g);
+        for i in 0..MAX_STEPS {
+            g.node_mut(exposure).unwrap().set_param("ev", ImageId(1), (i + 1) as f32 * 0.01);
+            assert!(h.commit_if_changed(&g, false));
+        }
+        assert_eq!(h.undo_len(), MAX_STEPS);
+        let (shared, unshared) = retained_bytes(&h);
+        eprintln!("undo memory, 3000 strokes x 50 points, {MAX_STEPS} edits of another node: before (full copies) {unshared} bytes, after (shared nodes) {shared} bytes, factor {:.0}", unshared as f64 / shared as f64);
+        let draw_bytes = node_bytes(g.node(draw).unwrap());
+        assert!(draw_bytes > 1_000_000, "the Draw node is big ({draw_bytes} bytes)");
+        assert!(shared < draw_bytes * 2, "one copy of the Draw node plus small nodes, got {shared}");
+        assert!(unshared > draw_bytes * MAX_STEPS, "full copies would hold it in every step");
+        // Every snapshot still has the full data, and undo/redo walk all steps.
+        let back = h.undo().unwrap();
+        assert!(matches!(back.node(draw).unwrap().data(ImageId(1)), Some(NodeData::Strokes(s)) if s.len() == 1500));
+        assert!((back.node(exposure).unwrap().param("ev", ImageId(1)) - 1.99).abs() < 1e-4);
+        assert!(h.redo().is_some());
+    }
+
+    #[test]
+    fn an_edit_copies_only_the_node_it_changes() {
+        let mut g = Graph::new();
+        let a = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
+        let b = g.add_node(NodeKind::Exposure, [100.0, 0.0]);
+        let mut h = History::new(&g);
+        g.node_mut(a).unwrap().set_param("ev", ImageId(1), 1.0);
+        assert!(h.commit_if_changed(&g, false));
+        let before = h.undo.back().unwrap();
+        assert_eq!(before.node_identity(b), g.node_identity(b), "the untouched node is shared");
+        assert_ne!(before.node_identity(a), g.node_identity(a), "the edited node was copied");
+        assert_eq!(before.node(a).unwrap().param("ev", ImageId(1)), 0.0, "the snapshot keeps the old value");
+    }
+
+    #[test]
+    fn multi_node_edit_and_restore_graph_are_single_steps() {
+        let mut g = Graph::new();
+        let a = g.add_node(NodeKind::Exposure, [0.0, 0.0]);
+        let b = g.add_node(NodeKind::Exposure, [100.0, 0.0]);
+        let mut h = History::new(&g);
+        // Two nodes changed in the same frame: one step, both restored by undo.
+        g.node_mut(a).unwrap().set_param("ev", ImageId(1), 1.0);
+        g.node_mut(b).unwrap().pos = [5.0, 5.0];
+        assert!(h.commit_if_changed(&g, false));
+        // A restored whole graph (new nodes, other edges) is one step as well.
+        let mut other = Graph::new();
+        other.add_node(NodeKind::Source, [0.0, 0.0]);
+        assert!(h.commit_if_changed(&other, false));
+        assert_eq!(h.undo_len(), 2);
+        let first = h.undo().unwrap();
+        assert!(first.node(a).unwrap().param("ev", ImageId(1)) == 1.0 && first.nodes().count() == 2 && first.nodes().all(|n| n.kind != NodeKind::Source));
+        let zero = h.undo().unwrap();
+        assert_eq!(zero.node(a).unwrap().param("ev", ImageId(1)), 0.0);
+        assert_eq!(zero.node(b).unwrap().pos, [100.0, 0.0]);
+        assert_eq!(h.redo().unwrap(), first);
+    }
+}

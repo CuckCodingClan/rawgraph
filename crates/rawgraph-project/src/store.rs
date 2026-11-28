@@ -15,13 +15,14 @@
 //! never damages the file on disk; the test `migration_chain_is_complete`
 //! fails if a step is missing.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rawgraph_core::{CaptureInfo, Graph, ImageId};
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, ErrorCode, OpenFlags, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use crate::history::{HistoryEntry, HistoryLog};
 use crate::{ids, ColorLabel, Flag, ImageEntry, Project, ProjectError, SourceFolder, SCHEMA_VERSION};
@@ -75,9 +76,15 @@ fn db_err(e: rusqlite::Error) -> ProjectError {
         if matches!(f.code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) {
             return ProjectError::Corrupt(format!("not a RawGraph project file ({e})"));
         }
+        if matches!(f.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) {
+            return ProjectError::Io(PROJECT_BUSY_TEXT.to_owned());
+        }
     }
     ProjectError::Database(e.to_string())
 }
+
+/// What the user sees when another program or computer holds the project file locked.
+pub(crate) const PROJECT_BUSY_TEXT: &str = "The project file is in use by another program or computer; try again.";
 
 fn flag_to_text(f: Flag) -> &'static str {
     match f {
@@ -216,17 +223,25 @@ fn write_all(
     tx.commit().map_err(db_err)
 }
 
-/// Writes the project's current state (its own revision and history).
+/// Writes the project's current state (its own revision and history). An
+/// existing file of the same project and the current schema is updated in
+/// place (only what differs); anything else is written as a whole new file.
 pub(crate) fn save(project: &Project, path: &Path) -> Result<(), ProjectError> {
+    if path.is_file() && crate::writemode::write_mode(path).mode == crate::writemode::WriteMode::InPlace {
+        let own = (project.revision, project.history.clone());
+        if let InPlace::Written { .. } = update_in_place(project, path, &mut |_| Ok(own.clone()))? {
+            return Ok(());
+        }
+    }
     let ver = Versioning { revision: project.revision, log: &project.history };
-    write_file(project, &ver, path, &[], true)
+    write_file(project, &ver, path, &[], true, None)
 }
 
 /// Like [`save`] with additional `meta` rows (used by recovery files). An
 /// older file at `path` is not backed up: recovery files are disposable.
 pub(crate) fn save_with_meta(project: &Project, path: &Path, extra: &[(&str, String)]) -> Result<(), ProjectError> {
     let ver = Versioning { revision: project.revision, log: &project.history };
-    write_file(project, &ver, path, extra, false)
+    write_file(project, &ver, path, extra, false, None)
 }
 
 /// Writes a complete new file next to the target and swaps it in, so a
@@ -239,6 +254,7 @@ pub(crate) fn write_file(
     path: &Path,
     extra: &[(&str, String)],
     backup: bool,
+    guard: Option<&dyn Fn() -> Result<(), ProjectError>>,
 ) -> Result<(), ProjectError> {
     let mut tmp_name: OsString = path.as_os_str().to_owned();
     tmp_name.push(".saving");
@@ -252,7 +268,24 @@ pub(crate) fn write_file(
         if backup {
             backup_other_version(path)?;
         }
-        std::fs::rename(&tmp, path).map_err(|e| ProjectError::Io(format!("{}: {e}", path.display())))
+        // Narrow the window for a conflict: look at the file once more right before the swap.
+        if let Some(check) = guard {
+            check()?;
+        }
+        // A journal next to the target belongs to the content that is about to be replaced (or to
+        // nothing): it must never sit next to the new file, where SQLite would replay it. It is
+        // moved aside, not replayed (it may be a live writer's or another computer's) and not
+        // deleted; if the swap fails it goes back.
+        let aside = move_journal_aside(path)?;
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some((journal, stale)) = aside {
+                    let _ = std::fs::rename(&stale, &journal);
+                }
+                Err(ProjectError::Io(format!("{}: {e}", path.display())))
+            }
+        }
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -262,7 +295,7 @@ pub(crate) fn write_file(
 
 /// Schema version recorded in a project file, `None` if it is not readable as one.
 fn file_schema_version(path: &Path) -> Option<u32> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let conn = open_read(path).ok()?;
     let text: String = conn
         .query_row("SELECT value FROM meta WHERE key = 'schema_version'", [], |r| r.get(0))
         .optional()
@@ -314,7 +347,7 @@ pub(crate) struct DiskIdentity {
 }
 
 pub(crate) fn read_identity(path: &Path) -> Result<DiskIdentity, ProjectError> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db_err)?;
+    let conn = open_read(path)?;
     let version = read_version(&conn)?;
     // Schema 1 has no project id; a newer schema is not interpreted.
     if !(2..=SCHEMA_VERSION).contains(&version) {
@@ -370,7 +403,7 @@ pub(crate) fn load(path: &Path) -> Result<Project, ProjectError> {
     if !meta.is_file() {
         return Err(ProjectError::Io(format!("{} is not a file", path.display())));
     }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db_err)?;
+    let conn = open_read(path)?;
     let version = read_version(&conn)?;
     if version > SCHEMA_VERSION {
         return Err(ProjectError::TooNew { file_version: version, supported: SCHEMA_VERSION });
@@ -612,12 +645,13 @@ fn read_current(conn: &Connection) -> Result<Project, ProjectError> {
         folders,
         migrated_from: None,
         scan_threads: crate::DEFAULT_SCAN_THREADS,
+        last_write: None,
     })
 }
 
 /// All `meta` rows of a project file plus its image count, read-only.
 pub(crate) fn read_meta(path: &Path) -> Result<(std::collections::HashMap<String, String>, usize), ProjectError> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db_err)?;
+    let conn = open_read(path)?;
     let mut map = std::collections::HashMap::new();
     {
         let mut stmt = conn.prepare("SELECT key, value FROM meta").map_err(db_err)?;
@@ -634,4 +668,436 @@ pub(crate) fn read_meta(path: &Path) -> Result<(std::collections::HashMap<String
 #[cfg(test)]
 pub(crate) fn migration_steps() -> Vec<u32> {
     MIGRATIONS.iter().map(|(f, _)| *f).collect()
+}
+
+// ------------------------------------------------------------------ in-place update
+
+/// How long one lock request waits for another process that holds the file locked (a save asks twice: write lock, then commit; so at most about 4 s).
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+// Test hook (per thread): the next in-place update fails after all rows were written but
+// before the transaction is committed (crash-safety tests).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Decides revision and history of an in-place update from the identity of the file (or refuses).
+pub(crate) type Prepare<'a> = dyn FnMut(&DiskIdentity) -> Result<(u64, HistoryLog), ProjectError> + 'a;
+
+/// Outcome of [`update_in_place`].
+pub(crate) enum InPlace {
+    /// The file now holds the project, with this revision and history.
+    Written { revision: u64, log: HistoryLog },
+    /// The target is not a current-schema file of this project (or cannot be
+    /// updated row by row): the caller writes the whole file instead.
+    NotApplicable(&'static str),
+}
+
+/// Internal: why a row-by-row update stopped.
+enum DiffError {
+    /// A constraint did not allow the row-wise change; a full rewrite will do it.
+    Fallback,
+    Fatal(ProjectError),
+}
+
+impl From<rusqlite::Error> for DiffError {
+    fn from(e: rusqlite::Error) -> Self {
+        if matches!(&e, rusqlite::Error::SqliteFailure(f, _) if f.code == ErrorCode::ConstraintViolation) {
+            DiffError::Fallback
+        } else {
+            DiffError::Fatal(db_err(e))
+        }
+    }
+}
+
+impl From<ProjectError> for DiffError {
+    fn from(e: ProjectError) -> Self {
+        DiffError::Fatal(e)
+    }
+}
+
+fn identity_in(conn: &Connection) -> Option<DiskIdentity> {
+    let version = read_version(conn).ok()?;
+    if version != SCHEMA_VERSION {
+        return None;
+    }
+    let uuid = get_meta(conn, "project_uuid").ok()??;
+    let revision = parse_revision(conn).ok()?;
+    Some(DiskIdentity { version, uuid: Some(uuid), revision })
+}
+
+/// Updates an existing project file of the current schema in place, in ONE
+/// transaction of SQLite's rollback journal: only the image rows, the graph,
+/// the folders and the `meta` values that differ are written, history entries
+/// are appended (pruned ones deleted), old ones are not rewritten.
+///
+/// The transaction takes the write lock first (`BEGIN IMMEDIATE`), reads the
+/// file's identity under that lock and hands it to `prepare`, which decides
+/// the new revision and history or refuses (the revision/conflict check). So
+/// the check and the write are one atomic step with respect to other writers.
+/// A failure of any kind rolls the transaction back and leaves the old content.
+///
+/// The rollback journal (not WAL) is used on purpose: WAL needs shared memory
+/// and does not work on network shares (SMB/NFS) or synced folders; the
+/// rollback journal is a plain file next to the project file.
+pub(crate) fn update_in_place(
+    project: &Project,
+    path: &Path,
+    prepare: &mut Prepare<'_>,
+) -> Result<InPlace, ProjectError> {
+    let Ok(mut conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE) else {
+        return Ok(InPlace::NotApplicable("cannot open the file for update"));
+    };
+    let _ = conn.busy_timeout(BUSY_TIMEOUT);
+    let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+        Ok(tx) => tx,
+        Err(e) => {
+            return match &e {
+                rusqlite::Error::SqliteFailure(f, _) if matches!(f.code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) => Ok(InPlace::NotApplicable("not a project file")),
+                _ => Err(db_err(e)),
+            };
+        }
+    };
+    let Some(identity) = identity_in(&tx) else { return Ok(InPlace::NotApplicable("older file format")) };
+    if identity.uuid.as_deref() != Some(project.uuid.as_str()) {
+        return Ok(InPlace::NotApplicable("file of another project"));
+    }
+    let (revision, log) = prepare(&identity)?;
+    match apply_diff(&tx, project, &Versioning { revision, log: &log }) {
+        Ok(()) => {}
+        Err(DiffError::Fallback) => return Ok(InPlace::NotApplicable("update row by row not possible")),
+        Err(DiffError::Fatal(e)) => return Err(e),
+    }
+    #[cfg(test)]
+    if FAIL_BEFORE_COMMIT.with(|f| f.replace(false)) {
+        return Err(ProjectError::Database("injected failure before commit".into()));
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(InPlace::Written { revision, log })
+}
+
+/// One `images` row without its position.
+#[derive(PartialEq)]
+struct ImageRow {
+    uuid: String,
+    path: String,
+    hash: String,
+    size: i64,
+    mtime: Option<i64>,
+    capture: String,
+    rating: i64,
+    flag: String,
+    label: Option<String>,
+    missing: i64,
+}
+
+fn image_row(e: &ImageEntry) -> Result<ImageRow, ProjectError> {
+    let path = e
+        .path
+        .to_str()
+        .ok_or_else(|| ProjectError::Io(format!("path {} is not valid UTF-8", e.path.display())))?;
+    Ok(ImageRow {
+        uuid: e.uuid.clone(),
+        path: path.to_owned(),
+        hash: e.content_hash.clone(),
+        size: to_i64(e.file_size, "file size")?,
+        mtime: e.modified_unix_ms,
+        capture: serde_json::to_string(&e.capture).map_err(|err| ProjectError::Corrupt(err.to_string()))?,
+        rating: i64::from(e.rating),
+        flag: flag_to_text(e.flag).to_owned(),
+        label: e.color_label.map(label_to_text).map(str::to_owned),
+        missing: i64::from(e.missing),
+    })
+}
+
+fn apply_diff(tx: &Connection, project: &Project, ver: &Versioning<'_>) -> Result<(), DiffError> {
+    {
+        let mut up = tx.prepare(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value IS NOT excluded.value",
+        )?;
+        up.execute(params!["application", "rawgraph"])?;
+        up.execute(params!["schema_version", SCHEMA_VERSION.to_string()])?;
+        up.execute(params!["next_image_id", project.next_image_id.to_string()])?;
+        up.execute(params!["project_uuid", project.uuid])?;
+        up.execute(params!["revision", ver.revision.to_string()])?;
+        // Anything else (e.g. `recovery_*` keys of a recovery copy) does not belong in a project file: same result as a full write.
+        tx.execute("DELETE FROM meta WHERE key NOT IN ('application', 'schema_version', 'next_image_id', 'project_uuid', 'revision')", [])?;
+    }
+    diff_images(tx, project)?;
+    diff_graph(tx, project)?;
+    diff_folders(tx, project)?;
+    diff_history(tx, ver)?;
+    Ok(())
+}
+
+fn diff_images(tx: &Connection, project: &Project) -> Result<(), DiffError> {
+    let mut old: HashMap<i64, (i64, ImageRow)> = HashMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, position, uuid, path, content_hash, file_size, modified_unix_ms, capture, rating, flag, color_label, missing FROM images",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                ImageRow {
+                    uuid: r.get(2)?,
+                    path: r.get(3)?,
+                    hash: r.get(4)?,
+                    size: r.get(5)?,
+                    mtime: r.get(6)?,
+                    capture: r.get(7)?,
+                    rating: r.get(8)?,
+                    flag: r.get(9)?,
+                    label: r.get(10)?,
+                    missing: r.get(11)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, pos, fields) = row?;
+            old.insert(id, (pos, fields));
+        }
+    }
+    let mut new: Vec<(i64, i64, ImageRow)> = Vec::with_capacity(project.images.len());
+    for (pos, e) in project.images.iter().enumerate() {
+        new.push((to_i64(e.id.0, "image id")?, to_i64(pos as u64, "position")?, image_row(e)?));
+    }
+    // 1. Rows that are gone.
+    {
+        let keep: HashSet<i64> = new.iter().map(|(id, _, _)| *id).collect();
+        let mut del = tx.prepare("DELETE FROM images WHERE id = ?1")?;
+        for id in old.keys().filter(|id| !keep.contains(id)) {
+            del.execute(params![id])?;
+        }
+    }
+    // 2. Rows that change position leave their old slot first, so no two rows
+    //    ever share a position (the key) halfway through.
+    {
+        let mut park = tx.prepare("UPDATE images SET position = ?1 WHERE id = ?2")?;
+        for (id, pos, _) in &new {
+            if old.get(id).is_some_and(|(old_pos, _)| old_pos != pos) {
+                park.execute(params![-pos - 1, id])?;
+            }
+        }
+    }
+    // 3. New rows, changed rows, rows that only moved.
+    let mut ins = tx.prepare(
+        "INSERT INTO images (position, id, uuid, path, content_hash, file_size, capture, rating, flag, color_label, missing, modified_unix_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )?;
+    let mut upd = tx.prepare(
+        "UPDATE images SET position = ?1, uuid = ?3, path = ?4, content_hash = ?5, file_size = ?6, capture = ?7, rating = ?8, flag = ?9,
+                color_label = ?10, missing = ?11, modified_unix_ms = ?12 WHERE id = ?2",
+    )?;
+    let mut mv = tx.prepare("UPDATE images SET position = ?1 WHERE id = ?2")?;
+    for (id, pos, r) in &new {
+        let values = params![pos, id, r.uuid, r.path, r.hash, r.size, r.capture, r.rating, r.flag, r.label, r.missing, r.mtime];
+        match old.get(id) {
+            None => {
+                ins.execute(values)?;
+            }
+            Some((_, old_fields)) if old_fields != r => {
+                upd.execute(values)?;
+            }
+            Some((old_pos, _)) if old_pos != pos => {
+                mv.execute(params![pos, id])?;
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn diff_graph(tx: &Connection, project: &Project) -> Result<(), DiffError> {
+    let json = project.graph.to_json();
+    let old: Option<String> = tx.query_row("SELECT json FROM graph WHERE id = 1", [], |r| r.get(0)).optional()?;
+    match old {
+        Some(old) if old == json => {}
+        Some(_) => {
+            tx.execute("UPDATE graph SET json = ?1 WHERE id = 1", params![json])?;
+        }
+        None => {
+            tx.execute("INSERT INTO graph (id, json) VALUES (1, ?1)", params![json])?;
+        }
+    }
+    Ok(())
+}
+
+fn diff_folders(tx: &Connection, project: &Project) -> Result<(), DiffError> {
+    let mut new: Vec<(String, i64)> = Vec::new();
+    for f in &project.folders {
+        let path = f
+            .path
+            .to_str()
+            .ok_or_else(|| ProjectError::Io(format!("path {} is not valid UTF-8", f.path.display())))?;
+        new.push((path.to_owned(), i64::from(f.recursive)));
+    }
+    let old: Vec<(String, i64)> = {
+        let mut stmt = tx.prepare("SELECT path, recursive FROM folders ORDER BY position")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    if old == new {
+        return Ok(());
+    }
+    tx.execute("DELETE FROM folders", [])?;
+    let mut ins = tx.prepare("INSERT INTO folders (position, path, recursive) VALUES (?1, ?2, ?3)")?;
+    for (pos, (path, recursive)) in new.iter().enumerate() {
+        ins.execute(params![to_i64(pos as u64, "position")?, path, recursive])?;
+    }
+    Ok(())
+}
+
+fn diff_history(tx: &Connection, ver: &Versioning<'_>) -> Result<(), DiffError> {
+    /// What a stored history row looks like without reading its snapshot.
+    #[derive(PartialEq)]
+    struct Meta {
+        time: i64,
+        author: String,
+        device: String,
+        summary: String,
+    }
+    let mut old: HashMap<i64, (Meta, bool)> = HashMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT revision, time_unix_ms, author, device, summary, graph_json IS NOT NULL FROM history",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                Meta { time: r.get(1)?, author: r.get(2)?, device: r.get(3)?, summary: r.get(4)? },
+                r.get::<_, bool>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (revision, meta, has) = row?;
+            old.insert(revision, (meta, has));
+        }
+    }
+    let mut revisions = HashSet::new();
+    for e in &ver.log.entries {
+        revisions.insert(to_i64(e.revision, "revision")?);
+    }
+    {
+        let mut del = tx.prepare("DELETE FROM history WHERE revision = ?1")?;
+        for revision in old.keys().filter(|r| !revisions.contains(r)) {
+            del.execute(params![revision])?;
+        }
+    }
+    let mut put = tx.prepare(
+        "INSERT OR REPLACE INTO history (revision, time_unix_ms, author, device, summary, graph_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    let mut drop_snapshot = tx.prepare("UPDATE history SET graph_json = NULL WHERE revision = ?1")?;
+    for (e, snap) in ver.log.entries.iter().zip(&ver.log.snapshots) {
+        let revision = to_i64(e.revision, "revision")?;
+        let meta = Meta { time: e.time_unix_ms, author: e.author.clone(), device: e.device.clone(), summary: e.summary.clone() };
+        match old.get(&revision) {
+            // A snapshot of a revision never changes, so metadata and presence are enough (the snapshots, up to 32 MB, are not read).
+            Some((old_meta, has)) if *old_meta == meta && *has == snap.is_some() => {}
+            Some((old_meta, true)) if *old_meta == meta && snap.is_none() => {
+                drop_snapshot.execute(params![revision])?;
+            }
+            _ => {
+                put.execute(params![revision, e.time_unix_ms, e.author, e.device, e.summary, snap.as_deref()])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn journal_of(path: &Path) -> PathBuf {
+    let mut journal: OsString = path.as_os_str().to_owned();
+    journal.push("-journal");
+    PathBuf::from(journal)
+}
+
+/// Opens a project file for reading, always read-only, and starts ONE read
+/// transaction: everything read through the connection comes from a single
+/// consistent state of the file, even if somebody commits meanwhile. The caller
+/// just drops the connection.
+///
+/// Reading never writes. A rollback journal next to the file (`<name>-journal`)
+/// that SQLite would have to replay (an interrupted save) is not replayed here:
+/// a reader may be on another computer, or the "interrupted" save may be a live
+/// one on a share with weak locking. The error says what to do;
+/// [`recover_unfinished_save`] is the explicit way.
+fn open_read(path: &Path) -> Result<Connection, ProjectError> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(db_err)?;
+    let _ = conn.busy_timeout(BUSY_TIMEOUT);
+    let started = conn
+        .execute_batch("BEGIN")
+        .and_then(|()| conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).map(|_| ()));
+    match started {
+        Ok(()) => Ok(conn),
+        Err(e) if journal_of(path).exists() && !is_busy(&e) => Err(ProjectError::UnfinishedSave(path.to_path_buf())),
+        Err(e) => Err(db_err(e)),
+    }
+}
+
+
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(f, _) if matches!(f.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked))
+}
+
+
+/// Rolls an interrupted save back: opens the file read-write once so SQLite
+/// replays a hot `<name>-journal` onto it, which restores the last complete
+/// state. A journal that is still there after the write lock was granted is not
+/// hot (for example one whose header was zeroed by a kill before it was synced):
+/// it is moved aside, never deleted. Only to be called when the file is written by
+/// this computer alone (in-place mode), or on explicit request of the user when
+/// no program is saving it. Returns whether a journal was there.
+pub(crate) fn recover_unfinished_save(path: &Path) -> Result<bool, ProjectError> {
+    if !journal_of(path).exists() {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(db_err)?;
+    let _ = conn.busy_timeout(BUSY_TIMEOUT);
+    // The write lock is only given after SQLite has dealt with a hot journal.
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(db_err)?;
+    move_journal_aside(path)?;
+    conn.execute_batch("ROLLBACK").map_err(db_err)?;
+    Ok(true)
+}
+
+/// UTC time as `YYYYMMDD-HHMMSS`.
+fn stamp() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}-{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
+/// Moves `<name>-journal` to `<name>-journal.stale-<YYYYMMDD-HHMMSS>` (never deletes it, never
+/// replays it). Returns `(journal, new name)` when there was one.
+fn move_journal_aside(path: &Path) -> Result<Option<(PathBuf, PathBuf)>, ProjectError> {
+    let journal = journal_of(path);
+    if !journal.exists() {
+        return Ok(None);
+    }
+    let stamp = stamp();
+    for n in 1..=1000u32 {
+        let mut name: OsString = journal.as_os_str().to_owned();
+        name.push(if n == 1 { format!(".stale-{stamp}") } else { format!(".stale-{stamp}-{n}") });
+        let stale = PathBuf::from(name);
+        if stale.exists() {
+            continue;
+        }
+        return std::fs::rename(&journal, &stale)
+            .map(|()| Some((journal.clone(), stale)))
+            .map_err(|e| ProjectError::Io(format!("cannot move the leftover journal {} aside: {e}", journal.display())));
+    }
+    Err(ProjectError::Io(format!("too many leftover journals next to {}", path.display())))
 }

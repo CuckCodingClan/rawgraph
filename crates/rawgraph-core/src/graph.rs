@@ -8,6 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -1310,12 +1311,46 @@ impl<'c> Ctx<'c> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// The node graph. Nodes are reference counted: cloning a graph (undo
+/// snapshots, render copies) shares every node and only [`Graph::node_mut`]
+/// copies the one node it changes (copy on write).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Graph {
     format_version: u32,
-    nodes: BTreeMap<NodeId, Node>,
+    #[serde(with = "shared_nodes")]
+    nodes: BTreeMap<NodeId, Arc<Node>>,
     edges: Vec<Edge>,
     next_id: u64,
+}
+
+impl PartialEq for Graph {
+    fn eq(&self, other: &Self) -> bool {
+        self.format_version == other.format_version
+            && self.next_id == other.next_id
+            && self.edges == other.edges
+            && self.nodes.len() == other.nodes.len()
+            // A node shared by both graphs is equal without looking at it.
+            && self.nodes.iter().zip(&other.nodes).all(|((ka, a), (kb, b))| ka == kb && (Arc::ptr_eq(a, b) || **a == **b))
+    }
+}
+
+/// Serde adapter: the file format stores plain nodes.
+mod shared_nodes {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::{Node, NodeId};
+
+    pub fn serialize<S: Serializer>(nodes: &BTreeMap<NodeId, Arc<Node>>, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_map(nodes.iter().map(|(k, v)| (k, &**v)))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<NodeId, Arc<Node>>, D::Error> {
+        let plain = BTreeMap::<NodeId, Node>::deserialize(d)?;
+        Ok(plain.into_iter().map(|(k, v)| (k, Arc::new(v))).collect())
+    }
 }
 
 impl Default for Graph {
@@ -1336,7 +1371,7 @@ impl Graph {
         let mode = if kind == NodeKind::Draw { Mode::Individual } else { Mode::All };
         self.nodes.insert(
             id,
-            Node {
+            Arc::new(Node {
                 id,
                 kind,
                 mode,
@@ -1347,7 +1382,7 @@ impl Graph {
                 exposed_inputs: Vec::new(),
                 exposed_outputs: Vec::new(),
                 pos,
-            },
+            }),
         );
         id
     }
@@ -1372,7 +1407,7 @@ impl Graph {
 
     /// Expose a parameter as an auxiliary image control input.
     pub fn expose_parameter(&mut self, id: NodeId, parameter: &str, ty: PortType) -> Result<usize, GraphError> {
-        let node = self.nodes.get_mut(&id).ok_or(GraphError::UnknownNode(id))?;
+        let node = self.nodes.get_mut(&id).map(Arc::make_mut).ok_or(GraphError::UnknownNode(id))?;
         if !Self::supported_parameter_inputs(node.kind).contains(&parameter)
             || node.exposed_inputs.iter().flatten().any(|p| p.parameter == parameter) {
             return Err(GraphError::Parse(format!("invalid or already exposed parameter {parameter}")));
@@ -1384,7 +1419,7 @@ impl Graph {
 
     /// Expose an alias of a built-in output; aliases never point at aliases.
     pub fn expose_output(&mut self, id: NodeId, source_port: usize, label: &str) -> Result<usize, GraphError> {
-        let node = self.nodes.get_mut(&id).ok_or(GraphError::UnknownNode(id))?;
+        let node = self.nodes.get_mut(&id).map(Arc::make_mut).ok_or(GraphError::UnknownNode(id))?;
         if node.kind.outputs().get(source_port).is_none() { return Err(GraphError::NoSuchPort { node: id, port: source_port }); }
         if label.trim().is_empty() || label.chars().count() > 128 || label.contains('\0') { return Err(GraphError::Parse("invalid output label".into())); }
         let port = node.kind.outputs().len() + node.exposed_outputs.len();
@@ -1392,14 +1427,14 @@ impl Graph {
         Ok(port)
     }
     pub fn remove_exposed_input(&mut self, id: NodeId, port: usize) -> bool {
-        let Some(node) = self.nodes.get_mut(&id) else { return false };
+        let Some(node) = self.nodes.get_mut(&id).map(Arc::make_mut) else { return false };
         let Some(slot) = port.checked_sub(node.kind.inputs().len()).and_then(|i| node.exposed_inputs.get_mut(i)) else { return false };
         if slot.take().is_none() { return false; }
         self.edges.retain(|e| e.to != id || e.to_port != port);
         true
     }
     pub fn remove_exposed_output(&mut self, id: NodeId, port: usize) -> bool {
-        let Some(node) = self.nodes.get_mut(&id) else { return false };
+        let Some(node) = self.nodes.get_mut(&id).map(Arc::make_mut) else { return false };
         let Some(slot) = port.checked_sub(node.kind.outputs().len()).and_then(|i| node.exposed_outputs.get_mut(i)) else { return false };
         if slot.take().is_none() { return false; }
         self.edges.retain(|e| e.from != id || e.from_port != port);
@@ -1412,15 +1447,23 @@ impl Graph {
     }
 
     pub fn node(&self, id: NodeId) -> Option<&Node> {
-        self.nodes.get(&id)
+        self.nodes.get(&id).map(|n| &**n)
     }
 
+    /// Mutable access to one node. A node that other graphs (undo snapshots)
+    /// still share is copied first; the other nodes stay shared.
     pub fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
-        self.nodes.get_mut(&id)
+        self.nodes.get_mut(&id).map(Arc::make_mut)
     }
 
     pub fn nodes(&self) -> impl Iterator<Item = &Node> {
-        self.nodes.values()
+        self.nodes.values().map(|n| &**n)
+    }
+
+    /// Address of the allocation behind node `id`: two graphs that report the
+    /// same value share that node's memory (undo history accounting, tests).
+    pub fn node_identity(&self, id: NodeId) -> Option<usize> {
+        self.nodes.get(&id).map(|n| Arc::as_ptr(n) as usize)
     }
 
     pub fn edges(&self) -> &[Edge] {
@@ -2199,7 +2242,7 @@ impl Subgraph {
                     exposed_outputs: n.exposed_outputs.clone(),
                     pos: n.pos,
                 };
-                (id, node)
+                (id, Arc::new(node))
             })
             .collect();
         let edges = sub
@@ -2256,7 +2299,7 @@ impl Graph {
             .iter()
             .map(|n| {
                 let id = self.add_node(n.kind, [n.pos[0] + offset[0], n.pos[1] + offset[1]]);
-                let node = self.nodes.get_mut(&id).expect("node was just added");
+                let node = self.nodes.get_mut(&id).map(Arc::make_mut).expect("node was just added");
                 node.exposed_inputs = n.exposed_inputs.clone();
                 node.exposed_outputs = n.exposed_outputs.clone();
                 node.mode = n.mode;

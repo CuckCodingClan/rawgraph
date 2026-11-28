@@ -571,17 +571,30 @@ fn failed_commits_leave_project_and_file_unchanged() {
     assert!(matches!(p.commit(&t.path("dir.rawgraph"), "x"), Err(ProjectError::Io(_))));
     assert_eq!(p, snapshot);
 
-    // The temporary file name is blocked: the write fails, the old file stays.
-    fs::create_dir_all(t.path("p.rawgraph.saving")).unwrap();
+    // In-place update: the transaction fails after all rows were written but
+    // before it is committed. The file keeps its old bytes, the project is unchanged.
     p.graph.add_node(NodeKind::Exposure, [0.0, 0.0]);
     let changed = p.clone();
+    crate::store::FAIL_BEFORE_COMMIT.with(|f| f.set(true));
     assert!(p.commit(&file, "x").is_err());
-    assert_eq!(fs::read(&file).unwrap(), on_disk);
+    assert_eq!(fs::read(&file).unwrap(), on_disk, "rollback restores the file exactly");
+    assert!(!t.path("p.rawgraph-journal").exists(), "no journal is left behind");
     assert_eq!(p, changed, "a failed commit changes nothing, not even the history");
     assert_eq!(p.revision(), 1);
     assert_eq!(p.history().len(), 1);
-    fs::remove_dir_all(t.path("p.rawgraph.saving")).unwrap();
     assert_eq!(p.commit(&file, "now it works").unwrap(), 2);
+
+    // Full rewrite (another project's file is replaced): the temporary file name is
+    // blocked, the write fails, the old file stays.
+    let other = t.path("other.rawgraph");
+    Project::new().commit(&other, "theirs").unwrap();
+    let other_bytes = fs::read(&other).unwrap();
+    fs::create_dir_all(t.path("other.rawgraph.saving")).unwrap();
+    assert!(p.commit_overwrite(&other, "x").is_err());
+    assert_eq!(fs::read(&other).unwrap(), other_bytes);
+    assert_eq!(p.revision(), 2);
+    fs::remove_dir_all(t.path("other.rawgraph.saving")).unwrap();
+    assert_eq!(p.commit_overwrite(&other, "now it works").unwrap(), 3);
 }
 
 // ---- folders ----

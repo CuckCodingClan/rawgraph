@@ -233,14 +233,15 @@ fn quitting_with_unsaved_changes_and_a_conflict_does_not_close() {
 }
 
 #[test]
-fn a_save_during_a_scan_waits() {
+fn a_save_during_a_scan_goes_through_and_saves_what_was_found() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = session_with_images(dir.path(), 1);
     s.begin_scan();
     let mut flow: SaveFlow<Act> = SaveFlow::default();
     let out = flow.save(&mut s, &dir.path().join("x.rawgraph"), None);
-    assert!(matches!(out, Outcome::Failed(ref m) if m.contains("scan")), "{out:?}");
-    assert!(!dir.path().join("x.rawgraph").exists());
+    assert!(matches!(out, Outcome::Saved { revision: 1, .. }), "{out:?}");
+    assert!(dir.path().join("x.rawgraph").exists());
+    assert!(s.scanning, "the scan goes on");
 }
 
 // ------------------------------------------------------------------ A3: another project's file
@@ -297,7 +298,7 @@ fn a_newer_format_is_refused_with_a_clear_message_and_the_project_stays() {
     let before = s.project.clone();
     s.set_rating(s.visible()[0], 3);
     let err = s.load_project(&newer).unwrap_err();
-    assert_eq!(err, "This project was saved by a newer version of RawGraph (format 3, this version reads up to 2)");
+    assert_eq!(err.to_string(), "This project was saved by a newer version of RawGraph (format 3, this version reads up to 2)");
     assert_eq!(s.project.images().len(), before.images().len(), "the current project stays open");
     assert!(s.dirty, "with its unsaved change");
     assert!(s.project_path.is_none());
@@ -543,3 +544,106 @@ fn a_long_output_folder_shows_its_end_in_the_field() {
     assert!(!shown.contains("Photos"), "{shown}");
 }
 
+
+// ------------------------------------------------------------------ unfinished saves (journal of an interrupted save)
+
+/// Serialises the tests that switch "always rewrite the whole file" (a process-wide setting) and
+/// switches it back at the end.
+static MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct Whole;
+impl Whole {
+    fn on() -> (std::sync::MutexGuard<'static, ()>, Whole) {
+        let guard = MODE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        rawgraph_project::set_always_rewrite(true);
+        (guard, Whole)
+    }
+}
+impl Drop for Whole {
+    fn drop(&mut self) {
+        rawgraph_project::set_always_rewrite(false);
+    }
+}
+
+/// A saved project with the journal of an interrupted save beside it.
+fn project_with_journal(dir: &Path) -> (PathBuf, Project) {
+    let mut s = session_with_images(dir, 3);
+    let file = dir.join("p.rawgraph");
+    commit(&mut s, &file);
+    std::fs::write(dir.join("p.rawgraph-journal"), vec![0xA5u8; 2048]).unwrap();
+    (file, s.project.clone())
+}
+
+#[test]
+fn a_project_with_a_journal_on_a_local_drive_is_recovered_when_it_is_opened() {
+    let _lock = MODE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let (file, saved) = project_with_journal(dir.path());
+    assert!(rawgraph_project::write_mode(&file).mode == rawgraph_project::WriteMode::InPlace, "the temp folder is an ordinary local folder");
+    let opened = revisions::open_project_ex(&file).unwrap();
+    assert!(opened.recovered);
+    assert_eq!(opened.note, Some(revisions::RECOVERED_NOTE));
+    assert_eq!(opened.project, saved);
+    assert!(!dir.path().join("p.rawgraph-journal").exists());
+    // The session path (--project) says the same.
+    std::fs::write(dir.path().join("p.rawgraph-journal"), vec![0xA5u8; 2048]).unwrap();
+    let mut s = Session::new(Project::new(), provider());
+    assert_eq!(s.load_project(&file).unwrap(), Some(revisions::RECOVERED_NOTE));
+    assert_eq!(s.project, saved);
+}
+
+#[test]
+fn a_project_with_a_journal_on_a_shared_place_asks_first_and_opens_after_the_recovery() {
+    let (_lock, _whole) = Whole::on();
+    let dir = tempfile::tempdir().unwrap();
+    let (file, saved) = project_with_journal(dir.path());
+    let err = revisions::open_project_ex(&file).err().expect("must not open");
+    assert_eq!(err, revisions::OpenError::Unfinished(file.clone()));
+    assert!(err.to_string().contains("unfinished save") && err.to_string().contains("no other computer is saving"), "{err}");
+    assert!(dir.path().join("p.rawgraph-journal").exists(), "nothing was touched");
+    let mut s = Session::new(Project::new(), provider());
+    assert!(matches!(s.load_project(&file), Err(revisions::OpenError::Unfinished(_))));
+    assert_eq!(s.project_path, None, "the open project stays as it was");
+    // The user says "Recover unfinished save": the dialog calls this and retries.
+    assert!(Project::recover_unfinished_save(&file).unwrap());
+    let opened = revisions::open_project_ex(&file).unwrap();
+    assert!(!opened.recovered && opened.project == saved);
+}
+
+#[test]
+fn saving_onto_a_shared_file_with_a_journal_asks_and_goes_through_after_the_recovery() {
+    let (_lock, _whole) = Whole::on();
+    let dir = tempfile::tempdir().unwrap();
+    let (file, _) = project_with_journal(dir.path());
+    assert!(Project::recover_unfinished_save(&file).unwrap());
+    let mut s = Session::new(Project::load(&file).unwrap(), provider());
+    s.project_path = Some(file.clone());
+    add(&mut s, NodeKind::Contrast);
+    // A new interrupted save appears beside the file while the project is open.
+    std::fs::write(dir.path().join("p.rawgraph-journal"), vec![0xA5u8; 2048]).unwrap();
+    let mut flow: SaveFlow<Act> = SaveFlow::default();
+    let out = flow.save(&mut s, &file, Some(Act::Quit));
+    assert!(matches!(&out, Outcome::Unfinished { target, then: Some(Act::Quit) } if target == &file), "{out:?}");
+    assert!(s.dirty, "nothing was saved");
+    assert!(Project::recover_unfinished_save(&file).unwrap());
+    match flow.save(&mut s, &file, Some(Act::Quit)) {
+        Outcome::Saved { revision: 2, then, .. } => assert_eq!(then, Some(Act::Quit)),
+        other => panic!("{other:?}"),
+    }
+    assert!(!s.dirty);
+    assert_eq!(s.project.last_write().map(|w| w.mode), Some(rawgraph_project::WriteMode::FullRewrite), "what really happened is known for the status line");
+}
+
+#[test]
+fn the_status_line_says_how_the_file_was_really_written() {
+    let _lock = MODE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session_with_images(dir.path(), 2);
+    let file = dir.path().join("p.rawgraph");
+    commit(&mut s, &file);
+    let first = s.project.last_write().unwrap().describe();
+    assert!(first.starts_with("whole file rewritten") && first.contains("new file"), "{first}");
+    add(&mut s, NodeKind::Contrast);
+    commit(&mut s, &file);
+    assert!(s.project.last_write().unwrap().describe().starts_with("in place"));
+}

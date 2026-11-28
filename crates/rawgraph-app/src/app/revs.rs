@@ -22,12 +22,15 @@ impl App {
         match outcome {
             Outcome::Saved { revision, target, then } => {
                 self.discard_own_recovery();
-                self.status.info(format!("Saved {} (revision {revision})", target.display()));
+                // What the save really did (a first save or a format change writes the whole file even where in place is allowed).
+                let how = self.session.project.last_write().map_or_else(|| rawgraph_project::write_mode(&target).describe(), |w| w.describe());
+                self.status.info(format!("Saved {} (revision {revision}; {how})", target.display()));
                 if let Some(p) = then {
                     self.execute(p, ctx);
                 }
             }
             Outcome::Asked => {}
+            Outcome::Unfinished { target, then } => self.ask_unfinished(target.clone(), super::ext::Retry::Save { target, then }),
             Outcome::Failed(text) => {
                 if !text.is_empty() {
                     self.status.error(text);
@@ -61,6 +64,10 @@ impl App {
                     _ => "the target belongs to another project".to_owned(),
                 };
                 eprintln!("--save-project: nothing was written ({what}); the window asks how to go on");
+            }
+            Outcome::Unfinished { target, .. } => {
+                eprintln!("--save-project: {} has an unfinished save beside it; the window asks whether to recover it", target.display());
+                self.ask_unfinished(target.clone(), super::ext::Retry::Save { target, then: None });
             }
             Outcome::Failed(e) => {
                 eprintln!("--save-project: {e}");

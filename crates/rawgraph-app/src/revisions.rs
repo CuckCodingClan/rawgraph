@@ -243,14 +243,55 @@ pub fn too_new_text(file_version: u32, supported: u32) -> String {
     format!("This project was saved by a newer version of RawGraph (format {file_version}, this version reads up to {supported})")
 }
 
-/// Loads a project file. The note is set when the file was of format 1 (it was converted in memory).
-pub fn open_project(path: &Path) -> Result<(Project, Option<&'static str>), String> {
-    let version = file_format_version(path);
-    match Project::load(path) {
-        Ok(p) => Ok((p, (version == Some(1)).then_some(CONVERTED_NOTE))),
-        Err(ProjectError::TooNew { file_version, supported }) => Err(too_new_text(file_version, supported)),
-        Err(e) => Err(e.to_string()),
+/// Shown when an interrupted save next to the project file was rolled back while opening it.
+pub const RECOVERED_NOTE: &str = "Recovered an interrupted save";
+
+/// Why a project file could not be opened.
+#[derive(Debug, PartialEq)]
+pub enum OpenError {
+    /// An interrupted save left its journal next to the file and the place is shared (network drive,
+    /// sync folder): the user has to say whether it may be rolled back. Carries the project file.
+    Unfinished(std::path::PathBuf),
+    Other(String),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenError::Unfinished(file) => write!(f, "{}", ProjectError::UnfinishedSave(file.clone())),
+            OpenError::Other(text) => write!(f, "{text}"),
+        }
     }
+}
+
+/// A project that was opened: the note is set when the file was of format 1 (converted in memory) or
+/// when an interrupted save was rolled back first.
+pub struct Opened {
+    pub project: Project,
+    pub note: Option<&'static str>,
+    pub recovered: bool,
+}
+
+/// Loads a project file. An interrupted save next to a file on a local drive that only this computer
+/// writes is rolled back automatically; on a network drive or in a sync folder `OpenError::Unfinished`
+/// is returned so the application can ask.
+pub fn open_project_ex(path: &Path) -> Result<Opened, OpenError> {
+    let version = file_format_version(path);
+    match Project::load_recovering(path) {
+        Ok((project, recovered)) => {
+            let note = if recovered { Some(RECOVERED_NOTE) } else { (version == Some(1)).then_some(CONVERTED_NOTE) };
+            Ok(Opened { project, note, recovered })
+        }
+        Err(ProjectError::UnfinishedSave(file)) => Err(OpenError::Unfinished(file)),
+        Err(ProjectError::TooNew { file_version, supported }) => Err(OpenError::Other(too_new_text(file_version, supported))),
+        Err(e) => Err(OpenError::Other(e.to_string())),
+    }
+}
+
+/// Like [`open_project_ex`] with the error as text.
+#[cfg(test)]
+pub fn open_project(path: &Path) -> Result<(Project, Option<&'static str>), String> {
+    open_project_ex(path).map(|o| (o.project, o.note)).map_err(|e| e.to_string())
 }
 
 /// What overwriting the file at `target` throws away: the revisions of the others

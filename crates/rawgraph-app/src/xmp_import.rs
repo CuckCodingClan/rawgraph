@@ -219,6 +219,37 @@ fn label_of(text: &str) -> Option<ColorLabel> {
     }
 }
 
+/// Number of files an XMP import reads at the same time. Reading is waiting for
+/// the disk or the network share, not computing, so the number is fixed instead
+/// of following the CPU count, and the reads run on their own pool: the global
+/// rayon pool belongs to rendering and must not be held up by a slow share.
+pub const XMP_READ_THREADS: usize = 8;
+
+/// Reads every target with at most `threads` reads at a time. The result is in
+/// target order whatever finishes first. After `cancel` is set no new file is
+/// started (those entries are `None`). `done` counts finished files for progress.
+fn read_all(
+    targets: &[Target],
+    threads: usize,
+    cancel: &AtomicBool,
+    done: &AtomicUsize,
+    read: &(dyn Fn(&Path) -> Decision + Sync),
+) -> Vec<Option<(ImageId, Decision)>> {
+    let one = |t: &Target| {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let decision = read(&t.path);
+        done.fetch_add(1, Ordering::Relaxed);
+        Some((t.id, decision))
+    };
+    match rayon::ThreadPoolBuilder::new().num_threads(threads.max(1)).thread_name(|i| format!("rawgraph-xmp-read-{i}")).build() {
+        Ok(pool) => pool.install(|| targets.par_iter().map(one).collect()),
+        // No threads available: read one after the other.
+        Err(_) => targets.iter().map(one).collect(),
+    }
+}
+
 pub enum JobResult {
     Done(XmpFound),
     Cancelled,
@@ -245,17 +276,7 @@ impl XmpJob {
         let total = targets.len();
         let (c2, d2) = (cancel.clone(), done.clone());
         let spawned = std::thread::Builder::new().name("rawgraph-xmp".into()).spawn(move || {
-            let results: Vec<Option<(ImageId, Decision)>> = targets
-                .par_iter()
-                .map(|t| {
-                    if c2.load(Ordering::Relaxed) {
-                        return None;
-                    }
-                    let d = read_target(&t.path, &opts);
-                    d2.fetch_add(1, Ordering::Relaxed);
-                    Some((t.id, d))
-                })
-                .collect();
+            let results = read_all(&targets, XMP_READ_THREADS, &c2, &d2, &|path| read_target(path, &opts));
             let reply = if c2.load(Ordering::Relaxed) {
                 JobResult::Cancelled
             } else {
@@ -501,5 +522,80 @@ mod tests {
         assert!(would_change(&e, &rating(-1)));
         assert!(would_change(&e, &XmpCulling { rating: None, label: Some("Rot".into()) }));
         assert!(!would_change(&e, &XmpCulling { rating: None, label: Some("Turquoise".into()) }));
+    }
+
+    fn fake_targets(n: u64) -> Vec<Target> {
+        (1..=n).map(|i| Target { id: ImageId(i), path: PathBuf::from(format!("/share/IMG_{i}.CR3")) }).collect()
+    }
+
+    /// A reader that takes a while (like a network share) and watches how many reads overlap.
+    fn slow_reader<'a>(live: &'a AtomicUsize, peak: &'a AtomicUsize) -> impl Fn(&Path) -> Decision + Sync + 'a {
+        move |path: &Path| {
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            // Later files finish first, so a wrong order would show.
+            let n: u64 = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.trim_start_matches("IMG_").parse().ok()).unwrap_or(0);
+            std::thread::sleep(std::time::Duration::from_millis(40u64.saturating_sub(n % 40)));
+            live.fetch_sub(1, Ordering::SeqCst);
+            match n % 3 {
+                0 => Decision::NoXmp,
+                1 => Decision::Use(rating((n % 5) as i8 + 1), Origin::Sidecar),
+                _ => Decision::Error,
+            }
+        }
+    }
+
+    #[test]
+    fn xmp_files_are_read_in_parallel_but_never_more_than_the_pool_size_and_in_order() {
+        let targets = fake_targets(64);
+        let (live, peak, done) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+        let reader = slow_reader(&live, &peak);
+        let started = Instant::now();
+        let parallel = read_all(&targets, XMP_READ_THREADS, &AtomicBool::new(false), &done, &reader);
+        let parallel_time = started.elapsed();
+        let peak = peak.load(Ordering::SeqCst);
+        assert!((2..=XMP_READ_THREADS).contains(&peak), "reads overlap but never exceed the pool size: {peak}");
+        assert_eq!(done.load(Ordering::SeqCst), 64, "progress counts every file");
+        // Identical to reading one after the other, in target order.
+        let serial = read_all(&targets, 1, &AtomicBool::new(false), &AtomicUsize::new(0), &reader);
+        assert_eq!(parallel, serial);
+        assert_eq!(parallel.iter().flatten().map(|(id, _)| id.0).collect::<Vec<_>>(), (1..=64).collect::<Vec<_>>());
+        eprintln!("64 slow reads: {parallel_time:?} with {XMP_READ_THREADS} threads");
+    }
+
+    #[test]
+    fn a_cancelled_xmp_read_starts_no_new_file() {
+        let targets = fake_targets(50);
+        let (live, peak, done) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+        let cancel = AtomicBool::new(false);
+        let reader = slow_reader(&live, &peak);
+        let results = read_all(&targets, 4, &cancel, &done, &|p: &Path| {
+            cancel.store(true, Ordering::SeqCst);
+            reader(p)
+        });
+        assert!(results.iter().filter(|r| r.is_some()).count() <= 4 + 1, "only the reads that were already running finish");
+        assert_eq!(results.len(), 50);
+    }
+
+    #[test]
+    fn errors_stay_per_file_in_a_parallel_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut targets = Vec::new();
+        for i in 0..40u64 {
+            let path = dir.path().join(format!("{i}.png"));
+            match i % 4 {
+                0 => png(&path, Some(&SIDECAR_XML.replace("RATING", "3"))),
+                1 => {
+                    png(&path, None);
+                    std::fs::write(path.with_extension("xmp"), "<<< broken").unwrap();
+                }
+                _ => png(&path, None),
+            }
+            targets.push(Target { id: ImageId(i + 1), path });
+        }
+        let found = run(XmpJob::start(egui::Context::default(), targets.clone(), 0, BOTH));
+        assert_eq!((found.items.len(), found.errors, found.without_xmp), (10, 10, 20));
+        let ids: Vec<u64> = found.items.iter().map(|(id, _, _)| id.0).collect();
+        assert_eq!(ids, (0..40u64).filter(|i| i % 4 == 0).map(|i| i + 1).collect::<Vec<_>>(), "found items stay in image order");
     }
 }

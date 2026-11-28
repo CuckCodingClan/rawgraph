@@ -113,6 +113,8 @@ struct Settings {
     click_zoom: f32,
     wheel_navigates: bool,
     editable_thumb_gib: u32,
+    /// Always write the whole project file instead of updating it in place.
+    always_rewrite: bool,
 }
 
 impl Default for Settings {
@@ -128,6 +130,7 @@ impl Default for Settings {
             click_zoom: 2.0,
             wheel_navigates: false,
             editable_thumb_gib: crate::live_thumbs::DEFAULT_GIB,
+            always_rewrite: false,
         }
     }
 }
@@ -490,6 +493,8 @@ pub struct App {
     lock: Option<SessionLock>,
     startup_scan: Option<Receiver<Orphans>>,
     recovery_dialog: Option<RecoveryDialog>,
+    /// A project file with an unfinished save beside it: waiting for the user's decision.
+    unfinished: Option<ext::UnfinishedState>,
     autosave: Scheduler,
     autosave_job: Option<WriteJob>,
     own_recovery: OwnFiles,
@@ -593,6 +598,7 @@ impl App {
             Session::new(crate::session::fresh_project(), provider.clone())
         };
         let mut status = Status::default();
+        let mut startup_unfinished: Option<PathBuf> = None;
         if let Some(path) = &cli.project {
             crate::splash::stage(crate::splash::Stage::OpeningProject);
             match session.load_project(path) {
@@ -600,6 +606,11 @@ impl App {
                     if let Some(n) = note {
                         status.info(n);
                     }
+                }
+                Err(crate::revisions::OpenError::Unfinished(_)) => {
+                    // The dialog opens with the first frame.
+                    startup_unfinished = Some(path.clone());
+                    eprintln!("--project: {} has an unfinished save beside it", path.display());
                 }
                 Err(e) => {
                     status.error(format!("Cannot open {}: {e}", path.display()));
@@ -623,6 +634,7 @@ impl App {
                 }),
             },
         );
+        rawgraph_project::set_always_rewrite(settings.always_rewrite);
         let dirs = DataDirs::from_option(cli.data_dir.as_deref());
         let thumb_cache = rawgraph_project::ThumbCache::new(&dirs.thumbs(), CACHE_BUDGET).map_err(|e| eprintln!("thumbnail cache: {e}")).ok().map(Arc::new);
         let mut live = crate::live_thumbs::LiveThumbs::new(cc.egui_ctx.clone(), provider.clone(), dirs.thumbs().join("linear"), settings.editable_thumb_gib);
@@ -765,6 +777,7 @@ impl App {
             lock,
             startup_scan,
             recovery_dialog: None,
+            unfinished: None,
             autosave: Scheduler::with_interval(Duration::from_secs(app_autosave_secs)),
             autosave_job: None,
             own_recovery: OwnFiles::default(),
@@ -815,6 +828,9 @@ impl App {
         });
         app.start_capture_refresh(&cc.egui_ctx);
         app.start_missing_check(&cc.egui_ctx);
+        if let Some(path) = startup_unfinished {
+            app.ask_unfinished(path.clone(), ext::Retry::Open(path));
+        }
         if let Some(folder) = app.cli.open_folder.clone() {
             app.start_scan(&cc.egui_ctx, folder);
         }
@@ -1051,22 +1067,8 @@ impl App {
         let Some(d) = self.dialog.take() else { return };
         let Some(path) = result else { return };
         match d.kind {
-            DialogKind::OpenProject => match crate::revisions::open_project(&path) {
-                Ok((p, note)) => {
-                    self.cancel_scan();
-                    self.discard_own_recovery();
-                    self.session.replace_project(p, Some(path.clone()));
-                    self.after_document_change();
-                    self.start_capture_refresh(ctx);
-                    self.start_missing_check(ctx);
-                    match note {
-                        Some(n) => self.status.info(n),
-                        None => self.status.info(format!("Opened {}", path.display())),
-                    }
-                }
-                // The current project stays open.
-                Err(e) => self.status.error(format!("Cannot open {}: {e}", path.display())),
-            },
+            // The current project stays open if that fails.
+            DialogKind::OpenProject => self.open_project_path(&path, ctx),
             DialogKind::OpenFolder => self.start_scan(ctx, path),
             DialogKind::ExportFolder => self.export_ui.out_dir = path.to_string_lossy().into_owned(),
             DialogKind::LocateFile(id) => self.locate_file(id, path),
@@ -1273,6 +1275,7 @@ impl App {
         self.session.begin_scan();
         let absolute = std::path::absolute(&folder).unwrap_or_else(|_| folder.clone());
         self.session.scan_count = Some((crate::session::folder_key(&absolute.to_string_lossy()), recursive, 0));
+        self.session.scan_folder = Some((absolute.clone(), recursive));
         self.scan = Some(ScanJob::start(ctx.clone(), self.session.project.clone(), folder.clone(), recursive));
         self.status.info(format!("Scanning {}", folder.display()));
     }
@@ -1331,8 +1334,8 @@ impl App {
             }
         }
         if let Some((project, report)) = finished {
-            let changed = project != self.session.project;
-            self.session.finish_scan(project, changed);
+            // The session takes over the commit state, graph and edits itself and decides whether anything is unsaved.
+            self.session.finish_scan(project, false);
             let text = summarize(&report);
             if report.failed.is_empty() {
                 self.status.info(text);
@@ -2408,6 +2411,11 @@ impl App {
                 ui.radio_value(&mut self.viewer.wheel_navigates, false, "Zoom");
                 ui.radio_value(&mut self.viewer.wheel_navigates, true, "Navigate images");
                 ui.separator();
+                let mut rewrite = rawgraph_project::always_rewrite();
+                if ui.checkbox(&mut rewrite, "Always rewrite the whole project file").on_hover_text("Saves by writing a complete new file instead of updating the project file in place. Used automatically on network drives and in sync folders (Nextcloud, Dropbox, OneDrive).").changed() {
+                    rawgraph_project::set_always_rewrite(rewrite);
+                }
+                ui.separator();
                 ui.label(RichText::new("Preview size (long edge)").weak());
                 for n in PREVIEW_SIZES {
                     if ui.radio(preview == n, format!("{n} px")).clicked() {
@@ -3052,6 +3060,7 @@ impl eframe::App for App {
         self.secondary_windows(&ctx);
         self.workspace_windows(&ctx);
         self.recovery_window(&ctx);
+        self.unfinished_window(&ctx);
         self.xmp_window(&ctx);
         self.relink_windows(&ctx);
         self.clear_cache_window(&ctx);
@@ -3141,6 +3150,7 @@ impl eframe::App for App {
             click_zoom: self.viewer.click_zoom,
             wheel_navigates: self.viewer.wheel_navigates,
             editable_thumb_gib: self.filmstrip.live.budget(),
+            always_rewrite: rawgraph_project::always_rewrite(),
             // GPU-only is a test setting from the command line, never saved.
             renderer: if self.renderer_mode == RendererMode::Gpu { RendererMode::Auto } else { self.renderer_mode },
         };
