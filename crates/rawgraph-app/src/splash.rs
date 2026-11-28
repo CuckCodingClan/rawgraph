@@ -21,7 +21,7 @@ impl Stage {
 }
 
 fn enabled(cli: &Cli) -> bool {
-    !cli.help && !cli.capture() && !cli.bench && !cli.bench_tools
+    !cli.help && !cli.capture() && !cli.benching() && !cli.bench_tools
         && cli.run_export_node.is_none() && !cli.simulate_crash && cli.export.is_none()
 }
 

@@ -201,6 +201,8 @@ enum Msg {
     Render(Request),
     /// Write the GPU picture shown last to this PNG.
     Dump(PathBuf),
+    /// Forget every cached result and every GPU base image (cold-start measurements).
+    DropCaches,
     Shutdown,
 }
 
@@ -298,6 +300,12 @@ impl Renderer {
         let _ = self.tx.send(Msg::Dump(path));
     }
 
+    /// Makes the worker forget its evaluator cache and the GPU base images, so that the next
+    /// request starts cold (`--bench-first-frame`). Applied before any later request.
+    pub fn drop_caches(&self) {
+        let _ = self.tx.send(Msg::DropCaches);
+    }
+
     /// Newest acceptable reply since the last call, if any.
     pub fn poll(&mut self) -> Option<Reply> {
         let mut latest = None;
@@ -364,6 +372,7 @@ impl Drop for Renderer {
 enum Next {
     Render(Box<Request>),
     Dump(PathBuf),
+    DropCaches,
     /// Nothing arrived until the scope refinement was due.
     Refine,
     Shutdown,
@@ -389,13 +398,14 @@ fn next_message(rx: &Receiver<Msg>, stash: &mut Option<Msg>, deadline: Option<In
     match first {
         Msg::Shutdown => Next::Shutdown,
         Msg::Dump(path) => Next::Dump(path),
+        Msg::DropCaches => Next::DropCaches,
         Msg::Render(mut latest) => {
             while let Ok(next) = rx.try_recv() {
                 match next {
                     Msg::Render(r) => latest = r,
                     Msg::Shutdown => return Next::Shutdown,
-                    dump @ Msg::Dump(_) => {
-                        *stash = Some(dump);
+                    other @ (Msg::Dump(_) | Msg::DropCaches) => {
+                        *stash = Some(other);
                         break;
                     }
                 }
@@ -414,7 +424,7 @@ fn take_latest(rx: &Receiver<Msg>) -> Option<Request> {
         match next_message(rx, &mut stash, None) {
             Next::Render(r) => return Some(*r),
             Next::Shutdown => return None,
-            Next::Dump(_) | Next::Refine => {}
+            Next::Dump(_) | Next::DropCaches | Next::Refine => {}
         }
     }
 }
@@ -492,6 +502,16 @@ fn worker<B: Backend>(
                         job = Some(PreloadJob { graph: request.graph.clone(), node: request.node, image: request.image, hints: request.hints.clone(), cancel: request.cancel.clone() });
                     }
                 }
+            }
+            Next::DropCaches => {
+                evaluator.clear();
+                if let Some(g) = gpu.as_mut() {
+                    g.forget_bases();
+                }
+                preloader.on_request();
+                job = None;
+                resting = None;
+                cpu_resting = None;
             }
             Next::Dump(path) => {
                 let result = match gpu.as_mut() {

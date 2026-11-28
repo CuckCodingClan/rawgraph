@@ -11,3 +11,8 @@ rawgraph-fx = { path = "../rawgraph-fx" }
 
 [dev-dependencies]
 serde_json.workspace = true
+
+# Custom harness: the test executable doubles as the fake depth worker (`--fake <mode> ...`).
+[[test]]
+name = "depth_worker"
+harness = false

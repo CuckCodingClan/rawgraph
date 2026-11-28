@@ -6,6 +6,8 @@
 //! nodes downstream of the change, and Individual-mode edits of one image never
 //! touch the cache entries of another.
 
+pub mod depth;
+
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -622,7 +624,7 @@ impl Evaluator {
             self.compute_develop(graph, node, image, &inputs, env, memo)?
         } else {
             let lens = if node.kind == NodeKind::LensManual { lens_profile_for(graph, node, image, provider) } else { None };
-            compute(node, image, &inputs, provider, lens.as_ref(), env)?
+            compute(node, image, &inputs, provider, lens.as_ref(), env, cancel)?
         };
         self.misses += 1;
         self.cache.insert(key, Entry { fingerprint, value: value.clone() });
@@ -1602,37 +1604,19 @@ fn long_edge(img: &ImageBuf) -> f32 {
 }
 
 
-// One-shot, versioned binary protocol. No shell or network access is invoked by RawGraph.
-fn depth_worker(image: &ImageBuf) -> Result<Value, String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let worker = std::env::var_os("RAWGRAPH_DEPTH_WORKER").ok_or("Depth Map: set RAWGRAPH_DEPTH_WORKER to the configured executable; see docs/depth-estimate.md")?;
-    let mut command = Command::new(worker);
-    if let Some(script) = std::env::var_os("RAWGRAPH_DEPTH_SCRIPT") { command.arg(script); }
-    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("Depth Map: cannot start worker: {e}"))?;
-    let write_result = (|| -> std::io::Result<()> {
-        let mut input = std::io::BufWriter::new(child.stdin.take().unwrap());
-        input.write_all(b"RGD1")?;
-        input.write_all(&image.width().to_le_bytes())?;
-        input.write_all(&image.height().to_le_bytes())?;
-        for v in image.data() { input.write_all(&v.to_le_bytes())?; }
-        input.flush()?;
-        Ok(())
-    })();
-    let out = child.wait_with_output().map_err(|e| format!("Depth Map worker: {e}"))?;
-    if !out.status.success() { return Err(format!("Depth Map worker failed: {}", String::from_utf8_lossy(&out.stderr))); }
-    write_result.map_err(|e| format!("Depth Map worker input: {e}"))?;
-    decode_depth_reply(image.width(), image.height(), &out.stdout)
+/// Runs the persistent Depth Map worker (see [`depth`]); cancelling kills the worker process.
+fn depth_worker(image: &ImageBuf, cancel: &CancelToken) -> Result<Value, EvalError> {
+    let config = depth::DepthConfig::from_env().map_err(EvalError::Provider)?;
+    match depth::estimate(&config, image.width(), image.height(), image.data(), cancel) {
+        Ok(data) => Ok(grayscale_rgba(MaskBuf { width: image.width(), height: image.height(), data })),
+        Err(depth::DepthError::Cancelled) => Err(EvalError::Cancelled),
+        Err(depth::DepthError::Failed(e)) => Err(EvalError::Provider(e)),
+    }
 }
 
+#[cfg(test)]
 fn decode_depth_reply(width: u32, height: u32, bytes: &[u8]) -> Result<Value, String> {
-    let expected = (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(4)).and_then(|n| n.checked_add(12)).ok_or("Depth Map: image too large")?;
-    if bytes.len() != expected || &bytes[..4] != b"RGD1" || bytes[4..8] != width.to_le_bytes() || bytes[8..12] != height.to_le_bytes() {
-        return Err("Depth Map: invalid worker response".into());
-    }
-    let data: Vec<f32> = bytes[12..].as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
-    if data.iter().any(|v| !v.is_finite() || !(0.0..=1.0).contains(v)) { return Err("Depth Map: invalid depth values".into()); }
-    Ok(grayscale_rgba(MaskBuf { width, height, data }))
+    depth::decode_reply(width, height, bytes).map(|data| grayscale_rgba(MaskBuf { width, height, data }))
 }
 
 /// Render a Generator independently of any source image or provider. Callers are
@@ -1675,6 +1659,7 @@ fn compute(
     provider: &dyn ImageProvider,
     lens: Option<&LensProfile>,
     env: &Env,
+    cancel: &CancelToken,
 ) -> Result<Value, EvalError> {
     let id = node.id;
     let param = |name: &str| node.param(name, image);
@@ -1709,7 +1694,7 @@ fn compute(
         NodeKind::Source => provider.image(image).map(Value::Images).map_err(EvalError::Provider),
         NodeKind::DepthMap => {
             let src = input_image(inputs, 0, id)?;
-            depth_worker(&src).map_err(EvalError::Provider)
+            depth_worker(&src, cancel)
         }
         NodeKind::MetadataFilter | NodeKind::MetadataSplit | NodeKind::Output | NodeKind::Export => {
             Ok(Value::Images(input_image(inputs, 0, id)?))
@@ -2452,7 +2437,7 @@ mod tests {
     #[test]
     fn depth_missing_worker_is_actionable() {
         if std::env::var_os("RAWGRAPH_DEPTH_WORKER").is_some() { return; }
-        let err = depth_worker(&ImageBuf::new(1, 1)).unwrap_err();
+        let err = depth_worker(&ImageBuf::new(1, 1), &CancelToken::new()).unwrap_err().to_string();
         assert!(err.contains("RAWGRAPH_DEPTH_WORKER"), "{err}");
     }
 

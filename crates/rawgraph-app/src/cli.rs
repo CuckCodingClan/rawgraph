@@ -39,6 +39,14 @@ pub struct Cli {
     pub preview_size: Option<u32>,
     /// Automated timing run (stepping through all images), prints `BENCH` lines.
     pub bench: bool,
+    /// `--bench-first-frame <folder>`: selection -> first visible frame, per image (see README).
+    pub bench_first_frame: Option<PathBuf>,
+    /// `--runs N`: rounds of the first-frame benchmark (default 1).
+    pub runs: Option<u32>,
+    /// `--uncached`: first-frame benchmark without the cached passes.
+    pub uncached: bool,
+    /// `--bench-out <file.csv>`: per-image CSV of the first-frame benchmark.
+    pub bench_out: Option<PathBuf>,
     /// Do not descend into sub-folders when scanning.
     pub no_recursive: bool,
     /// Show the viewer at 100 % (noise and detail checks).
@@ -228,6 +236,11 @@ Usage: rawgraph-app [options]
   --no-gpu-preload             do not upload the neighbour images to the GPU in the background
   --actual-size                show the viewer at 100 %
   --bench                      timing run over all images, then exit
+  --bench-first-frame <folder> selection -> first visible picture / final frame per image
+                               (reads the folder only; use a fresh --data-dir), then exit
+      --runs <N>               rounds over the folder (default 1)
+      --uncached               only the uncached passes (skip the cached ones)
+      --bench-out <file.csv>   per-image CSV (a <file>-summary.csv with median/p95 follows)
   --renderer auto|cpu|gpu      preview renderer (gpu: fail instead of falling back; for tests)
   --dump-frame <path.png>      write the viewer picture (GPU or CPU frame) as a PNG, then exit
   --workspace <name>           start in a workspace: single, dual, dual-scopes, dual-scopes-clean,
@@ -471,6 +484,11 @@ impl Cli {
     pub fn capture(&self) -> bool {
         self.screenshot.is_some() || self.dump_frame.is_some()
     }
+
+    /// An automated timing run (any of the benchmarks): no persisted settings, no splash.
+    pub fn benching(&self) -> bool {
+        self.bench || self.bench_first_frame.is_some()
+    }
 }
 
 /// Parses the arguments after the program name.
@@ -503,6 +521,21 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String
                 cli.preview_size = Some(n);
             }
             "--bench" => cli.bench = true,
+            "--bench-first-frame" => {
+                let folder = PathBuf::from(it.next().ok_or("--bench-first-frame needs a folder")?);
+                cli.open_folder = Some(folder.clone());
+                cli.bench_first_frame = Some(folder);
+            }
+            "--runs" => {
+                let v = it.next().ok_or("--runs needs a number")?;
+                let n = v.parse::<u32>().map_err(|_| format!("--runs: \"{v}\" is not an integer"))?;
+                if !(1..=100).contains(&n) {
+                    return Err(format!("--runs: {n} is outside 1..100"));
+                }
+                cli.runs = Some(n);
+            }
+            "--uncached" => cli.uncached = true,
+            "--bench-out" => cli.bench_out = Some(PathBuf::from(it.next().ok_or("--bench-out needs a file path")?)),
             "--renderer" => {
                 let v = it.next().ok_or("--renderer needs auto, cpu or gpu")?;
                 cli.renderer = Some(crate::gpu_path::RendererMode::parse(&v).ok_or_else(|| format!("--renderer: \"{v}\" is not auto, cpu or gpu"))?);
@@ -756,6 +789,12 @@ mod tests {
         assert_eq!(cli.filter_iso, Some((Some(100.0), Some(800.0))));
         assert_eq!(cli.preview_size, Some(1920));
         assert!(cli.bench);
+        let ff = parse("--bench-first-frame C:/photos --runs 3 --uncached --bench-out out.csv --data-dir C:/d").unwrap();
+        assert_eq!(ff.bench_first_frame, Some(PathBuf::from("C:/photos")));
+        assert_eq!(ff.open_folder, Some(PathBuf::from("C:/photos")));
+        assert_eq!((ff.runs, ff.uncached, ff.bench_out.clone()), (Some(3), true, Some(PathBuf::from("out.csv"))));
+        assert!(ff.benching() && !ff.bench && !Cli::default().benching());
+        assert!(parse("--runs 0").is_err() && parse("--runs x").is_err() && parse("--bench-first-frame").is_err());
         let more = parse("--demo-graph --flag 1:pick --flag 2:reject --label 0:green --label 3:none").unwrap();
         assert!(more.demo_graph);
         assert_eq!(more.flag, vec![(1, rawgraph_project::Flag::Pick), (2, rawgraph_project::Flag::Reject)]);

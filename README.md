@@ -42,6 +42,42 @@ CPU and available GPU benchmark with:
 cargo test -p rawgraph-app gallery_benchmark -- --ignored --nocapture
 ```
 
+**Selection to first visible frame** is measured with the application itself (release build;
+it opens the folder like a user, selects the images one after another and exits):
+
+```text
+rawgraph-app --bench-first-frame <folder> --preview-size 2560 --data-dir <fresh folder> ^
+             [--runs N] [--uncached] [--bench-out first-frame.csv]
+```
+
+Per image it records the time from the selection request until (a) the first picture of any
+kind is on screen (edited/cached thumbnail, embedded preview or cached proxy) and (b) the
+final graph render is on screen, accurate to one frame. It prints a table with median and p95
+(per camera format when the folder mixes formats) for the *uncached* and the *cached* views
+separately, plus file size, proxy size and the GPU/CPU path, and writes one CSV row per
+selection to `--bench-out` and a `<name>-summary.csv` next to it. `--runs N` repeats the
+passes over the folder; `--uncached` skips the cached passes (default: an uncached pass, an
+unmeasured warm-up pass, then a cached pass per run). Without `--data-dir` a temporary data
+folder is used and removed afterwards.
+
+- **Uncached** means RawGraph's own caches are emptied before every selection: decoded
+  proxies, prefetch, the render worker's evaluator cache and GPU base images, thumbnail
+  textures in memory, and the thumbnail caches on disk (all below `--data-dir`, so use a
+  fresh one, never your normal data folder). Background thumbnail and gallery workers keep
+  running as in normal use.
+- **The operating system's file cache cannot be flushed** by the benchmark. Only the first
+  uncached pass over a folder (labelled "uncached (first pass)") is cold for the files; with
+  `--runs 2` or more the repeats ("uncached (repeat)") find the files in the OS cache. For a
+  NAS, read the cold figure from the first pass, after a reboot or after not having touched
+  the folder.
+- The folder is only read. The run snapshots the files (size, modification time) before and
+  after and reports "unchanged"; exit code 3 if they differ.
+- Close other GPU-heavy programs first: with the GPU saturated by another job the window
+  needs minutes to start and every number is inflated. Check free video memory
+  (`nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader`) before a run.
+- No reference numbers are recorded here yet (Windows SSD and NAS runs on real RAW folders
+  are still to be taken).
+
 Source scans run in stages so a large folder is usable at once:
 
 1. **Count**: the directory listing alone (no image file is opened). The Source
