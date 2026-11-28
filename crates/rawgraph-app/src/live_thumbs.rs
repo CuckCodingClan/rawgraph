@@ -390,7 +390,8 @@ impl GpuBatch {
             let mut render = || -> Option<DisplayTarget> {
                 if job.cancel.is_cancelled() || port.is_some() || job.graph.node(node).is_some_and(|n| n.kind == NodeKind::Export) { return None; }
                 let plan = eval.plan_tail(&job.graph, node, id, p).ok()?;
-                if plan.ops.is_empty() { return None; }
+                // The thumbnails only run pointwise tails (`plan_tail`); anything else is a CPU base.
+                if plan.ops.is_empty() || plan.ops.iter().any(rawgraph_engine::TailOp::is_neighbourhood) { return None; }
                 let key = (id, (plan.base, Some(plan.base_port)), plan.base_fingerprint);
                 if !self.bases.contains(&key) {
                     let img = eval.eval_base(&job.graph, &plan, id, p, &job.cancel).ok()?;

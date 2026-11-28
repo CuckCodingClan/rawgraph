@@ -286,6 +286,40 @@ settings (size, colour space, profile and metadata groups) do not apply. A run
 with mixed per-image XMP and rendered formats reports rendered items as failed;
 run those separately. Quick Export remains a rendered-image export.
 
+### What runs on the GPU
+
+The viewer splits the graph at the node it shows. Everything upstream of the **last node the
+GPU cannot run** is evaluated on the CPU (the *base*, cached and uploaded once); the nodes behind
+it form the *tail*, a chain of GPU nodes (`rawgraph-gpu`, `chain.rs`) that is re-run for every
+slider move, followed by the display transform. The CPU functions stay the reference: every GPU
+operation is tested against them and agrees within one code value after the display transform
+(measured differences below). Any error, out-of-memory condition or unsupported node falls back to
+the CPU for that frame; the status bar then says why.
+
+| Node | On the GPU | Notes |
+| --- | --- | --- |
+| Capture EV, Exposure, White Balance, Saturation, Contrast, Highlights / Shadows, Color Wheels, Tone Curve, Curves (all channels), Hue / Saturation, Vignette, Black & White | pointwise tail, fused into **one pass** | without a connected control map |
+| Develop (exposure, contrast, vibrance, saturation, Legacy tone, white/black, dynamic) | pointwise tail | the base part (white balance, baseline) is the cached CPU base |
+| Develop **Lights / Shadows / White / Black** (non-Legacy local tone) | neighbourhood node | the 512 px guided-filter grid is estimated on the CPU from the base with the exposure gain applied, cached by an id and uploaded once; the per-pixel part runs on the GPU. Dragging Lights, Shadows, White, Black, Contrast or Saturation only re-runs that pass; changing Exposure or the base re-estimates the grid |
+| Filter: Gaussian and Box, low and high pass | neighbourhood node | separable passes; radii from 16 px on use the same box-downscaled approximation as the CPU |
+| Sharpen | neighbourhood node | log-luminance guide, true Gaussian below 4 px, box blur above, soft limiter |
+| Filter with a connected radius map, Filter Lens/Motion/Radial/Diamond/Median/Bilateral, Sharpen with an amount map | CPU base | |
+| Clarity, Noise Reduction, Layer, Lens Correction, Transform, Depth Map, Pixel Sort, anything with a connected control map | CPU base | everything behind such a node still runs on the GPU |
+
+Measured on an RTX 3070 (1280 px picture, slider to frame without the window, median of nine
+moves; `cargo test -p rawgraph-app slider_to_frame -- --ignored --nocapture`, `RG_BENCH_EDGE`
+sets the size): Develop Lights CPU 23.7 ms, GPU 2.5 ms; Filter radius CPU 7.5 ms, GPU 4.9 ms;
+Sharpen amount CPU 8.2 ms, GPU 3.0 ms. CPU and GPU pictures of a generated 2560 px test image
+(`cargo run -p rawgraph-app --example gentest`, `--dump-frame`, `--example pngdiff`) differ by at
+most one code value in under 0.07 % of the pixels.
+
+Intermediate textures: the base is never written. Passes ping-pong between a few scratch
+textures of the base's size that belong to the display class; a third one exists only while an
+operation needs the original next to its blurred copy (high pass, Sharpen after another node), and
+a low-resolution pair only while a blur radius of 16 px or more is in the chain. A frame that needs
+fewer textures frees the rest. An out-of-memory error while allocating one follows the usual rules
+(everything is released, this image is shown on the CPU).
+
 ### Per-node timing
 
 Enable **Debug → Per-node CPU timing** to profile the previews. Each node then shows a
@@ -295,7 +329,7 @@ the cache. The node taking at least half of the preview's time is red, one takin
 a fifth is amber. Hover a label for the exact time, its share, and the number of
 computations and result-cache hits. Cache hits are reported separately,
 not as operation timings. Times include evaluation overhead and are diagnostic, not a
-benchmark. The GPU tail is batched and has no per-node GPU timings; a GPU-resident
+benchmark. The GPU tail (pointwise and neighbourhood operations) has no per-node GPU timings; a GPU-resident
 base or Develop pre-tone base may not appear. Turning the option off disables the
 per-node timing clocks. Overlay, histogram, and scope work is not included.
 
@@ -492,10 +526,11 @@ revisions, history, graph restore, conflict check and crash recovery, and a pack
 updated in place in one rollback-journal transaction (only changed rows, appended history, conflict check inside
 the transaction, only on local drives outside sync folders, otherwise the whole file is rewritten; see `docs/project-format.md`), saving works while a folder scan runs, XMP import reads
 with its own 8-thread pool, and undo steps share unchanged nodes instead of copying the graph.
-The interactive preview runs the trailing pointwise operations and the display transform on the GPU
+The interactive preview runs the trailing operations (pointwise ones, the Develop local tone, Filter
+and Sharpen; see "What runs on the GPU") and the display transform on the GPU
 with automatic CPU fallback; everything else, including export, uses the CPU reference path.
-Not yet built: Layer mode "All combinations", HEIC on macOS/Linux, a lens database, GPU versions of the
-non-pointwise effects, HDR output and ACES output transforms, merging of concurrent edits, node
+Not yet built: Layer mode "All combinations", HEIC on macOS/Linux, a lens database, GPU versions of Noise
+Reduction, Clarity, Layer and Lens Correction, HDR output and ACES output transforms, merging of concurrent edits, node
 groups and macros, installer and signing, macOS/Linux verification. Interactive use with a real
 mouse and keyboard has not been tested by hand yet. Open questions: `docs/offene-punkte.md`.
 

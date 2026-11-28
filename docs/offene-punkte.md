@@ -57,7 +57,7 @@ Offen geblieben und nicht begonnen: Frage 15 (Benennung aus deiner Beschriftungs
 - **Lens Correction „Auto“** wirkt nur bei Sony-DNG. Ob die Korrektur genau so sitzt wie bei Adobe, ist nicht gegengeprüft (Annahme zum Bezugsrahmen der Daten).
 - **AVIF ist langsam:** 3–5 s je Bild bei Langkante 2048, rund 7,5 s bei 24 Megapixeln. Adobe RGB geht als AVIF nicht. Die AVIF-Pixel sind nicht durch Zurücklesen geprüft, nur der Dateiaufbau.
 - **Exportierte Farbprofile** sind durch Tests belegt, aber in keinem farbverwalteten Betrachter (Photoshop) angesehen.
-- **GPU-Vorschau:** Develop-Regler, Belichtung, Kontrast, Kurven (alle sieben Arten), Farbton/Sättigung, Farbräder, Vignette und die Anzeige laufen auf der GPU. Layer, Lens Correction, Weichzeichner, Rauschminderung, Schärfen, Klarheit, Zuschneiden, alles mit Maske, die Vergleichsansicht und der Export laufen auf der CPU.
+- **GPU-Vorschau:** Develop-Regler, Belichtung, Kontrast, Kurven (alle sieben Arten), Farbton/Sättigung, Farbräder, Vignette und die Anzeige laufen auf der GPU, ebenso die Nachbarschafts-Operationen Develop Lichter/Schatten/Weiß/Schwarz (lokale Tonwerte; das 512-px-Gitter wird auf der CPU geschätzt), Filter (Gauß und Box, Tief- und Hochpass) und Schärfen. Layer, Lens Correction, Rauschminderung, Klarheit, Zuschneiden, Filter mit Radius-Karte oder anderem Kern, Schärfen mit Mengen-Karte, alles mit Maske, die Vergleichsansicht und der Export laufen auf der CPU (siehe README, „What runs on the GPU“).
 - **Bildwechsel** wird durch das Vorladen der Nachbarbilder nur um 7–11 ms schneller.
 - **Pinsel reagiert träge:** rund 50 ms von der Mausbewegung bis zum Bild bei 30 Strichen; im Fenster nicht nachgemessen.
 - **Speichern während eines Ordner-Scans** geht jetzt: gespeichert wird, was bis dahin gefunden ist; der Scan läuft weiter und ergänzt danach ohne falschen Konflikt (Revision und Verlauf werden übernommen). Noch nicht fertig gehashte Bilder stehen als „ausstehend“ in der Datei und werden beim nächsten Scan nachgeholt.
@@ -96,7 +96,7 @@ Reihenfolge nach meinem Vorschlag.
 1. **Layer-Modus „All“** und zusammengesetzte Bild-Identitäten (Frage 28).
 2. **ACES-Ausgabe und HDR:** echte Output-Transforms, HDR-Vorschau, HDR-Export, Scopes mit Nits-Skala (Fragen 7 und 19).
 3. **Objektivdatenbank** für Verzeichnung und Vignette (Frage 27); Farbsäume aus dem Bild schätzen; Kameraprofile.
-4. **GPU-Rechenweg ausbauen:** Masken, Layer, Weichzeichner, Schärfen, Rauschminderung, Geometrie, Scopes auf der GPU.
+4. **GPU-Rechenweg ausbauen:** Masken, Layer (Platzieren und Mischen), Rauschminderung (Guided Filter), Lens Correction (Verzeichnung, Vignette), Geometrie, Scopes auf der GPU; Filter mit Radius-Karte. Weichzeichner, Schärfen und die lokalen Tonwerte laufen bereits dort.
 5. **Lokale Werkzeuge:** Dunst entfernen, Fleckenentfernung, Lichter/Schatten mit lokaler Anpassung.
 6. **Graph-Bedienung:** Gruppen und Makros, Kommentare, Ausrichten.
 7. **Weitere Nodes:** Körnung, LUT; Masken aus KI (Motiv, Himmel), Tiefe, importiertes Bild.

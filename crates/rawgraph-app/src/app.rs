@@ -375,6 +375,10 @@ struct Bench {
     dev_contrast: Vec<f32>,
     curve: Vec<f32>,
     hue: Vec<f32>,
+    /// Develop Lights (local tone), Filter radius and Sharpen amount changes: latency to the frame.
+    lights: Vec<f32>,
+    filter: Vec<f32>,
+    sharpen: Vec<f32>,
     steps: Vec<f32>,
     step_pending: bool,
     steps_started: bool,
@@ -404,6 +408,9 @@ enum BenchPhase {
     ToneCurve,
     CurveDrag,
     HueSat,
+    DevelopLights,
+    FilterRadius,
+    SharpenAmount,
     Steps,
     Done,
 }
@@ -701,6 +708,9 @@ impl App {
             dev_contrast: Vec::new(),
             curve: Vec::new(),
             hue: Vec::new(),
+            lights: Vec::new(),
+            filter: Vec::new(),
+            sharpen: Vec::new(),
             steps: Vec::new(),
             step_pending: false,
             steps_started: false,
@@ -2046,7 +2056,14 @@ impl App {
                     b.event = event;
                 }
             }
-            BenchPhase::DevelopExposure | BenchPhase::DevelopContrast | BenchPhase::ToneCurve | BenchPhase::CurveDrag | BenchPhase::HueSat => {
+            BenchPhase::DevelopExposure
+            | BenchPhase::DevelopContrast
+            | BenchPhase::ToneCurve
+            | BenchPhase::CurveDrag
+            | BenchPhase::HueSat
+            | BenchPhase::DevelopLights
+            | BenchPhase::FilterRadius
+            | BenchPhase::SharpenAmount => {
                 let id = self.session.current_image();
                 if let Some(e) = matches(event, id) {
                     match b.phase {
@@ -2054,6 +2071,9 @@ impl App {
                         BenchPhase::DevelopContrast => b.dev_contrast.push(e.1),
                         BenchPhase::ToneCurve => b.tone.push(e.1),
                         BenchPhase::CurveDrag => b.curve.push(e.1),
+                        BenchPhase::DevelopLights => b.lights.push(e.1),
+                        BenchPhase::FilterRadius => b.filter.push(e.1),
+                        BenchPhase::SharpenAmount => b.sharpen.push(e.1),
                         _ => b.hue.push(e.1),
                     }
                     b.drag_scopes.push(self.scope_worker_ms);
@@ -2064,6 +2084,9 @@ impl App {
                             BenchPhase::DevelopContrast => BenchPhase::ToneCurve,
                             BenchPhase::ToneCurve => BenchPhase::CurveDrag,
                             BenchPhase::CurveDrag => BenchPhase::HueSat,
+                            BenchPhase::HueSat => BenchPhase::DevelopLights,
+                            BenchPhase::DevelopLights => BenchPhase::FilterRadius,
+                            BenchPhase::FilterRadius => BenchPhase::SharpenAmount,
                             _ => BenchPhase::Steps,
                         };
                         self.bench_enter(&mut b, next);
@@ -2281,12 +2304,20 @@ impl App {
     fn bench_enter(&mut self, b: &mut Bench, mut phase: BenchPhase) {
         loop {
             let kind = match phase {
-                BenchPhase::Develop | BenchPhase::DevelopExposure | BenchPhase::DevelopContrast => Some(NodeKind::Develop),
+                BenchPhase::Develop | BenchPhase::DevelopExposure | BenchPhase::DevelopContrast | BenchPhase::DevelopLights => Some(NodeKind::Develop),
                 BenchPhase::ToneCurve => Some(NodeKind::ToneCurve),
                 BenchPhase::CurveDrag => Some(NodeKind::PointCurve),
                 BenchPhase::HueSat => Some(NodeKind::HueSaturation),
+                BenchPhase::FilterRadius => Some(NodeKind::Blur),
+                BenchPhase::SharpenAmount => Some(NodeKind::Sharpen),
                 _ => None,
             };
+            // The Filter and Sharpen phases bring their own node when the graph has none.
+            if matches!(phase, BenchPhase::FilterRadius | BenchPhase::SharpenAmount) {
+                if let Some(kind) = kind {
+                    self.bench_ensure_node(kind);
+                }
+            }
             let Some(kind) = kind else {
                 b.phase = phase;
                 b.idx = 0;
@@ -2311,9 +2342,27 @@ impl App {
                 BenchPhase::DevelopContrast => BenchPhase::ToneCurve,
                 BenchPhase::ToneCurve => BenchPhase::CurveDrag,
                 BenchPhase::CurveDrag => BenchPhase::HueSat,
+                BenchPhase::HueSat => BenchPhase::DevelopLights,
+                BenchPhase::DevelopLights => BenchPhase::FilterRadius,
+                BenchPhase::FilterRadius => BenchPhase::SharpenAmount,
                 _ => BenchPhase::Steps,
             };
         }
+    }
+
+    /// The first node of `kind`, or a new one between the Output node and what feeds it.
+    fn bench_ensure_node(&mut self, kind: NodeKind) -> Option<NodeId> {
+        let g = &mut self.session.project.graph;
+        if let Some(n) = g.nodes().find(|n| n.kind == kind) {
+            return Some(n.id);
+        }
+        let out = g.nodes().find(|n| n.kind == NodeKind::Output).map(|n| n.id)?;
+        let (up, up_port) = g.input_edge(out, 0)?;
+        let node = g.add_node(kind, [200.0, 140.0]);
+        g.connect(up, node, 0).ok()?;
+        g.connect(node, out, 0).ok()?;
+        let _ = up_port;
+        Some(node)
     }
 
     /// One slider / point move of the Tone Curve, Curve or Hue / Saturation phase of the benchmark.
@@ -2340,6 +2389,19 @@ impl App {
             BenchPhase::HueSat => {
                 n.set_param("red_s", image, -0.5 + t);
                 n.set_param("blue_h", image, 0.3 - 0.6 * t);
+            }
+            BenchPhase::DevelopLights => {
+                // The (non-Legacy) local tone: Lights and Shadows, the part a GPU tail now runs.
+                n.set_param("highlights", image, -0.8 + 1.6 * t);
+                n.set_param("shadows", image, 0.2 + 0.4 * t);
+            }
+            BenchPhase::FilterRadius => {
+                // 4 to 24 per mille of the long edge: 10 to 61 px at 2560 px.
+                n.set_param("radius", image, 4.0 + 20.0 * t);
+            }
+            BenchPhase::SharpenAmount => {
+                n.set_param("radius", image, 1.0);
+                n.set_param("amount", image, 0.2 + 0.8 * t);
             }
             _ => {}
         }
@@ -3528,6 +3590,9 @@ fn print_bench(b: &Bench, session: &Session, mode: RendererMode, refined: &[f32]
     eprintln!("BENCH tone-curve change -> frame shown:      {}", stats(&b.tone));
     eprintln!("BENCH curve-point drag -> frame shown:       {}", stats(&b.curve));
     eprintln!("BENCH hue/saturation change -> frame shown:  {}", stats(&b.hue));
+    eprintln!("BENCH develop lights/shadows (local tone) change -> frame: {}", stats(&b.lights));
+    eprintln!("BENCH filter radius change -> frame:         {}", stats(&b.filter));
+    eprintln!("BENCH sharpen amount change -> frame:        {}", stats(&b.sharpen));
     eprintln!("BENCH step to a neighbour (proxy decoded, idle time to preload): {}", stats(&b.steps));
     eprintln!("BENCH scopes while dragging (worker, exposure+Develop frames): {}", stats(&b.drag_scopes));
     eprintln!("BENCH scopes at rest (last frame -> exact scopes shown; GPU only, includes the 150 ms idle wait): {}", stats(refined));

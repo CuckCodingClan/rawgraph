@@ -7,7 +7,7 @@ use eframe::egui::TextureId;
 use eframe::egui_wgpu::RenderState;
 use eframe::wgpu;
 use rawgraph_core::ImageBuf;
-use rawgraph_gpu::{display_samples, render_into, DisplayTarget, GpuContext, GpuError, GpuImage, GpuToneMap, PointOp};
+use rawgraph_gpu::{display_samples, render_chain_into, ChainScratch, DisplayTarget, GpuContext, GpuError, GpuImage, GpuNode, GpuToneMap, Loc};
 use rawgraph_scopes::DisplayImage;
 
 use crate::gpu_path::GpuFailure;
@@ -23,9 +23,13 @@ pub struct GpuSetup {
 }
 
 pub struct RealClass {
-    scratch: GpuImage,
+    /// The textures the chain writes into: allocated when a frame needs them, trimmed to what the
+    /// last frame needed.
+    scratch: ChainScratch,
     target: DisplayTarget,
     id: Option<TextureId>,
+    /// Where the float result of the last frame lives (the scopes read it there).
+    result: Loc,
 }
 
 pub struct RealBackend {
@@ -75,7 +79,7 @@ impl Backend for RealBackend {
     }
 
     fn new_class(&mut self, width: u32, height: u32) -> Result<RealClass, GpuError> {
-        let scratch = GpuImage::new_empty(&self.ctx, width, height)?;
+        let scratch = ChainScratch::new();
         let target = DisplayTarget::new(&self.ctx, width, height)?;
         // Magnified pixels stay crisp, reduced pictures are smooth: like the CPU texture.
         let id = self.render_state.as_ref().map(|rs| {
@@ -90,7 +94,7 @@ impl Backend for RealBackend {
                 },
             )
         });
-        Ok(RealClass { scratch, target, id })
+        Ok(RealClass { scratch, target, id, result: Loc::Base })
     }
 
     fn texture_id(&self, class: &RealClass) -> TextureId {
@@ -103,13 +107,19 @@ impl Backend for RealBackend {
         }
     }
 
-    fn render(&mut self, base: &GpuImage, class: &RealClass, ops: &[PointOp], exposure_ev: f32, tone: GpuToneMap) -> Result<(), GpuError> {
-        render_into(&self.ctx, base, &class.scratch, &class.target, ops, exposure_ev, tone)
+    fn render(&mut self, base: &GpuImage, class: &mut RealClass, nodes: &[GpuNode], exposure_ev: f32, tone: GpuToneMap) -> Result<(), GpuError> {
+        class.result = Loc::Base;
+        class.result = render_chain_into(&self.ctx, base, &mut class.scratch, &class.target, nodes, exposure_ev, tone)?;
+        Ok(())
     }
 
     fn samples(&mut self, base: &GpuImage, class: &RealClass, ops_empty: bool, exposure_ev: f32, tone: GpuToneMap, step: u32) -> Result<DisplayImage, GpuError> {
-        let src = if ops_empty { base } else { &class.scratch };
+        let src = if ops_empty { base } else { class.scratch.resolve(base, class.result) };
         display_samples(&self.ctx, src, exposure_ev, tone, step)
+    }
+
+    fn free_caches(&mut self) {
+        self.ctx.clear_grid_cache();
     }
 
     fn read_rgba8(&mut self, class: &RealClass) -> Result<Vec<u8>, GpuError> {
