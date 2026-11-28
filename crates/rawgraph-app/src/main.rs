@@ -31,6 +31,8 @@ mod histogram;
 mod history;
 mod inspector;
 mod gradient_editor;
+mod handles;
+mod handles_logic;
 mod icons;
 mod missing_check;
 mod node_ui;

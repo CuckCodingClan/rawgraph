@@ -310,6 +310,40 @@ Generator uses an optional input's dimensions and collection, or produces a stan
 
 Preview filenames, the window title, and `--version` use `YYMM.###` (three-digit monthly build number, starting at `001`). Cargo stores the equivalent unpadded SemVer, such as `26.11.1` for `2611.001`.
 
+### Viewer handles
+
+Some nodes can be edited directly on the picture. The handles appear only while that node
+is selected and the pointer is over the viewer, and only when the viewer shows the node's
+own result or a later stage reached through nothing but Crop / Rotate nodes (they then
+follow the crop and rotation). Drag a handle to change the setting live; each drag is one
+undo step. Double-click a handle to reset what it controls. In Individual mode a drag only
+changes the photo on screen. Space+drag and the middle button still pan.
+
+- **Generator (Gradient):** Linear shows a line from the start (hollow knob, where the ramp
+  begins) to the end (filled knob); drag either end to set angle and length while the other
+  end stays put. Radial and Diamond show their outer contour with an edge knob (radius and
+  angle); Reflected shows both mirrored ends; Angle shows a direction knob. The small
+  hollow centre knob moves the whole gradient (new **Gradient center X / Y** settings,
+  default 50 % / 50 %, so older graphs look the same). Double-click the centre to recentre;
+  double-click an end to reset angle and scale.
+- **Crop / Rotate:** besides the crop frame, a knob above the top edge straightens: drag it
+  around the picture to turn the image (−45° to 45°, the fine grid shows while turning).
+  Double-click it for 0°. Scale and move are the crop frame itself (corners and inside);
+  there are no separate scale or offset settings.
+- **Vignette:** three rings at the exact distances the effect uses (the same
+  centre-to-half-diagonal metric): the bright ring is the midpoint, the faint inner and
+  outer rings are where the feather starts and reaches full strength. Drag the midpoint
+  knob (top right) or a feather knob (bottom right).
+- **Filter (Motion kernel):** an arrow from the image centre points along the blur; the
+  faint line through the centre shows the streak length (the radius). Drag the arrow head
+  to set Motion angle. Hidden when a Direction (RGB) map is connected or another kernel is
+  chosen.
+- **White balance picker:** White Balance and Develop have a **Pick neutral** button. Then
+  click a grey or white area in the viewer: RawGraph averages a small patch of the node's
+  input (not its output) and sets temperature and tint so that patch becomes neutral.
+  Develop switches to Custom white balance. The picker turns itself off after one click;
+  Escape cancels. A colour beyond the slider ranges gets the closest setting and a note.
+
 ### Pixel Sort
 
 Pixel Sort stably sorts all complete RGBA pixels across the image, filling each column top-to-bottom from left to right. Brightness is linear ACEScg luminance; saturation is RGB chroma (max minus min) divided by the largest absolute RGB component, or zero for black; hue is the ACEScg RGB chroma-vector angle (neutral hue zero). These metrics accept signed and HDR values without clamping. Ties retain source row-major order; reverse changes the key direction without reversing ties. Pixels with non-finite RGB sort last in either direction. Alpha travels unchanged with its pixel and does not affect its key.

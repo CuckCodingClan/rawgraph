@@ -38,7 +38,8 @@ pub const MAX_PIXELS: u64 = 4_194_304;
 pub enum Pattern {
     Solid { color: [f32; 3] },
     Gradient { start: [f32; 3], end: [f32; 3], vertical: bool },
-    StyledGradient { start: [f32; 3], end: [f32; 3], style: u32, angle: f32, scale: f32, reverse: bool, vertical: bool, ramp: Ramp },
+    /// `center`: normalised frame position of the gradient origin ((0.5, 0.5) = frame centre).
+    StyledGradient { start: [f32; 3], end: [f32; 3], style: u32, angle: f32, scale: f32, center: [f32; 2], reverse: bool, vertical: bool, ramp: Ramp },
     /// Eight vertical reference bars in scene-linear ACEScg, not a calibrated chart.
     Chart,
     /// Reproducible monochrome uniform noise in [0, 1].
@@ -93,7 +94,7 @@ pub fn generate_with_ramp(width: u32, height: u32, pattern: Pattern, structured:
     match pattern {
         Pattern::Solid { color } if !valid(color) => return Err("non-finite color"),
         Pattern::Gradient { start, end, .. } if !valid(start) || !valid(end) => return Err("non-finite color"),
-        Pattern::StyledGradient { start, end, angle, scale, .. } if !valid(start) || !valid(end) || !angle.is_finite() || !scale.is_finite() || scale <= 0.0 => return Err("invalid gradient"),
+        Pattern::StyledGradient { start, end, angle, scale, center, .. } if !valid(start) || !valid(end) || !angle.is_finite() || !scale.is_finite() || scale <= 0.0 || !center.iter().all(|c| c.is_finite()) => return Err("invalid gradient"),
         Pattern::Checker { cell_size: 0, .. } => return Err("checker cell size must be nonzero"),
         _ => {}
     }
@@ -110,14 +111,15 @@ pub fn generate_with_ramp(width: u32, height: u32, pattern: Pattern, structured:
                     let t = p as f32 / n.saturating_sub(1).max(1) as f32;
                     std::array::from_fn(|i| start[i] * (1.0 - t) + end[i] * t)
                 }
-                Pattern::StyledGradient { start, end, style, angle, scale, reverse, vertical, ramp } => {
+                Pattern::StyledGradient { start, end, style, angle, scale, center, reverse, vertical, ramp } => {
                     // Normalized frame coordinates; the default remains the exact legacy ramp.
                     let u = x as f32 / width.saturating_sub(1).max(1) as f32;
                     let v = y as f32 / height.saturating_sub(1).max(1) as f32;
                     let radians = (angle + if vertical { 90.0 } else { 0.0 }).to_radians();
                     let (sin, cos) = radians.sin_cos();
-                    let dx = u - 0.5;
-                    let dy = v - 0.5;
+                    let centred = center == [0.5, 0.5];
+                    let dx = u - center[0];
+                    let dy = v - center[1];
                     let along = dx * cos + dy * sin;
                     let across = -dx * sin + dy * cos;
                     let raw = match style {
@@ -125,8 +127,8 @@ pub fn generate_with_ramp(width: u32, height: u32, pattern: Pattern, structured:
                         2 => ((dy.atan2(dx) - radians) / std::f32::consts::TAU).rem_euclid(1.0) / scale,
                         3 => along.abs() * 2.0 / scale,
                         4 => (along.abs() + across.abs()) * 2.0 / scale,
-                        _ if angle == 0.0 && !vertical && scale == 1.0 => u,
-                        _ if angle == 0.0 && vertical && scale == 1.0 => v,
+                        _ if centred && angle == 0.0 && !vertical && scale == 1.0 => u,
+                        _ if centred && angle == 0.0 && vertical && scale == 1.0 => v,
                         _ => 0.5 + along / scale,
                     };
                     let t = raw.clamp(0.0, 1.0);
@@ -229,6 +231,48 @@ mod tests {
         assert_eq!(a.pixel(0, 0), [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(a.pixel(1, 0), [1.0; 4]);
         assert_eq!(b.pixel(1, 0), [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn gradient_center_default_is_bit_identical_and_moves_the_origin() {
+        let ramp = Ramp { color_middle: None, color_midpoints: [0.5; 2], alpha: [1.0; 3], alpha_middle: None, alpha_midpoints: [0.5; 2], smooth: 0.0, dither: false };
+        let styled = |style, angle, scale, center| Pattern::StyledGradient { start: [0.0; 3], end: [1.0; 3], style, angle, scale, center, reverse: false, vertical: false, ramp };
+        // The old renderer's formulas with the origin fixed at the frame centre.
+        let old = |style: u32, angle: f32, scale: f32, u: f32, v: f32| {
+            let r = angle.to_radians();
+            let (s, c) = r.sin_cos();
+            let (dx, dy) = (u - 0.5, v - 0.5);
+            let along = dx * c + dy * s;
+            let across = -dx * s + dy * c;
+            let raw = match style {
+                1 => (dx * dx + dy * dy).sqrt() * 2.0 / scale,
+                2 => ((dy.atan2(dx) - r) / std::f32::consts::TAU).rem_euclid(1.0) / scale,
+                3 => along.abs() * 2.0 / scale,
+                4 => (along.abs() + across.abs()) * 2.0 / scale,
+                _ if angle == 0.0 && scale == 1.0 => u,
+                _ => 0.5 + along / scale,
+            };
+            raw.clamp(0.0, 1.0)
+        };
+        for style in 0..5 {
+            for (angle, scale) in [(0.0, 1.0), (33.0, 0.7), (-120.0, 2.5)] {
+                let img = generate(9, 7, styled(style, angle, scale, [0.5, 0.5])).unwrap();
+                for y in 0..7 {
+                    for x in 0..9 {
+                        let t = old(style, angle, scale, x as f32 / 8.0, y as f32 / 6.0);
+                        assert_eq!(img.pixel(x, y)[0].to_bits(), t.to_bits(), "style {style} at {x},{y}");
+                    }
+                }
+            }
+        }
+        // Moved origin: a radial gradient is 0 at the new centre.
+        let img = generate(9, 9, styled(1, 0.0, 1.0, [0.25, 0.75])).unwrap();
+        assert_eq!(img.pixel(2, 6)[0], 0.0);
+        assert!(img.pixel(4, 4)[0] > 0.0);
+        // Linear with the default angle and scale but a moved centre leaves the fast path.
+        let img = generate(9, 1, styled(0, 0.0, 1.0, [0.25, 0.5])).unwrap();
+        assert_eq!(img.pixel(2, 0)[0], 0.5, "t = 0.5 at the centre");
+        assert!(generate(2, 2, styled(0, 0.0, 1.0, [f32::NAN, 0.5])).is_err());
     }
 
     #[test]

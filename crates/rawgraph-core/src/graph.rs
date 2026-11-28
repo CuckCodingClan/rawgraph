@@ -243,6 +243,9 @@ const GENERATOR_PARAMS: &[ParamSpec] = &[
     choice("gradient_style", "Gradient style", &["Linear", "Radial", "Angle", "Reflected", "Diamond"], 0),
     p("gradient_angle", "Gradient angle", "deg", -180.0, 180.0, 0.0),
     p("gradient_scale", "Gradient scale", "%", 1.0, 400.0, 100.0),
+    // Gradient origin in percent of the frame (50 / 50 = centre); may lie outside the frame.
+    p("gradient_center_x", "Gradient center X", "%", -100.0, 200.0, 50.0),
+    p("gradient_center_y", "Gradient center Y", "%", -100.0, 200.0, 50.0),
     toggle("gradient_reverse", "Reverse gradient", false),
     p("start_r", "Start red", "", -4.0, 4.0, 0.0), p("start_g", "Start green", "", -4.0, 4.0, 0.0), p("start_b", "Start blue", "", -4.0, 4.0, 0.0),
     p("end_r", "End red", "", -4.0, 4.0, 1.0), p("end_g", "End green", "", -4.0, 4.0, 1.0), p("end_b", "End blue", "", -4.0, 4.0, 1.0),

@@ -16,6 +16,10 @@ use crate::viewer::{Geometry, Orient, Viewer};
 pub struct Tools {
     paint: Option<PaintDrag>,
     crop: Option<CropDrag>,
+    /// Dragging the straighten knob: (pointer angle at the press in degrees, angle then, moved).
+    straighten: Option<(f32, f32, bool)>,
+    /// On-picture handles of the other nodes (gradients, vignette, motion direction, picker).
+    pub handles: crate::handles::Handles,
 }
 
 struct PaintDrag {
@@ -113,6 +117,7 @@ impl Tools {
         }
         if !matches!(mode, ToolMode::Crop(_)) {
             self.crop = None;
+            self.straighten = None;
         }
         match mode {
             ToolMode::Brush(node) => self.brush(ui, geom, session, node),
@@ -120,7 +125,7 @@ impl Tools {
                 self.crop(ui, geom, session, node, frame);
                 None
             }
-            ToolMode::None => None,
+            ToolMode::None => self.handles.show(ui, geom, session, frame),
         }
     }
 
@@ -245,8 +250,8 @@ impl Tools {
         let to_frac = |p: Pos2| [(p.x - pic.min.x) / pic.width(), (p.y - pic.min.y) / pic.height()];
 
         let typing = ctx.egui_wants_keyboard_input();
-        let (pos, latest, space, middle, down, pressed, time) = ctx.input(|i| {
-            (i.pointer.hover_pos(), i.pointer.latest_pos(), i.key_down(Key::Space), i.pointer.middle_down(), i.pointer.primary_down(), i.pointer.primary_pressed(), i.time)
+        let (pos, latest, space, middle, down, pressed, time, double) = ctx.input(|i| {
+            (i.pointer.hover_pos(), i.pointer.latest_pos(), i.key_down(Key::Space), i.pointer.middle_down(), i.pointer.primary_down(), i.pointer.primary_pressed(), i.time, i.pointer.button_double_clicked(egui::PointerButton::Primary))
         });
         let space = space && !typing;
         let inside = geom.response.hovered() && pos.is_some_and(|p| geom.viewport.contains(p));
@@ -266,9 +271,42 @@ impl Tools {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
 
-        // Grab a handle.
+        // The straighten knob above the crop: drag around the picture centre to turn it.
         let screen = to_screen(rect);
-        if pressed && inside && !space && !middle && self.crop.is_none() {
+        let knob = straighten_knob(screen, geom.viewport);
+        let pointer_deg = |p: Pos2| (p.y - center.y).atan2(p.x - center.x).to_degrees();
+        if pressed && inside && !space && !middle && self.crop.is_none() && self.straighten.is_none() && pos.is_some_and(|p| p.distance(knob) <= 10.0) {
+            self.straighten = pos.map(|p| (pointer_deg(p), params.angle_deg, false));
+        }
+        if let Some((press_deg, start, moved)) = &mut self.straighten {
+            if let Some(p) = latest {
+                let delta = (pointer_deg(p) - *press_deg + 180.0).rem_euclid(360.0) - 180.0;
+                *moved |= delta.abs() > 0.05;
+                if *moved {
+                    let angle = crop_logic::straighten_angle(*start, delta);
+                    if let Some(n) = session.project.graph.node_mut(node) {
+                        if (n.param("angle", image) - angle).abs() > 1e-5 {
+                            n.set_param("angle", image, angle);
+                        }
+                    }
+                }
+            }
+            if !down {
+                if double && !*moved {
+                    if let Some(n) = session.project.graph.node_mut(node) {
+                        if n.param("angle", image) != 0.0 {
+                            n.set_param("angle", image, 0.0);
+                        }
+                    }
+                }
+                self.straighten = None;
+            }
+            ctx.request_repaint();
+        }
+        let straightening = self.straighten.is_some();
+
+        // Grab a handle.
+        if pressed && inside && !space && !middle && self.crop.is_none() && !straightening {
             if let Some(h) = pos.and_then(|p| crop_logic::hit_handle(screen, [p.x, p.y], 11.0)) {
                 let press = pos.map_or([0.0, 0.0], to_frac);
                 let handle_at = h.position([rect.l, rect.t, rect.r, rect.b]);
@@ -294,9 +332,13 @@ impl Tools {
         let screen = to_screen(rect);
 
         // Cursor.
-        let hot = dragging.or_else(|| if inside && !space { pos.and_then(|p| crop_logic::hit_handle(screen, [p.x, p.y], 11.0)) } else { None });
+        let knob = straighten_knob(screen, geom.viewport);
+        let knob_hot = straightening || (inside && !space && self.crop.is_none() && pos.is_some_and(|p| p.distance(knob) <= 10.0));
+        let hot = if knob_hot { None } else { dragging.or_else(|| if inside && !space { pos.and_then(|p| crop_logic::hit_handle(screen, [p.x, p.y], 11.0)) } else { None }) };
         if inside && space {
             ctx.set_cursor_icon(CursorIcon::Grab);
+        } else if knob_hot {
+            ctx.set_cursor_icon(if straightening { CursorIcon::Grabbing } else { CursorIcon::Grab });
         } else if let Some(h) = hot {
             ctx.set_cursor_icon(match h {
                 Handle::TopLeft | Handle::BottomRight => CursorIcon::ResizeNwSe,
@@ -306,7 +348,10 @@ impl Tools {
                 Handle::Move => CursorIcon::Move,
             });
         }
-        paint_crop(ui, geom.viewport, pic, screen, grid, hot);
+        paint_crop(ui, geom.viewport, pic, screen, grid || straightening, hot);
+        if inside || straightening {
+            paint_straighten(ui, geom.viewport, screen, knob_hot);
+        }
         if let Some(n) = session.project.graph.node(node) {
             let (w, h) = crop_logic::result_size(frame[0], frame[1], &transform_params(n, image));
             let text = format!("{w} x {h}");
@@ -318,6 +363,24 @@ impl Tools {
             painter.galley(r.center() - galley.size() / 2.0, galley, Color32::WHITE);
         }
     }
+}
+
+/// Where the straighten knob sits: a short stem above the middle of the crop's top edge, or
+/// just inside it when the edge is at the top of the viewer.
+pub fn straighten_knob(c: [f32; 4], viewport: Rect) -> Pos2 {
+    let above = c[1] - 22.0;
+    Pos2::new((c[0] + c[2]) * 0.5, if above < viewport.top() + 10.0 { c[1] + 22.0 } else { above })
+}
+
+fn paint_straighten(ui: &egui::Ui, viewport: Rect, c: [f32; 4], hot: bool) {
+    let painter = ui.painter_at(viewport);
+    let knob = straighten_knob(c, viewport);
+    let foot = Pos2::new(knob.x, c[1]);
+    painter.line_segment([foot, knob], Stroke::new(2.4, Color32::from_black_alpha(110)));
+    painter.line_segment([foot, knob], Stroke::new(1.0, Color32::from_white_alpha(170)));
+    let color = if hot { Color32::from_rgb(255, 210, 90) } else { Color32::WHITE };
+    painter.circle_filled(knob, 6.5, Color32::from_black_alpha(150));
+    painter.circle_stroke(knob, 4.8, Stroke::new(1.8, color));
 }
 
 fn paint_brush_cursor(ui: &egui::Ui, viewport: Rect, p: Pos2, radius: f32, hardness: f32, erase: bool) {

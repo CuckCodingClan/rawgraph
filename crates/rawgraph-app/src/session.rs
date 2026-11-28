@@ -179,6 +179,8 @@ pub struct Session {
     /// Brush settings of the Draw tool.
     pub brush: BrushSettings,
     pub crop: CropUi,
+    /// The node whose white-balance picker is armed (a click in the viewer picks a neutral point).
+    pub wb_pick: Option<NodeId>,
     /// Luminance histogram behind the curve editor, made by the render worker.
     pub curve_hist: Option<CurveHist>,
     /// Requests of the inspector for the application (dialogs, export), taken once per frame.
@@ -230,6 +232,7 @@ impl Session {
             filter: FilterUi::default(),
             brush: BrushSettings::default(),
             crop: CropUi::default(),
+            wb_pick: None,
             curve_hist: None,
             ui_requests: Vec::new(),
             export_busy: false,

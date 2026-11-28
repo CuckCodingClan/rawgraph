@@ -331,6 +331,33 @@ fn dragging_a_corner_handle_writes_the_crop_as_one_undo_step() {
 }
 
 #[test]
+fn the_straighten_knob_turns_the_picture_and_double_click_levels_it() {
+    let mut v = View::new(NodeKind::Transform);
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+    let knob = crate::tools::straighten_knob(crop_screen(&v), viewport);
+    let centre = Pos2::new(450.0, 300.0);
+    // Turn the knob 10 degrees clockwise around the picture centre.
+    let r = knob - centre;
+    let (s, c) = 10f32.to_radians().sin_cos();
+    let to = centre + Vec2::new(r.x * c - r.y * s, r.x * s + r.y * c);
+    drag_screen(&mut v, knob, to);
+    let image = v.s.current_image();
+    let angle = v.s.project.graph.node(v.node).unwrap().param("angle", image);
+    assert!((angle - 10.0).abs() < 0.5, "turned by the pointer's angle: {angle}");
+    assert!(crop_of(&v).is_full(), "the crop is not touched");
+    assert_eq!(v.steps, 1);
+    let knob = crate::tools::straighten_knob(crop_screen(&v), viewport);
+    v.move_to(knob);
+    for _ in 0..2 {
+        v.button(PointerButton::Primary, true);
+        v.button(PointerButton::Primary, false);
+    }
+    v.frame(vec![]);
+    assert_eq!(v.s.project.graph.node(v.node).unwrap().param("angle", image), 0.0, "double-click levels the picture");
+    assert_eq!(crate::crop_logic::straighten_angle(40.0, 20.0), 45.0, "clamped to the parameter range");
+}
+
+#[test]
 fn an_edge_handle_moves_one_edge_and_the_inside_moves_the_rectangle() {
     let mut v = View::new(NodeKind::Transform);
     let [x0, y0, _, y1] = crop_screen(&v);
