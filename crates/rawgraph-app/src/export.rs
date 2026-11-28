@@ -4,9 +4,10 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
-use rawgraph_batch::{ExportError, ExportFormat, ExportItem, ExportReport, ExportSettings, ItemStatus, OnConflict};
+use rawgraph_batch::{ExportError, ExportFormat, ExportItem, ExportReport, ExportSettings, ItemStatus, OnConflict, SheetBinding};
 use rawgraph_core::{Graph, ImageId, NodeId, NodeKind, PortType};
 use rawgraph_engine::CancelToken;
 use rawgraph_scopes::DisplayTransform;
@@ -71,6 +72,8 @@ pub struct ExportState {
     pub embed_profile: bool,
     /// "Copy capture metadata" (default on).
     pub copy_metadata: bool,
+    /// The loaded caption sheet (for `{sheet_name}` / `{caption}` in the name template); set by the app.
+    pub sheet: Option<Arc<SheetBinding>>,
 }
 
 impl Default for ExportState {
@@ -88,6 +91,7 @@ impl Default for ExportState {
             apply_tone_map: true,
             embed_profile: true,
             copy_metadata: true,
+            sheet: None,
         }
     }
 }
@@ -164,6 +168,7 @@ impl ExportState {
             generator_view_tone: view.tone.tone_map(),
             embed_profile: self.embed_profile,
             copy_metadata: self.copy_metadata,
+            sheet: self.sheet.clone(),
             ..Default::default()
         })
     }
@@ -208,6 +213,8 @@ pub struct NodeRun {
     pub display: DisplayTransform,
     pub members: Vec<ImageId>,
     pub culling: std::collections::HashMap<ImageId, (u8, rawgraph_project::Flag, Option<rawgraph_project::ColorLabel>)>,
+    /// The loaded caption sheet, for the name tokens of the node's template.
+    pub sheet: Option<Arc<SheetBinding>>,
 }
 
 /// A running export. The graph is cloned, so the app stays fully usable.
@@ -263,7 +270,7 @@ impl ExportJob {
                     let _ = tx_p.send(ExportMsg::Progress { done, total });
                     ctx_p.request_repaint();
                 }))
-            } else { rawgraph_batch::export_node(&graph, node, &run2.catalog, &selection, run2.display, &c2, &mut |p| {
+            } else { rawgraph_batch::export_node_sheet(&graph, node, &run2.catalog, &selection, run2.display, run2.sheet.clone(), &c2, &mut |p| {
                 let _ = tx_p.send(ExportMsg::Progress { done: p.done, total: p.total });
                 ctx_p.request_repaint();
             }) };
@@ -373,7 +380,7 @@ pub fn node_plan(session: &mut Session, node: NodeId, scope: Scope) -> (Vec<Expo
     let display = node_display(&session.view);
     let members = node_members(session, node);
     let culling = session.project.images().iter().map(|e| (e.id, (e.rating, e.flag, e.color_label))).collect();
-    (items, NodeRun { catalog, display, members, culling })
+    (items, NodeRun { catalog, display, members, culling, sheet: session.caption_sheet.clone() })
 }
 
 /// Whether `out_dir` is the folder of any source photo of `catalog`: an export never writes there.
@@ -596,7 +603,7 @@ pub fn show_dialog(ctx: &egui::Context, area: egui::Rect, st: &mut ExportState, 
             ui.end_row();
 
             ui.label("File name");
-            ui.add(egui::TextEdit::singleline(&mut st.template).desired_width(280.0)).on_hover_text("{name} source name, {index} / {index:04} position, {id} image id");
+            ui.add(egui::TextEdit::singleline(&mut st.template).desired_width(280.0)).on_hover_text(crate::node_ui::NAME_TEMPLATE_HELP);
             ui.end_row();
 
             ui.label("Existing files");

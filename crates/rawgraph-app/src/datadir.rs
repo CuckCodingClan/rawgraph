@@ -47,6 +47,11 @@ impl DataDirs {
     pub fn recipes(&self) -> PathBuf {
         self.root.join("recipes")
     }
+
+    /// The undo log of batch renames while the project has no file of its own.
+    pub fn rename_log(&self) -> PathBuf {
+        self.root.join("rename").join("unsaved-project.rename-log.json")
+    }
 }
 
 #[cfg(test)]
@@ -59,6 +64,7 @@ mod tests {
         assert_eq!(d.recovery(), PathBuf::from("X:/data/recovery"));
         assert_eq!(d.thumbs(), PathBuf::from("X:/data/cache/thumbs"));
         assert_eq!(d.recipes(), PathBuf::from("X:/data/recipes"));
+        assert_eq!(d.rename_log(), PathBuf::from("X:/data/rename/unsaved-project.rename-log.json"));
         assert_eq!(DataDirs::from_option(Some(Path::new("Y:/z"))).root(), Path::new("Y:/z"));
         assert!(DataDirs::standard().root().ends_with("rawgraph"));
     }

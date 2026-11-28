@@ -439,7 +439,7 @@ Legacy compatibility only: hidden from the add-node UI and no longer part of new
 
 ### Export (`Export`)
 
-Structured fields: output folder, filename template, artist, copyright, and description. The inspector groups PNG and TIFF by format with a separate 8/16-bit selector; the table lists their underlying stored choices. PNG 16-bit data map bypasses photo colour transforms. Viewing JPEG or 8-bit PNG shows an automatic encode/decode preview without writing a file. XMP is metadata-only; other codecs do not currently preview. HEIC is not implemented.
+Structured fields: output folder, filename template (`{name}`, `{index}`, `{id}`, and with a loaded caption sheet `{sheet_name}`, `{caption}`, `{no:03}`; an image without a sheet row fails on its own), artist, copyright, and description. The inspector groups PNG and TIFF by format with a separate 8/16-bit selector; the table lists their underlying stored choices. PNG 16-bit data map bypasses photo colour transforms. Viewing JPEG or 8-bit PNG shows an automatic encode/decode preview without writing a file. XMP is metadata-only; other codecs do not currently preview. HEIC is not implemented.
 
 - **Inputs:** Images: Images (required)
 - **Outputs:** None

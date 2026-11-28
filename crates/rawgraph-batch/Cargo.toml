@@ -9,6 +9,7 @@ rawgraph-core.workspace = true
 rawgraph-engine = { path = "../rawgraph-engine" }
 rawgraph-scopes = { path = "../rawgraph-scopes" }
 rawgraph-io = { path = "../rawgraph-io" }
+rawgraph-rename = { path = "../rawgraph-rename" }
 rayon.workspace = true
 
 [dev-dependencies]

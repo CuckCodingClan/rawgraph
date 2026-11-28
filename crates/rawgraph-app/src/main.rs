@@ -44,6 +44,8 @@ mod ranges_logic;
 mod recipes;
 mod recovery_guard;
 mod relink;
+mod rename_ops;
+mod rename_ui;
 mod render;
 mod revisions;
 mod save_flow;

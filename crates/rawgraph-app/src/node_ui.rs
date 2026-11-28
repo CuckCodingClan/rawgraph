@@ -246,7 +246,7 @@ pub fn colour_space_applies(format: ExportFileFormat) -> bool {
 }
 
 pub const EXR_SPACE_NOTE: &str = "EXR files are linear ACEScg: the colour space and the profile do not apply.";
-pub const NAME_TEMPLATE_HELP: &str = "{name} source name, {index} / {index:04} position, {id} image id";
+pub const NAME_TEMPLATE_HELP: &str = "{name} source name, {index} / {index:04} position, {id} image id; with a caption sheet (Library menu): {sheet_name}, {caption}, {no} / {no:03} photo number";
 
 /// The two rows of the box of an Export node: format and quality, then the folder.
 pub fn export_box_rows(node: &Node, image: ImageId) -> Vec<(String, String)> {

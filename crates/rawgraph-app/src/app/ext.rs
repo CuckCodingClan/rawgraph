@@ -572,7 +572,7 @@ impl App {
         self.relink = RelinkUi::Folder { old, new: String::new(), preview: None, error: None };
     }
 
-    fn after_relink(&mut self, ids: &[rawgraph_core::ImageId]) {
+    pub(super) fn after_relink(&mut self, ids: &[rawgraph_core::ImageId]) {
         if ids.is_empty() {
             self.filmstrip.thumbs.clear();
         } else {

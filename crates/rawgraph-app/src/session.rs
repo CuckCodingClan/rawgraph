@@ -189,6 +189,8 @@ pub struct Session {
     pub ui_requests: Vec<UiRequest>,
     /// An export job is running (the Export button of a node is off meanwhile).
     pub export_busy: bool,
+    /// The caption sheet loaded for renaming and export names (session only, not saved).
+    pub caption_sheet: Option<Arc<rawgraph_batch::SheetBinding>>,
     /// `--inspector-scroll`: keeps the inspector scrolled to this offset (screenshots).
     pub inspector_scroll: Option<f32>,
     demo_entries: Vec<ImageEntry>,
@@ -240,6 +242,7 @@ impl Session {
             curve_hist: None,
             ui_requests: Vec::new(),
             export_busy: false,
+            caption_sheet: None,
             inspector_scroll: None,
             demo_entries: Vec::new(),
             visible: Vec::new(),
