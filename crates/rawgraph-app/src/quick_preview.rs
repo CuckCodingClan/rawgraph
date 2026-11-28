@@ -23,7 +23,7 @@ impl QuickPreview {
         let _ = std::thread::Builder::new().name("rawgraph-quick-preview".into()).spawn(move || {
             while let Ok(job) = jobs.recv() {
                 let job = jobs.try_iter().last().unwrap_or(job);
-                let pixels = cache.as_ref().and_then(|cache| (!job.hash.is_empty()).then(|| cache.get(&job.hash, crate::thumbs::THUMB_SIZE)).flatten())
+                let pixels = cache.as_ref().and_then(|cache| (!job.hash.is_empty()).then(|| cache.get(&job.hash, crate::thumbs::THUMB_CACHE_KEY)).flatten())
                     .and_then(|bytes| crate::thumbs::decode_jpeg(&bytes))
                     .or_else(|| {
                         (rawgraph_io::source_kind(&job.path) == Some(rawgraph_io::SourceKind::Raw)).then(|| rawgraph_io::raw::load_embedded_preview(&job.path, 1280).ok().flatten()).flatten()

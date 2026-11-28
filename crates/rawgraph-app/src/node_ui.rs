@@ -716,6 +716,9 @@ pub fn export_section(ui: &mut egui::Ui, session: &mut Session, id: NodeId, imag
                 if let (ExportFileFormat::Heic, Some(why)) = (spec.format, &heic_why) {
                     ui.label(RichText::new(why.as_str()).color(ERROR));
                 }
+                if spec.format == ExportFileFormat::Heic && matches!(heic, Some(Err(_))) && ui.small_button("Check HEIC again").on_hover_text("Look again whether the system HEIC encoder is installed").clicked() {
+                    crate::export::heic_recheck();
+                }
             });
             ui.end_row();
 

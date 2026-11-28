@@ -3406,7 +3406,6 @@ dependencies = [
  "exr",
  "image",
  "kamadak-exif",
- "memchr",
  "ravif",
  "rawgraph-core",
  "rawler",

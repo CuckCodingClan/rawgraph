@@ -3,7 +3,11 @@
 //! * Windows: Windows Imaging Component (WIC) HEIF container. It works while the "HEVC Video
 //!   Extensions" (and the "HEIF Image Extensions") from the Microsoft Store are installed; without
 //!   them [`heic_available`] says so. 8 bits per channel, quality, the ICC profile of the output
-//!   space and EXIF (best effort, see `write_exif`) are written.
+//!   space and EXIF (best effort, see `write_exif`) are written. The file gets a `colr nclx`
+//!   property (BT.709 matrix, full range) because WIC does not signal the matrix it uses and other
+//!   decoders would assume BT.601 (visible colour shifts); sizes the encoder rejects (tile
+//!   remainders of 2 to 10 pixels above 4096) are encoded on a canvas padded to a multiple of 64
+//!   and cropped with a `clap` property.
 //! * macOS / Linux: not available (clear message). A macOS ImageIO implementation could not be
 //!   compiled and checked on the build machine, so none is shipped.
 //!
@@ -26,9 +30,23 @@ pub struct HeicImage {
 }
 
 /// Whether HEIC can be written here. `Err` holds the reason, ready to show next to a greyed-out
-/// option. The answer comes from a real trial encode of a tiny picture and is cached per process.
+/// option. The answer comes from a real trial encode of a picture; a success is cached for the
+/// process, a failure is not (installing the extensions takes effect without a restart).
 pub fn heic_available() -> Result<(), String> {
     imp::available()
+}
+
+/// Smallest side (pixels) the operating system's HEIC encoder handles reliably: below it the
+/// Windows encoder fails, writes files that cannot be decoded, or ends the whole process.
+pub const HEIC_MIN_SIDE: u32 = 16;
+
+/// A finished HEIC file and how much of the requested EXIF the encoder accepted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeicEncoded {
+    pub bytes: Vec<u8>,
+    /// EXIF entries the encoder accepted / that were requested.
+    pub exif_written: usize,
+    pub exif_requested: usize,
 }
 
 /// The ICC profile of a HEIF/HEIC file: payload of the first `colr` box of type `prof`/`rICC`
@@ -58,7 +76,7 @@ mod imp {
 
     use rawgraph_core::color::OutputSpace;
     use windows::core::{Interface, PCWSTR, PSTR, PWSTR};
-    use windows::Win32::Foundation::{HGLOBAL, RPC_E_CHANGED_MODE};
+    use windows::Win32::Foundation::{E_INVALIDARG, HGLOBAL, RPC_E_CHANGED_MODE};
     use windows::Win32::Graphics::Imaging::*;
     use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, IPropertyBag2, PROPBAG2, PROPVARIANT};
     use windows::Win32::System::Com::{
@@ -67,7 +85,8 @@ mod imp {
     };
     use windows::Win32::System::Variant::{VARIANT, VT_LPSTR, VT_R4};
 
-    use super::{HeicImage, HEIC_MISSING_MESSAGE};
+    use super::{HeicEncoded, HeicImage, HEIC_MISSING_MESSAGE};
+    use crate::heif_box::{add_primary_properties, clap_box, nclx_box, NewProp};
     use crate::icc::icc_profile;
     use crate::meta::ExportMetadata;
     use crate::IoError;
@@ -101,17 +120,20 @@ mod imp {
     }
 
     pub fn available() -> Result<(), String> {
-        static ANSWER: OnceLock<Result<(), String>> = OnceLock::new();
-        ANSWER
-            .get_or_init(|| {
-                let rgb = [200u8, 120, 40].repeat(16 * 16);
-                match encode(16, 16, &rgb, 90, None, None, false) {
-                    Ok(bytes) if bytes.len() > 16 => Ok(()),
-                    Ok(_) => Err(HEIC_MISSING_MESSAGE.to_string()),
-                    Err(_) => Err(HEIC_MISSING_MESSAGE.to_string()),
-                }
-            })
-            .clone()
+        static OK: OnceLock<()> = OnceLock::new();
+        if OK.get().is_some() {
+            return Ok(());
+        }
+        let rgb = [200u8, 120, 40].repeat(16 * 16);
+        match encode(16, 16, &rgb, 90, None, None, false) {
+            Ok(e) if e.bytes.len() > 16 => {
+                let _ = OK.set(());
+                Ok(())
+            }
+            Ok(_) => Err("The Windows HEIC encoder returned an empty file".to_string()),
+            Err(IoError::Unsupported(why)) => Err(why),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     fn read_stream(stream: &IStream) -> Result<Vec<u8>, IoError> {
@@ -170,10 +192,12 @@ mod imp {
     /// copyright, description, software, capture date, exposure time, f-number, focal length and ISO.
     /// GPS is not written (it needs rational vectors that this path does not build). Returns how
     /// many entries the encoder accepted.
-    pub(super) fn write_exif(writer: &IWICMetadataQueryWriter, md: &ExportMetadata) -> usize {
+    pub(super) fn write_exif(writer: &IWICMetadataQueryWriter, md: &ExportMetadata) -> (usize, usize) {
         let mut ok = 0usize;
+        let mut req = 0usize;
         let mut text = |name: &str, v: &Option<String>| {
             if let Some(v) = v.as_deref().filter(|v| !v.is_empty()) {
+                req += 1;
                 if let Some(pv) = lpstr(v) { ok += usize::from(set(writer, name, &pv)); }
             }
         };
@@ -187,79 +211,142 @@ mod imp {
         text("/ifd/exif/{ushort=42036}", &md.lens);
         let rational = |(n, d): (u32, u32)| PROPVARIANT::from((u64::from(d) << 32) | u64::from(n));
         if let Some(r) = md.exposure_time {
+            req += 1;
             ok += usize::from(set(writer, "/ifd/exif/{ushort=33434}", &rational(r)));
         }
         if let Some(r) = md.f_number {
+            req += 1;
             ok += usize::from(set(writer, "/ifd/exif/{ushort=33437}", &rational(r)));
         }
         if let Some(r) = md.focal_length {
+            req += 1;
             ok += usize::from(set(writer, "/ifd/exif/{ushort=37386}", &rational(r)));
         }
         if let Some(iso) = md.iso {
+            req += 1;
             ok += usize::from(set(writer, "/ifd/exif/{ushort=34855}", &PROPVARIANT::from(iso.min(65535) as u16)));
         }
-        ok
+        (ok, req)
+    }
+
+    /// Errors that mean "the encoder is not installed", as opposed to a failure for this picture.
+    fn is_missing(code: i32) -> bool {
+        // WINCODEC_ERR_COMPONENTNOTFOUND, WINCODEC_ERR_UNSUPPORTEDOPERATION-style codec lookups,
+        // REGDB_E_CLASSNOTREG, CO_E_CLASSSTRING.
+        matches!(code as u32, 0x88982F50 | 0x88982F8B | 0x80040154 | 0x800401F3)
+    }
+
+    /// One encode with WIC at exactly this size. The picture is stored as is (no container fix-ups).
+    fn encode_once(
+        width: u32, height: u32, rgb: &[u8], quality: u8, space: Option<OutputSpace>, exif: Option<&ExportMetadata>, with_icc: bool,
+    ) -> windows::core::Result<(Vec<u8>, usize, usize)> {
+        unsafe {
+            let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+            let stream = CreateStreamOnHGlobal(HGLOBAL::default(), true)?;
+            let encoder = factory.CreateEncoder(&GUID_ContainerFormatHeif, std::ptr::null())?;
+            encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+            let mut frame: Option<IWICBitmapFrameEncode> = None;
+            let mut bag: Option<IPropertyBag2> = None;
+            encoder.CreateNewFrame(&mut frame, &mut bag)?;
+            let frame = frame.ok_or_else(windows::core::Error::empty)?;
+            if let Some(bag) = &bag {
+                set_quality(bag, quality)?;
+            }
+            frame.Initialize(bag.as_ref())?;
+            frame.SetSize(width, height)?;
+            frame.SetResolution(96.0, 96.0)?;
+            let mut format = GUID_WICPixelFormat24bppBGR;
+            frame.SetPixelFormat(&mut format)?;
+            let pixels: Vec<u8> = if format == GUID_WICPixelFormat24bppBGR {
+                rgb.as_chunks::<3>().0.iter().flat_map(|p| [p[2], p[1], p[0]]).collect()
+            } else if format == GUID_WICPixelFormat24bppRGB {
+                rgb.to_vec()
+            } else if format == GUID_WICPixelFormat32bppBGRA || format == GUID_WICPixelFormat32bppBGR {
+                rgb.as_chunks::<3>().0.iter().flat_map(|p| [p[2], p[1], p[0], 255]).collect()
+            } else {
+                return Err(windows::core::Error::new(windows::core::HRESULT(0x88982F80u32 as i32), "the HEIC encoder wants an unsupported pixel format"));
+            };
+            if with_icc {
+                if let Some(space) = space {
+                    let cc = factory.CreateColorContext()?;
+                    cc.InitializeFromMemory(icc_profile(space))?;
+                    frame.SetColorContexts(&[Some(cc)])?;
+                }
+            }
+            let (mut written, mut requested) = (0, 0);
+            if let Some(md) = exif {
+                if let Ok(writer) = frame.GetMetadataQueryWriter() {
+                    (written, requested) = write_exif(&writer, md);
+                }
+            }
+            let stride = (pixels.len() / height as usize) as u32;
+            frame.WritePixels(height, stride, &pixels)?;
+            frame.Commit()?;
+            encoder.Commit()?;
+            let bytes = read_stream(&stream).map_err(|e| windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32), e.to_string()))?;
+            Ok((bytes, written, requested))
+        }
+    }
+
+    /// Repeats the last row and column so the picture fills `padded`.
+    fn pad(rgb: &[u8], (w, h): (u32, u32), (pw, ph): (u32, u32)) -> Vec<u8> {
+        let (w, h, pw, ph) = (w as usize, h as usize, pw as usize, ph as usize);
+        let mut out = Vec::with_capacity(pw * ph * 3);
+        for y in 0..ph {
+            let row = &rgb[y.min(h - 1) * w * 3..][..w * 3];
+            out.extend_from_slice(row);
+            let last = &row[(w - 1) * 3..];
+            for _ in w..pw {
+                out.extend_from_slice(last);
+            }
+        }
+        out
     }
 
     /// Encodes 8-bit RGB. `exif`: metadata to try to store. `with_icc` embeds `space`'s profile.
-    pub fn encode(width: u32, height: u32, rgb: &[u8], quality: u8, space: Option<OutputSpace>, exif: Option<&ExportMetadata>, with_icc: bool) -> Result<Vec<u8>, IoError> {
+    ///
+    /// Beyond what WIC writes: a `colr nclx` property states the colour coding (BT.709 matrix, full
+    /// range, primaries and transfer of the output space), because without it other decoders
+    /// assume BT.601 and shift colours. If WIC rejects the size (`E_INVALIDARG`: tile remainders of
+    /// 2 to 10 pixels above 4096 px) the picture is encoded again on a canvas padded by repeating
+    /// the edge pixels to a multiple of 64, and a `clap` property crops it back to the real size.
+    pub fn encode(width: u32, height: u32, rgb: &[u8], quality: u8, space: Option<OutputSpace>, exif: Option<&ExportMetadata>, with_icc: bool) -> Result<HeicEncoded, IoError> {
+        if width < super::HEIC_MIN_SIDE || height < super::HEIC_MIN_SIDE {
+            return Err(IoError::Unsupported(format!("HEIC needs at least {0} pixels on each side (this picture is {width}x{height})", super::HEIC_MIN_SIDE)));
+        }
         let _com = Com::new();
-        let run = || -> windows::core::Result<Vec<u8>> {
-            unsafe {
-                let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
-                let stream = CreateStreamOnHGlobal(HGLOBAL::default(), true)?;
-                let encoder = factory.CreateEncoder(&GUID_ContainerFormatHeif, std::ptr::null())?;
-                encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
-                let mut frame: Option<IWICBitmapFrameEncode> = None;
-                let mut bag: Option<IPropertyBag2> = None;
-                encoder.CreateNewFrame(&mut frame, &mut bag)?;
-                let frame = frame.ok_or_else(windows::core::Error::empty)?;
-                if let Some(bag) = &bag {
-                    let _ = set_quality(bag, quality);
-                }
-                frame.Initialize(bag.as_ref())?;
-                frame.SetSize(width, height)?;
-                frame.SetResolution(96.0, 96.0)?;
-                let mut format = GUID_WICPixelFormat24bppBGR;
-                frame.SetPixelFormat(&mut format)?;
-                let pixels: Vec<u8> = if format == GUID_WICPixelFormat24bppBGR {
-                    rgb.as_chunks::<3>().0.iter().flat_map(|p| [p[2], p[1], p[0]]).collect()
-                } else if format == GUID_WICPixelFormat24bppRGB {
-                    rgb.to_vec()
-                } else if format == GUID_WICPixelFormat32bppBGRA || format == GUID_WICPixelFormat32bppBGR {
-                    rgb.as_chunks::<3>().0.iter().flat_map(|p| [p[2], p[1], p[0], 255]).collect()
-                } else {
-                    return Err(windows::core::Error::new(windows::core::HRESULT(0x88982F80u32 as i32), "the HEIC encoder wants an unsupported pixel format"));
-                };
-                if with_icc {
-                    if let Some(space) = space {
-                        if let Ok(cc) = factory.CreateColorContext() {
-                            if cc.InitializeFromMemory(icc_profile(space)).is_ok() {
-                                let _ = frame.SetColorContexts(&[Some(cc)]);
-                            }
-                        }
-                    }
-                }
-                if let Some(md) = exif {
-                    if let Ok(writer) = frame.GetMetadataQueryWriter() {
-                        write_exif(&writer, md);
-                    }
-                }
-                let stride = (pixels.len() / height as usize) as u32;
-                frame.WritePixels(height, stride, &pixels)?;
-                frame.Commit()?;
-                encoder.Commit()?;
-                let bytes = read_stream(&stream).map_err(|_| windows::core::Error::empty())?;
-                Ok(bytes)
-            }
-        };
-        run().map_err(|e| {
-            if e.code().0 as u32 == 0x88982F50 || e.code().0 as u32 == 0x88982F8B || e.code().0 as u32 == 0x80040154 {
+        let rejected = |e: windows::core::Error| {
+            if is_missing(e.code().0) {
                 IoError::Unsupported(HEIC_MISSING_MESSAGE.into())
             } else {
-                IoError::Unsupported(format!("{HEIC_MISSING_MESSAGE} ({e})"))
+                IoError::Unsupported(format!("The Windows HEVC encoder rejected {width}x{height} (0x{:08X}: {})", e.code().0 as u32, e.message()))
             }
-        })
+        };
+        let mut canvas = None;
+        let (bytes, exif_written, exif_requested) = match encode_once(width, height, rgb, quality, space, exif, with_icc) {
+            Ok(r) => r,
+            Err(e) if e.code() == E_INVALIDARG && (!width.is_multiple_of(64) || !height.is_multiple_of(64)) => {
+                let padded = (width.div_ceil(64) * 64, height.div_ceil(64) * 64);
+                canvas = Some(padded);
+                encode_once(padded.0, padded.1, &pad(rgb, (width, height), padded), quality, space, exif, with_icc).map_err(rejected)?
+            }
+            Err(e) => return Err(rejected(e)),
+        };
+        let (primaries, transfer) = crate::avif::cicp(space.unwrap_or(OutputSpace::Srgb)).map_or((2, 2), |(p, t)| (u16::from(p), u16::from(t)));
+        let mut bytes = bytes;
+        let mut props = vec![NewProp { data: nclx_box(primaries, transfer, 1, true), essential: false }];
+        if let Some(c) = canvas {
+            // A tile grid states the real size itself; anything else is cropped with `clap`.
+            let grid = crate::heif_box::crop_grid_to(&mut bytes, c, (width, height)).map_err(|e| IoError::Io(format!("HEIC container: {e}")))?;
+            if !grid {
+                props.push(NewProp { data: clap_box(width, height, c), essential: true });
+            }
+        }
+        let mut bytes = add_primary_properties(&bytes, &props).map_err(|e| IoError::Io(format!("HEIC container: {e}")))?;
+        // ffmpeg and other decoders read the matrix from the bitstream's VUI, not from `colr`.
+        crate::heif_box::patch_vui_colour(&mut bytes, primaries as u8, transfer as u8, 1, true)
+            .map_err(|e| IoError::Io(format!("HEIC colour signalling: {e} (the Windows encoder changed?)")))?;
+        Ok(HeicEncoded { bytes, exif_written, exif_requested })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<HeicImage, IoError> {
@@ -299,7 +386,7 @@ mod imp {
 mod imp {
     use rawgraph_core::color::OutputSpace;
 
-    use super::HeicImage;
+    use super::{HeicEncoded, HeicImage};
     use crate::meta::ExportMetadata;
     use crate::IoError;
 
@@ -313,11 +400,36 @@ mod imp {
         Err(WHY.to_string())
     }
 
-    pub fn encode(_: u32, _: u32, _: &[u8], _: u8, _: Option<OutputSpace>, _: Option<&ExportMetadata>, _: bool) -> Result<Vec<u8>, IoError> {
+    pub fn encode(_: u32, _: u32, _: &[u8], _: u8, _: Option<OutputSpace>, _: Option<&ExportMetadata>, _: bool) -> Result<HeicEncoded, IoError> {
         Err(IoError::Unsupported(WHY.into()))
     }
 
     pub fn decode(_: &[u8]) -> Result<HeicImage, IoError> {
         Err(IoError::Unsupported(WHY.into()))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use rawgraph_core::color::OutputSpace;
+
+    use crate::heif_box::vui_colour;
+
+    /// The colour description inside the bitstream (what ffmpeg reads) and in `colr` agree.
+    #[test]
+    fn bitstream_and_container_state_the_same_colour_coding() {
+        if super::heic_available().is_err() {
+            return;
+        }
+        for (space, want) in [(OutputSpace::Srgb, (1, 13)), (OutputSpace::DisplayP3, (12, 13)), (OutputSpace::Rec2020, (9, 14)), (OutputSpace::AdobeRgb, (2, 2))] {
+            for (w, h) in [(64u32, 48u32), (4104, 600)] {
+                let rgb = vec![120u8; (w * h * 3) as usize];
+                let bytes = super::imp::encode(w, h, &rgb, 90, Some(space), None, true).unwrap().bytes;
+                assert_eq!(vui_colour(&bytes), Some((want.0, want.1, 1, true)), "{space:?} {w}x{h}");
+                let nclx = bytes.windows(8).position(|b| b == b"colrnclx").expect("colr nclx");
+                assert_eq!(&bytes[nclx + 8..nclx + 15], &[0, u16::from(want.0) as u8, 0, want.1, 0, 1, 0x80], "{space:?} {w}x{h}");
+                assert!(super::embedded_icc(&bytes).is_some(), "the ICC profile stays next to nclx");
+            }
+        }
     }
 }

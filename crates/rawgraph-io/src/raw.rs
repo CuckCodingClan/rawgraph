@@ -1124,17 +1124,19 @@ fn embedded_preview(path: &Path, max_dim: u32, min_dim: u32) -> Result<Option<Pr
         let params = RawDecodeParams::default();
         let md = decoder.raw_metadata(&src, &params).map_err(rawler_err)?;
         let orientation = orientation_of(&md);
-        let icc = || crate::icc::find_jpeg_icc(src.buf());
+        let icc = |img: &image::DynamicImage| crate::icc::find_preview_icc(src.buf(), img.width(), img.height());
         // Accept an embedded image only if it is not much smaller than requested.
         let good = |i: &image::DynamicImage| i.width().max(i.height()) >= min_dim;
         if let Ok(Some(img)) = decoder.preview_image(&src, &params) {
             if good(&img) {
-                return Ok(Some((upright_embedded(img, orientation), icc())));
+                let profile = icc(&img);
+                return Ok(Some((upright_embedded(img, orientation), profile)));
             }
         }
         if let Ok(Some(img)) = decoder.thumbnail_image(&src, &params) {
             if good(&img) {
-                return Ok(Some((upright_embedded(img, orientation), icc())));
+                let profile = icc(&img);
+                return Ok(Some((upright_embedded(img, orientation), profile)));
             }
         }
         Ok(None)
