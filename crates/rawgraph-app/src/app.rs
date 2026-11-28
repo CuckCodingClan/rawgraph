@@ -3891,22 +3891,24 @@ mod tests {
 
     #[test]
     fn identical_state_gives_equal_request_keys_regardless_of_node_position() {
+        // Other tests reload LUTs in parallel, which moves the global LUT generation: not part of this test.
+        let key = |s: &Session, out, prep, overlay| RequestKey { lut_generation: 0, ..RequestKey::new(s, out, prep, overlay) };
         let mut s = demo_session();
         let out = s.output_node().unwrap();
-        let a = RequestKey::new(&s, out, None, None);
+        let a = key(&s, out, None, None);
         let id = s.node_by_index(3).unwrap();
         s.project.graph.node_mut(id).unwrap().pos = [999.0, 999.0];
-        assert!(a == RequestKey::new(&s, out, None, None), "moving a node must not trigger a render");
+        assert!(a == key(&s, out, None, None), "moving a node must not trigger a render");
         s.project.graph.node_mut(id).unwrap().set_param("temp", ImageId(1), 20.0);
-        assert!(a != RequestKey::new(&s, out, None, None), "a parameter change must");
-        let b = RequestKey::new(&s, out, None, None);
+        assert!(a != key(&s, out, None, None), "a parameter change must");
+        let b = key(&s, out, None, None);
         s.provider.set_preview_size(1280);
-        assert!(b != RequestKey::new(&s, out, None, None), "a new preview size must");
-        let c = RequestKey::new(&s, out, Some(PrepareSettings::default()), None);
+        assert!(b != key(&s, out, None, None), "a new preview size must");
+        let c = key(&s, out, Some(PrepareSettings::default()), None);
         let changed = PrepareSettings { gain: 2.0, ..PrepareSettings::default() };
-        assert!(c == RequestKey::new(&s, out, Some(PrepareSettings::default()), None), "same scope settings: no new request");
-        assert!(c != RequestKey::new(&s, out, Some(changed), None), "a scope settings change must trigger a new request");
-        assert!(c != RequestKey::new(&s, out, None, None), "hiding the scopes must too");
+        assert!(c == key(&s, out, Some(PrepareSettings::default()), None), "same scope settings: no new request");
+        assert!(c != key(&s, out, Some(changed), None), "a scope settings change must trigger a new request");
+        assert!(c != key(&s, out, None, None), "hiding the scopes must too");
         assert_eq!(demo_graph().nodes().count(), 9);
     }
 
