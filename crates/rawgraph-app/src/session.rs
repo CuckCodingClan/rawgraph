@@ -177,6 +177,9 @@ pub struct Session {
     pub dirty: bool,
     /// The three built-in test images instead of the project's images.
     pub demo: bool,
+    /// Last photo selected in each node's gallery, so switching nodes/collections
+    /// and coming back keeps the place (session-only).
+    pub gallery_memory: HashMap<NodeId, ImageId>,
     pub filter: FilterUi,
     /// Brush settings of the Draw tool.
     pub brush: BrushSettings,
@@ -248,6 +251,7 @@ impl Session {
             scan_count: None,
             scan_edits: HashMap::new(),
             scan_folder: None,
+            gallery_memory: HashMap::new(),
             collection: CollectionResult::default(),
             images_gen: 1,
             capture_cache: None,
@@ -399,6 +403,17 @@ impl Session {
         let members = crate::collection::view_members(&self.project.graph, &ids, &captures, node);
         let images = self.gallery_images(&members);
         self.step_gallery(target, &images, delta);
+    }
+
+    /// Photo to select when `node`'s gallery (`images`) does not contain the current
+    /// selection: the photo last selected there, else the first one.
+    pub fn gallery_fallback(&self, node: Option<NodeId>, images: &[ImageId]) -> Option<ImageId> {
+        node.and_then(|n| self.gallery_memory.get(&n)).copied().filter(|id| images.contains(id)).or_else(|| images.first().copied())
+    }
+
+    /// Remembers `image` as the selection of `node`'s gallery.
+    pub fn remember_gallery(&mut self, node: Option<NodeId>, image: Option<ImageId>) {
+        if let (Some(node), Some(image)) = (node, image) { self.gallery_memory.insert(node, image); }
     }
 
     pub fn step_gallery(&mut self, target: ViewerTarget, images: &[ImageId], delta: i32) {
@@ -767,6 +782,7 @@ impl Session {
         self.node_sel.clear();
         self.viewed_node = None;
         self.selected = None;
+        self.gallery_memory.clear();
         self.edit_gen += 1;
         self.sync_paths();
         self.refresh_visible();
@@ -971,12 +987,11 @@ impl Session {
     }
 }
 
-/// Graph of a new project: Source -> Develop -> Exposure -> Contrast ->
-/// Highlights / Shadows -> Saturation, everything neutral except the
-/// Develop defaults (as-shot white balance, baseline exposure on).
+/// Graph of a new project: Source -> Develop -> Export, everything at its
+/// defaults (as-shot white balance, baseline exposure on).
 pub fn default_graph() -> Graph {
     let mut g = Graph::new();
-    let kinds = [NodeKind::Source, NodeKind::Develop, NodeKind::Exposure, NodeKind::Contrast, NodeKind::HighlightsShadows, NodeKind::Saturation];
+    let kinds = [NodeKind::Source, NodeKind::Develop, NodeKind::Export];
     let ids: Vec<NodeId> = kinds.iter().enumerate().map(|(i, k)| g.add_node(*k, [i as f32 * 240.0, 40.0])).collect();
     crate::node_ui::set_source_folder(&mut g, ids[0], None);
     for pair in ids.windows(2) {
@@ -1249,14 +1264,29 @@ pub mod tests {
     }
 
     #[test]
+    fn each_gallery_remembers_its_last_selected_photo() {
+        let mut s = demo_session();
+        let (a, b) = (NodeId(1), NodeId(2));
+        let (one, two, three) = (ImageId(1), ImageId(2), ImageId(3));
+        assert_eq!(s.gallery_fallback(Some(a), &[one, two, three]), Some(one), "nothing remembered: first photo");
+        s.remember_gallery(Some(a), Some(three));
+        s.remember_gallery(Some(b), Some(two));
+        assert_eq!(s.gallery_fallback(Some(a), &[one, two, three]), Some(three), "back to the photo last selected there");
+        assert_eq!(s.gallery_fallback(Some(b), &[two]), Some(two));
+        assert_eq!(s.gallery_fallback(Some(a), &[one, two]), Some(one), "a remembered photo that left the collection falls back to the first");
+        assert_eq!(s.gallery_fallback(None, &[two, three]), Some(two));
+        assert_eq!(s.gallery_fallback(Some(a), &[]), None);
+        s.new_project();
+        assert!(s.gallery_memory.is_empty(), "a new project forgets the old selections");
+    }
+
+    #[test]
     fn new_projects_start_with_the_default_graph() {
         let g = default_graph();
-        assert!(g.validate().is_empty());
+        let issues: Vec<String> = g.validate().into_iter().map(|i| i.message).collect();
+        assert_eq!(issues, ["Export: no output folder set"], "the only hint is to choose an export folder");
         let kinds: Vec<NodeKind> = g.nodes().map(|n| n.kind).collect();
-        assert_eq!(
-            kinds,
-            [NodeKind::Source, NodeKind::Develop, NodeKind::Exposure, NodeKind::Contrast, NodeKind::HighlightsShadows, NodeKind::Saturation]
-        );
+        assert_eq!(kinds, [NodeKind::Source, NodeKind::Develop, NodeKind::Export]);
         // A plain chain: every node is fed by the one before it.
         let ids: Vec<NodeId> = g.nodes().map(|n| n.id).collect();
         assert!(matches!(g.node(ids[0]).unwrap().data(ImageId(0)), Some(rawgraph_core::NodeData::Folder(f)) if f.is_empty()));
