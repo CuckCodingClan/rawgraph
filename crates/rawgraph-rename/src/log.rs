@@ -18,6 +18,9 @@ pub enum RunState {
     Undone,
     /// The run failed (or was refused) and every file is under its old name.
     RolledBack,
+    /// The run failed and is being put back; still this when putting it back failed or the program
+    /// stopped meanwhile. Files may be at old, temporary or new names: recovery looks at each one.
+    RollingBack,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +37,10 @@ pub struct LogEntry {
     /// The size must be unchanged (false for sidecars, which programs rewrite).
     #[serde(default = "yes")]
     pub exact_size: bool,
+    /// Modification time (ns since 1970) when the run started, for pictures: renames keep it, so it tells
+    /// two files of the same size apart (a swap). `None` for sidecars and in older logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -65,8 +72,12 @@ impl Default for RenameLog {
 impl RenameLog {
     /// A missing file is an empty log; an unreadable or broken one is an error (never silently replaced).
     pub fn load(path: &Path) -> Result<RenameLog, String> {
-        if !path.exists() {
-            return Ok(RenameLog::default());
+        // `exists` would say "no" for a folder that cannot be read, and a new run would then start a new
+        // log over the old one.
+        match path.try_exists() {
+            Ok(false) => return Ok(RenameLog::default()),
+            Ok(true) => {}
+            Err(e) => return Err(format!("{}: {e}", path.display())),
         }
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         serde_json::from_str(&text).map_err(|e| format!("{} is not a valid rename log: {e}", path.display()))
@@ -105,7 +116,7 @@ impl RenameLog {
 
     /// Runs whose journal says they were interrupted.
     pub fn interrupted(&self) -> usize {
-        self.runs.iter().filter(|r| matches!(r.state, RunState::Started | RunState::Phase1Done)).count()
+        self.runs.iter().filter(|r| matches!(r.state, RunState::Started | RunState::Phase1Done | RunState::RollingBack)).count()
     }
 }
 
@@ -130,7 +141,7 @@ mod tests {
         let p = t.path().join("sub").join("log.json");
         assert_eq!(RenameLog::load(&p).unwrap(), RenameLog::default(), "missing = empty");
         let mut l = RenameLog::default();
-        l.runs.push(RunRecord { id: "a".into(), started_unix_ms: 5, label: "x".into(), kind: RunKind::Rename, state: RunState::Done, entries: vec![LogEntry { old: "a.jpg".into(), new: "b.jpg".into(), size: 3, exact_size: true }] });
+        l.runs.push(RunRecord { id: "a".into(), started_unix_ms: 5, label: "x".into(), kind: RunKind::Rename, state: RunState::Done, entries: vec![LogEntry { old: "a.jpg".into(), new: "b.jpg".into(), size: 3, exact_size: true, stamp: None }] });
         l.save(&p).unwrap();
         assert_eq!(RenameLog::load(&p).unwrap(), l);
         assert_eq!(l.last_undoable().map(|r| r.id.as_str()), Some("a"));

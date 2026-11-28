@@ -35,6 +35,39 @@ impl App {
         rename_ops::log_path(&self.session, &self.dirs)
     }
 
+    /// Closing while a rename runs: cancel it (the files are put back); the window closes on the next
+    /// request once it has stopped.
+    pub(super) fn cancel_rename_for_close(&mut self) {
+        if let Some(job) = &self.rename_job {
+            job.cancel();
+            self.status.error("A rename is running: it is being stopped and put back. Close RawGraph again when it has finished.");
+        }
+    }
+
+    /// After a project was opened: points images at the names a finished rename gave their files (when the
+    /// project was not saved after it), and says when the journal holds an interrupted rename.
+    pub(super) fn check_rename_log_on_open(&mut self) {
+        let log = self.rename_log_path();
+        match rename_ops::heal_from_log(&mut self.session, &log) {
+            Ok(h) => {
+                if h.relinked > 0 {
+                    self.after_relink(&[]);
+                    self.status.info(format!(
+                        "{} image(s) of this project now point at the names a finished rename gave their files (the project was not saved after the rename); save the project to keep it",
+                        h.relinked
+                    ));
+                }
+                if h.interrupted > 0 {
+                    self.status.error(format!(
+                        "{} interrupted rename(s) of this project are in the rename log: open Library > Rename files... and press Recover before you work with these files",
+                        h.interrupted
+                    ));
+                }
+            }
+            Err(e) => self.status.error(format!("The rename log of this project cannot be read ({e}); renaming and undo stay off until it is fixed")),
+        }
+    }
+
     /// Reads the journal state for the window (undo possible, interrupted runs, why it is unusable).
     fn refresh_rename_log_state(&mut self) {
         let log = self.rename_log_path();
@@ -165,6 +198,7 @@ impl App {
             Ok(o) => (false, format!("Renamed {} file(s) on disk; {} image(s) of the project follow. \"Undo last rename\" reverses it.", o.files, o.images)),
             Err(e) => (true, format!("{} failed: {e}", if job.undo { "Undo" } else { "Rename" })),
         };
+        let mut save_now = false;
         if let Ok(o) = &outcome {
             self.after_relink(&[]);
             if let Some(w) = &o.warning {
@@ -172,9 +206,7 @@ impl App {
             }
             if o.images > 0 {
                 if self.session.project_path.is_some() {
-                    // Keep the project file in step with the disk at once.
-                    self.session.next_summary = Some(format!("{} {} files", if job.undo { "Undid the rename of" } else { "Renamed" }, o.files));
-                    self.save_project(None, None, ctx);
+                    save_now = true;
                 } else {
                     message.1.push_str(" The project has no file yet: save it, or the new names are only in this session (the rename log keeps them).");
                 }
@@ -184,6 +216,12 @@ impl App {
             self.status.error(message.1.clone());
         } else {
             self.status.info(message.1.clone());
+        }
+        if save_now {
+            // Keep the project file in step with the disk at once. Saved after the report, so a failed save
+            // is the message that stays (and the next open of the project heals from the log).
+            self.session.next_summary = Some(format!("{} {} files", if job.undo { "Undid the rename of" } else { "Renamed" }, outcome.as_ref().map_or(0, |o| o.files)));
+            self.save_project(None, None, ctx);
         }
         if let Some(st) = &mut self.rename {
             st.message = Some(message);
