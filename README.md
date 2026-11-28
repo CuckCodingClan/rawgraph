@@ -227,9 +227,12 @@ run those separately. Quick Export remains a rendered-image export.
 
 ### Per-node timing
 
-Enable **Debug → Per-node CPU timing** to profile the next preview in a floating window.
-Rows report exclusive CPU wall time (upstream node evaluation excluded), number of
-computations, and result-cache hits for that preview. Cache hits are reported separately,
+Enable **Debug → Per-node CPU timing** to profile the previews. Each node then shows a
+small label just under its bottom-right corner with its exclusive CPU wall time for the
+last preview (upstream node evaluation excluded), or **cached** when its result came from
+the cache. The node taking at least half of the preview's time is red, one taking at least
+a fifth is amber. Hover a label for the exact time, its share, and the number of
+computations and result-cache hits. Cache hits are reported separately,
 not as operation timings. Times include evaluation overhead and are diagnostic, not a
 benchmark. The GPU tail is batched and has no per-node GPU timings; a GPU-resident
 base or Develop pre-tone base may not appear. Turning the option off disables the

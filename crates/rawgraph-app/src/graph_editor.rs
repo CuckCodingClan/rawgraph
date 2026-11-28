@@ -367,6 +367,38 @@ pub struct GraphEditor {
     recipes_dir: Option<std::path::PathBuf>,
     manage_open: bool,
     edit: EditState,
+    /// Debug > Per-node CPU timing: the last profiled preview, drawn under each node.
+    pub timings: Option<NodeTimings>,
+}
+
+/// Per-node CPU timing of the last profiled preview, for the on-node debug labels.
+#[derive(Clone, Debug, Default)]
+pub struct NodeTimings {
+    pub rows: HashMap<NodeId, rawgraph_engine::NodeTiming>,
+    pub total: std::time::Duration,
+    /// The pointwise tail ran batched on the GPU, so those nodes have no CPU time.
+    pub gpu_tail: bool,
+}
+
+impl NodeTimings {
+    pub fn new(rows: &[rawgraph_engine::NodeTiming], gpu_tail: bool) -> Self {
+        Self { total: rows.iter().map(|r| r.cpu).sum(), rows: rows.iter().map(|r| (r.node, r.clone())).collect(), gpu_tail }
+    }
+
+    /// Label, colour and hover text for one node, or None if it has no timing.
+    fn label(&self, id: NodeId) -> Option<(String, Color32, String)> {
+        let r = self.rows.get(&id)?;
+        let ms = r.cpu.as_secs_f64() * 1000.0;
+        let share = if self.total.is_zero() { 0.0 } else { r.cpu.as_secs_f64() / self.total.as_secs_f64() };
+        let text = if r.computed == 0 && r.cache_hits > 0 { "cached".to_owned() } else if ms < 10.0 { format!("{ms:.1} ms") } else { format!("{ms:.0} ms") };
+        let color = if r.computed == 0 { Color32::from_gray(120) }
+            else if share >= 0.5 { Color32::from_rgb(235, 110, 95) }
+            else if share >= 0.2 { Color32::from_rgb(230, 180, 90) }
+            else { Color32::from_gray(185) };
+        let mut tip = format!("{ms:.3} ms exclusive CPU time ({:.0} % of this preview), {} computed, {} cache hits", share * 100.0, r.computed, r.cache_hits);
+        if self.gpu_tail { tip.push_str("\nThe pointwise tail ran batched on the GPU; those nodes have no CPU time here."); }
+        Some((text, color, tip))
+    }
 }
 
 /// How a node takes part in the selection.
@@ -397,6 +429,7 @@ impl Default for GraphEditor {
             recipes_dir: None,
             manage_open: false,
             edit: EditState::default(),
+            timings: None,
         }
     }
 }
@@ -710,6 +743,7 @@ impl GraphEditor {
             }
             // Keep the selection outline above the tabs, even at minimum zoom.
             self.paint_outline(&painter, node_rect, selected, viewed);
+            self.paint_timing(ui, &painter, id, node_rect);
 
             // Ports.
             if self.zoom > 0.0 {
@@ -1090,6 +1124,22 @@ impl GraphEditor {
         }
     }
 
+    /// Debug timing pill just below the node: time spent in this node for the last preview.
+    fn paint_timing(&self, ui: &mut egui::Ui, painter: &egui::Painter, id: NodeId, node_rect: Rect) {
+        let Some(timings) = &self.timings else { return };
+        let z = self.zoom;
+        if z < 0.35 { return; }
+        let Some((text, color, tip)) = timings.label(id) else { return };
+        let font = FontId::monospace(10.5 * z);
+        let galley = painter.layout_no_wrap(text, font, color);
+        let size = galley.size() + Vec2::new(10.0, 4.0) * z;
+        let pill = Rect::from_min_size(Pos2::new(node_rect.right() - size.x, node_rect.bottom() + 4.0 * z), size);
+        painter.rect_filled(pill, (4.0 * z).round() as u8, Color32::from_rgb(28, 30, 35));
+        painter.galley(pill.center() - galley.size() / 2.0, galley, color);
+        ui.interact(pill, ui.scope_id().with(("timing", id.0)), Sense::hover()).on_hover_text(tip);
+        #[cfg(test)] painter.ctx().data_mut(|d| d.insert_temp(egui::Id::unique(("timing_pill", id.0)), pill));
+    }
+
     fn badges(&self, ui: &mut egui::Ui, painter: &egui::Painter, node: &Node, title: &TitleBar, issue: Option<&str>) {
         let id = node.id;
         let z = self.zoom;
@@ -1417,6 +1467,32 @@ mod tests {
 
     fn port_control(h: &Harness, id: NodeId, name: &'static str) -> Rect {
         h.ctx.data(|d| d.get_temp(egui::Id::unique(("port_control", id, name))).expect(name))
+    }
+
+    #[test]
+    fn per_node_timing_is_drawn_under_each_node_and_hidden_when_off() {
+        let mut g = Graph::new();
+        let src = g.add_node(NodeKind::Source, [40.0, 40.0]);
+        let exp = g.add_node(NodeKind::Exposure, [300.0, 40.0]);
+        g.connect(src, exp, 0).unwrap();
+        let mut h = Harness::new(g);
+        let pill = |h: &Harness, id: NodeId| h.ctx.data(|d| d.get_temp::<Rect>(egui::Id::unique(("timing_pill", id.0))));
+        assert!(pill(&h, exp).is_none(), "no timing labels while the debug option is off");
+        let row = |node, ms: u64, computed, cache_hits| rawgraph_engine::NodeTiming { node, cpu: std::time::Duration::from_millis(ms), computed, cache_hits };
+        let t = NodeTimings::new(&[row(src, 0, 0, 1), row(exp, 12, 1, 0)], false);
+        assert_eq!(t.label(exp).unwrap().0, "12 ms");
+        assert_eq!(t.label(src).unwrap().0, "cached");
+        assert_eq!(t.label(exp).unwrap().1, Color32::from_rgb(235, 110, 95), "the node with most of the time is highlighted");
+        h.ed.timings = Some(t);
+        h.settle();
+        let node_rect = |h: &Harness, id: NodeId| {
+            let n = h.s.project.graph.node(id).unwrap();
+            let xf = h.xf();
+            Rect::from_min_size(xf.to_screen(Pos2::new(n.pos[0], n.pos[1])), actual_node_size(n) * xf.zoom)
+        };
+        let (rect, p) = (node_rect(&h, exp), pill(&h, exp).expect("timing pill drawn"));
+        assert!(p.top() >= rect.bottom() && (p.right() - rect.right()).abs() < 1e-3, "pill sits right under the node");
+        assert!(pill(&h, src).is_some());
     }
 
     #[test]

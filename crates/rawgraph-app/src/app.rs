@@ -2648,6 +2648,9 @@ impl App {
                 .size_range(180.0..=max.max(240.0))
                 .show(ui, |ui| self.scopes_ui(ui));
         }
+        self.editor.timings = self.timing_debug.then(|| {
+            crate::graph_editor::NodeTimings::new(self.node_timings.as_deref().unwrap_or_default(), self.timing_gpu_tail)
+        });
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.editor.show(ui, &mut self.session, &mut self.status));
     }
 
@@ -2982,18 +2985,6 @@ impl eframe::App for App {
             self.prompt = Some(Pending::Quit);
         }
         self.poll_renderer(&ctx);
-        if self.timing_debug {
-            egui::Window::new("Per-node timing").show(&ctx, |ui| {
-                ui.label("Last preview: exclusive CPU wall time; cache hits are not timed.");
-                if self.timing_gpu_tail { ui.label("GPU tail is batched; per-node GPU timing unavailable. A GPU-resident base or Develop pre-tone base may not appear."); }
-                if let Some(rows) = &self.node_timings {
-                    for row in rows {
-                        let name = self.session.project.graph.node(row.node).map(|n| format!("{:?}", n.kind)).unwrap_or_default();
-                        ui.label(format!("{:?} {}: {:.3} ms ({} computed, {} cache hits)", row.node, name, row.cpu.as_secs_f64() * 1000.0, row.computed, row.cache_hits));
-                    }
-                } else { ui.label("Waiting for a profiled preview."); }
-            });
-        }
         self.poll_scan(&ctx);
         self.poll_capture_refresh();
         self.poll_export();
