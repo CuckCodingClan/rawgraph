@@ -237,6 +237,15 @@ impl App {
                 self.first_frame_abort(&e, 2, ctx);
                 return;
             }
+            // Nothing is rendered without a node to view (a new project's graph has no Output node):
+            // view the Output node, or else the last node of the graph, as `--bench` does.
+            if self.cli_applied && self.session.selected_node.is_none() {
+                let g = &self.session.project.graph;
+                let pick = g.nodes().find(|n| n.kind == NodeKind::Output).or_else(|| g.nodes().last()).map(|n| n.id);
+                if pick.is_some() {
+                    self.session.selected_node = pick;
+                }
+            }
             let ready = self.cli_applied && self.scan.is_none() && n > 0 && self.last_key.is_some() && !self.renderer.pending();
             if !ready {
                 d.ready_since = None;

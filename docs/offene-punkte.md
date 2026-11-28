@@ -67,6 +67,7 @@ Offen geblieben und nicht begonnen: Frage 15 (Benennung aus deiner Beschriftungs
 - **Weichzeichner mit großem Radius** rechnet auf einem verkleinerten Bild; Abweichung 1–2 %, vor allem am Rand.
 - **Rückgängig-Speicher** teilt unveränderte Knoten zwischen den bis zu 200 Schritten (Arc, Kopie beim Schreiben). Wird derselbe Knoten in jedem Schritt geändert (z. B. Strich für Strich in einem Draw-Knoten mit Tausenden Strichen), hält jeder Schritt weiterhin eine Kopie dieses einen Knotens; Teilen auf Strichebene wäre der nächste Schritt.
 - **Erster Scan auf dem NAS:** rund 35 ms je Datei, also etwa zwei Minuten für 3.700 Bilder.
+- **Bildwahl bis Bild auf dem NAS** (gemessen 28.11.2026, Release, `--bench-first-frame`, 33 DNG à 31 MB, Vorschau 2560, zwei Runden): erstes Bild (Vorschaubild/eingebettete Vorschau) im Median 43 ms (p95 59 ms) ungecacht, 10 ms gecacht; fertig gerendertes Bild 0,66 s (p95 0,71 s) ungecacht, 0,57 s gecacht. Die Endbilder liefen dabei über die CPU (GPU durch einen anderen Job zu 6,3 von 8 GB belegt). Der Ordner blieb unverändert.
 - **XMP-Import** liest Begleitdateien mit einem eigenen Pool aus 8 Threads (nicht mehr auf dem Render-Pool); Ergebnis und Reihenfolge sind unabhängig vom Tempo der einzelnen Dateien.
 - **Arbeitsspeicher beim Export:** 1,4 GB je Bild, mit Rauschminderung in voller Größe 3,1 GB; ein Layer-Bild braucht das je Ebene.
 - **Vorschaubilder** beachten Farbprofile der Eingabedatei nicht.
