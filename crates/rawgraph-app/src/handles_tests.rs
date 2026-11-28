@@ -6,7 +6,7 @@ use crate::render::Frame;
 use crate::tools::Tools;
 use crate::viewer::Viewer;
 use eframe::egui::{Event, Modifiers};
-use rawgraph_core::ImageBuf;
+use rawgraph_core::{ImageBuf, Mode};
 use std::sync::Arc;
 
 const FRAME_W: u32 = 300;
@@ -246,6 +246,31 @@ fn handles_hide_when_the_pointer_leaves_the_viewer() {
     assert!(v.tools.handles.hot);
     v.frame(vec![Event::PointerGone]);
     assert!(!v.tools.handles.hot, "nothing is drawn or hot without the pointer over the viewer");
+}
+
+#[test]
+fn individual_mode_writes_only_the_current_image() {
+    let mut v = View::new(NodeKind::Vignette);
+    v.s.set_mode(v.node, Mode::Individual);
+    v.set("amount", -0.5);
+    let knob = v.at(logic::vignette_knob(0.5, [FRAME_W as f32, FRAME_H as f32], true));
+    v.drag_screen(knob, v.at(logic::vignette_knob(0.7, [FRAME_W as f32, FRAME_H as f32], true)));
+    let n = v.s.project.graph.node(v.node).unwrap();
+    assert!((n.param("midpoint", IMG) - 0.7).abs() < 0.02, "midpoint follows the ring: {}", n.param("midpoint", IMG));
+    assert_eq!(n.param("midpoint", ImageId(2)), 0.5, "another image keeps its value");
+    assert_eq!(n.param("feather", IMG), 0.5, "the midpoint ring leaves the feather alone");
+}
+
+#[test]
+fn feather_ring_sets_the_feather_and_double_click_resets_it() {
+    let mut v = View::new(NodeKind::Vignette);
+    let size = [FRAME_W as f32, FRAME_H as f32];
+    let outer = v.at(logic::vignette_knob(0.75, size, false));
+    v.drag_screen(outer, v.at(logic::vignette_knob(0.9, size, false)));
+    assert!((v.param("feather") - 0.8).abs() < 0.02, "{}", v.param("feather"));
+    assert_eq!(v.param("midpoint"), 0.5);
+    v.double_click(v.at(logic::vignette_knob(0.9, size, false)));
+    assert_eq!(v.param("feather"), 0.5);
 }
 
 #[test]

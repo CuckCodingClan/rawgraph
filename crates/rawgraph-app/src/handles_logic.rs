@@ -18,6 +18,12 @@ pub enum Part {
     Edge,
     /// Angle-style gradient direction (angle only).
     Direction,
+    /// Vignette midpoint ring.
+    Midpoint,
+    /// Vignette inner feather ring (effect starts).
+    FeatherInner,
+    /// Vignette outer feather ring (full effect).
+    FeatherOuter,
 }
 
 // ------------------------------------------------------------------ gradient
@@ -112,6 +118,7 @@ impl Gradient {
                 self.scale = (2.0 * v[0].hypot(v[1])).clamp(SCALE_MIN, SCALE_MAX);
             }
             Part::Direction => self.set_angle_from([p[0] - self.center[0], p[1] - self.center[1]]),
+            _ => {}
         }
         self
     }
@@ -129,6 +136,55 @@ impl Gradient {
             4 => [[r, 0.0], [0.0, r], [-r, 0.0], [0.0, -r]].iter().map(|[x, y]| [self.center[0] + x * c - y * s, self.center[1] + x * s + y * c]).collect(),
             _ => Vec::new(),
         }
+    }
+}
+
+// ------------------------------------------------------------------ vignette
+
+/// Vignette distance of a normalised point: `rawgraph_fx::vignette`'s metric (pixel distance
+/// from the frame centre over the half diagonal).
+pub fn vignette_distance(p: [f32; 2], size: [f32; 2]) -> f32 {
+    let (hw, hh) = (size[0] * 0.5, size[1] * 0.5);
+    let d = hw.hypot(hh);
+    if d <= 0.0 { return 0.0; }
+    ((p[0] - 0.5) * size[0]).hypot((p[1] - 0.5) * size[1]) / d
+}
+
+/// Radii (vignette distances) of the inner feather, midpoint and outer feather rings, exactly
+/// the smoothstep edges `rawgraph_fx::vignette` uses.
+pub fn vignette_rings(midpoint: f32, feather: f32) -> [f32; 3] {
+    let feather = feather.max(0.0);
+    let e0 = (midpoint - feather * 0.5).max(0.0);
+    let e1 = (midpoint + feather * 0.5).max(e0);
+    [e0, midpoint, e1]
+}
+
+/// Points of the ring at vignette distance `d` (a circle in pixels), normalised.
+pub fn vignette_ring(d: f32, size: [f32; 2], n: usize) -> Vec<[f32; 2]> {
+    let r = d * (size[0] * 0.5).hypot(size[1] * 0.5);
+    if size[0] <= 0.0 || size[1] <= 0.0 { return Vec::new(); }
+    (0..n).map(|i| {
+        let a = i as f32 / n as f32 * std::f32::consts::TAU;
+        [0.5 + r * a.cos() / size[0], 0.5 + r * a.sin() / size[1]]
+    }).collect()
+}
+
+/// Where the knob of a ring sits: on the diagonal towards the top-right corner (`upper`) or
+/// the bottom-right corner, so the midpoint and feather knobs stay apart when the rings meet.
+pub fn vignette_knob(d: f32, size: [f32; 2], upper: bool) -> [f32; 2] {
+    let (hw, hh) = (size[0] * 0.5, size[1] * 0.5);
+    let diag = hw.hypot(hh);
+    if diag <= 0.0 { return [0.5, 0.5]; }
+    let dy = d * hh / size[1];
+    [0.5 + d * hw / size[0], if upper { 0.5 - dy } else { 0.5 + dy }]
+}
+
+/// (midpoint, feather) after dragging a ring to vignette distance `d`.
+pub fn vignette_drag(part: Part, d: f32, midpoint: f32, feather: f32) -> (f32, f32) {
+    match part {
+        Part::Midpoint => (d.clamp(0.0, 1.0), feather),
+        Part::FeatherInner | Part::FeatherOuter => (midpoint, (2.0 * (d - midpoint).abs()).clamp(0.0, 1.0)),
+        _ => (midpoint, feather),
     }
 }
 
@@ -203,5 +259,26 @@ mod tests {
         assert!(a.center.iter().all(|c| (CENTER_MIN..=CENTER_MAX).contains(c)));
         let b = g(1).drag(Part::Edge, [0.4, 0.55]);
         assert_eq!(b.scale, SCALE_MIN);
+    }
+
+    #[test]
+    fn vignette_rings_use_the_effect_metric() {
+        let size = [300.0, 200.0];
+        assert_eq!(vignette_distance([0.5, 0.5], size), 0.0);
+        assert!((vignette_distance([1.0, 1.0], size) - 1.0).abs() < 1e-6, "corner is 1");
+        for d in [0.2, 0.5, 0.9] {
+            for p in vignette_ring(d, size, 16) {
+                assert!((vignette_distance(p, size) - d).abs() < 1e-5);
+            }
+            for upper in [true, false] {
+                assert!((vignette_distance(vignette_knob(d, size, upper), size) - d).abs() < 1e-5);
+            }
+        }
+        assert_eq!(vignette_rings(0.5, 0.4), [0.3, 0.5, 0.7]);
+        assert_eq!(vignette_rings(0.1, 0.6), [0.0, 0.1, 0.4]);
+        assert_eq!(vignette_drag(Part::Midpoint, 0.7, 0.5, 0.4), (0.7, 0.4));
+        let (m, f) = vignette_drag(Part::FeatherOuter, 0.8, 0.5, 0.4);
+        assert!((m - 0.5).abs() < 1e-6 && (f - 0.6).abs() < 1e-6);
+        assert_eq!(vignette_drag(Part::FeatherInner, 2.0, 0.5, 0.4).1, 1.0);
     }
 }

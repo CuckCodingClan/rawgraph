@@ -326,6 +326,10 @@ changes the photo on screen. Space+drag and the middle button still pan.
   hollow centre knob moves the whole gradient (new **Gradient center X / Y** settings,
   default 50 % / 50 %, so older graphs look the same). Double-click the centre to recentre;
   double-click an end to reset angle and scale.
+- **Vignette:** three rings at the exact distances the effect uses (the same
+  centre-to-half-diagonal metric): the bright ring is the midpoint, the faint inner and
+  outer rings are where the feather starts and reaches full strength. Drag the midpoint
+  knob (top right) or a feather knob (bottom right).
 
 ### Pixel Sort
 

@@ -12,7 +12,7 @@ use eframe::egui::{self, Color32, CursorIcon, Key, PointerButton, Pos2, Rect, St
 use rawgraph_core::{Graph, ImageId, Node, NodeId, NodeKind};
 
 use crate::frames::{self, Mapper};
-use crate::handles_logic::{Gradient, Part};
+use crate::handles_logic::{self as logic, Gradient, Part};
 use crate::session::Session;
 use crate::viewer::Geometry;
 
@@ -24,6 +24,7 @@ const HOT: Color32 = Color32::from_rgb(255, 210, 90);
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Model {
     Gradient(Gradient),
+    Vignette { midpoint: f32, feather: f32 },
 }
 
 /// The handle settings of `node` for `image`, `None` when the node has no handles (or they
@@ -38,6 +39,7 @@ pub fn model_of(_graph: &Graph, node: &Node, image: ImageId, _size: [f32; 2]) ->
             center: [p("gradient_center_x") / 100.0, p("gradient_center_y") / 100.0],
             vertical: node.toggle("vertical", image),
         })),
+        NodeKind::Vignette => Some(Model::Vignette { midpoint: p("midpoint"), feather: p("feather") }),
         _ => None,
     }
 }
@@ -46,15 +48,20 @@ pub fn model_of(_graph: &Graph, node: &Node, image: ImageId, _size: [f32; 2]) ->
 fn parts(model: &Model) -> &'static [Part] {
     match model {
         Model::Gradient(g) => g.parts(),
+        Model::Vignette { .. } => &[Part::Midpoint, Part::FeatherOuter, Part::FeatherInner],
     }
 }
 
 /// Parameter values after dragging `part` of `start` to `n` (normalised frame coordinates).
-pub fn drag_values(start: &Model, part: Part, n: [f32; 2], _size: [f32; 2]) -> Vec<(&'static str, f32)> {
+pub fn drag_values(start: &Model, part: Part, n: [f32; 2], size: [f32; 2]) -> Vec<(&'static str, f32)> {
     match *start {
         Model::Gradient(g) => {
             let g = g.drag(part, n);
             vec![("gradient_angle", g.angle), ("gradient_scale", g.scale * 100.0), ("gradient_center_x", g.center[0] * 100.0), ("gradient_center_y", g.center[1] * 100.0)]
+        }
+        Model::Vignette { midpoint, feather } => {
+            let (m, f) = logic::vignette_drag(part, logic::vignette_distance(n, size), midpoint, feather);
+            vec![("midpoint", m), ("feather", f)]
         }
     }
 }
@@ -65,6 +72,8 @@ pub fn reset_names(model: &Model, part: Part) -> &'static [&'static str] {
         (Model::Gradient(_), Part::Center) => &["gradient_center_x", "gradient_center_y"],
         (Model::Gradient(_), Part::Direction) => &["gradient_angle"],
         (Model::Gradient(_), _) => &["gradient_angle", "gradient_scale"],
+        (Model::Vignette { .. }, Part::Midpoint) => &["midpoint"],
+        (Model::Vignette { .. }, _) => &["feather"],
     }
 }
 
@@ -138,6 +147,11 @@ fn part_positions(model: &Model, f: &NodeFrame) -> Vec<(Part, Pos2)> {
 fn part_position(model: &Model, part: Part, f: &NodeFrame) -> Pos2 {
     match model {
         Model::Gradient(g) => f.to_screen(g.position(part)),
+        Model::Vignette { midpoint, feather } => {
+            let [e0, m, e1] = logic::vignette_rings(*midpoint, *feather);
+            let (d, upper) = match part { Part::Midpoint => (m, true), Part::FeatherInner => (e0, false), _ => (e1, false) };
+            f.to_screen(logic::vignette_knob(d, f.size, upper))
+        }
     }
 }
 
@@ -317,6 +331,19 @@ fn paint(ui: &egui::Ui, viewport: Rect, model: &Model, f: &NodeFrame, positions:
                 }
             }
             knob(&painter, c, false, hot == Some(Part::Center), 4.5);
+        }
+        Model::Vignette { midpoint, feather } => {
+            let rings = logic::vignette_rings(*midpoint, *feather);
+            for (i, d) in rings.iter().enumerate() {
+                if *d <= 0.0 {
+                    continue;
+                }
+                let pts: Vec<Pos2> = logic::vignette_ring(*d, f.size, 96).into_iter().map(|p| f.to_screen(p)).collect();
+                polyline(&painter, &pts, i == 1);
+            }
+            for (part, p) in positions {
+                knob(&painter, *p, *part == Part::Midpoint, hot == Some(*part), if *part == Part::Midpoint { 5.5 } else { 4.5 });
+            }
         }
     }
 }
