@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use rawgraph_core::{CaptureInfo, ImageBuf, ImageId, LensProfile};
@@ -111,6 +111,9 @@ pub struct FileProvider {
     done: Condvar,
     preview: AtomicU32,
     epoch: AtomicU64,
+    /// Foreground (viewer) decodes in progress. Background decoders (gallery bases,
+    /// prefetch) wait while this is non-zero so the viewer gets the disk/NAS and CPU.
+    foreground: AtomicUsize,
     demo: crate::session::TestImages,
 }
 
@@ -128,6 +131,7 @@ impl FileProvider {
             done: Condvar::new(),
             preview: AtomicU32::new(DEFAULT_PREVIEW),
             epoch: AtomicU64::new(0),
+            foreground: AtomicUsize::new(0),
             demo: crate::session::TestImages::new(),
         }
     }
@@ -290,6 +294,18 @@ impl FileProvider {
         self.cache.lock().ok()?.lru.get(&(id, self.preview_size()))
     }
 
+    /// True while a viewer decode is running.
+    pub fn foreground_busy(&self) -> bool { self.foreground.load(Ordering::Acquire) > 0 }
+
+    /// Blocks a background decoder while a viewer decode is running (bounded, so a stuck
+    /// foreground decode cannot starve the gallery forever). `cancelled` ends the wait early.
+    pub fn yield_to_foreground(&self, cancelled: impl Fn() -> bool) {
+        let started = std::time::Instant::now();
+        while self.foreground_busy() && !cancelled() && started.elapsed() < std::time::Duration::from_secs(20) {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+    }
+
     /// Speculative work never claims a foreground inflight slot. If a worker
     /// needs the same uncached image, it can start immediately on its own thread.
     pub fn prefetch(&self, id: ImageId) {
@@ -300,6 +316,8 @@ impl FileProvider {
         let Some(path) = self.path_of(id) else { return };
         let preview = self.preview_size();
         let key = (id, preview);
+        if self.cache.lock().is_ok_and(|c| c.lru.contains(&key) || c.inflight.contains(&key)) { return; }
+        self.yield_to_foreground(|| false);
         if self.cache.lock().is_ok_and(|c| c.lru.contains(&key) || c.inflight.contains(&key)) { return; }
         let epoch = self.epoch.load(Ordering::Relaxed);
         if let Ok(img) = decode(&path, preview) {
@@ -342,6 +360,7 @@ impl FileProvider {
             let full = self.demo.image(id)?;
             return Ok((Arc::new(full.downscale_box(size)), (full.width(), full.height())));
         }
+        self.yield_to_foreground(|| false);
         rawgraph_io::load(path, Some(size)).map(|l| (Arc::new(l.image), l.full_size)).map_err(|e| e.to_string())
     }
 
@@ -390,7 +409,9 @@ impl ImageProvider for FileProvider {
                 break;
             }
         }
+        self.foreground.fetch_add(1, Ordering::AcqRel);
         let result = self.decode(id, &path, preview);
+        self.foreground.fetch_sub(1, Ordering::AcqRel);
         if let Ok(mut c) = self.cache.lock() {
             c.inflight.remove(&key);
             if let Ok(img) = &result {
@@ -434,6 +455,24 @@ mod tests {
 
     fn img(w: u32, h: u32) -> Arc<ImageBuf> {
         Arc::new(ImageBuf::new(w, h))
+    }
+
+    #[test]
+    fn background_decodes_wait_while_the_viewer_decodes() {
+        let provider = Arc::new(FileProvider::new(32 << 20));
+        assert!(!provider.foreground_busy());
+        provider.foreground.fetch_add(1, Ordering::AcqRel);
+        let p = provider.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || { p.yield_to_foreground(|| false); tx.send(()).unwrap(); });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(150)).is_err(), "background work must wait for the viewer");
+        provider.foreground.fetch_sub(1, Ordering::AcqRel);
+        rx.recv_timeout(std::time::Duration::from_secs(2)).expect("resumes once the viewer decode is done");
+        waiter.join().unwrap();
+        let cancelled = std::time::Instant::now();
+        provider.foreground.fetch_add(1, Ordering::AcqRel);
+        provider.yield_to_foreground(|| true);
+        assert!(cancelled.elapsed() < std::time::Duration::from_millis(100), "a cancelled job does not wait");
     }
 
     #[test]

@@ -405,6 +405,8 @@ pub struct App {
     filmstrip: Filmstrip,
     quick_preview: crate::quick_preview::QuickPreview,
     quick_generation: u64,
+    /// The selection placeholder is the gallery's edited thumbnail (not an unedited preview).
+    placeholder_edited: bool,
     editor: GraphEditor,
     scope_panel: ScopePanel,
     /// UI-thread time of the last scope upload (`set_prepared`) in ms.
@@ -680,6 +682,7 @@ impl App {
             filmstrip,
             quick_preview: crate::quick_preview::QuickPreview::new(cc.egui_ctx.clone(), thumb_cache.clone()),
             quick_generation: 0,
+            placeholder_edited: false,
             editor,
             scope_panel: ScopePanel::new(),
             scope_ms: 0.0,
@@ -1608,13 +1611,20 @@ impl App {
             if viewer.preview_image.is_some() { *viewer = Viewer::with_preferences(viewer.click_zoom, viewer.wheel_navigates); }
             return;
         };
+        // The gallery already renders the Primary viewer's node for every photo, so its
+        // thumbnail shows the current edits; prefer it over an unedited proxy or camera JPEG.
+        let edited = if self.compare.active() { None } else { self.filmstrip.live.current(image) };
         if viewer.preview_image != Some(image) {
             self.quick_generation = self.quick_generation.wrapping_add(1);
             viewer.select(image, self.quick_generation);
             self.prefetch.forget();
             self.scopes_stale = true;
+            self.placeholder_edited = false;
             let provider = &self.session.provider;
-            if let Some(proxy) = provider.cached_proxy(image) {
+            if let Some(tex) = edited.clone() {
+                viewer.set_placeholder(self.quick_generation, tex.clone(), edited_geometry(&self.session, node, image, &tex));
+                self.placeholder_edited = true;
+            } else if let Some(proxy) = provider.cached_proxy(image) {
                 let size = (proxy.width(), proxy.height());
                 let tex = crate::quick_preview::proxy_texture(ctx, &proxy, self.session.view.transform());
                 viewer.set_placeholder(self.quick_generation, tex, crate::quick_preview::geometry(&self.session, node, image, size));
@@ -1628,8 +1638,15 @@ impl App {
             }
             ctx.request_repaint();
         }
+        if !self.placeholder_edited && viewer.awaiting_final() {
+            // The edited gallery thumbnail arrived after the selection: upgrade the placeholder.
+            if let Some(tex) = edited {
+                viewer.set_placeholder(self.quick_generation, tex.clone(), edited_geometry(&self.session, node, image, &tex));
+                self.placeholder_edited = true;
+            }
+        }
         for (generation, pixels) in self.quick_preview.poll() {
-            if generation != self.quick_generation || !viewer.awaiting_final() { continue; }
+            if generation != self.quick_generation || !viewer.awaiting_final() || self.placeholder_edited { continue; }
             let [w, h] = pixels.size;
             let size = crate::quick_preview::estimate_proxy_size(&self.session.provider, image, (w as u32, h as u32));
             let tex = ctx.load_texture("embedded selection preview", pixels, egui::TextureOptions::LINEAR);
@@ -3469,6 +3486,20 @@ fn setup_style(ctx: &egui::Context) {
         style.visuals.extreme_bg_color = egui::Color32::from_rgb(22, 24, 28);
         style.visuals.selection.bg_fill = egui::Color32::from_rgb(64, 110, 190);
     });
+}
+
+/// Placement of an edited gallery thumbnail as a selection placeholder: it is already the
+/// node's output (transforms and crop applied), so it maps 1:1 onto the final frame.
+fn edited_geometry(session: &crate::session::Session, node: rawgraph_core::NodeId, image: rawgraph_core::ImageId, tex: &egui::TextureHandle) -> crate::quick_preview::Geometry {
+    let [w, h] = tex.size();
+    let source = crate::quick_preview::estimate_proxy_size(&session.provider, image, (w as u32, h as u32));
+    let out = crate::quick_preview::geometry(session, node, image, source).size;
+    // Final frame's long edge, the thumbnail's own aspect (it is already the node's output).
+    let scale = out[0].max(out[1]).max(1) as f64 / w.max(h).max(1) as f64;
+    crate::quick_preview::Geometry {
+        size: [((w as f64 * scale).round() as u32).max(1), ((h as f64 * scale).round() as u32).max(1)],
+        uv: [egui::pos2(0.0, 0.0), egui::pos2(1.0, 0.0), egui::pos2(1.0, 1.0), egui::pos2(0.0, 1.0)],
+    }
 }
 
 #[cfg(test)]
